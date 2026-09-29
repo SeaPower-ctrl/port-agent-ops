@@ -16,23 +16,46 @@ Run:
 Then open http://localhost:5000
 """
 
-import sqlite3
 import os
+import re
 from datetime import datetime
 from functools import wraps
 from flask import Flask, request, jsonify, g, render_template_string, session, redirect, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
+import openpyxl
+import psycopg2
+import psycopg2.extras
 
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "do_tracker.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("APP_SECRET_KEY", "change-this-secret-key-later")
 
 
+class DBWrapper:
+    """Thin wrapper so the rest of the app can keep using SQLite-style
+    '?' placeholders and db.execute(...).fetchone()/fetchall(), while
+    actually talking to Postgres underneath."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def execute(self, query, params=()):
+        cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(query.replace("?", "%s"), params)
+        return cur
+
+    def commit(self):
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_FILE)
-        g.db.row_factory = sqlite3.Row
+        conn = psycopg2.connect(DATABASE_URL)
+        g.db = DBWrapper(conn)
     return g.db
 
 
@@ -44,17 +67,18 @@ def close_db(exception=None):
 
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute(
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute(
         """CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             role TEXT DEFAULT 'staff',
             created_at TEXT DEFAULT ''
         )"""
     )
-    conn.execute(
+    cur.execute(
         """CREATE TABLE IF NOT EXISTS records (
             bl_number TEXT PRIMARY KEY,
             consignee TEXT DEFAULT '',
@@ -72,6 +96,7 @@ def init_db():
         )"""
     )
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -184,7 +209,8 @@ def add_user():
             (username, generate_password_hash(password), role, datetime.now().strftime("%Y-%m-%d %H:%M")),
         )
         db.commit()
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
+        db.conn.rollback()
         return jsonify({"error": "Username already exists"}), 400
     return jsonify({"ok": True})
 
@@ -237,6 +263,90 @@ def submit_manifest():
         added += 1
     db.commit()
     return jsonify({"added": added})
+
+
+# Header names we'll recognize for each column, in the manifest Excel file.
+# Matching is case-insensitive and ignores spaces/punctuation.
+BL_HEADER_WORDS = ["blnumber", "bl", "billoflading", "billofladingno", "bl no", "blno"]
+CONSIGNEE_HEADER_WORDS = ["consignee", "consigneename", "customer", "customername"]
+
+
+def _normalize_header(text):
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+@app.route("/api/manifest/upload", methods=["POST"])
+@login_required
+def upload_manifest_excel():
+    if "file" not in request.files:
+        return jsonify({"error": "No file received"}), 400
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"error": "No file selected"}), 400
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        return jsonify({"error": "Please upload an .xlsx Excel file (not .xls or .csv)"}), 400
+
+    try:
+        wb = openpyxl.load_workbook(file, data_only=True)
+        sheet = wb.active
+    except Exception:
+        return jsonify({"error": "Couldn't read that file. Make sure it's a valid Excel (.xlsx) file."}), 400
+
+    rows = list(sheet.iter_rows(values_only=True))
+    if not rows:
+        return jsonify({"error": "That file looks empty."}), 400
+
+    # Try to find a header row (in the first 5 rows) naming the BL and Consignee columns.
+    bl_col = None
+    consignee_col = None
+    header_row_index = None
+
+    for i, row in enumerate(rows[:5]):
+        for col_index, cell in enumerate(row):
+            norm = _normalize_header(cell)
+            if norm and any(norm == w.replace(" ", "") or norm.startswith(w.replace(" ", "")) for w in BL_HEADER_WORDS):
+                bl_col = col_index
+                header_row_index = i
+            if norm and any(norm == w.replace(" ", "") for w in CONSIGNEE_HEADER_WORDS):
+                consignee_col = col_index
+                header_row_index = i
+        if bl_col is not None:
+            break
+
+    if bl_col is None:
+        # No recognizable header found - fall back to assuming column A is BL number,
+        # column B is consignee, and there's no header row.
+        bl_col = 0
+        consignee_col = 1
+        data_rows = rows
+    else:
+        data_rows = rows[header_row_index + 1:]
+
+    db = get_db()
+    added = 0
+    skipped = 0
+    for row in data_rows:
+        if bl_col >= len(row):
+            continue
+        raw_bl = row[bl_col]
+        if raw_bl is None or str(raw_bl).strip() == "":
+            continue
+        bl_number = str(raw_bl).strip().upper()
+        consignee = ""
+        if consignee_col is not None and consignee_col < len(row) and row[consignee_col]:
+            consignee = str(row[consignee_col]).strip()
+
+        existing = db.execute("SELECT 1 FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
+        if existing:
+            skipped += 1
+            continue
+        db.execute(
+            "INSERT INTO records (bl_number, consignee, created_at) VALUES (?, ?, ?)",
+            (bl_number, consignee, datetime.now().strftime("%Y-%m-%d %H:%M")),
+        )
+        added += 1
+    db.commit()
+    return jsonify({"added": added, "skipped": skipped})
 
 
 @app.route("/api/records/<bl_number>/toggle", methods=["POST"])
@@ -468,6 +578,11 @@ PAGE_HTML = """
       <textarea id="manifestInput" placeholder="Paste manifest: one BL per line, e.g.&#10;MSCU1234567, ABC Trading Co&#10;COSU9876543, Al Fahad Trading"></textarea>
       <button onclick="submitManifest()">Add to Board</button>
     </div>
+    <div class="row" style="margin-top:10px; align-items:center;">
+      <span style="font-size:12px; color:var(--muted);">Or upload an Excel manifest (.xlsx):</span>
+      <input type="file" id="excelFile" accept=".xlsx,.xlsm">
+      <button onclick="uploadExcel()" class="secondary" style="background:#eef2f5; color:var(--text);">Upload Excel</button>
+    </div>
   </div>
 
   <div class="summary" id="summary"></div>
@@ -515,6 +630,23 @@ async function submitManifest() {
   document.getElementById('manifestInput').value = '';
   await fetchRecords();
   alert(data.added + ' new BL record(s) added.');
+}
+
+async function uploadExcel() {
+  const fileInput = document.getElementById('excelFile');
+  const file = fileInput.files[0];
+  if (!file) { alert('Choose an Excel file first.'); return; }
+
+  const formData = new FormData();
+  formData.append('file', file);
+
+  const res = await fetch('/api/manifest/upload', { method: 'POST', body: formData });
+  const data = await res.json();
+  if (data.error) { alert(data.error); return; }
+
+  fileInput.value = '';
+  await fetchRecords();
+  alert(data.added + ' new BL record(s) added' + (data.skipped ? `, ${data.skipped} already on the board (skipped)` : '') + '.');
 }
 
 async function toggle(bl, field, value) {
