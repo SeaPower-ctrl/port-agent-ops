@@ -250,7 +250,7 @@ def submit_manifest():
             continue
         parts = [p.strip() for p in raw.split(",", 1)]
         bl_number = parts[0].upper()
-        consignee = parts[1] if len(parts) > 1 else ""
+        consignee = _clean_party_name(parts[1]) if len(parts) > 1 else ""
         if not bl_number:
             continue
         existing = db.execute("SELECT 1 FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
@@ -269,10 +269,53 @@ def submit_manifest():
 # Matching is case-insensitive and ignores spaces/punctuation.
 BL_HEADER_WORDS = ["blnumber", "bl", "billoflading", "billofladingno", "bl no", "blno"]
 CONSIGNEE_HEADER_WORDS = ["consignee", "consigneename", "customer", "customername"]
+NOTIFY_HEADER_WORDS = ["notifyparty", "notify", "notifypartyname", "notifypartydetails"]
 
 
 def _normalize_header(text):
     return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+# Words/patterns that mark where an address, phone number, or registration
+# detail starts inside a consignee/notify-party cell - everything from the
+# earliest of these onward gets cut off, keeping just the company name.
+_NAME_STOP_PATTERNS = [
+    r"\bADDRESS\b", r"\bADD\s*:", r"\bTEL\b", r"\bFAX\b", r"\bP\.?\s*O\.?\s*BOX\b",
+    r"\bC\.?\s*R\.?\s*(NO|NUMBER)?\s*:", r"\bCOMMERCIAL REGISTRATION\b",
+    r"\bREGISTRATION NUMBER\b", r"\bVAT\b", r"\bSTREET\b", r"\bDIST\.?\b",
+    r"\bKINGDOM OF\b", r"\bKSA\b", r"\bBUILDING\b", r"\bFLOOR\b", r"\bWITH\b",
+    r"\d{2,}",  # a run of 2+ digits usually starts a building/street/reg number
+]
+_BANK_PATTERNS = [r"\bTO\s+(THE\s+)?ORDER\b", r"\bBANK\b"]
+
+
+def _clean_party_name(text):
+    """Take a messy consignee/notify-party cell and return just the company
+    name, cutting off address, phone, and registration-number clutter."""
+    if not text:
+        return ""
+    text = str(text)
+    # A cell often has the name on its own line, address below - use the
+    # first non-empty line as the starting point.
+    lines = [l.strip() for l in re.split(r"[\r\n]+", text) if l.strip()]
+    if not lines:
+        return ""
+    candidate = lines[0]
+
+    earliest = len(candidate)
+    for pat in _NAME_STOP_PATTERNS:
+        m = re.search(pat, candidate, re.IGNORECASE)
+        if m and m.start() < earliest:
+            earliest = m.start()
+
+    cleaned = candidate[:earliest].strip(" ,.-:;")
+    return cleaned if cleaned else candidate.strip()
+
+
+def _looks_like_bank_or_order(text):
+    if not text:
+        return False
+    return any(re.search(pat, text, re.IGNORECASE) for pat in _BANK_PATTERNS)
 
 
 @app.route("/api/manifest/upload", methods=["POST"])
@@ -303,9 +346,11 @@ def upload_manifest_excel():
         if not rows:
             continue
 
-        # Try to find a header row (in the first 5 rows) naming the BL and Consignee columns.
+        # Try to find a header row (in the first 5 rows) naming the BL,
+        # Consignee, and Notify Party columns.
         bl_col = None
         consignee_col = None
+        notify_col = None
         header_row_index = None
 
         for i, row in enumerate(rows[:5]):
@@ -316,6 +361,9 @@ def upload_manifest_excel():
                     header_row_index = i
                 if norm and any(norm == w.replace(" ", "") for w in CONSIGNEE_HEADER_WORDS):
                     consignee_col = col_index
+                    header_row_index = i
+                if norm and any(norm == w.replace(" ", "") for w in NOTIFY_HEADER_WORDS):
+                    notify_col = col_index
                     header_row_index = i
             if bl_col is not None:
                 break
@@ -336,9 +384,19 @@ def upload_manifest_excel():
             if raw_bl is None or str(raw_bl).strip() == "":
                 continue
             bl_number = str(raw_bl).strip().upper()
-            consignee = ""
+
+            raw_consignee = ""
             if consignee_col is not None and consignee_col < len(row) and row[consignee_col]:
-                consignee = str(row[consignee_col]).strip()
+                raw_consignee = str(row[consignee_col]).strip()
+            consignee = _clean_party_name(raw_consignee)
+
+            # If the consignee cell is really a bank / "to order of" clause,
+            # the Notify Party is usually the actual receiving company - use
+            # that instead when the file has one.
+            if _looks_like_bank_or_order(consignee) and notify_col is not None and notify_col < len(row) and row[notify_col]:
+                notify_cleaned = _clean_party_name(str(row[notify_col]).strip())
+                if notify_cleaned:
+                    consignee = notify_cleaned
 
             existing = db.execute("SELECT 1 FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
             if existing:
@@ -394,11 +452,63 @@ def update_remarks(bl_number):
     return jsonify({"ok": True})
 
 
+@app.route("/api/records/<path:bl_number>/consignee", methods=["POST"])
+@login_required
+def update_consignee(bl_number):
+    data = request.get_json(force=True)
+    consignee = data.get("consignee", "")
+    db = get_db()
+    db.execute("UPDATE records SET consignee = ? WHERE bl_number = ?", (consignee, bl_number.upper()))
+    db.commit()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/records/<path:bl_number>", methods=["DELETE"])
 @login_required
 def delete_record(bl_number):
     db = get_db()
     db.execute("DELETE FROM records WHERE bl_number = ?", (bl_number.upper(),))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/records/restore", methods=["POST"])
+@login_required
+def restore_record():
+    """Used by the 'Undo' notice after a delete - re-inserts a record with
+    all its original fields, rather than a bare fresh row."""
+    data = request.get_json(force=True)
+    bl_number = str(data.get("bl_number", "")).strip().upper()
+    if not bl_number:
+        return jsonify({"error": "missing bl_number"}), 400
+
+    db = get_db()
+    existing = db.execute("SELECT 1 FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
+    if existing:
+        return jsonify({"ok": True, "note": "already exists"})
+
+    db.execute(
+        """INSERT INTO records
+           (bl_number, consignee, invoice_issued, invoice_by, invoice_at,
+            approval_received, approval_by, approval_at, do_issued, do_by, do_at,
+            remarks, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            bl_number,
+            data.get("consignee", ""),
+            1 if data.get("invoice_issued") else 0,
+            data.get("invoice_by", ""),
+            data.get("invoice_at", ""),
+            1 if data.get("approval_received") else 0,
+            data.get("approval_by", ""),
+            data.get("approval_at", ""),
+            1 if data.get("do_issued") else 0,
+            data.get("do_by", ""),
+            data.get("do_at", ""),
+            data.get("remarks", ""),
+            data.get("created_at", ""),
+        ),
+    )
     db.commit()
     return jsonify({"ok": True})
 
@@ -475,6 +585,14 @@ USERS_HTML = """
   button { background:var(--accent); color:#fff; border:none; border-radius:6px; padding:8px 14px; font-size:13px; cursor:pointer; }
   .del { background:none; color:#c0392b; }
   .row { display:flex; gap:8px; flex-wrap:wrap; }
+  #toastHost { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; }
+  .toast { background: #1a2733; color: #fff; padding: 10px 14px; border-radius: 8px; font-size: 13px;
+           display: flex; align-items: center; gap: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+           animation: toast-in .15s ease-out; max-width: 320px; }
+  .toast a { color: #7fc8ff; font-weight: 600; text-decoration: none; cursor: pointer; white-space: nowrap; }
+  .toast.fading { animation: toast-out .2s ease-in forwards; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes toast-out { to { opacity: 0; transform: translateY(6px); } }
 </style></head><body>
   <div class="topbar">
     <h2 style="margin:0;font-size:18px;">Manage Users</h2>
@@ -497,28 +615,52 @@ USERS_HTML = """
           <td>{{ u['username'] }}</td>
           <td>{{ u['role'] }}</td>
           <td>{{ u['created_at'] }}</td>
-          <td><button class="del" onclick="delUser({{ u['id'] }})">Remove</button></td>
+          <td><button class="del" onclick="delUser({{ u['id'] }}, {{ u['username']|tojson }})">Remove</button></td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
+  <div id="toastHost"></div>
 <script>
+function showToast(message, opts) {
+  opts = opts || {};
+  const host = document.getElementById('toastHost');
+  const el = document.createElement('div');
+  el.className = 'toast';
+  const text = document.createElement('span');
+  text.textContent = message;
+  el.appendChild(text);
+  if (opts.actionLabel && typeof opts.onAction === 'function') {
+    const a = document.createElement('a');
+    a.textContent = opts.actionLabel;
+    a.onclick = () => { opts.onAction(); dismiss(); };
+    el.appendChild(a);
+  }
+  host.appendChild(el);
+  const duration = opts.duration || 3500;
+  const timer = setTimeout(dismiss, duration);
+  function dismiss() {
+    clearTimeout(timer);
+    el.classList.add('fading');
+    setTimeout(() => el.remove(), 220);
+  }
+}
 async function addUser() {
   const username = document.getElementById('newUsername').value.trim();
   const password = document.getElementById('newPassword').value;
   const role = document.getElementById('newRole').value;
-  if (!username || !password) { alert('Fill in username and password'); return; }
+  if (!username || !password) { showToast('Fill in username and password'); return; }
   const res = await fetch('/api/users', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({username, password, role})});
   const data = await res.json();
-  if (data.error) { alert(data.error); return; }
+  if (data.error) { showToast(data.error); return; }
   location.reload();
 }
-async function delUser(id) {
-  if (!confirm('Remove this user?')) return;
+async function delUser(id, username) {
   await fetch('/api/users/' + id, {method:'DELETE'});
-  location.reload();
+  showToast('Removed user ' + (username || '') + '.');
+  setTimeout(() => location.reload(), 600);
 }
 </script>
 </body></html>
@@ -554,15 +696,34 @@ PAGE_HTML = """
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
   th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
-  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-  .pill.yes { background: #e3f6ea; color: var(--green); }
-  .pill.no { background: #fdecec; color: #c0392b; }
   .checkwrap { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; }
   .meta { font-size: 10px; color: var(--muted); }
-  .remarks-input { width: 100%; border: 1px solid transparent; background: transparent; font-size: 12px; }
-  .remarks-input:focus { border-color: var(--border); background: #fff; }
+  .remarks-input, .consignee-input { width: 100%; border: 1px solid transparent; background: transparent; font-size: 12px; font-family: inherit; padding: 3px 4px; border-radius: 4px; }
+  .remarks-input:focus, .consignee-input:focus { border-color: var(--border); background: #fff; }
   .del { background: none; color: #c0392b; font-size: 12px; padding: 2px 6px; }
   .overflow { overflow-x: auto; }
+
+  /* Sliding toggle switch */
+  .switch { position: relative; display: inline-block; width: 42px; height: 23px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #dfe6ec; transition: background-color .2s ease; border-radius: 24px; }
+  .slider:before { position: absolute; content: ""; height: 17px; width: 17px; left: 3px; bottom: 3px;
+                   background-color: #fff; transition: transform .2s ease; border-radius: 50%;
+                   box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
+  input:checked + .slider { background-color: var(--green); }
+  input:checked + .slider:before { transform: translateX(19px); }
+
+  /* Toast notifications (replace confirm()/alert() popups) */
+  #toastHost { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; }
+  .toast { background: #1a2733; color: #fff; padding: 10px 14px; border-radius: 8px; font-size: 13px;
+           display: flex; align-items: center; gap: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+           animation: toast-in .15s ease-out; max-width: 320px; }
+  .toast a { color: #7fc8ff; font-weight: 600; text-decoration: none; cursor: pointer; white-space: nowrap; }
+  .toast.fading { animation: toast-out .2s ease-in forwards; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes toast-out { to { opacity: 0; transform: translateY(6px); } }
+
   @media (max-width: 600px) {
     .stat { min-width: 45%; }
   }
@@ -614,10 +775,40 @@ PAGE_HTML = """
     </div>
   </div>
 
+  <div id="toastHost"></div>
+
 <script>
+const CURRENT_USER = {{ username|tojson }};
 let records = [];
+let pollTimer = null;
+let suppressPollUntil = 0;
+
+function showToast(message, opts) {
+  opts = opts || {};
+  const host = document.getElementById('toastHost');
+  const el = document.createElement('div');
+  el.className = 'toast';
+  const text = document.createElement('span');
+  text.textContent = message;
+  el.appendChild(text);
+  if (opts.actionLabel && typeof opts.onAction === 'function') {
+    const a = document.createElement('a');
+    a.textContent = opts.actionLabel;
+    a.onclick = () => { opts.onAction(); dismiss(); };
+    el.appendChild(a);
+  }
+  host.appendChild(el);
+  const duration = opts.duration || 3500;
+  const timer = setTimeout(dismiss, duration);
+  function dismiss() {
+    clearTimeout(timer);
+    el.classList.add('fading');
+    setTimeout(() => el.remove(), 220);
+  }
+}
 
 async function fetchRecords() {
+  if (Date.now() < suppressPollUntil) return;
   const res = await fetch('/api/records');
   if (res.status === 401 || res.redirected) { location.reload(); return; }
   records = await res.json();
@@ -634,61 +825,110 @@ async function submitManifest() {
   const data = await res.json();
   document.getElementById('manifestInput').value = '';
   await fetchRecords();
-  alert(data.added + ' new BL record(s) added.');
+  showToast(data.added + ' new BL record(s) added.');
 }
 
 async function uploadExcel() {
   const fileInput = document.getElementById('excelFile');
   const file = fileInput.files[0];
-  if (!file) { alert('Choose an Excel file first.'); return; }
+  if (!file) { showToast('Choose an Excel file first.'); return; }
 
   const formData = new FormData();
   formData.append('file', file);
 
   const res = await fetch('/api/manifest/upload', { method: 'POST', body: formData });
   const data = await res.json();
-  if (data.error) { alert(data.error); return; }
+  if (data.error) { showToast(data.error); return; }
 
   fileInput.value = '';
   await fetchRecords();
-  alert(data.added + ' new BL record(s) added' + (data.skipped ? `, ${data.skipped} already on the board (skipped)` : '') + '.');
+  showToast(data.added + ' new BL record(s) added' + (data.skipped ? `, ${data.skipped} already on the board (skipped)` : '') + '.');
 }
 
-async function toggle(bl, field, value) {
-  await fetch(`/api/records/${bl}/toggle`, {
+function nowLabel() {
+  const d = new Date();
+  return d.toISOString().slice(0, 16).replace('T', ' ');
+}
+
+function toggle(bl, field, value) {
+  // Optimistic update: reflect the change instantly, no waiting on the server.
+  const rec = records.find(r => r.bl_number === bl);
+  if (rec) {
+    rec[field] = value ? 1 : 0;
+    const byField = field.replace('_issued', '_by').replace('_received', '_by');
+    const atField = field.replace('_issued', '_at').replace('_received', '_at');
+    if (value) {
+      rec[byField] = CURRENT_USER;
+      rec[atField] = nowLabel();
+    }
+    render();
+  }
+  suppressPollUntil = Date.now() + 1500;
+  fetch(`/api/records/${encodeURIComponent(bl)}/toggle`, {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({field, value})
-  });
-  await fetchRecords();
+  }).then(() => fetchRecords()).catch(() => { showToast('Could not save that change - retrying...'); fetchRecords(); });
 }
 
 let remarksTimers = {};
 function onRemarksInput(bl, value) {
+  const rec = records.find(r => r.bl_number === bl);
+  if (rec) rec.remarks = value;
   clearTimeout(remarksTimers[bl]);
   remarksTimers[bl] = setTimeout(async () => {
-    await fetch(`/api/records/${bl}/remarks`, {
+    await fetch(`/api/records/${encodeURIComponent(bl)}/remarks`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({remarks: value})
     });
   }, 500);
 }
 
-async function deleteRecord(bl) {
-  if (!confirm('Remove BL ' + bl + ' from the board?')) return;
-  await fetch(`/api/records/${bl}`, {method: 'DELETE'});
-  await fetchRecords();
+let consigneeTimers = {};
+function onConsigneeInput(bl, value) {
+  const rec = records.find(r => r.bl_number === bl);
+  if (rec) rec.consignee = value;
+  clearTimeout(consigneeTimers[bl]);
+  consigneeTimers[bl] = setTimeout(async () => {
+    await fetch(`/api/records/${encodeURIComponent(bl)}/consignee`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({consignee: value})
+    });
+  }, 500);
+}
+
+function deleteRecord(bl) {
+  const idx = records.findIndex(r => r.bl_number === bl);
+  if (idx === -1) return;
+  const removed = records[idx];
+  records.splice(idx, 1);
+  render();
+  suppressPollUntil = Date.now() + 4000;
+  fetch(`/api/records/${encodeURIComponent(bl)}`, {method: 'DELETE'});
+
+  showToast('Removed BL ' + bl + '.', {
+    actionLabel: 'Undo',
+    duration: 5000,
+    onAction: async () => {
+      await fetch('/api/records/restore', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(removed)
+      });
+      await fetchRecords();
+      showToast('Restored BL ' + bl + '.');
+    }
+  });
 }
 
 function checkbox(bl, field, checked, by, at) {
   const id = bl + '_' + field;
   return `
     <div class="checkwrap">
-      <label>
+      <label class="switch">
         <input type="checkbox" id="${id}" ${checked ? 'checked' : ''}
           onchange="toggle('${bl}', '${field}', this.checked)">
-        <span class="pill ${checked ? 'yes' : 'no'}">${checked ? 'Yes' : 'No'}</span>
+        <span class="slider"></span>
       </label>
-      ${checked ? `<span class="meta">${by} - ${at}</span>` : ''}
+      ${checked ? `<span class="meta">${by || ''} - ${at || ''}</span>` : ''}
     </div>`;
 }
 
@@ -702,12 +942,13 @@ function render() {
   tbody.innerHTML = filtered.map(r => `
     <tr>
       <td><b>${r.bl_number}</b></td>
-      <td>${r.consignee || '-'}</td>
+      <td><input class="consignee-input" type="text" value="${(r.consignee || '').replace(/"/g,'&quot;')}"
+            oninput="onConsigneeInput('${r.bl_number}', this.value)" placeholder="consignee name..."></td>
       <td>${checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at)}</td>
       <td>${checkbox(r.bl_number, 'approval_received', !!r.approval_received, r.approval_by, r.approval_at)}</td>
       <td>${checkbox(r.bl_number, 'do_issued', !!r.do_issued, r.do_by, r.do_at)}</td>
       <td><input class="remarks-input" type="text" value="${(r.remarks || '').replace(/"/g,'&quot;')}"
-            onchange="onRemarksInput('${r.bl_number}', this.value)" placeholder="notes..."></td>
+            oninput="onRemarksInput('${r.bl_number}', this.value)" placeholder="notes..."></td>
       <td><button class="del" onclick="deleteRecord('${r.bl_number}')">Remove</button></td>
     </tr>
   `).join('') || '<tr><td colspan="7" style="color:#888;">No BLs on the board yet. Paste a manifest above to get started.</td></tr>';
