@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """
-Port Agent Ops - DO Tracker (v2, with logins)
-------------------------------------------------
-Same shared Delivery Order board as before, now with:
-  - Login required to view or use the board.
-  - First time the app ever runs, it asks you to create the first
-    Admin account (that's you).
-  - Admins can add more staff accounts (Settings > Manage Users).
-  - Mobile-friendly layout - works fine on a phone browser.
-
-Run:
-    pip install -r requirements.txt
-    python app.py   (or: py app.py on Windows)
-
-Then open http://localhost:5000
+Port Agent Ops - DO Tracker (v2, with logins & Neon DB support)
+----------------------------------------------------------------
+Shared Delivery Order board configured for production on Render + Neon DB.
 """
 
 import os
 import re
+import time
 from datetime import datetime
 from functools import wraps
 from flask import Flask, request, jsonify, g, render_template_string, session, redirect, url_for
@@ -25,17 +15,35 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import openpyxl
 import psycopg2
 import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2 import sql
 
+# Get Database URL and normalize schema prefix for psycopg2/SQLAlchemy compatibility
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# Ensure SSL mode is enabled for Neon DB
+if DATABASE_URL and "sslmode" not in DATABASE_URL:
+    delimiter = "&" if "?" in DATABASE_URL else "?"
+    DATABASE_URL += f"{delimiter}sslmode=require"
 
 app = Flask(__name__)
+
+# Security & Session Configuration
 app.secret_key = os.environ.get("APP_SECRET_KEY", "change-this-secret-key-later")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=os.environ.get("FLASK_ENV") == "production"
+)
+
+# Initialize Connection Pool
+db_pool = ThreadedConnectionPool(1, 10, dsn=DATABASE_URL) if DATABASE_URL else None
 
 
 class DBWrapper:
-    """Thin wrapper so the rest of the app can keep using SQLite-style
-    '?' placeholders and db.execute(...).fetchone()/fetchall(), while
-    actually talking to Postgres underneath."""
+    """Wrapper so the app uses SQLite-style '?' placeholders while executing against Postgres."""
 
     def __init__(self, conn):
         self.conn = conn
@@ -54,7 +62,15 @@ class DBWrapper:
 
 def get_db():
     if "db" not in g:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = db_pool.getconn()
+        # Ping check: verify connection is alive (handles Neon DB auto-suspend wakeups)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            db_pool.putconn(conn, close=True)
+            conn = db_pool.getconn()
+
         g.db = DBWrapper(conn)
     return g.db
 
@@ -63,10 +79,12 @@ def get_db():
 def close_db(exception=None):
     db = g.pop("db", None)
     if db is not None:
-        db.close()
+        db_pool.putconn(db.conn)
 
 
 def init_db():
+    if not DATABASE_URL:
+        return
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute(
@@ -95,9 +113,18 @@ def init_db():
             created_at TEXT DEFAULT ''
         )"""
     )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_records_created_at ON records (created_at DESC);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_records_consignee ON records (consignee);")
     conn.commit()
     cur.close()
     conn.close()
+
+
+# Auto-initialize database tables on app startup
+try:
+    init_db()
+except Exception as e:
+    print(f"Database initialization warning: {e}")
 
 
 def any_users_exist():
@@ -127,6 +154,9 @@ def admin_required(f):
 
 # ---------- Auth routes ----------
 
+LOGIN_ATTEMPTS = {}
+
+
 @app.route("/setup", methods=["GET", "POST"])
 def setup():
     if any_users_exist():
@@ -154,16 +184,30 @@ def login():
         return redirect(url_for("setup"))
     error = None
     if request.method == "POST":
+        ip = request.remote_addr
+        now = time.time()
+
+        # Brute force protection: max 5 attempts per minute per IP
+        attempts = [t for t in LOGIN_ATTEMPTS.get(ip, []) if now - t < 60]
+        if len(attempts) >= 5:
+            return render_template_string(LOGIN_HTML, error="Too many failed attempts. Please try again in a minute.")
+
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         db = get_db()
         user = db.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+
         if user and check_password_hash(user["password_hash"], password):
+            LOGIN_ATTEMPTS.pop(ip, None)
             session["user_id"] = user["id"]
             session["username"] = user["username"]
             session["role"] = user["role"]
             return redirect(url_for("index"))
+
+        attempts.append(now)
+        LOGIN_ATTEMPTS[ip] = attempts
         error = "Wrong username or password."
+
     return render_template_string(LOGIN_HTML, error=error)
 
 
@@ -233,7 +277,7 @@ def delete_user(user_id):
 @login_required
 def list_records():
     db = get_db()
-    rows = db.execute("SELECT * FROM records ORDER BY created_at DESC").fetchall()
+    rows = db.execute("SELECT * FROM records ORDER BY created_at DESC LIMIT 500").fetchall()
     return jsonify([dict(r) for r in rows])
 
 
@@ -265,8 +309,6 @@ def submit_manifest():
     return jsonify({"added": added})
 
 
-# Header names we'll recognize for each column, in the manifest Excel file.
-# Matching is case-insensitive and ignores spaces/punctuation.
 BL_HEADER_WORDS = ["blnumber", "bl", "billoflading", "billofladingno", "bl no", "blno"]
 CONSIGNEE_HEADER_WORDS = ["consignee", "consigneename", "customer", "customername"]
 
@@ -296,7 +338,6 @@ def upload_manifest_excel():
     if not rows:
         return jsonify({"error": "That file looks empty."}), 400
 
-    # Try to find a header row (in the first 5 rows) naming the BL and Consignee columns.
     bl_col = None
     consignee_col = None
     header_row_index = None
@@ -314,8 +355,6 @@ def upload_manifest_excel():
             break
 
     if bl_col is None:
-        # No recognizable header found - fall back to assuming column A is BL number,
-        # column B is consignee, and there's no header row.
         bl_col = 0
         consignee_col = 1
         data_rows = rows
@@ -370,11 +409,16 @@ def toggle_status(bl_number):
     by_val = user if value else ""
 
     db = get_db()
-    db.execute(
-        f"UPDATE records SET {field} = ?, {by_field} = ?, {at_field} = ? WHERE bl_number = ?",
-        (value, by_val, now, bl_number.upper()),
+    query = sql.SQL("UPDATE records SET {} = %s, {} = %s, {} = %s WHERE bl_number = %s").format(
+        sql.Identifier(field),
+        sql.Identifier(by_field),
+        sql.Identifier(at_field)
     )
+    
+    cur = db.conn.cursor()
+    cur.execute(query, (value, by_val, now, bl_number.upper()))
     db.commit()
+    cur.close()
     return jsonify({"ok": True})
 
 
@@ -683,7 +727,7 @@ function checkbox(bl, field, checked, by, at) {
           onchange="toggle('${bl}', '${field}', this.checked)">
         <span class="pill ${checked ? 'yes' : 'no'}">${checked ? 'Yes' : 'No'}</span>
       </label>
-      ${checked ? `<span class="meta">${by} - ${at}</span>` : ''}
+      ${checked ? `<span class="meta">${by} -${at}</span>` : ''}
     </div>`;
 }
 
@@ -730,6 +774,5 @@ setInterval(fetchRecords, 4000);
 """
 
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
