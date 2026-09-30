@@ -22,7 +22,7 @@ import csv
 import io
 from datetime import datetime
 from functools import wraps
-from flask import Flask, request, jsonify, g, render_template_string, session, redirect, url_for
+from flask import Flask, request, jsonify, g, render_template_string, session, redirect, url_for, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 import openpyxl
 import xlrd
@@ -110,6 +110,11 @@ def init_db():
     # Each record is owned by whichever staff account created it - DO Tracker
     # is per-staff (admin sees everything, staff only see their own).
     cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS created_by TEXT DEFAULT ''")
+    # Direct Delivery Classifier: NULL = not yet classified, 0 = not direct
+    # delivery, 1 = direct delivery. dd_reason is the short human-readable
+    # reason shown on hover (e.g. "42.5MT item" or "oversize but wheeled").
+    cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS is_direct_delivery INTEGER")
+    cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS dd_reason TEXT DEFAULT ''")
     cur.execute(
         """CREATE TABLE IF NOT EXISTS vessels (
             name TEXT PRIMARY KEY,
@@ -219,6 +224,18 @@ def vessel_tracker_page():
     return render_template_string(VESSEL_TRACKER_HTML, username=session.get("username"), role=session.get("role"))
 
 
+@app.route("/kpi")
+@login_required
+def kpi_page():
+    return render_template_string(KPI_HTML, username=session.get("username"), role=session.get("role"))
+
+
+@app.route("/direct-delivery")
+@login_required
+def direct_delivery_page():
+    return render_template_string(DIRECT_DELIVERY_HTML, username=session.get("username"), role=session.get("role"))
+
+
 @app.route("/users")
 @login_required
 @admin_required
@@ -279,6 +296,121 @@ def list_records():
             (session.get("username"),),
         ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+def _parse_ts(s):
+    """Parses the app's 'YYYY-MM-DD HH:MM' timestamp strings. Returns None
+    for blank/unparseable values instead of raising, since plenty of older
+    or in-progress records have empty *_at fields."""
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+
+
+@app.route("/api/kpi", methods=["GET"])
+@login_required
+def kpi_data():
+    """Port Agent KPI - built entirely from the DO Tracker board, no
+    separate data entry. Three things a port agent's manager would actually
+    want to see:
+      - turnaround: how long BLs take to move through each stage, on average
+      - backlog: what's stuck right now, oldest first
+      - workload: how many BLs each agent is carrying (admin only - staff
+        only ever see their own records anyway, so a "workload" breakdown
+        for them would just be a breakdown of one)
+    """
+    db = get_db()
+    is_admin = session.get("role") == "admin"
+    if is_admin:
+        rows = db.execute("SELECT * FROM records ORDER BY created_at ASC").fetchall()
+    else:
+        rows = db.execute(
+            "SELECT * FROM records WHERE created_by = ? ORDER BY created_at ASC",
+            (session.get("username"),),
+        ).fetchall()
+    records = [dict(r) for r in rows]
+
+    def avg_hours(deltas):
+        if not deltas:
+            return None
+        return round(sum(deltas) / len(deltas) / 3600.0, 1)
+
+    invoice_hrs, approval_hrs, do_hrs = [], [], []
+    now = datetime.utcnow()
+    pending_invoice, pending_approval, pending_do = [], [], []
+    per_agent = {}
+
+    for r in records:
+        created = _parse_ts(r.get("created_at"))
+        agent = r.get("created_by") or "(unknown)"
+        bucket = per_agent.setdefault(agent, {"total": 0, "complete": 0, "pending": 0, "turnarounds": []})
+        bucket["total"] += 1
+
+        complete = bool(r.get("invoice_issued") and r.get("approval_received") and r.get("do_issued"))
+        if complete:
+            bucket["complete"] += 1
+        else:
+            bucket["pending"] += 1
+
+        if created:
+            inv_at = _parse_ts(r.get("invoice_at"))
+            appr_at = _parse_ts(r.get("approval_at"))
+            do_at = _parse_ts(r.get("do_at"))
+            if inv_at:
+                invoice_hrs.append((inv_at - created).total_seconds())
+            if appr_at:
+                approval_hrs.append((appr_at - created).total_seconds())
+            if do_at:
+                do_hrs.append((do_at - created).total_seconds())
+                bucket["turnarounds"].append((do_at - created).total_seconds())
+
+            days_open = round((now - created).total_seconds() / 86400.0, 1)
+            entry = {
+                "bl_number": r.get("bl_number"), "port": r.get("port"), "vessel": r.get("vessel"),
+                "created_by": agent, "days_open": days_open,
+            }
+            if not r.get("invoice_issued"):
+                pending_invoice.append(entry)
+            if not r.get("approval_received"):
+                pending_approval.append(entry)
+            if not r.get("do_issued"):
+                pending_do.append(entry)
+
+    for lst in (pending_invoice, pending_approval, pending_do):
+        lst.sort(key=lambda e: -e["days_open"])
+
+    workload = None
+    if is_admin:
+        workload = [
+            {
+                "agent": agent, "total": b["total"], "complete": b["complete"], "pending": b["pending"],
+                "avg_turnaround_hours": avg_hours(b["turnarounds"]),
+            }
+            for agent, b in sorted(per_agent.items(), key=lambda kv: -kv[1]["total"])
+        ]
+
+    return jsonify({
+        "total_bls": len(records),
+        "turnaround": {
+            "avg_hours_to_invoice": avg_hours(invoice_hrs),
+            "avg_hours_to_approval": avg_hours(approval_hrs),
+            "avg_hours_to_do": avg_hours(do_hrs),
+        },
+        "backlog": {
+            "pending_invoice": pending_invoice[:15],
+            "pending_approval": pending_approval[:15],
+            "pending_do": pending_do[:15],
+            "counts": {
+                "pending_invoice": len(pending_invoice),
+                "pending_approval": len(pending_approval),
+                "pending_do": len(pending_do),
+            },
+        },
+        "workload": workload,
+    })
 
 
 def _owns_record(bl_number):
@@ -512,6 +644,244 @@ def upload_manifest_excel():
 
     db.commit()
     return jsonify({"added": added, "skipped": skipped})
+
+
+# ---------- Direct Delivery Classifier ----------
+# Rule: a BL is Direct Delivery if any item in its packing list is over 30MT
+# (heavy lift) or over 12m long (oversize) - UNLESS that item has wheels it
+# can drive off on, or is a coil, in which case it doesn't need a low-bed
+# trailer and so is NOT direct delivery even though it's heavy/oversize.
+# A BL can span several sub-sheets in the packing list (e.g. 004A-004I are
+# all BL "004"), so classification is done BL-wise after grouping, not
+# per sub-sheet.
+
+DD_WEIGHT_MT_THRESHOLD = 30.0
+DD_LENGTH_M_THRESHOLD = 12.0
+
+DD_WEIGHT_HEADER_WORDS = ["weight", "grossweight", "gw", "gwkgs", "gwmt", "totalweight", "wt", "kgs", "kg", "mt", "tons", "ton"]
+DD_LENGTH_HEADER_WORDS = ["length", "dimension", "dimensions", "size", "lwh", "l", "lm", "cargodimension", "dims"]
+DD_DESC_HEADER_WORDS = ["description", "desc", "cargo", "commodity", "itemdescription", "goodsdescription", "cargodescription"]
+
+# Exception keywords (English + common Chinese) - if the item description
+# contains any of these, it's excluded from Direct Delivery even if it
+# trips the weight/length threshold.
+DD_EXCEPTION_WORDS = [
+    "wheel", "wheels", "self-propelled", "self propelled", "tyre", "tire", "tyres", "tires",
+    "trailer mounted", "drive off", "roll on", "coil", "coils",
+    "轮", "车轮", "自走", "自行", "钢卷", "卷材", "卷",
+]
+
+
+def _dd_is_exception(description):
+    text = str(description or "").lower()
+    return any(w.lower() in text for w in DD_EXCEPTION_WORDS)
+
+
+def _dd_parse_weight_mt(raw):
+    """Best-effort: a bare number is assumed to already be in MT if it's
+    under 1000, or in KG (divided down to MT) if 1000 or over - this holds
+    for realistic single-item cargo weights either way it's written."""
+    try:
+        v = float(str(raw).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    return v / 1000.0 if v >= 1000 else v
+
+
+def _dd_parse_length_m(raw):
+    """Takes the first number out of a dimension cell (packing lists commonly
+    list Length x Width x Height, in that order) and scales it to meters:
+    >1000 assumed mm, 100-1000 assumed cm, otherwise assumed already meters."""
+    text = str(raw or "")
+    m = re.search(r"[\d.]+", text.replace(",", ""))
+    if not m:
+        return None
+    try:
+        v = float(m.group())
+    except ValueError:
+        return None
+    if v <= 0:
+        return None
+    if "mm" in text.lower():
+        return v / 1000.0
+    if "cm" in text.lower():
+        return v / 100.0
+    if v > 1000:
+        return v / 1000.0
+    if v > 100:
+        return v / 100.0
+    return v
+
+
+def _dd_bl_root(text):
+    """Strips a trailing sub-sheet letter suffix off a BL/sheet name, e.g.
+    "004A" -> "004", "004-I" -> "004", so every sub-sheet of one BL groups
+    together. Left as-is if it doesn't end in digits-then-letters."""
+    s = str(text or "").strip().upper()
+    m = re.match(r"^(.*\d)[\s\-_]?[A-Z]{1,2}$", s)
+    return m.group(1) if m else s
+
+
+def _extract_classification_rows(rows, sheet_bl_hint=None):
+    """Scans a grid of cell values for BL/weight/length/description columns
+    (first 5 rows, same tolerant approach as the BL-only extractor) and
+    returns one {bl, weight_mt, length_m, description} dict per data row.
+    Weight/length end up None where no matching column was found - those
+    rows simply can't be classified, rather than guessing."""
+    if not rows:
+        return []
+    bl_col = weight_col = length_col = desc_col = None
+    header_row_index = None
+    for i, row in enumerate(rows[:5]):
+        for col_index, cell in enumerate(row):
+            norm = _normalize_header(cell)
+            if not norm:
+                continue
+            if bl_col is None and any(norm == w.replace(" ", "") for w in BL_HEADER_WORDS):
+                bl_col = col_index
+            if weight_col is None and any(norm == w for w in DD_WEIGHT_HEADER_WORDS):
+                weight_col = col_index
+            if length_col is None and any(norm == w for w in DD_LENGTH_HEADER_WORDS):
+                length_col = col_index
+            if desc_col is None and any(norm == w for w in DD_DESC_HEADER_WORDS):
+                desc_col = col_index
+        if weight_col is not None or length_col is not None:
+            header_row_index = i
+            break
+
+    if header_row_index is None:
+        return []  # no recognizable weight/length column on this sheet at all
+
+    out = []
+    for row in rows[header_row_index + 1:]:
+        bl = str(row[bl_col]).strip().upper() if bl_col is not None and bl_col < len(row) and row[bl_col] else (sheet_bl_hint or "")
+        if not bl:
+            continue
+        weight_mt = _dd_parse_weight_mt(row[weight_col]) if weight_col is not None and weight_col < len(row) else None
+        length_m = _dd_parse_length_m(row[length_col]) if length_col is not None and length_col < len(row) else None
+        description = str(row[desc_col]).strip() if desc_col is not None and desc_col < len(row) and row[desc_col] else ""
+        if weight_mt is None and length_m is None:
+            continue
+        out.append({"bl": _dd_bl_root(bl), "weight_mt": weight_mt, "length_m": length_m, "description": description})
+    return out
+
+
+def _dd_classify_groups(items):
+    """Groups classification rows by BL and applies the Direct Delivery
+    rule, returning {bl_root: (is_direct, reason)}."""
+    by_bl = {}
+    for item in items:
+        by_bl.setdefault(item["bl"], []).append(item)
+
+    results = {}
+    for bl, group in by_bl.items():
+        best_trigger = None  # (weight_mt, length_m, description) of the strongest qualifying item
+        only_exception_triggers = True
+        any_trigger = False
+        for item in group:
+            w, l, d = item["weight_mt"], item["length_m"], item["description"]
+            triggers = (w is not None and w > DD_WEIGHT_MT_THRESHOLD) or (l is not None and l > DD_LENGTH_M_THRESHOLD)
+            if not triggers:
+                continue
+            any_trigger = True
+            if _dd_is_exception(d):
+                continue
+            only_exception_triggers = False
+            if best_trigger is None or (w or 0) > (best_trigger[0] or 0) or (l or 0) > (best_trigger[1] or 0):
+                best_trigger = (w, l, d)
+
+        if best_trigger is not None:
+            w, l, d = best_trigger
+            detail = f"{w:.1f}MT" if w and w > DD_WEIGHT_MT_THRESHOLD else f"{l:.1f}m"
+            results[bl] = (True, f"Direct delivery - item at {detail}" + (f" ({d[:40]})" if d else ""))
+        elif any_trigger and only_exception_triggers:
+            results[bl] = (False, "Heavy/oversize item(s) are wheeled or coiled - exception applies")
+        else:
+            results[bl] = (False, "All items under 30MT and 12m")
+    return results
+
+
+@app.route("/api/manifest/classify", methods=["POST"])
+@login_required
+def classify_manifest():
+    """Upload a packing list and this tags every matching BL already on the
+    board as Direct Delivery or not, with a short reason. BLs in the file
+    that aren't on the board yet are reported back but not created (they
+    still need a Port/Vessel, same as any other manifest upload)."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file received"}), 400
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"error": "No file selected"}), 400
+    filename = file.filename.lower()
+
+    items = []
+    try:
+        if filename.endswith((".xlsx", ".xlsm")):
+            wb = openpyxl.load_workbook(file, data_only=True)
+            for sheet in wb.worksheets:
+                rows = list(sheet.iter_rows(values_only=True))
+                items.extend(_extract_classification_rows(rows, sheet_bl_hint=_dd_bl_root(sheet.title)))
+        elif filename.endswith(".xls"):
+            book = xlrd.open_workbook(file_contents=file.read())
+            for sheet in book.sheets():
+                rows = [sheet.row_values(r) for r in range(sheet.nrows)]
+                items.extend(_extract_classification_rows(rows, sheet_bl_hint=_dd_bl_root(sheet.name)))
+        elif filename.endswith(".csv"):
+            text = file.read().decode("utf-8-sig", errors="ignore")
+            rows = list(csv.reader(io.StringIO(text)))
+            items.extend(_extract_classification_rows(rows))
+        else:
+            return jsonify({"error": "Please upload the packing list as .xlsx, .xls or .csv."}), 400
+    except Exception:
+        return jsonify({"error": "Couldn't read that file. Make sure it isn't corrupted or password-protected."}), 400
+
+    if not items:
+        return jsonify({"error": "Couldn't find a weight or length column in that file - classification needs at least one of those."}), 400
+
+    classified = _dd_classify_groups(items)
+
+    db = get_db()
+    matched, unmatched = [], []
+    for bl, (is_direct, reason) in classified.items():
+        row = db.execute("SELECT bl_number FROM records WHERE bl_number = ?", (bl,)).fetchone()
+        if row is None:
+            unmatched.append(bl)
+            continue
+        if not _owns_record(bl):
+            continue
+        db.execute(
+            "UPDATE records SET is_direct_delivery = ?, dd_reason = ? WHERE bl_number = ?",
+            (1 if is_direct else 0, reason, bl),
+        )
+        matched.append({"bl": bl, "direct": is_direct, "reason": reason})
+
+    db.commit()
+    return jsonify({"matched": matched, "unmatched": unmatched})
+
+
+@app.route("/api/direct-delivery", methods=["GET"])
+@login_required
+def list_direct_delivery():
+    """Every BL that's been through the classifier, for the Direct Delivery
+    page's results table - so a refresh doesn't lose what was just
+    uploaded. Matches DO Tracker's own visibility rule (staff only ever
+    see their own BLs) even though this is its own separate page."""
+    db = get_db()
+    if session.get("role") == "admin":
+        rows = db.execute(
+            "SELECT bl_number, port, vessel, is_direct_delivery, dd_reason, created_by "
+            "FROM records WHERE is_direct_delivery IS NOT NULL ORDER BY bl_number"
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT bl_number, port, vessel, is_direct_delivery, dd_reason, created_by "
+            "FROM records WHERE is_direct_delivery IS NOT NULL AND created_by = ? ORDER BY bl_number",
+            (session.get("username"),),
+        ).fetchall()
+    return jsonify([dict(r) for r in rows])
 
 
 @app.route("/api/records/<path:bl_number>/toggle", methods=["POST"])
@@ -1523,14 +1893,23 @@ HUB_HTML = """
       <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
     </a>
 
-    <div class="tile soon">
-      <span class="soon-pill">Coming soon</span>
+    <a class="tile" href="/kpi">
       <div class="tile-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M2 12h20"/></svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M18 17V9M13 17V5M8 17v-4"/></svg>
       </div>
-      <h3>More workspaces</h3>
-      <p>New features get added here as tiles, right alongside these.</p>
-    </div>
+      <h3>Port Agent KPI</h3>
+      <p>Turnaround times, pending backlog and workload, built from the DO Tracker board.</p>
+      <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
+    </a>
+
+    <a class="tile" href="/direct-delivery">
+      <div class="tile-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7l9-4 9 4-9 4-9-4z"/><path d="M3 7v10l9 4 9-4V7"/><path d="M12 11v10"/></svg>
+      </div>
+      <h3>Direct Delivery Classifier</h3>
+      <p>Upload a cargo packing list and see which BLs need direct delivery, by weight and size.</p>
+      <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
+    </a>
   </div>
 
 <script>
@@ -2060,6 +2439,505 @@ function setTheme(mode) {
 }
 
 loadData();
+</script>
+</body></html>
+"""
+
+KPI_HTML = """
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compass - Port Agent KPI</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + """">
+<style>
+  :root {
+    --bg: #f2f4f7; --card: #ffffff; --text: #1c2b3a; --muted: #7a8794; --border: #e6e9ed;
+    --navy: #123a56; --navy-deep: #0b2740; --navy-light: #1f5c85; --gold: #c9a227; --gold-light: #e0bd53;
+    --danger: #d1483f; --danger-bg: #fbeceb; --ok: #1c8a5a; --ok-bg: #e7f5ee;
+    --warn: #b8860b; --warn-bg: #fbf3df;
+    --shadow-sm: 0 1px 2px rgba(18,58,86,0.05); --shadow-md: 0 10px 30px rgba(18,58,86,0.10);
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --bg: #131a23; --card: #1a232f; --text: #e9eef3; --muted: #93a1b1; --border: #29323f;
+    --navy: #3f86ba; --navy-deep: #274a67; --navy-light: #5aa2d1; --gold: #e3bb4c; --gold-light: #f0cf72;
+    --danger: #e2685f; --danger-bg: #3a2220; --ok: #3ecb8e; --ok-bg: #163329;
+    --warn: #e3bb4c; --warn-bg: #362c14;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.25); --shadow-md: 0 10px 30px rgba(0,0,0,0.35);
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif;
+    background: var(--bg); color: var(--text); margin: 0; padding: 0 16px 32px;
+    transition: background-color .25s ease, color .25s ease;
+  }
+  .topbar {
+    position: sticky; top: 0; z-index: 50; display: flex; justify-content: space-between; align-items: center;
+    gap: 12px; flex-wrap: wrap; padding: 14px 16px; margin: 0 -16px 20px;
+    background: color-mix(in srgb, var(--bg) 86%, transparent);
+    backdrop-filter: saturate(180%) blur(14px); -webkit-backdrop-filter: saturate(180%) blur(14px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+  .brand img { height: 32px; width: auto; }
+  .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
+  .brand-text .app-name { font-size: 14.5px; font-weight: 700; color: var(--text); }
+  .brand-text .app-tag { font-size: 11px; color: var(--muted); }
+  .topbar-right { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+  .topbar-right a { color: var(--navy); text-decoration: none; font-weight: 600; font-size: 13px; padding: 6px 12px; border-radius: 20px; transition: background .15s ease; }
+  :root[data-theme="dark"] .topbar-right a { color: var(--navy-light); }
+  .topbar-right a:hover { background: var(--border); }
+
+  .theme-switch { position: relative; display: inline-flex; width: 54px; height: 29px; cursor: pointer; }
+  .theme-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .theme-track { position: absolute; inset: 0; border-radius: 999px; display: flex; align-items: center; justify-content: space-between; padding: 0 7px; background: linear-gradient(135deg,#8fcaf0,#f4d58d); transition: background .3s ease; }
+  :root[data-theme="dark"] .theme-track { background: linear-gradient(135deg,#1f2b42,#33456a); }
+  .theme-icon { width: 13px; height: 13px; color: #fff; opacity: .9; z-index: 1; }
+  .theme-icon svg { width: 100%; height: 100%; }
+  .theme-knob { position: absolute; top: 3px; left: 3px; width: 23px; height: 23px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.3); transition: transform .3s cubic-bezier(.4,0,.2,1); }
+  input:checked + .theme-track .theme-knob { transform: translateX(25px); background: #0b2740; }
+
+  .page-head { padding: 4px 4px 18px; }
+  .page-head .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--gold); margin-bottom: 6px; }
+  :root[data-theme="dark"] .page-head .eyebrow { color: var(--gold-light); }
+  .page-head h1 { font-size: 22px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  .page-head p { color: var(--muted); margin: 0; font-size: 13.5px; }
+
+  .metrics { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 20px; }
+  .metric-card { flex: 1; min-width: 160px; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow-sm); padding: 16px 18px; }
+  .metric-card .m-label { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; font-weight: 700; margin-bottom: 6px; }
+  .metric-card .m-value { font-size: 26px; font-weight: 700; }
+  .metric-card .m-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+  .kpi-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }
+  @media (max-width: 900px) { .kpi-grid { grid-template-columns: 1fr; } }
+
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 18px; box-shadow: var(--shadow-sm); padding: 16px 18px; }
+  .panel h2 { font-size: 15px; margin: 0 0 2px; }
+  .panel .panel-sub { font-size: 12px; color: var(--muted); margin: 0 0 12px; }
+
+  .backlog-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .backlog-row:last-child { border-bottom: none; }
+  .backlog-row .b-bl { font-weight: 700; }
+  .backlog-row .b-meta { font-size: 11.5px; color: var(--muted); }
+  .days-pill { font-size: 10.5px; font-weight: 700; padding: 3px 9px; border-radius: 999px; white-space: nowrap; }
+  .days-pill.ok { background: var(--ok-bg); color: var(--ok); }
+  .days-pill.warn { background: var(--warn-bg); color: var(--warn); }
+  .days-pill.danger { background: var(--danger-bg); color: var(--danger); }
+  .empty-note { color: var(--muted); font-size: 13px; padding: 10px 2px; }
+
+  .workload-panel { margin-top: 4px; }
+  table.workload { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  table.workload th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  table.workload td { padding: 10px; border-bottom: 1px solid var(--border); }
+  table.workload tr:last-child td { border-bottom: none; }
+
+  .loading-note { color: var(--muted); font-size: 13.5px; padding: 30px 4px; text-align: center; }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <a href="/" class="brand">
+      <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
+      <div class="brand-text">
+        <span class="app-name">Compass</span>
+        <span class="app-tag">Port Agent KPI</span>
+      </div>
+    </a>
+    <div class="topbar-right">
+      <label class="theme-switch" title="Toggle dark mode">
+        <input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')">
+        <span class="theme-track">
+          <span class="theme-icon sun">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg>
+          </span>
+          <span class="theme-icon moon">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg>
+          </span>
+          <span class="theme-knob"></span>
+        </span>
+      </label>
+      <a href="/do-tracker">DO Tracker</a>
+      {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
+      <span style="padding:6px 4px;">Signed in as <b>{{ username }}</b></span>
+      <a href="/logout">Log out</a>
+    </div>
+  </div>
+
+  <div class="page-head">
+    <div class="eyebrow">Compass</div>
+    <h1>Port Agent KPI</h1>
+    <p>{% if role == 'admin' %}Built from the DO Tracker board - every staff member's records.{% else %}Built from the DO Tracker board - your own records.{% endif %}</p>
+  </div>
+
+  <div id="content">
+    <div class="loading-note">Loading...</div>
+  </div>
+
+<script>
+(function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem('theme'); } catch (e) {}
+  const mode = saved || 'light';
+  document.documentElement.setAttribute('data-theme', mode);
+  window.addEventListener('DOMContentLoaded', () => {
+    const cb = document.getElementById('themeToggle');
+    if (cb) cb.checked = mode === 'dark';
+  });
+})();
+function setTheme(mode) {
+  document.documentElement.setAttribute('data-theme', mode);
+  try { localStorage.setItem('theme', mode); } catch (e) {}
+}
+
+const IS_ADMIN = {{ (role == 'admin')|tojson }};
+
+function daysPillClass(days) {
+  if (days >= 7) return 'danger';
+  if (days >= 3) return 'warn';
+  return 'ok';
+}
+
+function backlogRowsHtml(list, emptyMsg) {
+  if (!list.length) return `<div class="empty-note">${emptyMsg}</div>`;
+  return list.map(e => `
+    <div class="backlog-row">
+      <div>
+        <div class="b-bl">${e.bl_number}</div>
+        <div class="b-meta">${[e.port, e.vessel].filter(Boolean).join(' &middot; ') || 'No port/vessel set'}${IS_ADMIN ? ' &middot; ' + (e.created_by || 'unknown') : ''}</div>
+      </div>
+      <span class="days-pill ${daysPillClass(e.days_open)}">${e.days_open}d</span>
+    </div>`).join('');
+}
+
+function fmtHours(h) {
+  if (h === null || h === undefined) return '&ndash;';
+  if (h < 48) return h + 'h';
+  return (h / 24).toFixed(1) + 'd';
+}
+
+async function loadData() {
+  const res = await fetch('/api/kpi');
+  if (res.status === 401 || res.redirected) { location.reload(); return; }
+  const data = await res.json();
+
+  const workloadHtml = (data.workload && data.workload.length) ? `
+    <div class="panel workload-panel">
+      <h2>Workload per agent</h2>
+      <p class="panel-sub">Who's carrying what, right now.</p>
+      <table class="workload">
+        <thead><tr><th>Agent</th><th>Total BLs</th><th>Complete</th><th>Pending</th><th>Avg turnaround</th></tr></thead>
+        <tbody>
+          ${data.workload.map(w => `
+            <tr>
+              <td><b>${w.agent}</b></td>
+              <td>${w.total}</td>
+              <td>${w.complete}</td>
+              <td>${w.pending}</td>
+              <td>${fmtHours(w.avg_turnaround_hours)}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>` : '';
+
+  document.getElementById('content').innerHTML = `
+    <div class="metrics">
+      <div class="metric-card">
+        <div class="m-label">Total BLs</div>
+        <div class="m-value">${data.total_bls}</div>
+      </div>
+      <div class="metric-card">
+        <div class="m-label">Avg time to invoice</div>
+        <div class="m-value">${fmtHours(data.turnaround.avg_hours_to_invoice)}</div>
+        <div class="m-sub">from BL added</div>
+      </div>
+      <div class="metric-card">
+        <div class="m-label">Avg time to approval</div>
+        <div class="m-value">${fmtHours(data.turnaround.avg_hours_to_approval)}</div>
+        <div class="m-sub">from BL added</div>
+      </div>
+      <div class="metric-card">
+        <div class="m-label">Avg time to DO issued</div>
+        <div class="m-value">${fmtHours(data.turnaround.avg_hours_to_do)}</div>
+        <div class="m-sub">full turnaround</div>
+      </div>
+    </div>
+
+    <div class="kpi-grid">
+      <div class="panel">
+        <h2>Pending invoice</h2>
+        <p class="panel-sub">${data.backlog.counts.pending_invoice} BL(s) &middot; oldest first</p>
+        ${backlogRowsHtml(data.backlog.pending_invoice, 'Nothing pending - invoices are all caught up.')}
+      </div>
+      <div class="panel">
+        <h2>Pending approval</h2>
+        <p class="panel-sub">${data.backlog.counts.pending_approval} BL(s) &middot; oldest first</p>
+        ${backlogRowsHtml(data.backlog.pending_approval, 'Nothing pending - approvals are all caught up.')}
+      </div>
+      <div class="panel">
+        <h2>Pending DO</h2>
+        <p class="panel-sub">${data.backlog.counts.pending_do} BL(s) &middot; oldest first</p>
+        ${backlogRowsHtml(data.backlog.pending_do, 'Nothing pending - all DOs are issued.')}
+      </div>
+    </div>
+
+    ${workloadHtml}
+  `;
+}
+
+loadData();
+</script>
+</body></html>
+"""
+
+DIRECT_DELIVERY_HTML = """
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compass - Direct Delivery Classifier</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + """">
+<style>
+  :root {
+    --bg: #f2f4f7; --card: #ffffff; --text: #1c2b3a; --muted: #7a8794; --border: #e6e9ed;
+    --navy: #123a56; --navy-deep: #0b2740; --navy-light: #1f5c85; --gold: #c9a227; --gold-light: #e0bd53;
+    --danger: #d1483f; --danger-bg: #fbeceb; --ok: #1c8a5a; --ok-bg: #e7f5ee;
+    --shadow-sm: 0 1px 2px rgba(18,58,86,0.05); --shadow-md: 0 10px 30px rgba(18,58,86,0.10);
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --bg: #131a23; --card: #1a232f; --text: #e9eef3; --muted: #93a1b1; --border: #29323f;
+    --navy: #3f86ba; --navy-deep: #274a67; --navy-light: #5aa2d1; --gold: #e3bb4c; --gold-light: #f0cf72;
+    --danger: #e2685f; --danger-bg: #3a2220; --ok: #3ecb8e; --ok-bg: #163329;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.25); --shadow-md: 0 10px 30px rgba(0,0,0,0.35);
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif;
+    background: var(--bg); color: var(--text); margin: 0; padding: 0 16px 32px;
+    transition: background-color .25s ease, color .25s ease;
+  }
+  .topbar {
+    position: sticky; top: 0; z-index: 50; display: flex; justify-content: space-between; align-items: center;
+    gap: 12px; flex-wrap: wrap; padding: 14px 16px; margin: 0 -16px 20px;
+    background: color-mix(in srgb, var(--bg) 86%, transparent);
+    backdrop-filter: saturate(180%) blur(14px); -webkit-backdrop-filter: saturate(180%) blur(14px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+  .brand img { height: 32px; width: auto; }
+  .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
+  .brand-text .app-name { font-size: 14.5px; font-weight: 700; color: var(--text); }
+  .brand-text .app-tag { font-size: 11px; color: var(--muted); }
+  .topbar-right { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+  .topbar-right a { color: var(--navy); text-decoration: none; font-weight: 600; font-size: 13px; padding: 6px 12px; border-radius: 20px; transition: background .15s ease; }
+  :root[data-theme="dark"] .topbar-right a { color: var(--navy-light); }
+  .topbar-right a:hover { background: var(--border); }
+
+  .theme-switch { position: relative; display: inline-flex; width: 54px; height: 29px; cursor: pointer; }
+  .theme-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .theme-track { position: absolute; inset: 0; border-radius: 999px; display: flex; align-items: center; justify-content: space-between; padding: 0 7px; background: linear-gradient(135deg,#8fcaf0,#f4d58d); transition: background .3s ease; }
+  :root[data-theme="dark"] .theme-track { background: linear-gradient(135deg,#1f2b42,#33456a); }
+  .theme-icon { width: 13px; height: 13px; color: #fff; opacity: .9; z-index: 1; }
+  .theme-icon svg { width: 100%; height: 100%; }
+  .theme-knob { position: absolute; top: 3px; left: 3px; width: 23px; height: 23px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.3); transition: transform .3s cubic-bezier(.4,0,.2,1); }
+  input:checked + .theme-track .theme-knob { transform: translateX(25px); background: #0b2740; }
+
+  .page-head { padding: 4px 4px 18px; }
+  .page-head .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--gold); margin-bottom: 6px; }
+  :root[data-theme="dark"] .page-head .eyebrow { color: var(--gold-light); }
+  .page-head h1 { font-size: 22px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  .page-head p { color: var(--muted); margin: 0; font-size: 13.5px; max-width: 640px; }
+
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 18px; box-shadow: var(--shadow-sm); padding: 18px 20px; margin-bottom: 18px; }
+  .panel h2 { font-size: 15px; margin: 0 0 2px; }
+  .panel .panel-sub { font-size: 12px; color: var(--muted); margin: 0 0 14px; }
+
+  .dropzone {
+    display: flex; align-items: center; gap: 12px; cursor: pointer;
+    border: 1.5px dashed var(--border); border-radius: 14px; padding: 16px;
+    transition: border-color .15s ease, background .15s ease;
+  }
+  .dropzone:hover, .dropzone.dragover {
+    border-color: var(--navy-light); background: color-mix(in srgb, var(--navy-light) 6%, transparent);
+  }
+  .dropzone-icon {
+    width: 36px; height: 36px; border-radius: 10px; background: var(--ok-bg); color: var(--ok);
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  .dropzone-icon svg { width: 19px; height: 19px; }
+  .dropzone-text { font-size: 13px; color: var(--text); }
+  .dropzone-text b { font-weight: 700; }
+  .dropzone-sub { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+  .status-line { font-size: 13px; color: var(--muted); margin-top: 12px; min-height: 18px; }
+  .status-line.ok { color: var(--ok); }
+  .status-line.error { color: var(--danger); }
+
+  table.dd-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  table.dd-table th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  table.dd-table td { padding: 10px; border-bottom: 1px solid var(--border); }
+  table.dd-table tr:last-child td { border-bottom: none; }
+
+  .dd-badge { display:inline-block; padding:3px 9px; border-radius:20px; font-size:11px; font-weight:700; letter-spacing:.3px; text-transform:uppercase; }
+  .dd-badge.dd-yes { background: rgba(212,160,23,0.16); color:#8a6d1f; border:1px solid rgba(212,160,23,0.4); }
+  :root[data-theme="dark"] .dd-badge.dd-yes { color: var(--gold-light); }
+  .dd-badge.dd-no { background: rgba(120,120,120,0.12); color: var(--muted); border:1px solid var(--border); }
+
+  .empty-note { color: var(--muted); font-size: 13px; padding: 10px 2px; }
+  .unmatched-note { font-size: 12.5px; color: var(--muted); margin-top: 10px; padding: 10px 12px; background: var(--bg); border-radius: 10px; }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <a href="/" class="brand">
+      <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
+      <div class="brand-text">
+        <span class="app-name">Compass</span>
+        <span class="app-tag">Direct Delivery Classifier</span>
+      </div>
+    </a>
+    <div class="topbar-right">
+      <label class="theme-switch" title="Toggle dark mode">
+        <input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')">
+        <span class="theme-track">
+          <span class="theme-icon sun">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg>
+          </span>
+          <span class="theme-icon moon">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg>
+          </span>
+          <span class="theme-knob"></span>
+        </span>
+      </label>
+      <a href="/do-tracker">DO Tracker</a>
+      {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
+      <span style="padding:6px 4px;">Signed in as <b>{{ username }}</b></span>
+      <a href="/logout">Log out</a>
+    </div>
+  </div>
+
+  <div class="page-head">
+    <div class="eyebrow">Compass</div>
+    <h1>Direct Delivery Classifier</h1>
+    <p>Upload a cargo packing list and every BL over 30MT or 12m gets flagged as Direct Delivery - unless it's wheeled or a coil, in which case it doesn't need a low-bed trailer. BLs need to already be on the DO Tracker board to get tagged.</p>
+  </div>
+
+  <div class="panel">
+    <h2>Classify a packing list</h2>
+    <p class="panel-sub">.xlsx, .xls or .csv - reads the weight/length/description columns automatically.</p>
+    <label class="dropzone" id="dropzone" for="classifyFile">
+      <div class="dropzone-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8">
+          <path d="M12 16V4M12 4l-4 4M12 4l4 4"/><path d="M4 16v3a1 1 0 001 1h14a1 1 0 001-1v-3"/>
+        </svg>
+      </div>
+      <div>
+        <div class="dropzone-text"><b>Click to upload</b> or drag &amp; drop the packing list</div>
+        <div class="dropzone-sub">.xlsx, .xls or .csv</div>
+      </div>
+      <input type="file" id="classifyFile" accept=".xlsx,.xlsm,.xls,.csv" style="display:none" onchange="uploadClassify()">
+    </label>
+    <div class="status-line" id="statusLine"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Classified BLs</h2>
+    <p class="panel-sub" id="resultsSub">Loading...</p>
+    <div id="resultsBody"></div>
+  </div>
+
+<script>
+(function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem('theme'); } catch (e) {}
+  const mode = saved || 'light';
+  document.documentElement.setAttribute('data-theme', mode);
+  window.addEventListener('DOMContentLoaded', () => {
+    const cb = document.getElementById('themeToggle');
+    if (cb) cb.checked = mode === 'dark';
+  });
+})();
+function setTheme(mode) {
+  document.documentElement.setAttribute('data-theme', mode);
+  try { localStorage.setItem('theme', mode); } catch (e) {}
+}
+
+const dropzone = document.getElementById('dropzone');
+['dragenter', 'dragover'].forEach(evt => {
+  dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+});
+['dragleave', 'drop'].forEach(evt => {
+  dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.remove('dragover'); });
+});
+dropzone.addEventListener('drop', e => {
+  const f = e.dataTransfer.files[0];
+  if (f) { document.getElementById('classifyFile').files = e.dataTransfer.files; uploadClassify(); }
+});
+
+function ddBadgeHtml(direct) {
+  return `<span class="dd-badge ${direct ? 'dd-yes' : 'dd-no'}">${direct ? 'Direct Delivery' : 'Not direct'}</span>`;
+}
+
+async function uploadClassify() {
+  const input = document.getElementById('classifyFile');
+  const file = input.files[0];
+  if (!file) return;
+  const status = document.getElementById('statusLine');
+  status.className = 'status-line';
+  status.textContent = 'Classifying...';
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const res = await fetch('/api/manifest/classify', {method: 'POST', body: fd});
+    const data = await res.json();
+    if (!res.ok) {
+      status.className = 'status-line error';
+      status.textContent = data.error || 'Could not classify that file.';
+      input.value = '';
+      return;
+    }
+    const matched = data.matched || [];
+    const direct = matched.filter(m => m.direct).length;
+    const unmatched = data.unmatched || [];
+    status.className = 'status-line ok';
+    status.textContent = matched.length
+      ? `Tagged ${matched.length} BL(s) - ${direct} direct delivery.${unmatched.length ? ' ' + unmatched.length + ' BL(s) in the file aren\\'t on the DO Tracker board yet, so they were skipped.' : ''}`
+      : 'No BLs from the packing list matched anything on the DO Tracker board.';
+    input.value = '';
+    await loadResults();
+  } catch (e) {
+    status.className = 'status-line error';
+    status.textContent = 'Could not classify that file.';
+    input.value = '';
+  }
+}
+
+async function loadResults() {
+  const res = await fetch('/api/direct-delivery');
+  if (res.status === 401 || res.redirected) { location.reload(); return; }
+  const rows = await res.json();
+  const sub = document.getElementById('resultsSub');
+  const body = document.getElementById('resultsBody');
+  if (!rows.length) {
+    sub.textContent = 'Nothing classified yet.';
+    body.innerHTML = '<div class="empty-note">Upload a packing list above to get started.</div>';
+    return;
+  }
+  const direct = rows.filter(r => r.is_direct_delivery === 1).length;
+  sub.textContent = `${rows.length} BL(s) classified - ${direct} direct delivery.`;
+  body.innerHTML = `
+    <table class="dd-table">
+      <thead><tr><th>BL Number</th><th>Port</th><th>Vessel</th><th>Status</th><th>Reason</th></tr></thead>
+      <tbody>
+        ${rows.map(r => `
+          <tr>
+            <td><b>${r.bl_number}</b></td>
+            <td>${r.port || '-'}</td>
+            <td>${r.vessel || '-'}</td>
+            <td>${ddBadgeHtml(r.is_direct_delivery === 1)}</td>
+            <td style="color:var(--muted);">${r.dd_reason || ''}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+loadResults();
 </script>
 </body></html>
 """
