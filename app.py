@@ -330,11 +330,25 @@ def _normalize_header(text):
     return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
 
 
-def _extract_bl_numbers_from_rows(rows):
+def _extract_bl_numbers_from_rows(rows, allow_no_header_fallback=True):
     """rows: a list of rows, each row a sequence of cell values (any type,
     already-stringifiable). Looks for a header naming the BL Number column
-    in the first 5 rows (same recognized header words used for Excel);
-    falls back to treating column A as the BL number with no header row.
+    in the first 5 rows (same recognized header words used for Excel).
+
+    If no such header is found:
+      - allow_no_header_fallback=False skips this table entirely (used for
+        sheets/tables beyond the first one in a multi-sheet/multi-table
+        file - real manifests are commonly one main BL-list sheet plus
+        per-BL "attachment" sheets, e.g. a vehicle's chassis/engine-number
+        list, which have an ITEM/serial column but no BL Number column at
+        all; blindly reading their column A as BL numbers turns "1, 2, 3,
+        4..." into fake BL records).
+      - allow_no_header_fallback=True (the default - used for a lone
+        sheet/table, or plain pasted text) falls back to column A as the
+        BL number. As a safety net even then, if the values that column A
+        produces are themselves just "1", "2", "3", "4", ... (a serial/
+        item counter, not real BL data), this is skipped too.
+
     Returns a flat list of upper-cased BL number strings (not deduped)."""
     if not rows:
         return []
@@ -344,13 +358,20 @@ def _extract_bl_numbers_from_rows(rows):
     for i, row in enumerate(rows[:5]):
         for col_index, cell in enumerate(row):
             norm = _normalize_header(cell)
-            if norm and any(norm == w.replace(" ", "") or norm.startswith(w.replace(" ", "")) for w in BL_HEADER_WORDS):
+            # Exact match only - a loose "startswith" here used to also
+            # match unrelated things like a "B/L ATTACHMENT" sheet title
+            # (normalizes to "blattachment", which starts with "bl"),
+            # falsely treating it as a real header and reading junk data
+            # out of the column below it.
+            if norm and any(norm == w.replace(" ", "") for w in BL_HEADER_WORDS):
                 bl_col = col_index
                 header_row_index = i
         if bl_col is not None:
             break
 
     if bl_col is None:
+        if not allow_no_header_fallback:
+            return []
         bl_col = 0
         data_rows = rows
     else:
@@ -363,7 +384,20 @@ def _extract_bl_numbers_from_rows(rows):
         raw_bl = row[bl_col]
         if raw_bl is None or str(raw_bl).strip() == "":
             continue
-        out.append(str(raw_bl).strip().upper())
+        candidate = str(raw_bl).strip().upper()
+        # Skip a trailing "TOTAL:" / "GRAND TOTAL" summary row - manifests
+        # commonly have one at the bottom of the same column as the BL
+        # numbers, and it isn't a real BL.
+        norm_candidate = _normalize_header(candidate)
+        if norm_candidate in ("total", "totals", "grandtotal"):
+            continue
+        out.append(candidate)
+
+    if header_row_index is None:
+        sample = out[:5]
+        if sample == [str(n) for n in range(1, len(sample) + 1)]:
+            return []
+
     return out
 
 
@@ -407,16 +441,22 @@ def upload_manifest_excel():
             wb = openpyxl.load_workbook(file, data_only=True)
             # Go through every sheet (not just the first/active one) so BLs
             # aren't missed if the file has multiple tabs or was last saved
-            # on a different sheet.
-            for sheet in wb.worksheets:
+            # on a different sheet. Only the FIRST sheet gets the "no
+            # header -> assume column A" fallback: a real-world manifest is
+            # commonly one main BL-list sheet plus per-BL "attachment"
+            # sheets (e.g. a vehicle's chassis/engine-number list) that
+            # have their own ITEM/serial column but no BL data at all -
+            # falling back on those would read "1, 2, 3, 4..." as BL
+            # numbers.
+            for i, sheet in enumerate(wb.worksheets):
                 rows = list(sheet.iter_rows(values_only=True))
-                bl_numbers.extend(_extract_bl_numbers_from_rows(rows))
+                bl_numbers.extend(_extract_bl_numbers_from_rows(rows, allow_no_header_fallback=(i == 0)))
 
         elif filename.endswith(".xls"):
             book = xlrd.open_workbook(file_contents=file.read())
-            for sheet in book.sheets():
+            for i, sheet in enumerate(book.sheets()):
                 rows = [sheet.row_values(r) for r in range(sheet.nrows)]
-                bl_numbers.extend(_extract_bl_numbers_from_rows(rows))
+                bl_numbers.extend(_extract_bl_numbers_from_rows(rows, allow_no_header_fallback=(i == 0)))
 
         elif filename.endswith(".csv"):
             text = file.read().decode("utf-8-sig", errors="ignore")
@@ -427,23 +467,25 @@ def upload_manifest_excel():
             import docx
             document = docx.Document(file)
             if document.tables:
-                for table in document.tables:
+                for i, table in enumerate(document.tables):
                     rows = [[cell.text for cell in row.cells] for row in table.rows]
-                    bl_numbers.extend(_extract_bl_numbers_from_rows(rows))
+                    bl_numbers.extend(_extract_bl_numbers_from_rows(rows, allow_no_header_fallback=(i == 0)))
             else:
                 full_text = "\n".join(p.text for p in document.paragraphs)
                 bl_numbers.extend(_extract_bl_numbers_from_lines(full_text))
 
         elif filename.endswith(".pdf"):
             import pdfplumber
-            found_table = False
+            all_tables = []
             with pdfplumber.open(file) as pdf:
                 for page in pdf.pages:
                     for table in (page.extract_tables() or []):
                         if table:
-                            found_table = True
-                            bl_numbers.extend(_extract_bl_numbers_from_rows(table))
-                if not found_table:
+                            all_tables.append(table)
+                if all_tables:
+                    for i, table in enumerate(all_tables):
+                        bl_numbers.extend(_extract_bl_numbers_from_rows(table, allow_no_header_fallback=(i == 0)))
+                else:
                     for page in pdf.pages:
                         bl_numbers.extend(_extract_bl_numbers_from_lines(page.extract_text() or ""))
 
