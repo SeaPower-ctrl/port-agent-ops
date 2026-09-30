@@ -1011,6 +1011,43 @@ AUTH_STYLE = """
     10%,90% { transform: translateX(-1px); } 20%,80% { transform: translateX(2px); }
     30%,50%,70% { transform: translateX(-4px); } 40%,60% { transform: translateX(4px); }
   }
+
+  /* Password show/hide toggle */
+  .pw-wrap { position: relative; }
+  .pw-wrap input { padding-right: 42px; }
+  .pw-toggle {
+    position: absolute; right: 5px; top: 50%; transform: translateY(-50%);
+    width: 32px; height: 32px; margin: 0; padding: 0; background: none; border: none;
+    display: flex; align-items: center; justify-content: center; cursor: pointer;
+    color: var(--muted); border-radius: 8px; transition: color .15s ease, background .15s ease;
+  }
+  .pw-toggle:hover { color: var(--text); background: color-mix(in srgb, var(--border) 70%, transparent); }
+  .pw-toggle:active { transform: translateY(-50%) scale(.92); }
+  .pw-toggle svg { width: 18px; height: 18px; pointer-events: none; }
+
+  /* Custom cursor - a small dot with a soft trailing glow, on top of the
+     drifting blobs. Only on real mouse/trackpad input (hover:hover and
+     pointer:fine) - touch and coarse-pointer devices keep the native
+     cursor untouched and never see this. */
+  @media (hover: hover) and (pointer: fine) {
+    body, a, button, input, .theme-switch, .pw-toggle { cursor: none; }
+    .cursor-glow {
+      position: fixed; left: 0; top: 0; width: 30px; height: 30px; border-radius: 50%;
+      background: radial-gradient(circle, var(--gold) 0%, transparent 72%);
+      transform: translate(-50%, -50%); pointer-events: none; z-index: 9999;
+      opacity: 0; transition: opacity .25s ease, width .2s ease, height .2s ease;
+    }
+    .cursor-glow.active { opacity: .5; }
+    .cursor-glow.hovering { width: 52px; height: 52px; opacity: .65; }
+    .cursor-glow.pressed { width: 20px; height: 20px; opacity: .85; }
+    .cursor-dot {
+      position: fixed; left: 0; top: 0; width: 6px; height: 6px; border-radius: 50%;
+      background: var(--gold-light); transform: translate(-50%, -50%); pointer-events: none;
+      z-index: 10000; opacity: 0; transition: opacity .25s ease;
+      box-shadow: 0 0 8px color-mix(in srgb, var(--gold-light) 70%, transparent);
+    }
+    .cursor-dot.active { opacity: 1; }
+  }
 </style>
 <script>
 (function initTheme() {
@@ -1027,6 +1064,62 @@ function setTheme(mode) {
   document.documentElement.setAttribute('data-theme', mode);
   try { localStorage.setItem('theme', mode); } catch (e) {}
 }
+
+function togglePw(btn) {
+  const wrap = btn.closest('.pw-wrap');
+  const input = wrap.querySelector('input');
+  const eye = btn.querySelector('.icon-eye');
+  const eyeOff = btn.querySelector('.icon-eye-off');
+  const showing = input.type === 'password';
+  input.type = showing ? 'text' : 'password';
+  eye.style.display = showing ? 'none' : '';
+  eyeOff.style.display = showing ? '' : 'none';
+  btn.setAttribute('aria-label', showing ? 'Hide password' : 'Show password');
+}
+
+/* Custom trailing cursor - a small dot glued to the real pointer, plus a
+   soft glow that eases toward it a beat behind. Desktop-only (see the
+   hover:hover/pointer:fine CSS gate above); this script itself also bails
+   out early on touch/coarse-pointer devices so it costs nothing there. */
+(function initCursor() {
+  if (!window.matchMedia || !window.matchMedia('(hover: hover) and (pointer: fine)').matches) return;
+  window.addEventListener('DOMContentLoaded', () => {
+    const glow = document.createElement('div');
+    glow.className = 'cursor-glow';
+    const dot = document.createElement('div');
+    dot.className = 'cursor-dot';
+    document.body.appendChild(glow);
+    document.body.appendChild(dot);
+
+    let mx = window.innerWidth / 2, my = window.innerHeight / 2;
+    let gx = mx, gy = my;
+    let active = false;
+
+    document.addEventListener('mousemove', (e) => {
+      mx = e.clientX; my = e.clientY;
+      dot.style.left = mx + 'px'; dot.style.top = my + 'px';
+      if (!active) { active = true; glow.classList.add('active'); dot.classList.add('active'); }
+    });
+    document.addEventListener('mouseleave', () => {
+      active = false; glow.classList.remove('active'); dot.classList.remove('active');
+    });
+    document.addEventListener('mousedown', () => glow.classList.add('pressed'));
+    document.addEventListener('mouseup', () => glow.classList.remove('pressed'));
+    document.addEventListener('mouseover', (e) => {
+      if (e.target.closest('a, button, input, select, .theme-switch')) glow.classList.add('hovering');
+    });
+    document.addEventListener('mouseout', (e) => {
+      if (e.target.closest('a, button, input, select, .theme-switch')) glow.classList.remove('hovering');
+    });
+
+    (function raf() {
+      gx += (mx - gx) * 0.16;
+      gy += (my - gy) * 0.16;
+      glow.style.left = gx + 'px'; glow.style.top = gy + 'px';
+      requestAnimationFrame(raf);
+    })();
+  });
+})();
 </script>
 """
 
@@ -1044,6 +1137,11 @@ THEME_TOGGLE_SNIPPET = """
     </span>
   </label>
 """
+
+PW_TOGGLE_BTN = """<button type="button" class="pw-toggle" onclick="togglePw(this)" tabindex="-1" aria-label="Show password">
+      <svg class="icon-eye" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+      <svg class="icon-eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 19c-7 0-11-7-11-7a21.6 21.6 0 0 1 5.06-6.17M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 7 11 7a21.6 21.6 0 0 1-2.16 3.19M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="M1 1l22 22"/></svg>
+    </button>"""
 
 SETUP_HTML = """
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1064,7 +1162,10 @@ SETUP_HTML = """
     <label>Choose a username</label>
     <input type="text" name="username" required autofocus>
     <label>Choose a password</label>
-    <input type="password" name="password" required>
+    <div class="pw-wrap">
+      <input type="password" name="password" required>
+      """ + PW_TOGGLE_BTN + """
+    </div>
     <button type="submit">Create Admin Account</button>
   </form>
 </div>
@@ -1090,7 +1191,10 @@ LOGIN_HTML = """
     <label>Username</label>
     <input type="text" name="username" required autofocus>
     <label>Password</label>
-    <input type="password" name="password" required>
+    <div class="pw-wrap">
+      <input type="password" name="password" required>
+      """ + PW_TOGGLE_BTN + """
+    </div>
     <button type="submit">Sign In</button>
   </form>
 </div>
