@@ -1395,7 +1395,7 @@ HUB_HTML = """
       <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
       <div class="brand-text">
         <span class="app-name">Compass</span>
-        <span class="app-tag">Sea Power &middot; Port Agent Ops</span>
+        <span class="app-tag">Sea Power Marine Services Co. Ltd</span>
       </div>
     </a>
     <div class="topbar-right">
