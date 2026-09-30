@@ -770,10 +770,9 @@ PAGE_HTML = """
     color: var(--muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase;
     letter-spacing: .05em; background: color-mix(in srgb, var(--border) 40%, transparent);
   }
-  tbody tr { transition: background .12s ease; animation: row-in .25s ease; }
+  tbody tr { transition: background .12s ease; }
   tbody tr:hover { background: color-mix(in srgb, var(--navy-light) 4%, transparent); }
   tbody tr:last-child td { border-bottom: none; }
-  @keyframes row-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
   .bl-cell { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .bl-cell b { font-weight: 700; letter-spacing: -0.01em; }
@@ -981,8 +980,12 @@ async function fetchRecords() {
       if (old) nr.remarks = old.remarks;
     }
   });
+  // Skip the rebuild entirely if nothing actually changed - this is what
+  // was causing the periodic flicker (the whole table used to redraw
+  // every 4 seconds even when nothing was different).
+  const changed = JSON.stringify(fresh) !== JSON.stringify(records);
   records = fresh;
-  if (editingCount === 0) render();
+  if (editingCount === 0 && changed) render();
 }
 
 /* ---------- Excel upload (drag & drop) ---------- */
