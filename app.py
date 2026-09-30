@@ -569,20 +569,20 @@ def delete_record(bl_number):
     return jsonify({"ok": True})
 
 
-@app.route("/api/records/restore", methods=["POST"])
-@login_required
-def restore_record():
-    """Used by the 'Undo' notice after a delete - re-inserts a record with
-    all its original fields, rather than a bare fresh row."""
-    data = request.get_json(force=True)
+def _restore_one_record(db, data):
+    """Re-inserts a record with all its original fields (rather than a
+    bare fresh row). Shared by the single 'Undo after delete' restore and
+    the bulk-undo-after-clear-all restore. Returns True if it inserted a
+    new row, False if that BL number already exists (a no-op, not an
+    error - the whole point of Undo is to be safe to click more than
+    once)."""
     bl_number = str(data.get("bl_number", "")).strip().upper()
     if not bl_number:
-        return jsonify({"error": "missing bl_number"}), 400
+        return False
 
-    db = get_db()
     existing = db.execute("SELECT 1 FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
     if existing:
-        return jsonify({"ok": True, "note": "already exists"})
+        return False
 
     db.execute(
         """INSERT INTO records
@@ -609,8 +609,66 @@ def restore_record():
             data.get("created_by") or session.get("username"),
         ),
     )
+    return True
+
+
+@app.route("/api/records/restore", methods=["POST"])
+@login_required
+def restore_record():
+    """Used by the 'Undo' notice after a delete - re-inserts a record with
+    all its original fields, rather than a bare fresh row."""
+    data = request.get_json(force=True)
+    db = get_db()
+    if not str(data.get("bl_number", "")).strip():
+        return jsonify({"error": "missing bl_number"}), 400
+    inserted = _restore_one_record(db, data)
     db.commit()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "note": None if inserted else "already exists"})
+
+
+@app.route("/api/records/bulk-delete", methods=["POST"])
+@login_required
+def bulk_delete_records():
+    """Removes many BLs in one call - the "Remove all" buttons on a
+    vessel/port group, or the whole board, use this instead of firing one
+    DELETE per row (the difference matters once a manifest has 100+ BLs).
+    Staff can only delete their own records even if other BLs were passed
+    in (ownership is still checked per-row); returns the full data of
+    whatever it actually deleted so the client can offer an Undo that
+    restores exactly those rows."""
+    data = request.get_json(force=True)
+    bl_numbers = [str(b).strip().upper() for b in data.get("bl_numbers", []) if str(b).strip()]
+    if not bl_numbers:
+        return jsonify({"error": "No BL numbers given"}), 400
+
+    db = get_db()
+    deleted = []
+    for bl_number in bl_numbers:
+        if not _owns_record(bl_number):
+            continue
+        row = db.execute("SELECT * FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
+        if row is None:
+            continue
+        deleted.append(dict(row))
+        db.execute("DELETE FROM records WHERE bl_number = ?", (bl_number,))
+    db.commit()
+    return jsonify({"deleted": deleted})
+
+
+@app.route("/api/records/bulk-restore", methods=["POST"])
+@login_required
+def bulk_restore_records():
+    """Undo counterpart to bulk-delete - re-inserts every record passed in
+    (skipping any that already exist, same as the single restore)."""
+    data = request.get_json(force=True)
+    items = data.get("records", [])
+    db = get_db()
+    restored = 0
+    for item in items:
+        if _restore_one_record(db, item):
+            restored += 1
+    db.commit()
+    return jsonify({"restored": restored})
 
 
 @app.route("/api/groups/rename", methods=["POST"])
@@ -2114,6 +2172,14 @@ PAGE_HTML = """
   }
   .port-header .group-name:focus { outline: none; border-color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.08); }
   .port-header .group-count { font-size: 11.5px; color: rgba(255,255,255,0.7); font-weight: 500; }
+  .group-remove {
+    margin-left: auto; background: none; border: none; cursor: pointer;
+    font-size: 11px; font-weight: 700; padding: 5px 11px; border-radius: 999px; flex-shrink: 0;
+  }
+  .port-header .group-remove { color: rgba(255,255,255,0.75); }
+  .port-header .group-remove:hover { background: rgba(255,255,255,0.14); color: #fff; }
+  .vessel-header .group-remove { color: var(--danger); }
+  .vessel-header .group-remove:hover { background: var(--danger-bg); }
   .port-body { border: 1px solid var(--border); border-top: none; border-radius: 0 0 14px 14px; overflow: hidden; background: var(--card); }
   .port-body.collapsed { display: none; }
 
@@ -2269,7 +2335,8 @@ PAGE_HTML = """
 
   <div class="card">
     <div class="row" style="margin-bottom:14px;">
-      <input type="text" id="searchBox" placeholder="Search BL number..." oninput="render()">
+      <input type="text" id="searchBox" placeholder="Search BL number..." oninput="render()" style="flex:1; min-width:180px;">
+      <button type="button" id="clearAllBtn" onclick="clearAllRecords()" style="background:none; color:var(--danger); border:1px solid var(--border);">Clear board</button>
     </div>
     <div id="groups"></div>
   </div>
@@ -2571,6 +2638,63 @@ function deleteRecord(bl) {
   });
 }
 
+/* ---------- Bulk remove (vessel group / port group / whole board) ----------
+   Same staged-confirm + Undo pattern as the single-row delete above, just
+   operating on a whole list of records at once via the bulk API so a
+   500-BL manifest doesn't fire 500 individual requests. */
+function confirmBulkRemove(label, list) {
+  if (!list.length) { showToast('Nothing to remove.'); return; }
+  showToast(`Remove all ${list.length} BL${list.length === 1 ? '' : 's'}${label ? ' in ' + label : ''}?`, {
+    actionLabel: 'Confirm',
+    duration: 6000,
+    onAction: () => doBulkRemove(list)
+  });
+}
+
+async function doBulkRemove(list) {
+  const blNumbers = list.map(r => r.bl_number);
+  const snapshot = list.map(r => ({...r}));
+
+  records = records.filter(r => !blNumbers.includes(r.bl_number));
+  render();
+  suppressPollUntil = Date.now() + 5000;
+
+  const res = await fetch('/api/records/bulk-delete', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({bl_numbers: blNumbers})
+  });
+  const data = await res.json();
+  const deleted = (data.deleted && data.deleted.length) ? data.deleted : snapshot;
+
+  showToast(`${deleted.length} BL${deleted.length === 1 ? '' : 's'} removed.`, {
+    actionLabel: 'Undo',
+    duration: 5000,
+    onAction: async () => {
+      await fetch('/api/records/bulk-restore', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({records: deleted})
+      });
+      await fetchRecords();
+      showToast('Restored.');
+    }
+  });
+  await fetchRecords();
+}
+
+function removeVesselGroup(portName, vesselName) {
+  const list = records.filter(r => (r.port || 'Unassigned') === portName && (r.vessel || 'Unassigned') === vesselName);
+  confirmBulkRemove(vesselName === 'Unassigned' ? null : vesselName, list);
+}
+
+function removePortGroup(portName) {
+  const list = records.filter(r => (r.port || 'Unassigned') === portName);
+  confirmBulkRemove(portName === 'Unassigned' ? null : portName, list);
+}
+
+function clearAllRecords() {
+  confirmBulkRemove('the whole board', records.slice());
+}
+
 async function renameGroup(type, oldPort, oldVessel, newValue, fallbackLabel) {
   const val = newValue.trim() || fallbackLabel;
   await fetch('/api/groups/rename', {
@@ -2717,6 +2841,7 @@ function render() {
               onclick="event.stopPropagation()"
               onchange="renameGroup('vessel', '${portName.replace(/'/g,"\\'")}', '${vesselName.replace(/'/g,"\\'")}', this.value, 'Unassigned')">
             <span class="group-count">${list.length} BL${list.length === 1 ? '' : 's'}</span>
+            <button type="button" class="group-remove" onclick="event.stopPropagation(); removeVesselGroup('${portName.replace(/'/g,"\\'")}', '${vesselName.replace(/'/g,"\\'")}')">Remove all</button>
           </div>
           <div class="vessel-body ${vesselCollapsed ? 'collapsed' : ''}">
             ${tableHtml(list)}
@@ -2732,6 +2857,7 @@ function render() {
             onclick="event.stopPropagation()"
             onchange="renameGroup('port', '${portName.replace(/'/g,"\\'")}', '', this.value, 'Unassigned')">
           <span class="group-count">${portTotal} BL${portTotal === 1 ? '' : 's'}</span>
+          <button type="button" class="group-remove" onclick="event.stopPropagation(); removePortGroup('${portName.replace(/'/g,"\\'")}')">Remove all</button>
         </div>
         <div class="port-body ${portCollapsed ? 'collapsed' : ''}">${vesselsHtml}</div>
       </div>`;
