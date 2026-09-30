@@ -101,6 +101,9 @@ def init_db():
     # add them if missing, so this upgrade doesn't require wiping the data.
     cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS port TEXT DEFAULT ''")
     cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS vessel TEXT DEFAULT ''")
+    # Each record is owned by whichever staff account created it - DO Tracker
+    # is per-staff (admin sees everything, staff only see their own).
+    cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS created_by TEXT DEFAULT ''")
     cur.execute(
         """CREATE TABLE IF NOT EXISTS vessels (
             name TEXT PRIMARY KEY,
@@ -109,6 +112,9 @@ def init_db():
             updated_at TEXT DEFAULT ''
         )"""
     )
+    # "operator" is set once, when the vessel is first added, and never
+    # overwritten afterward - it's whoever entered the vessel originally.
+    cur.execute("ALTER TABLE vessels ADD COLUMN IF NOT EXISTS operator TEXT DEFAULT ''")
     conn.commit()
     cur.close()
     conn.close()
@@ -259,8 +265,24 @@ def delete_user(user_id):
 @login_required
 def list_records():
     db = get_db()
-    rows = db.execute("SELECT * FROM records ORDER BY created_at DESC").fetchall()
+    if session.get("role") == "admin":
+        rows = db.execute("SELECT * FROM records ORDER BY created_at DESC").fetchall()
+    else:
+        rows = db.execute(
+            "SELECT * FROM records WHERE created_by = ? ORDER BY created_at DESC",
+            (session.get("username"),),
+        ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+def _owns_record(bl_number):
+    """Admins can touch any record. Staff can only touch records they
+    created themselves."""
+    if session.get("role") == "admin":
+        return True
+    db = get_db()
+    row = db.execute("SELECT created_by FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
+    return row is not None and row["created_by"] == session.get("username")
 
 
 @app.route("/api/manifest", methods=["POST"])
@@ -284,8 +306,8 @@ def submit_manifest():
         if existing:
             continue
         db.execute(
-            "INSERT INTO records (bl_number, consignee, created_at) VALUES (?, ?, ?)",
-            (bl_number, consignee, datetime.now().strftime("%Y-%m-%d %H:%M")),
+            "INSERT INTO records (bl_number, consignee, created_at, created_by) VALUES (?, ?, ?, ?)",
+            (bl_number, consignee, datetime.now().strftime("%Y-%m-%d %H:%M"), session.get("username")),
         )
         added += 1
     db.commit()
@@ -371,8 +393,8 @@ def upload_manifest_excel():
                 skipped += 1
                 continue
             db.execute(
-                "INSERT INTO records (bl_number, port, vessel, created_at) VALUES (?, ?, ?, ?)",
-                (bl_number, port, vessel, datetime.now().strftime("%Y-%m-%d %H:%M")),
+                "INSERT INTO records (bl_number, port, vessel, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
+                (bl_number, port, vessel, datetime.now().strftime("%Y-%m-%d %H:%M"), session.get("username")),
             )
             added += 1
 
@@ -383,6 +405,8 @@ def upload_manifest_excel():
 @app.route("/api/records/<path:bl_number>/toggle", methods=["POST"])
 @login_required
 def toggle_status(bl_number):
+    if not _owns_record(bl_number.upper()):
+        return "Not your record.", 403
     data = request.get_json(force=True)
     field = data.get("field")
     value = 1 if data.get("value") else 0
@@ -412,6 +436,8 @@ def toggle_status(bl_number):
 @app.route("/api/records/<path:bl_number>/remarks", methods=["POST"])
 @login_required
 def update_remarks(bl_number):
+    if not _owns_record(bl_number.upper()):
+        return "Not your record.", 403
     data = request.get_json(force=True)
     remarks = data.get("remarks", "")
     db = get_db()
@@ -423,6 +449,8 @@ def update_remarks(bl_number):
 @app.route("/api/records/<path:bl_number>", methods=["DELETE"])
 @login_required
 def delete_record(bl_number):
+    if not _owns_record(bl_number.upper()):
+        return "Not your record.", 403
     db = get_db()
     db.execute("DELETE FROM records WHERE bl_number = ?", (bl_number.upper(),))
     db.commit()
@@ -448,8 +476,8 @@ def restore_record():
         """INSERT INTO records
            (bl_number, consignee, port, vessel, invoice_issued, invoice_by, invoice_at,
             approval_received, approval_by, approval_at, do_issued, do_by, do_at,
-            remarks, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            remarks, created_at, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             bl_number,
             data.get("consignee", ""),
@@ -466,6 +494,7 @@ def restore_record():
             data.get("do_at", ""),
             data.get("remarks", ""),
             data.get("created_at", ""),
+            data.get("created_by") or session.get("username"),
         ),
     )
     db.commit()
@@ -483,24 +512,74 @@ def rename_group():
     old_port = data.get("old_port", "")
     new_value = data.get("new_value", "").strip()
     db = get_db()
+    is_admin = session.get("role") == "admin"
     if group_type == "port":
-        db.execute("UPDATE records SET port = ? WHERE port = ?", (new_value, old_port))
+        if is_admin:
+            db.execute("UPDATE records SET port = ? WHERE port = ?", (new_value, old_port))
+        else:
+            db.execute(
+                "UPDATE records SET port = ? WHERE port = ? AND created_by = ?",
+                (new_value, old_port, session.get("username")),
+            )
     elif group_type == "vessel":
         old_vessel = data.get("old_vessel", "")
-        db.execute(
-            "UPDATE records SET vessel = ? WHERE port = ? AND vessel = ?",
-            (new_value, old_port, old_vessel),
-        )
-        # Keep any saved MMSI attached to the vessel through the rename.
-        if old_vessel and new_value and old_vessel != new_value:
-            db.execute("UPDATE vessels SET name = ? WHERE name = ?", (new_value, old_vessel))
+        if is_admin:
+            db.execute(
+                "UPDATE records SET vessel = ? WHERE port = ? AND vessel = ?",
+                (new_value, old_port, old_vessel),
+            )
+        else:
+            db.execute(
+                "UPDATE records SET vessel = ? WHERE port = ? AND vessel = ? AND created_by = ?",
+                (new_value, old_port, old_vessel, session.get("username")),
+            )
     else:
         return jsonify({"error": "invalid type"}), 400
     db.commit()
     return jsonify({"ok": True})
 
 
-# ---------- Vessel Tracker (live positions via MarineTraffic's free embed) ----------
+# ---------- Vessel Tracker (standalone list, live positions via MarineTraffic's free embed) ----------
+# This list is fully independent of DO Tracker's records - vessels are
+# added/removed here directly. Whoever adds a vessel becomes its "operator"
+# permanently (shown everywhere), even after DO Tracker becomes per-staff.
+
+@app.route("/api/vessels", methods=["GET"])
+@login_required
+def list_vessels():
+    db = get_db()
+    rows = db.execute("SELECT name, mmsi, operator FROM vessels ORDER BY name").fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/vessels", methods=["POST"])
+@login_required
+def add_vessel():
+    data = request.get_json(force=True)
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Missing vessel name."}), 400
+    db = get_db()
+    existing = db.execute("SELECT 1 FROM vessels WHERE name = ?", (name,)).fetchone()
+    if existing:
+        return jsonify({"error": "That vessel is already on the list."}), 400
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    db.execute(
+        "INSERT INTO vessels (name, mmsi, operator, updated_by, updated_at) VALUES (?, '', ?, ?, ?)",
+        (name, session.get("username"), session.get("username"), now),
+    )
+    db.commit()
+    return jsonify({"ok": True, "name": name, "mmsi": "", "operator": session.get("username")})
+
+
+@app.route("/api/vessels/<path:name>", methods=["DELETE"])
+@login_required
+def delete_vessel(name):
+    db = get_db()
+    db.execute("DELETE FROM vessels WHERE name = ?", (name,))
+    db.commit()
+    return jsonify({"ok": True})
+
 
 @app.route("/api/vessels/mmsi", methods=["GET"])
 @login_required
@@ -521,14 +600,21 @@ def set_vessel_mmsi():
     if mmsi and (not mmsi.isdigit() or len(mmsi) != 9):
         return jsonify({"error": "MMSI must be exactly 9 digits."}), 400
     db = get_db()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
     if mmsi:
+        # operator is only set on the initial INSERT (whoever adds the vessel
+        # first) and deliberately left out of the ON CONFLICT update, so a
+        # later MMSI edit never reassigns ownership.
         db.execute(
-            """INSERT INTO vessels (name, mmsi, updated_by, updated_at) VALUES (?, ?, ?, ?)
+            """INSERT INTO vessels (name, mmsi, operator, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)
                ON CONFLICT (name) DO UPDATE SET mmsi = EXCLUDED.mmsi, updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at""",
-            (name, mmsi, session.get("username"), datetime.now().strftime("%Y-%m-%d %H:%M")),
+            (name, mmsi, session.get("username"), session.get("username"), now),
         )
     else:
-        db.execute("DELETE FROM vessels WHERE name = ?", (name,))
+        db.execute(
+            "UPDATE vessels SET mmsi = '', updated_by = ?, updated_at = ? WHERE name = ?",
+            (session.get("username"), now, name),
+        )
     db.commit()
     return jsonify({"ok": True, "vessel": name, "mmsi": mmsi})
 
@@ -1075,7 +1161,7 @@ HUB_HTML = """
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 21c2 1 4 1 6 0s4-1 6 0 4 1 6 0M4 18l1-9 2-3h10l2 3 1 9M9 6V3h6v3"/></svg>
       </div>
       <h3>Vessel Tracker</h3>
-      <p>Live positions for your vessels, straight from MarineTraffic - organized the same way as your board.</p>
+      <p>Live positions for your vessels, straight from MarineTraffic - its own list, tagged by operator.</p>
       <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
     </a>
 
@@ -1178,6 +1264,9 @@ VESSEL_TRACKER_HTML = """
     font-size: 13.5px; font-family: inherit; background: var(--bg); color: var(--text); margin-bottom: 12px;
   }
   .sidebar input:focus { outline: none; border-color: var(--navy-light); box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 20%, transparent); }
+  .add-vessel-row { display: flex; gap: 8px; margin-bottom: 12px; }
+  .add-vessel-row input[type=text] { margin-bottom: 0; }
+  .add-vessel-row .btn { flex-shrink: 0; }
 
   .port-head { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding: 10px 6px 6px; }
   .vessel-row {
@@ -1185,9 +1274,18 @@ VESSEL_TRACKER_HTML = """
     border-radius: 12px; cursor: pointer; transition: background .12s ease; margin-bottom: 2px;
   }
   .vessel-row:hover { background: var(--bg); }
+  .vessel-row:hover .row-del { opacity: 1; }
   .vessel-row.active { background: color-mix(in srgb, var(--navy) 12%, transparent); }
   :root[data-theme="dark"] .vessel-row.active { background: color-mix(in srgb, var(--navy-light) 20%, transparent); }
-  .vessel-row .vname { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .vname-wrap { overflow: hidden; min-width: 0; }
+  .vessel-row .vname { display: block; font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .vessel-row .voperator { display: block; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row-del {
+    flex-shrink: 0; width: 20px; height: 20px; border-radius: 50%; border: none; background: transparent;
+    color: var(--muted); font-size: 15px; line-height: 1; cursor: pointer; opacity: 0; transition: opacity .12s ease, background .12s ease, color .12s ease;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .row-del:hover { background: var(--danger-bg); color: var(--danger); opacity: 1; }
   .pill { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; padding: 3px 8px; border-radius: 999px; white-space: nowrap; flex-shrink: 0; }
   .pill.live { background: var(--ok-bg); color: var(--ok); }
   .pill.live::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); margin-right: 5px; animation: pulse 1.8s ease-in-out infinite; }
@@ -1200,12 +1298,21 @@ VESSEL_TRACKER_HTML = """
   .map-head h2 { margin: 0; font-size: 16.5px; }
   .map-head .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
   .map-actions { display: flex; align-items: center; gap: 8px; }
+  .zoom-ctl { display: flex; align-items: center; gap: 2px; background: var(--bg); border: 1px solid var(--border); border-radius: 999px; padding: 3px; margin-right: 4px; }
+  .zbtn { width: 26px; height: 26px; border-radius: 50%; border: none; background: transparent; color: var(--navy); font-size: 16px; font-weight: 700; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background .12s ease; }
+  :root[data-theme="dark"] .zbtn { color: var(--navy-light); }
+  .zbtn:hover { background: var(--card); }
+  .zbtn:disabled { opacity: .35; cursor: default; }
+  .zbtn:disabled:hover { background: transparent; }
+  .zlabel { font-size: 11.5px; font-weight: 700; color: var(--muted); width: 20px; text-align: center; }
   .btn { background: var(--navy); color: #fff; border: none; border-radius: 999px; padding: 8px 15px; font-size: 12.5px; font-weight: 600; cursor: pointer; transition: background .15s ease, transform .08s ease; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
   .btn:hover { background: var(--navy-light); }
   .btn:active { transform: scale(.97); }
   .btn.ghost { background: none; color: var(--navy); border: 1px solid var(--border); }
   :root[data-theme="dark"] .btn.ghost { color: var(--navy-light); }
   .btn.ghost:hover { background: var(--border); }
+  .btn.ghost.danger { color: var(--danger); }
+  .btn.ghost.danger:hover { background: var(--danger-bg); }
   .btn svg { width: 13px; height: 13px; }
 
   .map-body { flex: 1; position: relative; min-height: 480px; background: color-mix(in srgb, var(--border) 30%, transparent); }
@@ -1261,11 +1368,15 @@ VESSEL_TRACKER_HTML = """
   <div class="page-head">
     <div class="eyebrow">Live AIS</div>
     <h1>Vessel Tracker</h1>
-    <p>Real-time positions for the vessels on your DO Tracker board, pulled straight from MarineTraffic.</p>
+    <p>Real-time positions for the vessels you're tracking, pulled straight from MarineTraffic. Its own list - separate from DO Tracker.</p>
   </div>
 
   <div class="layout">
     <div class="panel sidebar">
+      <div class="add-vessel-row">
+        <input type="text" id="newVesselName" placeholder="Add a vessel name..." maxlength="80" onkeydown="if(event.key==='Enter')addVessel()">
+        <button class="btn" onclick="addVessel()">Add</button>
+      </div>
       <input type="text" id="searchBox" placeholder="Search vessel..." oninput="renderList()">
       <div id="vesselList"></div>
     </div>
@@ -1277,18 +1388,24 @@ VESSEL_TRACKER_HTML = """
           <div class="sub" id="mhSub">-</div>
         </div>
         <div class="map-actions">
+          <div class="zoom-ctl">
+            <button class="zbtn" id="zoomOut" onclick="adjustZoom(-1)" title="Zoom out">&minus;</button>
+            <span class="zlabel" id="zoomLabel">12</span>
+            <button class="zbtn" id="zoomIn" onclick="adjustZoom(1)" title="Zoom in">+</button>
+          </div>
           <button class="btn ghost" id="editMmsiBtn" onclick="showMmsiForm()">Edit MMSI</button>
           <a class="btn ghost" id="openExternal" href="#" target="_blank" rel="noopener">
             Open in MarineTraffic
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17L17 7M7 7h10v10"/></svg>
           </a>
+          <button class="btn ghost danger" id="removeVesselBtn" onclick="removeSelectedVessel()" title="Remove vessel">Remove</button>
         </div>
       </div>
       <div class="map-body" id="mapBody">
         <div class="empty-state" id="noSelection">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 21c2 1 4 1 6 0s4-1 6 0 4 1 6 0M4 18l1-9 2-3h10l2 3 1 9M9 6V3h6v3"/></svg>
-          <h3>Pick a vessel</h3>
-          <p>Select a vessel on the left to see its live position.</p>
+          <h3>Add a vessel to get started</h3>
+          <p>Type a vessel name on the left and hit Add, then give it an MMSI to start tracking it live.</p>
         </div>
       </div>
     </div>
@@ -1297,17 +1414,39 @@ VESSEL_TRACKER_HTML = """
 <div id="toastHost"></div>
 
 <script>
-let records = [];
-let mmsiMap = {};
+let vessels = {};
 let selected = null;
 
-const DEFAULT_CENTER = { lat: 22.5, lon: 41.5, zoom: 5 };
+const DEFAULT_CENTER = { lat: 22.5, lon: 41.5 };
+const MIN_ZOOM = 3, MAX_ZOOM = 16;
+let currentZoom = 12;
+try {
+  const savedZoom = parseInt(localStorage.getItem('vt_zoom'), 10);
+  if (savedZoom && savedZoom >= MIN_ZOOM && savedZoom <= MAX_ZOOM) currentZoom = savedZoom;
+} catch (e) {}
 
 function embedUrl(mmsi) {
-  return 'https://www.marinetraffic.com/en/ais/embed/zoom:' + DEFAULT_CENTER.zoom +
+  return 'https://www.marinetraffic.com/en/ais/embed/zoom:' + currentZoom +
     '/centery:' + DEFAULT_CENTER.lat + '/centerx:' + DEFAULT_CENTER.lon +
     '/maptype:4/shownames:true/mmsi:' + encodeURIComponent(mmsi) +
     '/shipid:0/fleet:/fleet_id:/vtypes:/showmenu:false/remember:false';
+}
+
+function adjustZoom(delta) {
+  currentZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, currentZoom + delta));
+  try { localStorage.setItem('vt_zoom', currentZoom); } catch (e) {}
+  updateZoomControls();
+  const mmsi = selected && mmsiMap[selected];
+  if (mmsi) showMap(mmsi);
+}
+
+function updateZoomControls() {
+  const label = document.getElementById('zoomLabel');
+  if (label) label.textContent = currentZoom;
+  const outBtn = document.getElementById('zoomOut');
+  const inBtn = document.getElementById('zoomIn');
+  if (outBtn) outBtn.disabled = currentZoom <= MIN_ZOOM;
+  if (inBtn) inBtn.disabled = currentZoom >= MAX_ZOOM;
 }
 function externalUrl(vesselName, mmsi) {
   if (mmsi) return 'https://www.marinetraffic.com/en/ais/details/ships/mmsi:' + encodeURIComponent(mmsi);
@@ -1315,12 +1454,16 @@ function externalUrl(vesselName, mmsi) {
 }
 
 async function loadData() {
-  const [rRes, mRes] = await Promise.all([
-    fetch('/api/records'), fetch('/api/vessels/mmsi')
-  ]);
-  records = await rRes.json();
-  mmsiMap = await mRes.json();
+  const res = await fetch('/api/vessels');
+  const list = await res.json();
+  vessels = {};
+  list.forEach(v => { vessels[v.name] = { mmsi: v.mmsi || '', operator: v.operator || '' }; });
   renderList();
+  if (selected && !vessels[selected]) {
+    selected = null;
+    document.getElementById('mapHead').style.display = 'none';
+    document.getElementById('mapBody').innerHTML = '<div class="empty-state" id="noSelection"><h3>Add a vessel to get started</h3><p>Type a vessel name on the left and hit Add, then give it an MMSI to start tracking it live.</p></div>';
+  }
 }
 
 function naturalCompare(a, b) {
@@ -1329,35 +1472,21 @@ function naturalCompare(a, b) {
 
 function renderList() {
   const q = document.getElementById('searchBox').value.trim().toLowerCase();
-  const ports = {};
-  records.forEach(r => {
-    const vessel = (r.vessel || '').trim();
-    if (!vessel) return;
-    if (q && !vessel.toLowerCase().includes(q)) return;
-    const port = r.port || 'Unassigned';
-    if (!ports[port]) ports[port] = new Set();
-    ports[port].add(vessel);
-  });
-  const portNames = Object.keys(ports).sort((a, b) => {
-    if (a === 'Unassigned') return 1;
-    if (b === 'Unassigned') return -1;
-    return naturalCompare(a, b);
-  });
+  const names = Object.keys(vessels).filter(v => !q || v.toLowerCase().includes(q)).sort(naturalCompare);
   const listEl = document.getElementById('vesselList');
-  if (portNames.length === 0) {
-    listEl.innerHTML = '<div class="empty-side">No vessels yet - add BLs with a vessel name on the DO Tracker board.</div>';
+  if (names.length === 0) {
+    listEl.innerHTML = '<div class="empty-side">No vessels yet - add one above to start tracking it.</div>';
     return;
   }
-  listEl.innerHTML = portNames.map(port => {
-    const vessels = Array.from(ports[port]).sort(naturalCompare);
-    return '<div class="port-head">' + escapeHtml(port) + '</div>' + vessels.map(v => {
-      const mmsi = mmsiMap[v] || '';
-      const isActive = selected === v;
-      return '<div class="vessel-row' + (isActive ? ' active' : '') + '" data-vessel="' + escapeHtml(v) + '" data-port="' + escapeHtml(port) + '">' +
-        '<span class="vname">' + escapeHtml(v) + '</span>' +
-        (mmsi ? '<span class="pill live">Live</span>' : '<span class="pill none">No MMSI</span>') +
-        '</div>';
-    }).join('');
+  listEl.innerHTML = names.map(v => {
+    const info = vessels[v];
+    const isActive = selected === v;
+    return '<div class="vessel-row' + (isActive ? ' active' : '') + '" data-vessel="' + escapeHtml(v) + '">' +
+      '<div class="vname-wrap"><span class="vname">' + escapeHtml(v) + '</span>' +
+      (info.operator ? '<span class="voperator">Operator: ' + escapeHtml(info.operator) + '</span>' : '') + '</div>' +
+      (info.mmsi ? '<span class="pill live">Live</span>' : '<span class="pill none">No MMSI</span>') +
+      '<button class="row-del" data-del="' + escapeHtml(v) + '" title="Remove vessel">&times;</button>' +
+      '</div>';
   }).join('');
 }
 
@@ -1366,24 +1495,63 @@ function escapeHtml(s) {
 }
 
 document.getElementById('vesselList').addEventListener('click', (e) => {
+  const delBtn = e.target.closest('.row-del');
+  if (delBtn) {
+    e.stopPropagation();
+    removeVessel(delBtn.dataset.del);
+    return;
+  }
   const row = e.target.closest('.vessel-row');
   if (!row) return;
-  selectVessel(row.dataset.vessel, row.dataset.port);
+  selectVessel(row.dataset.vessel);
 });
 
-function selectVessel(name, port) {
+function selectVessel(name) {
   selected = name;
   renderList();
+  const info = vessels[name] || { mmsi: '', operator: '' };
   document.getElementById('mapHead').style.display = 'flex';
   document.getElementById('mhName').textContent = name;
-  document.getElementById('mhSub').textContent = port;
-  document.getElementById('openExternal').href = externalUrl(name, mmsiMap[name]);
-  const mmsi = mmsiMap[name];
-  if (mmsi) {
-    showMap(mmsi);
+  document.getElementById('mhSub').textContent = info.operator ? ('Operator: ' + info.operator) : 'No operator on file';
+  document.getElementById('openExternal').href = externalUrl(name, info.mmsi);
+  updateZoomControls();
+  if (info.mmsi) {
+    showMap(info.mmsi);
   } else {
     showSetup(name);
   }
+}
+
+async function addVessel() {
+  const input = document.getElementById('newVesselName');
+  const name = input.value.trim();
+  if (!name) return;
+  const res = await fetch('/api/vessels', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name})
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) {
+    showToast(data.error || 'Could not add that vessel.', {error: true});
+    return;
+  }
+  input.value = '';
+  await loadData();
+  selectVessel(name);
+  showToast('Added ' + name + '.');
+}
+
+async function removeVessel(name) {
+  if (!confirm('Remove ' + name + ' from the tracker? This cannot be undone.')) return;
+  await fetch('/api/vessels/' + encodeURIComponent(name), {method: 'DELETE'});
+  if (selected === name) selected = null;
+  await loadData();
+  showToast('Removed ' + name + '.');
+}
+
+function removeSelectedVessel() {
+  if (!selected) return;
+  removeVessel(selected);
 }
 
 function showMap(mmsi) {
@@ -1409,7 +1577,7 @@ function showMmsiForm() {
   if (!selected) return;
   showSetup(selected);
   const input = document.getElementById('mmsiInput');
-  if (input) input.value = mmsiMap[selected] || '';
+  if (input) input.value = (vessels[selected] && vessels[selected].mmsi) || '';
 }
 
 async function saveMmsi() {
@@ -1429,7 +1597,8 @@ async function saveMmsi() {
     showToast(data.error || 'Could not save MMSI.', {error:true});
     return;
   }
-  mmsiMap[name] = val;
+  if (!vessels[name]) vessels[name] = { mmsi: '', operator: '' };
+  vessels[name].mmsi = val;
   showToast('Now tracking ' + name + '.');
   renderList();
   document.getElementById('openExternal').href = externalUrl(name, val);
@@ -1768,7 +1937,7 @@ PAGE_HTML = """
     </div>
   </div>
 
-  <div class="sub">Shared board, visible to everyone with a login. Organized by Port &rarr; Vessel. Updates automatically.</div>
+  <div class="sub">{% if role == 'admin' %}Admin view - every staff member's records, all in one place. Organized by Port &rarr; Vessel. Updates automatically.{% else %}Your own board - only records you've added. Organized by Port &rarr; Vessel. Updates automatically.{% endif %}</div>
 
   <div class="card">
     <div class="card-label">Add a manifest</div>
