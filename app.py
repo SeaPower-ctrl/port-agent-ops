@@ -133,6 +133,15 @@ def init_db():
             classified_at TEXT DEFAULT ''
         )"""
     )
+    # needs_review: the classifier flags a BL instead of silently trusting
+    # a shaky read - a value close enough to the 30MT/12m line that a small
+    # parsing slip could flip the verdict, a header where more than one
+    # column plausibly looked like "the" weight column, or a weight so
+    # large it got dropped by the sanity cap rather than risk misreading
+    # it. None of these mean the answer is wrong - just that it's worth a
+    # human glance rather than blind trust.
+    cur.execute("ALTER TABLE direct_delivery ADD COLUMN IF NOT EXISTS needs_review INTEGER DEFAULT 0")
+    cur.execute("ALTER TABLE direct_delivery ADD COLUMN IF NOT EXISTS review_note TEXT DEFAULT ''")
     conn.commit()
     cur.close()
     conn.close()
@@ -704,7 +713,35 @@ DD_DESC_HEADER_WORDS = ["description", "desc", "cargo", "commodity", "itemdescri
 # ordinary words like "TABLE" or "DOUBLE". A short B/L-style token is
 # matched separately by _DD_BL_HEADER_RE below.
 DD_BL_HEADER_WORDS = ["blnumber", "billoflading", "billofladingno", "blno", "提单号"]
-_DD_BL_HEADER_RE = re.compile(r"^B[./]?\s?L[./]?\s?(NO|NUMBER|#|$)", re.IGNORECASE)
+_DD_BL_HEADER_RE = re.compile(r"^(BILL|B[./]?\s?L[./]?)\s?(NO|NUMBER|#|$)", re.IGNORECASE)
+
+# A "TOTAL weight" column (e.g. "total(KGS)", "Total Weight(KG)", "合计重量")
+# is a LOT total (qty x per-unit weight), kept separate from the per-unit
+# "weight(KGS)" column some templates also carry. When both are present,
+# the per-unit column must NOT be divided by qty again - see the
+# weight_total cross-check in _extract_classification_rows.
+_DD_TOTAL_WEIGHT_RE = re.compile(
+    r"TOTAL.{0,15}(WEIGHT|WT|KGS?|吨)|(WEIGHT|WT|KGS?).{0,15}TOTAL|总重|合计重量|总计重量|总重量",
+    re.IGNORECASE,
+)
+
+# Some headers state their unit explicitly ("weight(KGS)", "毛重(MT)") - that
+# beats guessing the unit from the raw number's magnitude, which misreads a
+# real sub-1000 KG figure (e.g. 447 kg) as if it were already in MT.
+_DD_UNIT_KG_RE = re.compile(r"\bKGS?\b|千克|公斤", re.IGNORECASE)
+_DD_UNIT_MT_RE = re.compile(r"\bM\.?\s?T\.?S?\b|\bTONNES?\b|\bTONS?\b|吨", re.IGNORECASE)
+
+
+def _dd_header_weight_unit(cell):
+    """Returns "kg"/"mt" if this header cell states its weight unit
+    explicitly, else None (fall back to the magnitude heuristic)."""
+    if not isinstance(cell, str) or not cell.strip():
+        return None
+    if _DD_UNIT_KG_RE.search(cell):
+        return "kg"
+    if _DD_UNIT_MT_RE.search(cell):
+        return "mt"
+    return None
 
 # Exception keywords (English + common Chinese) - if the item's description
 # (or the sheet's overall goods/product-description line) contains any of
@@ -817,16 +854,23 @@ def _dd_parse_number(raw):
             return None
 
 
-def _dd_parse_weight_mt(raw):
+def _dd_parse_weight_mt(raw, unit_hint=None):
     """Best-effort: a bare number is assumed to already be in MT if it's
     under 1000, or in KG (divided down to MT) if 1000 or over - this holds
-    for realistic single-item cargo weights either way it's written. Note:
-    this may still be a LOT total awaiting division by a qty column - the
-    sanity cap is applied by the caller only once the final per-item
+    for realistic single-item cargo weights either way it's written. A
+    sub-1000 KG figure (e.g. a 447kg item) defeats that guess, so when the
+    column's own header states its unit explicitly (unit_hint, from
+    _dd_header_weight_unit), that always wins over the magnitude guess.
+    Note: this may still be a LOT total awaiting division by a qty column -
+    the sanity cap is applied by the caller only once the final per-item
     figure is known, not here."""
     v = _dd_parse_number(raw)
     if v is None or v <= 0:
         return None
+    if unit_hint == "kg":
+        return v / 1000.0
+    if unit_hint == "mt":
+        return v
     return v / 1000.0 if v >= 1000 else v
 
 
@@ -1041,17 +1085,21 @@ def _dd_sheet_is_non_saudi(rows, max_scan=25):
 
 def _dd_build_header_candidates(row):
     """Scans one row's string cells for every column that NAMES a tracked
-    field, returning {category: [column_index, ...]} - every match is kept
-    (not just the first) so a later resolution step can correctly hand a
-    column to the right category even when two categories' keywords both
-    landed on it (e.g. "QUANTITY" meaning tonnage, see _dd_scan_unit_row)."""
+    field, returning ({category: [column_index, ...]}, {col_index: unit})
+    - every match is kept (not just the first) so a later resolution step
+    can correctly hand a column to the right category even when two
+    categories' keywords both landed on it (e.g. "QUANTITY" meaning
+    tonnage, see _dd_scan_unit_row)."""
     cats = {"bl": [], "weight_gross": [], "weight_net": [], "weight_generic": [],
-            "length": [], "spec": [], "qty": [], "desc": []}
+            "weight_total": [], "length": [], "spec": [], "qty": [], "desc": []}
+    weight_units = {}
     for col_index, cell in enumerate(row):
         if not isinstance(cell, str) or not cell.strip():
             continue
         if _dd_header_matches(cell, DD_BL_HEADER_WORDS) or _DD_BL_HEADER_RE.match(cell.strip()):
             cats["bl"].append(col_index)
+        if _DD_TOTAL_WEIGHT_RE.search(cell):
+            cats["weight_total"].append(col_index)
         if _dd_header_matches(cell, DD_WEIGHT_GROSS_WORDS):
             cats["weight_gross"].append(col_index)
         if _dd_header_matches(cell, DD_WEIGHT_NET_WORDS):
@@ -1066,7 +1114,10 @@ def _dd_build_header_candidates(row):
             cats["qty"].append(col_index)
         if _dd_header_matches(cell, DD_DESC_HEADER_WORDS):
             cats["desc"].append(col_index)
-    return cats
+        unit = _dd_header_weight_unit(cell)
+        if unit:
+            weight_units[col_index] = unit
+    return cats, weight_units
 
 
 def _dd_is_header_row(cats):
@@ -1075,13 +1126,21 @@ def _dd_is_header_row(cats):
     return has_weight and has_other
 
 
-def _dd_resolve_header(cats, unit_overrides):
+def _dd_resolve_header(cats, unit_overrides, weight_units=None):
     """Turns the raw candidate lists (plus any confirmed units-row signal)
     into one final {category: column_index} mapping, each column used at
     most once. A units-row signal for a column overrides a conflicting
     label-only guess for that SAME column (e.g. "QUANTITY" mislabeled as
     qty gets corrected to weight), while other label matches (e.g. a
-    genuinely separate "NUMBER OF BUNDLES" column) are unaffected."""
+    genuinely separate "NUMBER OF BUNDLES" column) are unaffected.
+
+    "weight_total" (a column explicitly labelled as a TOTAL weight, e.g.
+    "total(KGS)") is resolved before the per-unit weight categories so it
+    never gets claimed as the primary weight column when a genuinely
+    separate per-unit column also exists. But if it's the ONLY weight-ish
+    column on this header, it IS the primary weight column (some templates
+    only have a lot-total weight, meant to be divided by qty as before), so
+    it's folded back into weight_generic in that case."""
     cats = {k: list(v) for k, v in cats.items()}
     for col, kind in unit_overrides.items():
         if kind == "weight":
@@ -1090,10 +1149,11 @@ def _dd_resolve_header(cats, unit_overrides):
             cats["weight_generic"] = [c for c in cats["weight_generic"] if c != col]
             cats["weight_net"] = [c for c in cats["weight_net"] if c != col]
             cats["weight_gross"] = [c for c in cats["weight_gross"] if c != col]
+            cats["weight_total"] = [c for c in cats["weight_total"] if c != col]
 
     found = {}
     used = set()
-    for cat in ("bl", "weight_gross", "weight_net", "length", "spec", "qty", "weight_generic", "desc"):
+    for cat in ("bl", "weight_total", "weight_gross", "weight_net", "length", "spec", "qty", "weight_generic", "desc"):
         for col in cats[cat]:
             if col not in used:
                 found[cat] = col
@@ -1103,12 +1163,27 @@ def _dd_resolve_header(cats, unit_overrides):
     for col, kind in unit_overrides.items():
         if col in used:
             continue
-        if kind == "weight" and not any(k in found for k in ("weight_gross", "weight_net", "weight_generic")):
+        if kind == "weight" and not any(k in found for k in ("weight_gross", "weight_net", "weight_generic", "weight_total")):
             found["weight_generic"] = col
             used.add(col)
         elif kind == "qty" and "qty" not in found:
             found["qty"] = col
             used.add(col)
+
+    if "weight_total" in found and not any(k in found for k in ("weight_gross", "weight_net", "weight_generic")):
+        # No separate per-unit weight column exists - this total-labelled
+        # column IS the one weight figure we have, so treat it as the
+        # ordinary (qty-divisible) primary weight column instead.
+        found["weight_generic"] = found.pop("weight_total")
+
+    # More than one column plausibly read as "the" per-unit weight (distinct
+    # from the separate weight_total cross-check column) means the header
+    # was genuinely ambiguous - we still have to pick one by priority, but
+    # it's worth flagging rather than asserting it with full confidence.
+    weight_like_cols = set(cats["weight_gross"]) | set(cats["weight_net"]) | set(cats["weight_generic"])
+    found["_ambiguous_weight"] = len(weight_like_cols) > 1
+
+    found["_weight_units"] = dict(weight_units or {})
     return found
 
 
@@ -1136,7 +1211,7 @@ def _extract_classification_rows(rows, sheet_bl_hint=None):
     n = len(rows)
     while i < n:
         row = rows[i]
-        cats = _dd_build_header_candidates(row)
+        cats, weight_units = _dd_build_header_candidates(row)
         # Peek at the next row for unit tokens (MT/PCS/...) BEFORE deciding
         # whether this row even qualifies as a header - some templates put
         # the weight/qty units on that row and leave the label row itself
@@ -1144,13 +1219,13 @@ def _extract_classification_rows(rows, sheet_bl_hint=None):
         # across the two rows).
         unit_overrides = {}
         if i + 1 < n:
-            next_cats = _dd_build_header_candidates(rows[i + 1])
+            next_cats, _next_units = _dd_build_header_candidates(rows[i + 1])
             if not _dd_is_header_row(next_cats):
                 unit_overrides = _dd_scan_unit_row(rows[i + 1])
-        has_weight = bool(cats["weight_gross"] or cats["weight_net"] or cats["weight_generic"]) or "weight" in unit_overrides.values()
+        has_weight = bool(cats["weight_gross"] or cats["weight_net"] or cats["weight_generic"] or cats["weight_total"]) or "weight" in unit_overrides.values()
         has_other = bool(cats["length"] or cats["spec"] or cats["qty"] or cats["bl"]) or "qty" in unit_overrides.values()
         if has_weight and has_other:
-            cols = _dd_resolve_header(cats, unit_overrides)
+            cols = _dd_resolve_header(cats, unit_overrides, weight_units)
             i += 2 if unit_overrides else 1
             continue
 
@@ -1168,6 +1243,10 @@ def _extract_classification_rows(rows, sheet_bl_hint=None):
         def cell_at(key):
             idx = cols.get(key)
             return row[idx] if idx is not None and idx < len(row) and row[idx] not in (None, "") else None
+
+        def weight_unit_for(key):
+            idx = cols.get(key)
+            return cols.get("_weight_units", {}).get(idx) if idx is not None else None
 
         bl_cell = cell_at("bl")
         if bl_cell is not None:
@@ -1187,8 +1266,14 @@ def _extract_classification_rows(rows, sheet_bl_hint=None):
             i += 1
             continue
 
-        weight_cell = cell_at("weight_gross") or cell_at("weight_net") or cell_at("weight_generic")
-        weight_mt = _dd_parse_weight_mt(weight_cell)
+        if cell_at("weight_gross") is not None:
+            weight_key = "weight_gross"
+        elif cell_at("weight_net") is not None:
+            weight_key = "weight_net"
+        else:
+            weight_key = "weight_generic"
+        weight_cell = cell_at(weight_key)
+        weight_mt = _dd_parse_weight_mt(weight_cell, unit_hint=weight_unit_for(weight_key))
 
         length_m = None
         length_cell = cell_at("length")
@@ -1198,19 +1283,52 @@ def _extract_classification_rows(rows, sheet_bl_hint=None):
             length_m = _dd_parse_spec_length_mm(cell_at("spec"))
 
         qty = _dd_parse_number(cell_at("qty"))
-        if weight_mt is not None and qty and qty > 0:
+
+        # A separate column explicitly labelled as a TOTAL weight (e.g.
+        # "total(KGS)") lets us tell a per-unit weight column apart from a
+        # lot-total one: if total =~ weight x qty, "weight" is ALREADY
+        # per-unit and must not be divided again.
+        skip_division = False
+        total_cell = cell_at("weight_total")
+        if total_cell is not None and weight_mt is not None and qty and qty > 0:
+            total_mt = _dd_parse_weight_mt(total_cell, unit_hint=weight_unit_for("weight_total"))
+            if total_mt is not None:
+                expected_total = weight_mt * qty
+                if expected_total > 0 and abs(total_mt - expected_total) <= max(0.05 * expected_total, 0.01):
+                    skip_division = True
+
+        division_guessed = bool(weight_mt is not None and qty and qty > 0 and not skip_division and total_cell is None)
+        if weight_mt is not None and qty and qty > 0 and not skip_division:
             weight_mt = weight_mt / qty
+
+        sanity_dropped = False
         # Sanity check the FINAL per-item weight only, once any lot-total
-        # has already been divided down by its piece/bundle/coil count.
+        # has already been divided down by its piece/bundle/coil count. A
+        # figure this far out isn't just "uncertain" - it's almost
+        # certainly a misread, so it's dropped rather than kept with a
+        # caveat, but the BL is still flagged so a human knows something
+        # on it couldn't be trusted.
         if weight_mt is not None and weight_mt > DD_SANITY_MAX_WEIGHT_MT:
             weight_mt = None
+            sanity_dropped = True
 
         description = str(cell_at("desc")).strip() if cell_at("desc") is not None else goods_line
 
-        if weight_mt is None and length_m is None:
+        if weight_mt is None and length_m is None and not sanity_dropped:
             i += 1
             continue
-        out.append({"bl": _dd_bl_root(bl), "weight_mt": weight_mt, "length_m": length_m, "description": description})
+
+        # The actual decision on whether any of this is worth flagging
+        # happens in _dd_classify_groups, once it's known whether the item
+        # is wheeled/coil-excepted (an excepted item's exact weight doesn't
+        # change the verdict, so there's nothing to double check either
+        # way) and whether it's the item that's actually driving the
+        # result. These are just the raw signals.
+        out.append({
+            "bl": _dd_bl_root(bl), "weight_mt": weight_mt, "length_m": length_m,
+            "description": description, "sanity_dropped": sanity_dropped,
+            "ambiguous_weight": bool(cols.get("_ambiguous_weight")), "division_guessed": division_guessed,
+        })
         i += 1
 
     if not out:
@@ -1218,19 +1336,31 @@ def _extract_classification_rows(rows, sheet_bl_hint=None):
     return out
 
 
+_DD_FREETEXT_WEIGHT_LABEL_RE = re.compile(
+    r"(?:G\.?\s*W\.?|GROSS\s*WEIGHT|N\.?\s*W\.?|NET\s*WEIGHT|TOTAL\s*WEIGHT)\s*[:：]?\s*"
+    r"([\d,]+\.?\d*)\s*(M\.?\s?T\.?S?|TONNES?|TONS?|KGS?)\b",
+    re.IGNORECASE,
+)
+
+
 def _dd_freetext_fallback(rows, sheet_bl_hint, goods_line):
     """Some packing lists aren't a table at all - just labelled cells like
-    "G.W.:161.261 MT" and "95 PIECES" scattered on the sheet. Scans every
-    cell's text for those patterns as a last resort."""
+    "G.W.:161.261 MT", "Gross Weight: 4500 KGS" or "95 PIECES" scattered on
+    the sheet (or, for an OCR'd scan/.doc, scattered across noisy
+    recognized text). Deliberately narrow and label-anchored rather than
+    "find any big number" - a loose guess here is exactly the kind of
+    wrong-weight bug this classifier has already been burned by once, so a
+    weight is only ever taken from text that explicitly names it."""
     if not sheet_bl_hint:
         return []
     blob_cells = [str(c) for row in rows for c in row if isinstance(c, str)]
     blob = " | ".join(blob_cells)
 
-    gw_match = re.search(r"G\.?\s*W\.?\s*[:：]?\s*([\d,]+\.?\d*)\s*MT", blob, re.IGNORECASE)
-    if not gw_match:
+    weight_match = _DD_FREETEXT_WEIGHT_LABEL_RE.search(blob)
+    if not weight_match:
         return []
-    weight_mt = _dd_parse_number(gw_match.group(1))
+    raw_value, unit = weight_match.group(1), weight_match.group(2)
+    weight_mt = _dd_parse_weight_mt(raw_value, unit_hint=_dd_header_weight_unit(unit))
     if not weight_mt or weight_mt > DD_SANITY_MAX_WEIGHT_MT:
         return []
 
@@ -1240,12 +1370,20 @@ def _dd_freetext_fallback(rows, sheet_bl_hint, goods_line):
         weight_mt = weight_mt / qty
 
     description = goods_line or blob[:200]
-    return [{"bl": _dd_bl_root(sheet_bl_hint), "weight_mt": weight_mt, "length_m": None, "description": description}]
+    return [{
+        "bl": _dd_bl_root(sheet_bl_hint), "weight_mt": weight_mt, "length_m": None,
+        "description": description, "sanity_dropped": False,
+        "ambiguous_weight": False, "division_guessed": False, "freetext": True,
+    }]
 
 
 def _dd_classify_groups(items):
     """Groups classification rows by BL and applies the Direct Delivery
-    rule, returning {bl_root: (is_direct, reason)}."""
+    rule, returning {bl_root: (is_direct, reason, needs_review, review_note)}.
+    needs_review is never a claim that the verdict is wrong - only that
+    some input to it (a borderline value, an ambiguous column, a dropped
+    outlier, a free-text guess) wasn't clean enough to trust blind, and a
+    quick look at the source file is worth it."""
     by_bl = {}
     for item in items:
         by_bl.setdefault(item["bl"], []).append(item)
@@ -1255,26 +1393,57 @@ def _dd_classify_groups(items):
         best_trigger = None  # (weight_mt, length_m, description) of the strongest qualifying item
         only_exception_triggers = True
         any_trigger = False
+        review_flags = []
         for item in group:
             w, l, d = item["weight_mt"], item["length_m"], item["description"]
+            excepted = _dd_is_exception(d)
+
+            # A wheeled/coil item's exact weight or length doesn't change
+            # its verdict either way, so there's nothing worth a human
+            # double-checking there - only a non-excepted item close
+            # enough to the 30MT/12m line (or missing data near it) can
+            # actually flip the outcome.
+            if not excepted:
+                weight_relevant = w is not None and w >= DD_WEIGHT_MT_THRESHOLD * 0.85
+                length_relevant = l is not None and l >= DD_LENGTH_M_THRESHOLD * 0.85
+                if w is not None and DD_WEIGHT_MT_THRESHOLD * 0.85 <= w <= DD_WEIGHT_MT_THRESHOLD * 1.15:
+                    review_flags.append(f"weight ({w:.1f}MT) is close to the 30MT line")
+                if l is not None and DD_LENGTH_M_THRESHOLD * 0.85 <= l <= DD_LENGTH_M_THRESHOLD * 1.15:
+                    review_flags.append(f"length ({l:.1f}m) is close to the 12m line")
+                if item.get("ambiguous_weight") and weight_relevant:
+                    review_flags.append("more than one column looked like the weight column")
+                if item.get("division_guessed") and weight_relevant:
+                    review_flags.append("weight was estimated by dividing a lot total by quantity (unverified)")
+                if item.get("sanity_dropped"):
+                    review_flags.append("a weight over 500MT was found on this BL and ignored as likely misread")
+                if item.get("freetext") and weight_relevant:
+                    review_flags.append("read from free text near the 30MT line - please double check the source file")
+
             triggers = (w is not None and w > DD_WEIGHT_MT_THRESHOLD) or (l is not None and l > DD_LENGTH_M_THRESHOLD)
             if not triggers:
                 continue
             any_trigger = True
-            if _dd_is_exception(d):
+            if excepted:
                 continue
             only_exception_triggers = False
             if best_trigger is None or (w or 0) > (best_trigger[0] or 0) or (l or 0) > (best_trigger[1] or 0):
                 best_trigger = (w, l, d)
 
+        needs_review = bool(review_flags)
+        # De-dupe while keeping order, and cap so the note stays readable.
+        seen = set()
+        unique_flags = [f for f in review_flags if not (f in seen or seen.add(f))]
+        review_note = "; ".join(unique_flags[:3])
+
         if best_trigger is not None:
             w, l, d = best_trigger
             detail = f"{w:.1f}MT" if w and w > DD_WEIGHT_MT_THRESHOLD else f"{l:.1f}m"
-            results[bl] = (True, f"Direct delivery - item at {detail}" + (f" ({d[:40]})" if d else ""))
+            reason = f"Direct delivery - item at {detail}" + (f" ({d[:40]})" if d else "")
+            results[bl] = (True, reason, needs_review, review_note)
         elif any_trigger and only_exception_triggers:
-            results[bl] = (False, "Heavy/oversize item(s) are wheeled or coiled - exception applies")
+            results[bl] = (False, "Heavy/oversize item(s) are wheeled or coiled - exception applies", needs_review, review_note)
         else:
-            results[bl] = (False, "All items under 30MT and 12m")
+            results[bl] = (False, "All items under 30MT and 12m", needs_review, review_note)
     return results
 
 
@@ -1309,6 +1478,96 @@ def _dd_skip_redundant_invoice_sheets(names):
     return {n for n in names if _dd_is_invoice_only_sheet_name(n)}
 
 
+def _dd_extract_pdf_bytes(pdf_bytes, filename_hint):
+    """Runs the existing table/text PDF scan over raw PDF bytes - shared by
+    real uploaded PDFs and by a .doc converted to PDF first (see below). A
+    page with neither a real table nor a text layer is almost always a
+    scanned/embedded PICTURE of the packing list (common for .doc files
+    that paste in a spreadsheet as an embedded object) rather than an
+    empty page, so as a last resort that page is rasterized and OCR'd too."""
+    import pdfplumber
+    items = []
+    blank_pages = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page_index, page in enumerate(pdf.pages):
+            tables = page.extract_tables() or []
+            if tables:
+                for table in tables:
+                    items.extend(_extract_classification_rows(table, sheet_bl_hint=filename_hint))
+                continue
+            text = page.extract_text() or ""
+            if text.strip():
+                rows = [[line] for line in text.split("\n")]
+                items.extend(_extract_classification_rows(rows, sheet_bl_hint=filename_hint))
+            else:
+                blank_pages.append(page_index)
+
+    if blank_pages:
+        try:
+            import pytesseract
+            from pdf2image import convert_from_bytes
+        except ImportError:
+            return items
+        try:
+            images = convert_from_bytes(pdf_bytes, dpi=200)
+        except Exception:
+            return items
+        for page_index in blank_pages:
+            if page_index >= len(images):
+                continue
+            try:
+                text = pytesseract.image_to_string(images[page_index])
+            except Exception:
+                continue
+            if text.strip():
+                # OCR text is too noisy for the column-index table logic -
+                # a garbled line can trivially "look like" a header/weight
+                # cell and hand back a plausible but wrong number (exactly
+                # the failure mode already fixed once this round). Only the
+                # label-anchored freetext fallback is trusted here.
+                rows = [[line] for line in text.split("\n")]
+                goods_line = _dd_find_goods_line(rows)
+                items.extend(_dd_freetext_fallback(rows, filename_hint, goods_line))
+    return items
+
+
+def _dd_office_doc_to_pdf_bytes(raw_bytes, suffix):
+    """Converts a legacy .doc (or other office file) to PDF using
+    LibreOffice headless, so its table layout is preserved and can be read
+    with the same pdfplumber path as a native PDF - a hand-rolled binary
+    .doc parser is too easy to get subtly wrong (which, for this
+    classifier, means a silently wrong weight - worse than just not
+    reading the file). Requires the `soffice` binary on the server; the
+    caller turns a missing binary or a conversion failure into a clear
+    per-file "couldn't read" message instead of crashing the whole
+    request."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, f"input{suffix}")
+        with open(src, "wb") as f:
+            f.write(raw_bytes)
+        subprocess.run(
+            ["soffice", "--headless", "--norestore", "--convert-to", "pdf", "--outdir", tmp, src],
+            check=True, timeout=90, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        pdf_path = os.path.join(tmp, "input.pdf")
+        with open(pdf_path, "rb") as f:
+            return f.read()
+
+
+def _dd_ocr_image_to_rows(file_storage):
+    """OCRs a scanned packing list (PNG/JPG/etc.) into text lines. Requires
+    pytesseract/Pillow AND the `tesseract-ocr` system binary on the server
+    - missing either raises, which the caller turns into a clear per-file
+    message."""
+    import pytesseract
+    from PIL import Image
+    img = Image.open(file_storage)
+    text = pytesseract.image_to_string(img)
+    return [[line] for line in text.split("\n")]
+
+
 def _dd_extract_from_upload(file_storage):
     """Reads every sheet/page of one uploaded file and returns its
     classification rows. Raises on a file that can't be read at all, but
@@ -1340,17 +1599,27 @@ def _dd_extract_from_upload(file_storage):
         rows = list(csv.reader(io.StringIO(text)))
         items.extend(_extract_classification_rows(rows, sheet_bl_hint=filename_hint))
     elif lower.endswith(".pdf"):
-        import pdfplumber
-        with pdfplumber.open(file_storage) as pdf:
-            for page in pdf.pages:
-                tables = page.extract_tables() or []
-                if tables:
-                    for table in tables:
-                        items.extend(_extract_classification_rows(table, sheet_bl_hint=filename_hint))
-                else:
-                    text = page.extract_text() or ""
-                    rows = [[line] for line in text.split("\n")]
-                    items.extend(_extract_classification_rows(rows, sheet_bl_hint=filename_hint))
+        items.extend(_dd_extract_pdf_bytes(file_storage.read(), filename_hint))
+    elif lower.endswith((".doc", ".docx")):
+        try:
+            pdf_bytes = _dd_office_doc_to_pdf_bytes(file_storage.read(), os.path.splitext(lower)[1])
+        except FileNotFoundError:
+            raise ValueError(f"Couldn't read {filename} - reading .doc/.docx files needs LibreOffice installed on the server.")
+        except Exception:
+            raise ValueError(f"Couldn't convert {filename} to a readable format.")
+        items.extend(_dd_extract_pdf_bytes(pdf_bytes, filename_hint))
+    elif lower.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")):
+        try:
+            rows = _dd_ocr_image_to_rows(file_storage)
+        except ImportError:
+            raise ValueError(f"Couldn't read {filename} - scanning images needs OCR support (pytesseract/tesseract) installed on the server.")
+        except Exception:
+            raise ValueError(f"Couldn't OCR {filename} - the image may be too low-resolution or unclear to read.")
+        # OCR text is too noisy to trust with the column-index table logic
+        # (see _dd_extract_pdf_bytes) - only the label-anchored freetext
+        # fallback is used for it.
+        goods_line = _dd_find_goods_line(rows)
+        items.extend(_dd_freetext_fallback(rows, filename_hint, goods_line))
     else:
         raise ValueError(f"Unsupported file type: {filename}")
     return items
@@ -1377,8 +1646,8 @@ def classify_manifest():
         filename = file.filename
         try:
             file_items = _dd_extract_from_upload(file)
-        except ValueError:
-            failed.append(filename)
+        except ValueError as e:
+            failed.append(str(e) if str(e) else filename)
             continue
         except Exception:
             failed.append(filename)
@@ -1396,15 +1665,16 @@ def classify_manifest():
     db = get_db()
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     results = []
-    for bl, (is_direct, reason) in classified.items():
+    for bl, (is_direct, reason, needs_review, review_note) in classified.items():
         db.execute(
-            """INSERT INTO direct_delivery (bl_number, is_direct, reason, classified_by, classified_at)
-               VALUES (?, ?, ?, ?, ?)
+            """INSERT INTO direct_delivery (bl_number, is_direct, reason, classified_by, classified_at, needs_review, review_note)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (bl_number) DO UPDATE SET is_direct = EXCLUDED.is_direct, reason = EXCLUDED.reason,
-                   classified_by = EXCLUDED.classified_by, classified_at = EXCLUDED.classified_at""",
-            (bl, 1 if is_direct else 0, reason, session.get("username"), now),
+                   classified_by = EXCLUDED.classified_by, classified_at = EXCLUDED.classified_at,
+                   needs_review = EXCLUDED.needs_review, review_note = EXCLUDED.review_note""",
+            (bl, 1 if is_direct else 0, reason, session.get("username"), now, 1 if needs_review else 0, review_note),
         )
-        results.append({"bl": bl, "direct": is_direct, "reason": reason})
+        results.append({"bl": bl, "direct": is_direct, "reason": reason, "needs_review": needs_review, "review_note": review_note})
     db.commit()
     return jsonify({"classified": results, "failed": failed})
 
@@ -1419,16 +1689,58 @@ def list_direct_delivery():
     db = get_db()
     if session.get("role") == "admin":
         rows = db.execute(
-            "SELECT bl_number, is_direct, reason, classified_by, classified_at "
+            "SELECT bl_number, is_direct, reason, classified_by, classified_at, needs_review, review_note "
             "FROM direct_delivery WHERE is_direct = 1 ORDER BY classified_at DESC, bl_number"
         ).fetchall()
     else:
         rows = db.execute(
-            "SELECT bl_number, is_direct, reason, classified_by, classified_at "
+            "SELECT bl_number, is_direct, reason, classified_by, classified_at, needs_review, review_note "
             "FROM direct_delivery WHERE is_direct = 1 AND classified_by = ? ORDER BY classified_at DESC, bl_number",
             (session.get("username"),),
         ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/direct-delivery/review", methods=["GET"])
+@login_required
+def list_direct_delivery_review():
+    """Every BL flagged needs_review, regardless of is_direct - a
+    borderline weight/length, an ambiguous header, a dropped sanity-cap
+    outlier, or a free-text-only read. Shown separately from the main
+    Direct Delivery list so an uncertain "not direct" doesn't just
+    disappear (the main list only ever shows is_direct=1 rows)."""
+    db = get_db()
+    if session.get("role") == "admin":
+        rows = db.execute(
+            "SELECT bl_number, is_direct, reason, classified_by, classified_at, review_note "
+            "FROM direct_delivery WHERE needs_review = 1 ORDER BY classified_at DESC, bl_number"
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT bl_number, is_direct, reason, classified_by, classified_at, review_note "
+            "FROM direct_delivery WHERE needs_review = 1 AND classified_by = ? ORDER BY classified_at DESC, bl_number",
+            (session.get("username"),),
+        ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/direct-delivery/<path:bl>", methods=["DELETE"])
+@login_required
+def delete_direct_delivery(bl):
+    """Removes one BL from the results list - for clearing out stale rows
+    left over from an earlier test/upload (e.g. a bogus BL name or a weight
+    that was misread before a classifier bug was fixed). Admins can remove
+    any row; staff can only remove rows they classified themselves."""
+    db = get_db()
+    if session.get("role") == "admin":
+        db.execute("DELETE FROM direct_delivery WHERE bl_number = ?", (bl,))
+    else:
+        db.execute(
+            "DELETE FROM direct_delivery WHERE bl_number = ? AND classified_by = ?",
+            (bl, session.get("username")),
+        )
+    db.commit()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/records/<path:bl_number>/toggle", methods=["POST"])
@@ -3367,7 +3679,7 @@ DIRECT_DELIVERY_HTML = """
 
   <div class="panel">
     <h2>Classify packing lists</h2>
-    <p class="panel-sub">.xlsx, .xls, .csv or .pdf - select or drop as many files as you have at once. Reads the weight/length/description columns automatically, and a BL split across several files (same reference number, different pages) is grouped back into one BL.</p>
+    <p class="panel-sub">.xlsx, .xls, .csv, .pdf, .doc/.docx, or a scanned photo (.png/.jpg) - select or drop as many files as you have at once. Reads the weight/length/description columns automatically, and a BL split across several files (same reference number, different pages) is grouped back into one BL.</p>
     <label class="dropzone" id="dropzone" for="classifyFile">
       <div class="dropzone-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8">
@@ -3376,11 +3688,17 @@ DIRECT_DELIVERY_HTML = """
       </div>
       <div>
         <div class="dropzone-text"><b>Click to upload</b> or drag &amp; drop your packing lists</div>
-        <div class="dropzone-sub">.xlsx, .xls, .csv or .pdf - multiple files at once is fine</div>
+        <div class="dropzone-sub">.xlsx, .xls, .csv, .pdf, .doc/.docx, .png/.jpg - multiple files at once is fine</div>
       </div>
-      <input type="file" id="classifyFile" accept=".xlsx,.xlsm,.xls,.csv,.pdf" multiple style="display:none" onchange="uploadClassify()">
+      <input type="file" id="classifyFile" accept=".xlsx,.xlsm,.xls,.csv,.pdf,.doc,.docx,.png,.jpg,.jpeg,.bmp,.tif,.tiff" multiple style="display:none" onchange="uploadClassify()">
     </label>
     <div class="status-line" id="statusLine"></div>
+  </div>
+
+  <div class="panel" id="reviewPanel" style="display:none;">
+    <h2>⚠ Needs a quick check</h2>
+    <p class="panel-sub" id="reviewSub">Loading...</p>
+    <div id="reviewBody"></div>
   </div>
 
   <div class="panel">
@@ -3441,14 +3759,17 @@ async function uploadClassify() {
     const classified = data.classified || [];
     const failed = data.failed || [];
     const direct = classified.filter(m => m.direct).length;
+    const flagged = classified.filter(m => m.needs_review).length;
     status.className = failed.length ? 'status-line error' : 'status-line ok';
     let msg = classified.length
       ? `Classified ${classified.length} BL(s) - ${direct} direct delivery.`
       : 'No BLs could be read from those files.';
+    if (flagged) msg += ` ${flagged} flagged for a quick manual check.`;
     if (failed.length) msg += ` Couldn't read: ${failed.join(', ')}.`;
     status.textContent = msg;
     input.value = '';
     await loadResults();
+    await loadReview();
   } catch (e) {
     status.className = 'status-line error';
     status.textContent = 'Could not classify those files.';
@@ -3470,19 +3791,55 @@ async function loadResults() {
   sub.textContent = `${rows.length} direct delivery BL(s).`;
   body.innerHTML = `
     <table class="dd-table">
-      <thead><tr><th>BL Number</th><th>Reason</th><th>Classified</th></tr></thead>
+      <thead><tr><th>BL Number</th><th>Reason</th><th>Classified</th><th></th></tr></thead>
       <tbody>
         ${rows.map(r => `
           <tr>
             <td><b>${r.bl_number}</b></td>
             <td style="color:var(--muted);">${r.reason || ''}</td>
             <td style="color:var(--muted);">${r.classified_by || ''}${r.classified_at ? ' - ' + r.classified_at : ''}</td>
+            <td><button class="btn ghost danger" style="padding:4px 10px;font-size:11.5px;" onclick="removeDirectDelivery('${r.bl_number.replace(/'/g, "\\\\'")}')">Remove</button></td>
           </tr>`).join('')}
       </tbody>
     </table>`;
 }
 
+async function loadReview() {
+  const res = await fetch('/api/direct-delivery/review');
+  if (res.status === 401 || res.redirected) return;
+  const rows = await res.json();
+  const panel = document.getElementById('reviewPanel');
+  const sub = document.getElementById('reviewSub');
+  const body = document.getElementById('reviewBody');
+  if (!rows.length) { panel.style.display = 'none'; return; }
+  panel.style.display = '';
+  sub.textContent = `${rows.length} BL(s) where something about the read was uncertain - not necessarily wrong, just worth a glance at the source file.`;
+  body.innerHTML = `
+    <table class="dd-table">
+      <thead><tr><th>BL Number</th><th>Verdict</th><th>Why flagged</th><th></th></tr></thead>
+      <tbody>
+        ${rows.map(r => `
+          <tr>
+            <td><b>${r.bl_number}</b></td>
+            <td>${ddBadgeHtml(!!r.is_direct)}</td>
+            <td style="color:var(--muted);">${r.review_note || ''}</td>
+            <td><button class="btn ghost danger" style="padding:4px 10px;font-size:11.5px;" onclick="removeDirectDelivery('${r.bl_number.replace(/'/g, "\\\\'")}', true)">Remove</button></td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+async function removeDirectDelivery(bl, fromReview) {
+  if (!confirm(`Remove ${bl} from this list? This won't affect the source files, only this table.`)) return;
+  try {
+    await fetch(`/api/direct-delivery/${encodeURIComponent(bl)}`, {method: 'DELETE'});
+  } catch (e) {}
+  await loadResults();
+  await loadReview();
+}
+
 loadResults();
+loadReview();
 </script>
 </body></html>
 """
