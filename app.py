@@ -248,9 +248,10 @@ def submit_manifest():
         raw = raw.strip()
         if not raw:
             continue
-        parts = [p.strip() for p in raw.split(",", 1)]
-        bl_number = parts[0].upper()
-        consignee = _clean_party_name(parts[1]) if len(parts) > 1 else ""
+        # Only the BL number matters now - if the user still pastes
+        # "BL, something" (old habit), just take the BL part.
+        bl_number = raw.split(",", 1)[0].strip().upper()
+        consignee = ""
         if not bl_number:
             continue
         existing = db.execute("SELECT 1 FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
@@ -265,57 +266,14 @@ def submit_manifest():
     return jsonify({"added": added})
 
 
-# Header names we'll recognize for each column, in the manifest Excel file.
-# Matching is case-insensitive and ignores spaces/punctuation.
+# Header names we'll recognize for the BL Number column in an uploaded
+# manifest. Matching is case-insensitive and ignores spaces/punctuation.
+# (Consignee is intentionally no longer tracked - only the BL number matters.)
 BL_HEADER_WORDS = ["blnumber", "bl", "billoflading", "billofladingno", "bl no", "blno"]
-CONSIGNEE_HEADER_WORDS = ["consignee", "consigneename", "customer", "customername"]
-NOTIFY_HEADER_WORDS = ["notifyparty", "notify", "notifypartyname", "notifypartydetails"]
 
 
 def _normalize_header(text):
     return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
-
-
-# Words/patterns that mark where an address, phone number, or registration
-# detail starts inside a consignee/notify-party cell - everything from the
-# earliest of these onward gets cut off, keeping just the company name.
-_NAME_STOP_PATTERNS = [
-    r"\bADDRESS\b", r"\bADD\s*:", r"\bTEL\b", r"\bFAX\b", r"\bP\.?\s*O\.?\s*BOX\b",
-    r"\bC\.?\s*R\.?\s*(NO|NUMBER)?\s*:", r"\bCOMMERCIAL REGISTRATION\b",
-    r"\bREGISTRATION NUMBER\b", r"\bVAT\b", r"\bSTREET\b", r"\bDIST\.?\b",
-    r"\bKINGDOM OF\b", r"\bKSA\b", r"\bBUILDING\b", r"\bFLOOR\b", r"\bWITH\b",
-    r"\d{2,}",  # a run of 2+ digits usually starts a building/street/reg number
-]
-_BANK_PATTERNS = [r"\bTO\s+(THE\s+)?ORDER\b", r"\bBANK\b"]
-
-
-def _clean_party_name(text):
-    """Take a messy consignee/notify-party cell and return just the company
-    name, cutting off address, phone, and registration-number clutter."""
-    if not text:
-        return ""
-    text = str(text)
-    # A cell often has the name on its own line, address below - use the
-    # first non-empty line as the starting point.
-    lines = [l.strip() for l in re.split(r"[\r\n]+", text) if l.strip()]
-    if not lines:
-        return ""
-    candidate = lines[0]
-
-    earliest = len(candidate)
-    for pat in _NAME_STOP_PATTERNS:
-        m = re.search(pat, candidate, re.IGNORECASE)
-        if m and m.start() < earliest:
-            earliest = m.start()
-
-    cleaned = candidate[:earliest].strip(" ,.-:;")
-    return cleaned if cleaned else candidate.strip()
-
-
-def _looks_like_bank_or_order(text):
-    if not text:
-        return False
-    return any(re.search(pat, text, re.IGNORECASE) for pat in _BANK_PATTERNS)
 
 
 @app.route("/api/manifest/upload", methods=["POST"])
@@ -346,11 +304,10 @@ def upload_manifest_excel():
         if not rows:
             continue
 
-        # Try to find a header row (in the first 5 rows) naming the BL,
-        # Consignee, and Notify Party columns.
+        # Try to find a header row (in the first 5 rows) naming the BL
+        # Number column. Only the BL number is tracked - consignee is not
+        # collected or stored.
         bl_col = None
-        consignee_col = None
-        notify_col = None
         header_row_index = None
 
         for i, row in enumerate(rows[:5]):
@@ -359,20 +316,13 @@ def upload_manifest_excel():
                 if norm and any(norm == w.replace(" ", "") or norm.startswith(w.replace(" ", "")) for w in BL_HEADER_WORDS):
                     bl_col = col_index
                     header_row_index = i
-                if norm and any(norm == w.replace(" ", "") for w in CONSIGNEE_HEADER_WORDS):
-                    consignee_col = col_index
-                    header_row_index = i
-                if norm and any(norm == w.replace(" ", "") for w in NOTIFY_HEADER_WORDS):
-                    notify_col = col_index
-                    header_row_index = i
             if bl_col is not None:
                 break
 
         if bl_col is None:
             # No recognizable header found - fall back to assuming column A is BL number,
-            # column B is consignee, and there's no header row.
+            # with no header row.
             bl_col = 0
-            consignee_col = 1
             data_rows = rows
         else:
             data_rows = rows[header_row_index + 1:]
@@ -385,26 +335,13 @@ def upload_manifest_excel():
                 continue
             bl_number = str(raw_bl).strip().upper()
 
-            raw_consignee = ""
-            if consignee_col is not None and consignee_col < len(row) and row[consignee_col]:
-                raw_consignee = str(row[consignee_col]).strip()
-            consignee = _clean_party_name(raw_consignee)
-
-            # If the consignee cell is really a bank / "to order of" clause,
-            # the Notify Party is usually the actual receiving company - use
-            # that instead when the file has one.
-            if _looks_like_bank_or_order(consignee) and notify_col is not None and notify_col < len(row) and row[notify_col]:
-                notify_cleaned = _clean_party_name(str(row[notify_col]).strip())
-                if notify_cleaned:
-                    consignee = notify_cleaned
-
             existing = db.execute("SELECT 1 FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
             if existing:
                 skipped += 1
                 continue
             db.execute(
-                "INSERT INTO records (bl_number, consignee, created_at) VALUES (?, ?, ?)",
-                (bl_number, consignee, datetime.now().strftime("%Y-%m-%d %H:%M")),
+                "INSERT INTO records (bl_number, created_at) VALUES (?, ?)",
+                (bl_number, datetime.now().strftime("%Y-%m-%d %H:%M")),
             )
             added += 1
 
@@ -448,17 +385,6 @@ def update_remarks(bl_number):
     remarks = data.get("remarks", "")
     db = get_db()
     db.execute("UPDATE records SET remarks = ? WHERE bl_number = ?", (remarks, bl_number.upper()))
-    db.commit()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/records/<path:bl_number>/consignee", methods=["POST"])
-@login_required
-def update_consignee(bl_number):
-    data = request.get_json(force=True)
-    consignee = data.get("consignee", "")
-    db = get_db()
-    db.execute("UPDATE records SET consignee = ? WHERE bl_number = ?", (consignee, bl_number.upper()))
     db.commit()
     return jsonify({"ok": True})
 
@@ -675,54 +601,162 @@ PAGE_HTML = """
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root {
-    --bg: #f4f6f8; --card: #ffffff; --text: #1a2733; --muted: #6b7a89;
-    --border: #dfe6ec; --accent: #1e5f8c; --green: #1f9d55; --amber: #c9891a;
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --text: #1c2b3a;
+    --muted: #7a8794;
+    --border: #e6e9ed;
+    --navy: #123a56;
+    --navy-deep: #0b2740;
+    --navy-light: #1f5c85;
+    --gold: #c9a227;
+    --gold-light: #e0bd53;
+    --success: #1f9d55;
+    --success-bg: #eaf7ef;
+    --danger: #d1483f;
+    --shadow-sm: 0 1px 2px rgba(18,58,86,0.05);
+    --shadow-md: 0 10px 30px rgba(18,58,86,0.08);
   }
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 16px; }
-  .topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom: 10px; flex-wrap: wrap; gap: 8px; }
-  .topbar a { color: var(--accent); text-decoration: none; font-size: 13px; }
-  h1 { font-size: 19px; margin: 0; }
-  .sub { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  html { -webkit-font-smoothing: antialiased; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif;
+    background: var(--bg); color: var(--text); margin: 0; padding: 0 16px 32px;
+  }
+
+  /* Header */
+  .topbar {
+    position: sticky; top: 0; z-index: 50;
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 12px; flex-wrap: wrap;
+    padding: 14px 16px; margin: 0 -16px 18px;
+    background: rgba(245,246,248,0.86); backdrop-filter: saturate(180%) blur(14px);
+    -webkit-backdrop-filter: saturate(180%) blur(14px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand img { height: 34px; width: auto; display: block; border-radius: 7px; }
+  .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
+  .brand-text .app-name { font-size: 15px; font-weight: 700; color: var(--navy-deep); letter-spacing: -0.01em; }
+  .brand-text .app-tag { font-size: 11px; color: var(--muted); font-weight: 500; }
+  .topbar-right { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+  .topbar-right a {
+    color: var(--navy); text-decoration: none; font-weight: 600; font-size: 13px;
+    padding: 6px 12px; border-radius: 20px; transition: background .15s ease;
+  }
+  .topbar-right a:hover { background: #e9edf1; }
+  .who { padding: 6px 10px; }
+  .who b { color: var(--text); }
+
+  .sub { color: var(--muted); font-size: 13px; margin: 2px 0 18px; }
+
+  /* Cards */
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+    padding: 18px; margin-bottom: 16px; box-shadow: var(--shadow-sm);
+  }
   .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-  textarea, input[type=text] { border: 1px solid var(--border); border-radius: 6px; padding: 9px; font-size: 14px; font-family: inherit; width: 100%; }
-  textarea { min-height: 70px; resize: vertical; }
-  button { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 9px 14px; font-size: 13px; cursor: pointer; }
-  button:hover { opacity: 0.9; }
-  .summary { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
-  .stat { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; font-size: 12px; flex: 1; min-width: 90px; }
-  .stat b { display: block; font-size: 18px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
-  .checkwrap { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; }
-  .meta { font-size: 10px; color: var(--muted); }
-  .remarks-input, .consignee-input { width: 100%; border: 1px solid transparent; background: transparent; font-size: 12px; font-family: inherit; padding: 3px 4px; border-radius: 4px; }
-  .remarks-input:focus, .consignee-input:focus { border-color: var(--border); background: #fff; }
-  .del { background: none; color: #c0392b; font-size: 12px; padding: 2px 6px; }
+  .card-label { font-size: 12px; font-weight: 600; color: var(--navy); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 10px; }
+
+  textarea, input[type=text] {
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+    font-size: 14px; font-family: inherit; width: 100%; background: #fbfbfc;
+    transition: border-color .15s ease, background .15s ease, box-shadow .15s ease;
+  }
+  textarea { min-height: 64px; resize: vertical; }
+  textarea:focus, input[type=text]:focus {
+    outline: none; border-color: var(--navy-light); background: #fff;
+    box-shadow: 0 0 0 3px rgba(31,92,133,0.12);
+  }
+
+  button {
+    background: var(--navy); color: #fff; border: none; border-radius: 999px;
+    padding: 10px 18px; font-size: 13px; font-weight: 600; cursor: pointer;
+    transition: background .15s ease, transform .08s ease;
+  }
+  button:hover { background: var(--navy-light); }
+  button:active { transform: scale(0.97); }
+  button.secondary { background: #eef1f4; color: var(--text); }
+  button.secondary:hover { background: #e2e7ec; }
+
+  input[type=file] { font-size: 12px; color: var(--muted); max-width: 220px; }
+
+  /* Summary stats */
+  .summary { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .stat {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    padding: 14px 18px; font-size: 12px; color: var(--muted); flex: 1; min-width: 120px;
+    box-shadow: var(--shadow-sm); position: relative; overflow: hidden;
+  }
+  .stat::before {
+    content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--navy-light);
+  }
+  .stat.gold::before { background: var(--gold); }
+  .stat.done::before { background: var(--success); }
+  .stat b { display: block; font-size: 22px; font-weight: 700; color: var(--text); letter-spacing: -0.01em; }
+
+  /* Table */
   .overflow { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid var(--border); }
+  th {
+    color: var(--muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase;
+    letter-spacing: .05em; background: #fafbfc;
+  }
+  tbody tr { transition: background .12s ease; }
+  tbody tr:hover { background: #f9fafb; }
+  tbody tr:last-child td { border-bottom: none; }
+
+  .bl-cell { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .bl-cell b { font-weight: 700; letter-spacing: -0.01em; }
+  .badge-complete {
+    display: inline-flex; align-items: center; gap: 3px;
+    background: var(--success-bg); color: var(--success); font-size: 10.5px; font-weight: 700;
+    padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: .03em;
+  }
+
+  .checkwrap { display: flex; flex-direction: column; gap: 3px; align-items: flex-start; }
+  .meta { font-size: 10px; color: var(--muted); }
+  .remarks-input {
+    width: 100%; border: 1px solid transparent; background: transparent;
+    font-size: 12.5px; font-family: inherit; padding: 5px 6px; border-radius: 6px;
+  }
+  .remarks-input:focus { border-color: var(--border); background: #fff; box-shadow: none; }
+  .del {
+    background: none; color: var(--danger); font-size: 12px; font-weight: 600;
+    padding: 5px 10px; border-radius: 999px;
+  }
+  .del:hover { background: #fbeceb; }
 
   /* Sliding toggle switch */
   .switch { position: relative; display: inline-block; width: 42px; height: 23px; flex-shrink: 0; }
   .switch input { opacity: 0; width: 0; height: 0; }
-  .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
-            background-color: #dfe6ec; transition: background-color .2s ease; border-radius: 24px; }
-  .slider:before { position: absolute; content: ""; height: 17px; width: 17px; left: 3px; bottom: 3px;
-                   background-color: #fff; transition: transform .2s ease; border-radius: 50%;
-                   box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
-  input:checked + .slider { background-color: var(--green); }
+  .slider {
+    position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+    background-color: #dfe6ec; transition: background-color .2s ease; border-radius: 24px;
+  }
+  .slider:before {
+    position: absolute; content: ""; height: 17px; width: 17px; left: 3px; bottom: 3px;
+    background-color: #fff; transition: transform .2s ease; border-radius: 50%;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  }
+  input:checked + .slider { background-color: var(--gold); }
   input:checked + .slider:before { transform: translateX(19px); }
 
   /* Toast notifications (replace confirm()/alert() popups) */
   #toastHost { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; }
-  .toast { background: #1a2733; color: #fff; padding: 10px 14px; border-radius: 8px; font-size: 13px;
-           display: flex; align-items: center; gap: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-           animation: toast-in .15s ease-out; max-width: 320px; }
-  .toast a { color: #7fc8ff; font-weight: 600; text-decoration: none; cursor: pointer; white-space: nowrap; }
+  .toast {
+    background: var(--navy-deep); color: #fff; padding: 11px 16px; border-radius: 12px; font-size: 13px;
+    display: flex; align-items: center; gap: 14px; box-shadow: var(--shadow-md);
+    animation: toast-in .18s ease-out; max-width: 320px;
+  }
+  .toast a { color: var(--gold-light); font-weight: 700; text-decoration: none; cursor: pointer; white-space: nowrap; }
   .toast.fading { animation: toast-out .2s ease-in forwards; }
-  @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-  @keyframes toast-out { to { opacity: 0; transform: translateY(6px); } }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes toast-out { to { opacity: 0; transform: translateY(8px); } }
+
+  @keyframes row-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+  tbody tr { animation: row-in .2s ease; }
 
   @media (max-width: 600px) {
     .stat { min-width: 45%; }
@@ -731,38 +765,46 @@ PAGE_HTML = """
 </head>
 <body>
   <div class="topbar">
-    <h1>Delivery Order Tracker</h1>
-    <div>
-      {% if role == 'admin' %}<a href="/users">Manage Users</a> &nbsp;|&nbsp; {% endif %}
-      {{ username }} &nbsp;|&nbsp; <a href="/logout">Log out</a>
+    <div class="brand">
+      <img src="data:image/jpeg;base64,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" alt="Sea Power">
+      <div class="brand-text">
+        <span class="app-name">Delivery Order Tracker</span>
+        <span class="app-tag">Sea Power &middot; Port Agent Ops</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
+      <span class="who">Signed in as <b>{{ username }}</b></span>
+      <a href="/logout">Log out</a>
     </div>
   </div>
-  <div class="sub">Shared board - visible to everyone with a login. Updates every few seconds.</div>
+
+  <div class="sub">Shared board, visible to everyone with a login. Updates automatically.</div>
 
   <div class="card">
+    <div class="card-label">Add BL numbers</div>
     <div class="row" style="align-items:flex-start;">
-      <textarea id="manifestInput" placeholder="Paste manifest: one BL per line, e.g.&#10;MSCU1234567, ABC Trading Co&#10;COSU9876543, Al Fahad Trading"></textarea>
+      <textarea id="manifestInput" placeholder="Paste BL numbers, one per line, e.g.&#10;MSCU1234567&#10;COSU9876543"></textarea>
       <button onclick="submitManifest()">Add to Board</button>
     </div>
-    <div class="row" style="margin-top:10px; align-items:center;">
-      <span style="font-size:12px; color:var(--muted);">Or upload an Excel manifest (.xlsx):</span>
+    <div class="row" style="margin-top:12px; align-items:center;">
+      <span style="font-size:12px; color:var(--muted); font-weight:500;">Or upload an Excel manifest (.xlsx):</span>
       <input type="file" id="excelFile" accept=".xlsx,.xlsm">
-      <button onclick="uploadExcel()" class="secondary" style="background:#eef2f5; color:var(--text);">Upload Excel</button>
+      <button onclick="uploadExcel()" class="secondary">Upload Excel</button>
     </div>
   </div>
 
   <div class="summary" id="summary"></div>
 
   <div class="card">
-    <div class="row" style="margin-bottom:12px;">
-      <input type="text" id="searchBox" placeholder="Search BL number or consignee..." oninput="render()">
+    <div class="row" style="margin-bottom:14px;">
+      <input type="text" id="searchBox" placeholder="Search BL number..." oninput="render()">
     </div>
     <div class="overflow">
       <table>
         <thead>
           <tr>
             <th>BL Number</th>
-            <th>Consignee</th>
             <th>Invoice Issued</th>
             <th>Approval Received</th>
             <th>DO Issued</th>
@@ -780,8 +822,13 @@ PAGE_HTML = """
 <script>
 const CURRENT_USER = {{ username|tojson }};
 let records = [];
-let pollTimer = null;
 let suppressPollUntil = 0;
+let editingCount = 0;
+
+function markEditing(delta) {
+  editingCount = Math.max(0, editingCount + delta);
+  if (editingCount === 0) render();
+}
 
 function showToast(message, opts) {
   opts = opts || {};
@@ -807,12 +854,38 @@ function showToast(message, opts) {
   }
 }
 
+function naturalCompare(a, b) {
+  const re = /(\d+)|(\D+)/g;
+  const ax = String(a || '').match(re) || [];
+  const bx = String(b || '').match(re) || [];
+  const len = Math.max(ax.length, bx.length);
+  for (let i = 0; i < len; i++) {
+    const av = ax[i] || '', bv = bx[i] || '';
+    if (av === bv) continue;
+    const an = parseInt(av, 10), bn = parseInt(bv, 10);
+    if (!isNaN(an) && !isNaN(bn)) {
+      if (an !== bn) return an - bn;
+    } else {
+      return av < bv ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
 async function fetchRecords() {
   if (Date.now() < suppressPollUntil) return;
   const res = await fetch('/api/records');
   if (res.status === 401 || res.redirected) { location.reload(); return; }
-  records = await res.json();
-  render();
+  const fresh = await res.json();
+  // Don't let a poll stomp remarks the user is still typing (unsaved edits).
+  fresh.forEach(nr => {
+    if (remarksTimers[nr.bl_number]) {
+      const old = records.find(r => r.bl_number === nr.bl_number);
+      if (old) nr.remarks = old.remarks;
+    }
+  });
+  records = fresh;
+  if (editingCount === 0) render();
 }
 
 async function submitManifest() {
@@ -876,22 +949,10 @@ function onRemarksInput(bl, value) {
   if (rec) rec.remarks = value;
   clearTimeout(remarksTimers[bl]);
   remarksTimers[bl] = setTimeout(async () => {
+    delete remarksTimers[bl];
     await fetch(`/api/records/${encodeURIComponent(bl)}/remarks`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({remarks: value})
-    });
-  }, 500);
-}
-
-let consigneeTimers = {};
-function onConsigneeInput(bl, value) {
-  const rec = records.find(r => r.bl_number === bl);
-  if (rec) rec.consignee = value;
-  clearTimeout(consigneeTimers[bl]);
-  consigneeTimers[bl] = setTimeout(async () => {
-    await fetch(`/api/records/${encodeURIComponent(bl)}/consignee`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({consignee: value})
     });
   }, 500);
 }
@@ -934,24 +995,31 @@ function checkbox(bl, field, checked, by, at) {
 
 function render() {
   const q = document.getElementById('searchBox').value.trim().toLowerCase();
-  const filtered = records.filter(r =>
-    r.bl_number.toLowerCase().includes(q) || (r.consignee || '').toLowerCase().includes(q)
-  );
+  const filtered = records
+    .filter(r => r.bl_number.toLowerCase().includes(q))
+    .sort((a, b) => naturalCompare(a.bl_number, b.bl_number));
 
   const tbody = document.getElementById('tbody');
-  tbody.innerHTML = filtered.map(r => `
+  tbody.innerHTML = filtered.map(r => {
+    const complete = !!(r.invoice_issued && r.approval_received && r.do_issued);
+    return `
     <tr>
-      <td><b>${r.bl_number}</b></td>
-      <td><input class="consignee-input" type="text" value="${(r.consignee || '').replace(/"/g,'&quot;')}"
-            oninput="onConsigneeInput('${r.bl_number}', this.value)" placeholder="consignee name..."></td>
+      <td>
+        <div class="bl-cell">
+          <b>${r.bl_number}</b>
+          ${complete ? '<span class="badge-complete">&check; Complete</span>' : ''}
+        </div>
+      </td>
       <td>${checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at)}</td>
       <td>${checkbox(r.bl_number, 'approval_received', !!r.approval_received, r.approval_by, r.approval_at)}</td>
       <td>${checkbox(r.bl_number, 'do_issued', !!r.do_issued, r.do_by, r.do_at)}</td>
       <td><input class="remarks-input" type="text" value="${(r.remarks || '').replace(/"/g,'&quot;')}"
-            oninput="onRemarksInput('${r.bl_number}', this.value)" placeholder="notes..."></td>
+            oninput="onRemarksInput('${r.bl_number}', this.value)"
+            onfocus="markEditing(1)" onblur="markEditing(-1)" placeholder="notes..."></td>
       <td><button class="del" onclick="deleteRecord('${r.bl_number}')">Remove</button></td>
     </tr>
-  `).join('') || '<tr><td colspan="7" style="color:#888;">No BLs on the board yet. Paste a manifest above to get started.</td></tr>';
+  `;
+  }).join('') || '<tr><td colspan="6" style="color:#9aa5b0; padding:24px 10px;">No BLs on the board yet. Paste a manifest above to get started.</td></tr>';
 
   const total = records.length;
   const invoicePending = records.filter(r => !r.invoice_issued).length;
@@ -961,10 +1029,10 @@ function render() {
 
   document.getElementById('summary').innerHTML = `
     <div class="stat"><b>${total}</b>Total BLs</div>
-    <div class="stat"><b>${invoicePending}</b>Invoice Pending</div>
-    <div class="stat"><b>${approvalPending}</b>Approval Pending</div>
-    <div class="stat"><b>${doPending}</b>DO Pending</div>
-    <div class="stat"><b>${complete}</b>Fully Complete</div>
+    <div class="stat gold"><b>${invoicePending}</b>Invoice Pending</div>
+    <div class="stat gold"><b>${approvalPending}</b>Approval Pending</div>
+    <div class="stat gold"><b>${doPending}</b>DO Pending</div>
+    <div class="stat done"><b>${complete}</b>Fully Complete</div>
   `;
 }
 
