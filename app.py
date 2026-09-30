@@ -1036,19 +1036,20 @@ def classify_manifest():
 @app.route("/api/direct-delivery", methods=["GET"])
 @login_required
 def list_direct_delivery():
-    """Every BL that's been through the classifier, for the Direct Delivery
-    page's results table - so a refresh doesn't lose what was just
-    uploaded. Admins see everything; staff only see what they classified."""
+    """Every BL that's been classified as Direct Delivery, for the results
+    table - so a refresh doesn't lose what was just uploaded. Not-direct
+    BLs aren't shown here at all. Admins see everything; staff only see
+    what they classified."""
     db = get_db()
     if session.get("role") == "admin":
         rows = db.execute(
             "SELECT bl_number, is_direct, reason, classified_by, classified_at "
-            "FROM direct_delivery ORDER BY classified_at DESC, bl_number"
+            "FROM direct_delivery WHERE is_direct = 1 ORDER BY classified_at DESC, bl_number"
         ).fetchall()
     else:
         rows = db.execute(
             "SELECT bl_number, is_direct, reason, classified_by, classified_at "
-            "FROM direct_delivery WHERE classified_by = ? ORDER BY classified_at DESC, bl_number",
+            "FROM direct_delivery WHERE is_direct = 1 AND classified_by = ? ORDER BY classified_at DESC, bl_number",
             (session.get("username"),),
         ).fetchall()
     return jsonify([dict(r) for r in rows])
@@ -3007,7 +3008,7 @@ DIRECT_DELIVERY_HTML = """
   </div>
 
   <div class="panel">
-    <h2>Classified BLs</h2>
+    <h2>Direct Delivery BLs</h2>
     <p class="panel-sub" id="resultsSub">Loading...</p>
     <div id="resultsBody"></div>
   </div>
@@ -3084,20 +3085,18 @@ async function loadResults() {
   const sub = document.getElementById('resultsSub');
   const body = document.getElementById('resultsBody');
   if (!rows.length) {
-    sub.textContent = 'Nothing classified yet.';
-    body.innerHTML = '<div class="empty-note">Upload a packing list above to get started.</div>';
+    sub.textContent = 'No direct delivery BLs yet.';
+    body.innerHTML = '<div class="empty-note">Upload a packing list above - any BL that comes back Direct Delivery will show up here.</div>';
     return;
   }
-  const direct = rows.filter(r => r.is_direct === 1).length;
-  sub.textContent = `${rows.length} BL(s) classified - ${direct} direct delivery.`;
+  sub.textContent = `${rows.length} direct delivery BL(s).`;
   body.innerHTML = `
     <table class="dd-table">
-      <thead><tr><th>BL Number</th><th>Status</th><th>Reason</th><th>Classified</th></tr></thead>
+      <thead><tr><th>BL Number</th><th>Reason</th><th>Classified</th></tr></thead>
       <tbody>
         ${rows.map(r => `
           <tr>
             <td><b>${r.bl_number}</b></td>
-            <td>${ddBadgeHtml(r.is_direct === 1)}</td>
             <td style="color:var(--muted);">${r.reason || ''}</td>
             <td style="color:var(--muted);">${r.classified_by || ''}${r.classified_at ? ' - ' + r.classified_at : ''}</td>
           </tr>`).join('')}
