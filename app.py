@@ -1016,7 +1016,7 @@ AUTH_STYLE = """
 (function initTheme() {
   let saved = null;
   try { saved = localStorage.getItem('theme'); } catch (e) {}
-  const mode = saved || ((window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light');
+  const mode = saved || 'light'; // default to light for first-time visitors; once they toggle, localStorage remembers it
   document.documentElement.setAttribute('data-theme', mode);
   window.addEventListener('DOMContentLoaded', () => {
     const cb = document.getElementById('themeToggle');
@@ -1182,7 +1182,7 @@ USERS_HTML = """
 (function initTheme() {
   let saved = null;
   try { saved = localStorage.getItem('theme'); } catch (e) {}
-  const mode = saved || ((window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light');
+  const mode = saved || 'light'; // default to light for first-time visitors; once they toggle, localStorage remembers it
   document.documentElement.setAttribute('data-theme', mode);
   window.addEventListener('DOMContentLoaded', () => {
     const cb = document.getElementById('themeToggle');
@@ -1456,7 +1456,7 @@ HUB_HTML = """
 (function initTheme() {
   let saved = null;
   try { saved = localStorage.getItem('theme'); } catch (e) {}
-  const mode = saved || ((window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light');
+  const mode = saved || 'light'; // default to light for first-time visitors; once they toggle, localStorage remembers it
   document.documentElement.setAttribute('data-theme', mode);
   window.addEventListener('DOMContentLoaded', () => {
     const cb = document.getElementById('themeToggle');
@@ -1966,7 +1966,7 @@ function showToast(msg, opts) {
 (function initTheme() {
   let saved = null;
   try { saved = localStorage.getItem('theme'); } catch (e) {}
-  const mode = saved || ((window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light');
+  const mode = saved || 'light'; // default to light for first-time visitors; once they toggle, localStorage remembers it
   document.documentElement.setAttribute('data-theme', mode);
   window.addEventListener('DOMContentLoaded', () => {
     const cb = document.getElementById('themeToggle');
@@ -2348,7 +2348,7 @@ PAGE_HTML = """
 (function initTheme() {
   let saved = null;
   try { saved = localStorage.getItem('theme'); } catch (e) {}
-  const mode = saved || ((window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light');
+  const mode = saved || 'light'; // default to light for first-time visitors; once they toggle, localStorage remembers it
   document.documentElement.setAttribute('data-theme', mode);
   window.addEventListener('DOMContentLoaded', () => {
     const cb = document.getElementById('themeToggle');
