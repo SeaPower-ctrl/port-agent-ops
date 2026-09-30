@@ -973,11 +973,17 @@ AUTH_STYLE = """
   }
   .brand-mark img {
     height: 56px; width: auto; margin-bottom: 12px;
-    animation: mark-in .7s .1s cubic-bezier(.34,1.56,.64,1) both;
+    animation: mark-in 2.1s .1s cubic-bezier(.22,.7,.2,1) both;
   }
+  /* Logo pops in, then swings and settles like a compass needle finding its heading */
   @keyframes mark-in {
-    from { opacity: 0; transform: scale(.6) rotate(-16deg); }
-    to { opacity: 1; transform: scale(1) rotate(0); }
+    0%   { opacity: 0; transform: scale(.6) rotate(-16deg); }
+    30%  { opacity: 1; transform: scale(1) rotate(15deg); }
+    48%  { transform: scale(1) rotate(-10deg); }
+    64%  { transform: scale(1) rotate(6deg); }
+    80%  { transform: scale(1) rotate(-3deg); }
+    92%  { transform: scale(1) rotate(1deg); }
+    100% { opacity: 1; transform: scale(1) rotate(0deg); }
   }
   .brand-mark .co { font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--gold); }
   .brand-mark .tag { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
@@ -989,19 +995,45 @@ AUTH_STYLE = """
   input, select {
     width: 100%; padding: 11px 13px; border: 1px solid var(--border); border-radius: 10px;
     font-size: 14.5px; font-family: inherit; background: var(--bg); color: var(--text);
-    transition: border-color .15s ease, background .15s ease, box-shadow .15s ease;
+    transition: border-color .2s ease, background .2s ease, box-shadow .25s ease, transform .15s ease;
   }
   input:focus, select:focus {
-    outline: none; border-color: var(--navy-light); background: var(--card);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 20%, transparent);
+    outline: none; border-color: var(--gold); background: var(--card);
+    transform: translateY(-1px);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--gold) 22%, transparent),
+                0 0 16px color-mix(in srgb, var(--gold) 35%, transparent);
   }
   button {
+    position: relative;
     width: 100%; background: var(--navy); color: #fff; border: none; border-radius: 999px;
     padding: 13px; font-size: 14px; font-weight: 700; margin-top: 24px; cursor: pointer;
     transition: background .15s ease, transform .08s ease;
   }
   button:hover { background: var(--navy-light); }
   button:active { transform: scale(.98); }
+
+  /* Loading state - shown while a form submit is in flight */
+  button.loading { color: transparent; pointer-events: none; }
+  button.loading::after {
+    content: ""; position: absolute; left: 50%; top: 50%; width: 18px; height: 18px;
+    margin: -9px 0 0 -9px; border: 2.5px solid rgba(255,255,255,.35); border-top-color: #fff;
+    border-radius: 50%; animation: btn-spin .65s linear infinite;
+  }
+  @keyframes btn-spin { to { transform: rotate(360deg); } }
+
+  /* Staggered entrance for the form fields, one after another */
+  form > label, form > input, form > .pw-wrap, form > button, form > .error {
+    animation: field-in .5s ease both;
+  }
+  form > label:nth-of-type(1) { animation-delay: .18s; }
+  form > input:nth-of-type(1), form > .pw-wrap:nth-of-type(1) { animation-delay: .24s; }
+  form > label:nth-of-type(2) { animation-delay: .30s; }
+  form > input:nth-of-type(2), form > .pw-wrap:nth-of-type(2) { animation-delay: .36s; }
+  form > button { animation-delay: .44s; }
+  @keyframes field-in {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
   .error {
     background: var(--danger-bg); color: var(--danger); padding: 10px 12px; border-radius: 10px;
     font-size: 13px; margin-top: 16px; text-align: center; font-weight: 600;
@@ -1120,6 +1152,18 @@ function togglePw(btn) {
     })();
   });
 })();
+
+/* Show a spinner on the submit button while the request is in flight,
+   so it's clear something is happening after clicking Sign In / Create. */
+window.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('form').forEach((form) => {
+    form.addEventListener('submit', () => {
+      if (!form.checkValidity()) return;
+      const btn = form.querySelector('button[type="submit"]');
+      if (btn) { btn.classList.add('loading'); btn.disabled = true; }
+    });
+  });
+});
 </script>
 """
 
