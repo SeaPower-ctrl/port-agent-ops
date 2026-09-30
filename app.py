@@ -18,6 +18,8 @@ Then open http://localhost:5000
 
 import os
 import re
+import csv
+import io
 from datetime import datetime
 from functools import wraps
 from flask import Flask, request, jsonify, g, render_template_string, session, redirect, url_for
@@ -328,6 +330,59 @@ def _normalize_header(text):
     return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
 
 
+def _extract_bl_numbers_from_rows(rows):
+    """rows: a list of rows, each row a sequence of cell values (any type,
+    already-stringifiable). Looks for a header naming the BL Number column
+    in the first 5 rows (same recognized header words used for Excel);
+    falls back to treating column A as the BL number with no header row.
+    Returns a flat list of upper-cased BL number strings (not deduped)."""
+    if not rows:
+        return []
+
+    bl_col = None
+    header_row_index = None
+    for i, row in enumerate(rows[:5]):
+        for col_index, cell in enumerate(row):
+            norm = _normalize_header(cell)
+            if norm and any(norm == w.replace(" ", "") or norm.startswith(w.replace(" ", "")) for w in BL_HEADER_WORDS):
+                bl_col = col_index
+                header_row_index = i
+        if bl_col is not None:
+            break
+
+    if bl_col is None:
+        bl_col = 0
+        data_rows = rows
+    else:
+        data_rows = rows[header_row_index + 1:]
+
+    out = []
+    for row in data_rows:
+        if bl_col >= len(row):
+            continue
+        raw_bl = row[bl_col]
+        if raw_bl is None or str(raw_bl).strip() == "":
+            continue
+        out.append(str(raw_bl).strip().upper())
+    return out
+
+
+def _extract_bl_numbers_from_lines(text):
+    """Fallback for formats with no real table (a .docx with no tables, or
+    a .pdf page with no detectable table/borders - common for manifests
+    exported or printed without visible grid lines). One BL per non-empty
+    line, taking whatever is before the first comma if present, then run
+    through the same header-recognition as tabular rows so a stray header
+    line like "BL Number" at the top doesn't get inserted as a record."""
+    rows = []
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        rows.append([raw.split(",", 1)[0].strip()])
+    return _extract_bl_numbers_from_rows(rows)
+
+
 @app.route("/api/manifest/upload", methods=["POST"])
 @login_required
 def upload_manifest_excel():
@@ -336,71 +391,82 @@ def upload_manifest_excel():
     file = request.files["file"]
     if not file.filename:
         return jsonify({"error": "No file selected"}), 400
-    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
-        return jsonify({"error": "Please upload an .xlsx Excel file (not .xls or .csv)"}), 400
 
+    filename = file.filename.lower()
     # The whole manifest gets tagged with the Port and Vessel it was
-    # uploaded for, so the board can be organized Port > Vessel.
-    port = request.form.get("port", "").strip()
-    vessel = request.form.get("vessel", "").strip()
+    # uploaded for, so the board can be organized Port > Vessel. Always
+    # stored upper-case for consistency, even if the field's own
+    # uppercasing-as-you-type got bypassed somehow (e.g. a pasted value).
+    port = request.form.get("port", "").strip().upper()
+    vessel = request.form.get("vessel", "").strip().upper()
+
+    bl_numbers = []
 
     try:
-        wb = openpyxl.load_workbook(file, data_only=True)
+        if filename.endswith((".xlsx", ".xlsm")):
+            wb = openpyxl.load_workbook(file, data_only=True)
+            # Go through every sheet (not just the first/active one) so BLs
+            # aren't missed if the file has multiple tabs or was last saved
+            # on a different sheet.
+            for sheet in wb.worksheets:
+                rows = list(sheet.iter_rows(values_only=True))
+                bl_numbers.extend(_extract_bl_numbers_from_rows(rows))
+
+        elif filename.endswith(".xls"):
+            book = xlrd.open_workbook(file_contents=file.read())
+            for sheet in book.sheets():
+                rows = [sheet.row_values(r) for r in range(sheet.nrows)]
+                bl_numbers.extend(_extract_bl_numbers_from_rows(rows))
+
+        elif filename.endswith(".csv"):
+            text = file.read().decode("utf-8-sig", errors="ignore")
+            rows = list(csv.reader(io.StringIO(text)))
+            bl_numbers.extend(_extract_bl_numbers_from_rows(rows))
+
+        elif filename.endswith(".docx"):
+            import docx
+            document = docx.Document(file)
+            if document.tables:
+                for table in document.tables:
+                    rows = [[cell.text for cell in row.cells] for row in table.rows]
+                    bl_numbers.extend(_extract_bl_numbers_from_rows(rows))
+            else:
+                full_text = "\n".join(p.text for p in document.paragraphs)
+                bl_numbers.extend(_extract_bl_numbers_from_lines(full_text))
+
+        elif filename.endswith(".pdf"):
+            import pdfplumber
+            found_table = False
+            with pdfplumber.open(file) as pdf:
+                for page in pdf.pages:
+                    for table in (page.extract_tables() or []):
+                        if table:
+                            found_table = True
+                            bl_numbers.extend(_extract_bl_numbers_from_rows(table))
+                if not found_table:
+                    for page in pdf.pages:
+                        bl_numbers.extend(_extract_bl_numbers_from_lines(page.extract_text() or ""))
+
+        else:
+            return jsonify({"error": "Unsupported file type. Please upload .xlsx, .xls, .csv, .docx or .pdf."}), 400
     except Exception:
-        return jsonify({"error": "Couldn't read that file. Make sure it's a valid Excel (.xlsx) file."}), 400
+        return jsonify({"error": "Couldn't read that file. Make sure it isn't corrupted or password-protected."}), 400
 
     db = get_db()
     added = 0
     skipped = 0
-
-    # Go through every sheet in the workbook (not just the first/active one)
-    # so BLs aren't missed if the file has multiple tabs or was last saved
-    # on a different sheet.
-    for sheet in wb.worksheets:
-        rows = list(sheet.iter_rows(values_only=True))
-        if not rows:
+    for bl_number in bl_numbers:
+        if not bl_number:
             continue
-
-        # Try to find a header row (in the first 5 rows) naming the BL
-        # Number column. Only the BL number is tracked - consignee is not
-        # collected or stored.
-        bl_col = None
-        header_row_index = None
-
-        for i, row in enumerate(rows[:5]):
-            for col_index, cell in enumerate(row):
-                norm = _normalize_header(cell)
-                if norm and any(norm == w.replace(" ", "") or norm.startswith(w.replace(" ", "")) for w in BL_HEADER_WORDS):
-                    bl_col = col_index
-                    header_row_index = i
-            if bl_col is not None:
-                break
-
-        if bl_col is None:
-            # No recognizable header found - fall back to assuming column A is BL number,
-            # with no header row.
-            bl_col = 0
-            data_rows = rows
-        else:
-            data_rows = rows[header_row_index + 1:]
-
-        for row in data_rows:
-            if bl_col >= len(row):
-                continue
-            raw_bl = row[bl_col]
-            if raw_bl is None or str(raw_bl).strip() == "":
-                continue
-            bl_number = str(raw_bl).strip().upper()
-
-            existing = db.execute("SELECT 1 FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
-            if existing:
-                skipped += 1
-                continue
-            db.execute(
-                "INSERT INTO records (bl_number, port, vessel, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
-                (bl_number, port, vessel, datetime.utcnow().strftime("%Y-%m-%d %H:%M"), session.get("username")),
-            )
-            added += 1
+        existing = db.execute("SELECT 1 FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
+        if existing:
+            skipped += 1
+            continue
+        db.execute(
+            "INSERT INTO records (bl_number, port, vessel, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
+            (bl_number, port, vessel, datetime.utcnow().strftime("%Y-%m-%d %H:%M"), session.get("username")),
+        )
+        added += 1
 
     db.commit()
     return jsonify({"added": added, "skipped": skipped})
@@ -1953,6 +2019,8 @@ PAGE_HTML = """
   }
   button:hover { background: var(--navy-light); }
   button:active { transform: scale(0.97); }
+  button:disabled { background: var(--border); color: var(--muted); cursor: not-allowed; }
+  button:disabled:hover { background: var(--border); }
 
   /* Excel dropzone */
   .dropzone {
@@ -2130,26 +2198,29 @@ PAGE_HTML = """
     <div class="tag-fields">
       <div>
         <label for="portField">Port</label>
-        <input type="text" id="portField" placeholder="e.g. Jeddah Port">
+        <input type="text" id="portField" placeholder="e.g. JEDDAH PORT" style="text-transform:uppercase;" oninput="this.value = this.value.toUpperCase();">
       </div>
       <div>
         <label for="vesselField">Vessel</label>
-        <input type="text" id="vesselField" placeholder="e.g. TAI KNIGHT">
+        <input type="text" id="vesselField" placeholder="e.g. TAI KNIGHT" style="text-transform:uppercase;" oninput="this.value = this.value.toUpperCase();">
       </div>
     </div>
-    <label class="dropzone" id="dropzone" for="excelFile">
+    <label class="dropzone" id="dropzone" for="manifestFile">
       <div class="dropzone-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8">
           <path d="M12 16V4M12 4l-4 4M12 4l4 4"/><path d="M4 16v3a1 1 0 001 1h14a1 1 0 001-1v-3"/>
         </svg>
       </div>
       <div>
-        <div class="dropzone-text"><b>Click to upload</b> or drag &amp; drop your Excel manifest</div>
-        <div class="dropzone-sub">.xlsx or .xlsm - the BL Number column is read automatically</div>
+        <div class="dropzone-text"><b>Click to upload</b> or drag &amp; drop your manifest</div>
+        <div class="dropzone-sub">.xlsx, .xls, .csv, .docx or .pdf - the BL Number column is read automatically</div>
         <div class="dropzone-filename" id="dropzoneFilename"></div>
       </div>
-      <input type="file" id="excelFile" accept=".xlsx,.xlsm" style="display:none" onchange="uploadExcel()">
+      <input type="file" id="manifestFile" accept=".xlsx,.xlsm,.xls,.csv,.docx,.pdf" style="display:none" onchange="stageManifestFile()">
     </label>
+    <div class="row" style="margin-top:14px;">
+      <button type="button" id="addManifestBtn" onclick="uploadExcel()" disabled>Add to board</button>
+    </div>
   </div>
 
   <div class="summary" id="summary"></div>
@@ -2264,7 +2335,10 @@ async function fetchRecords() {
   if (editingCount === 0 && changed) render();
 }
 
-/* ---------- Excel upload (drag & drop) ---------- */
+/* ---------- Manifest upload (drag & drop) ----------
+   The file is only *staged* here - it does NOT upload right away, so
+   there's time to fill in Port/Vessel first. It only actually uploads
+   when "Add to board" is clicked (uploadExcel below). */
 const dropzone = document.getElementById('dropzone');
 ['dragenter', 'dragover'].forEach(evt => {
   dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.add('dragover'); });
@@ -2275,18 +2349,35 @@ const dropzone = document.getElementById('dropzone');
 dropzone.addEventListener('drop', e => {
   const file = e.dataTransfer.files[0];
   if (!file) return;
-  document.getElementById('excelFile').files = e.dataTransfer.files;
-  uploadExcel();
+  document.getElementById('manifestFile').files = e.dataTransfer.files;
+  stageManifestFile();
 });
 
-async function uploadExcel() {
-  const fileInput = document.getElementById('excelFile');
+function stageManifestFile() {
+  const fileInput = document.getElementById('manifestFile');
   const file = fileInput.files[0];
-  if (!file) { showToast('Choose an Excel file first.'); return; }
+  const btn = document.getElementById('addManifestBtn');
+  if (!file) {
+    document.getElementById('dropzoneFilename').textContent = '';
+    btn.disabled = true;
+    return;
+  }
   document.getElementById('dropzoneFilename').textContent = file.name;
+  btn.disabled = false;
+}
 
-  const port = document.getElementById('portField').value.trim();
-  const vessel = document.getElementById('vesselField').value.trim();
+async function uploadExcel() {
+  const fileInput = document.getElementById('manifestFile');
+  const file = fileInput.files[0];
+  if (!file) { showToast('Choose a manifest file first.'); return; }
+
+  const btn = document.getElementById('addManifestBtn');
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = 'Adding...';
+
+  const port = document.getElementById('portField').value.trim().toUpperCase();
+  const vessel = document.getElementById('vesselField').value.trim().toUpperCase();
 
   const formData = new FormData();
   formData.append('file', file);
@@ -2295,7 +2386,18 @@ async function uploadExcel() {
 
   const res = await fetch('/api/manifest/upload', { method: 'POST', body: formData });
   const data = await res.json();
-  if (data.error) { showToast(data.error); return; }
+  if (data.error) {
+    showToast(data.error);
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+    return;
+  }
+
+  // Reset the dropzone so the same "Add to board" flow can be repeated
+  // for the next manifest without leftover state from this one.
+  fileInput.value = '';
+  document.getElementById('dropzoneFilename').textContent = '';
+  btn.textContent = originalLabel;
 
   await fetchRecords();
   showToast(data.added + ' new BL record(s) added' + (data.skipped ? `, ${data.skipped} already on the board (skipped)` : '') + '.');
