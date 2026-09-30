@@ -1119,163 +1119,6 @@ PW_TOGGLE_BTN = """<button type="button" class="pw-toggle" onclick="togglePw(thi
       <svg class="icon-eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 19c-7 0-11-7-11-7a21.6 21.6 0 0 1 5.06-6.17M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 7 11 7a21.6 21.6 0 0 1-2.16 3.19M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="M1 1l22 22"/></svg>
     </button>"""
 
-# Site-wide custom cursor - a small anchor that hangs from the real pointer,
-# dips over anything clickable, and drops fully with a little splash ring on
-# click. Desktop-only (hover:hover + pointer:fine, both in CSS and in the
-# script's own early-out) so touch/coarse-pointer devices are untouched and
-# pay nothing for it. Appended once near the end of every page's <body>.
-ANCHOR_CURSOR_SNIPPET = """
-<style>
-  @media (hover: hover) and (pointer: fine) {
-    * { cursor: none !important; }
-  }
-
-  /* Shown the moment a real page navigation or form submit is under way,
-     so there's never a stretch where the anchor cursor has vanished and
-     the browser's bare default cursor is sitting there instead. */
-  #anchorLoadingOverlay {
-    position: fixed; inset: 0; z-index: 2147483646;
-    background: var(--bg); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
-    opacity: 0; pointer-events: none; transition: opacity .2s ease;
-  }
-  #anchorLoadingOverlay.show { opacity: 1; }
-  #anchorLoadingOverlay svg { width: 34px; height: 34px; color: var(--gold-light); animation: anchor-bob 1.1s ease-in-out infinite; }
-  #anchorLoadingOverlay span { font-size: 12px; letter-spacing: .04em; color: var(--muted); }
-  @keyframes anchor-bob {
-    0%, 100% { transform: translateY(0); }
-    50% { transform: translateY(7px); }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    #anchorLoadingOverlay svg { animation: none; }
-  }
-</style>
-<script>
-(function initPageLoadingOverlay() {
-  var overlay = null, timer = null;
-  function show() {
-    if (!overlay) {
-      overlay = document.createElement('div');
-      overlay.id = 'anchorLoadingOverlay';
-      overlay.innerHTML =
-        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">' +
-        '<circle cx="12" cy="5" r="2.1"/><line x1="12" y1="7.1" x2="12" y2="19"/>' +
-        '<line x1="8" y1="10" x2="16" y2="10"/><path d="M4.3 13a7.7 7.7 0 0 0 15.4 0"/>' +
-        '</svg><span>Loading&hellip;</span>';
-      document.body.appendChild(overlay);
-    }
-    requestAnimationFrame(function () { overlay.classList.add('show'); });
-  }
-  function armed() {
-    clearTimeout(timer);
-    timer = setTimeout(show, 150);
-  }
-  document.addEventListener('click', function (e) {
-    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-    var a = e.target.closest && e.target.closest('a[href]');
-    if (!a) return;
-    if (a.target && a.target !== '_self') return;
-    if (a.hasAttribute('download')) return;
-    var href = a.getAttribute('href') || '';
-    if (!href || href.charAt(0) === '#' || href.indexOf('javascript:') === 0 ||
-        href.indexOf('mailto:') === 0 || href.indexOf('tel:') === 0) return;
-    armed();
-  }, true);
-  document.addEventListener('submit', function (e) {
-    var f = e.target;
-    if (!f || f.tagName !== 'FORM' || e.defaultPrevented) return;
-    if (f.checkValidity && !f.checkValidity()) return;
-    armed();
-  }, true);
-})();
-
-(function initAnchorCursor() {
-  if (!window.matchMedia || !window.matchMedia('(hover: hover) and (pointer: fine)').matches) return;
-  var reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  var INTERACTIVE = 'a, button, input, select, textarea, label, [role="button"], [onclick]';
-
-  window.addEventListener('DOMContentLoaded', function () {
-    var canvas = document.createElement('canvas');
-    canvas.style.cssText = 'position:fixed;left:0;top:0;pointer-events:none;z-index:2147483647;';
-    document.body.appendChild(canvas);
-    var ctx = canvas.getContext('2d');
-
-    function resize() {
-      canvas.width = window.innerWidth * devicePixelRatio;
-      canvas.height = window.innerHeight * devicePixelRatio;
-      canvas.style.width = window.innerWidth + 'px';
-      canvas.style.height = window.innerHeight + 'px';
-      ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
-    }
-    resize();
-    window.addEventListener('resize', resize);
-
-    var mx = -100, my = -100, visible = false, pressed = false, anchorDrop = 0;
-    var pings = [];
-    var goldColor = '#e0bd53';
-
-    function refreshColor() {
-      var v = getComputedStyle(document.documentElement).getPropertyValue('--gold-light').trim();
-      if (v) goldColor = v;
-    }
-    refreshColor();
-
-    document.addEventListener('mousemove', function (e) { mx = e.clientX; my = e.clientY; visible = true; });
-    document.addEventListener('mouseleave', function () { visible = false; });
-    document.addEventListener('mousedown', function () {
-      pressed = true;
-      pings.push({ x: mx, y: my, t: performance.now() });
-    });
-    window.addEventListener('mouseup', function () { pressed = false; });
-    var themeToggle = document.getElementById('themeToggle');
-    if (themeToggle) themeToggle.addEventListener('change', function () { setTimeout(refreshColor, 20); });
-
-    function draw(now) {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      if (visible) {
-        var hoverEl = document.elementFromPoint(mx, my);
-        var hovering = !!(hoverEl && hoverEl.closest && hoverEl.closest(INTERACTIVE));
-        var target = pressed ? 1 : (hovering ? 0.6 : 0);
-        anchorDrop += (target - anchorDrop) * 0.18;
-        var ax = mx, ay = my + anchorDrop * 14;
-        var rock = reduceMotion ? 0 : Math.sin(now / 480) * (0.05 + anchorDrop * 0.05);
-
-        ctx.save();
-        ctx.translate(ax, ay);
-        ctx.rotate(rock);
-        ctx.strokeStyle = goldColor; ctx.fillStyle = goldColor;
-        ctx.lineWidth = 1.5; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-        ctx.beginPath(); ctx.arc(0, -9.2, 2.1, 0, Math.PI * 2); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(0, -7.1); ctx.lineTo(0, 6.8); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(-4.6, -3.6); ctx.lineTo(4.6, -3.6); ctx.stroke();
-        ctx.beginPath(); ctx.arc(0, -3.6, 1, 0, Math.PI * 2); ctx.stroke();
-        ctx.beginPath(); ctx.arc(0, 1.4, 6.6, Math.PI * 0.14, Math.PI * 0.86); ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(-6.5, 4.9); ctx.quadraticCurveTo(-9.4, 5.7, -9.7, 2.6);
-        ctx.lineTo(-7.3, 4.1); ctx.closePath(); ctx.fill();
-        ctx.beginPath();
-        ctx.moveTo(6.5, 4.9); ctx.quadraticCurveTo(9.4, 5.7, 9.7, 2.6);
-        ctx.lineTo(7.3, 4.1); ctx.closePath(); ctx.fill();
-        ctx.restore();
-
-        pings = pings.filter(function (p) { return now - p.t < 600; });
-        pings.forEach(function (p) {
-          var f = (now - p.t) / 600;
-          ctx.beginPath();
-          ctx.ellipse(p.x, p.y + 10, 4 + f * 22, 2 + f * 8, 0, 0, Math.PI * 2);
-          ctx.strokeStyle = goldColor;
-          ctx.globalAlpha = (1 - f) * 0.6;
-          ctx.lineWidth = 1.4;
-          ctx.stroke();
-          ctx.globalAlpha = 1;
-        });
-      }
-      requestAnimationFrame(draw);
-    }
-    requestAnimationFrame(draw);
-  });
-})();
-</script>
-"""
 
 SETUP_HTML = """
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1303,7 +1146,6 @@ SETUP_HTML = """
     <button type="submit">Create Admin Account</button>
   </form>
 </div>
-""" + ANCHOR_CURSOR_SNIPPET + """
 </body></html>
 """
 
@@ -1333,7 +1175,6 @@ LOGIN_HTML = """
     <button type="submit">Sign In</button>
   </form>
 </div>
-""" + ANCHOR_CURSOR_SNIPPET + """
 </body></html>
 """
 
@@ -1542,7 +1383,6 @@ async function delUser(id, username) {
   setTimeout(() => location.reload(), 500);
 }
 </script>
-""" + ANCHOR_CURSOR_SNIPPET + """
 </body></html>
 """
 
@@ -1709,7 +1549,6 @@ function setTheme(mode) {
   try { localStorage.setItem('theme', mode); } catch (e) {}
 }
 </script>
-""" + ANCHOR_CURSOR_SNIPPET + """
 </body></html>
 """
 
@@ -2222,7 +2061,6 @@ function setTheme(mode) {
 
 loadData();
 </script>
-""" + ANCHOR_CURSOR_SNIPPET + """
 </body></html>
 """
 
@@ -3112,7 +2950,6 @@ function render() {
 fetchRecords();
 setInterval(fetchRecords, 4000);
 </script>
-""" + ANCHOR_CURSOR_SNIPPET + """
 </body>
 </html>
 """
