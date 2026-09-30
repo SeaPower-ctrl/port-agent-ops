@@ -110,11 +110,6 @@ def init_db():
     # Each record is owned by whichever staff account created it - DO Tracker
     # is per-staff (admin sees everything, staff only see their own).
     cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS created_by TEXT DEFAULT ''")
-    # Direct Delivery Classifier: NULL = not yet classified, 0 = not direct
-    # delivery, 1 = direct delivery. dd_reason is the short human-readable
-    # reason shown on hover (e.g. "42.5MT item" or "oversize but wheeled").
-    cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS is_direct_delivery INTEGER")
-    cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS dd_reason TEXT DEFAULT ''")
     cur.execute(
         """CREATE TABLE IF NOT EXISTS vessels (
             name TEXT PRIMARY KEY,
@@ -126,6 +121,18 @@ def init_db():
     # "operator" is set once, when the vessel is first added, and never
     # overwritten afterward - it's whoever entered the vessel originally.
     cur.execute("ALTER TABLE vessels ADD COLUMN IF NOT EXISTS operator TEXT DEFAULT ''")
+    # Direct Delivery Classifier - its own table, completely separate from
+    # DO Tracker's records. A BL gets a row here the moment it's classified,
+    # whether or not it's ever been on the DO Tracker board.
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS direct_delivery (
+            bl_number TEXT PRIMARY KEY,
+            is_direct INTEGER NOT NULL,
+            reason TEXT DEFAULT '',
+            classified_by TEXT DEFAULT '',
+            classified_at TEXT DEFAULT ''
+        )"""
+    )
     conn.commit()
     cur.close()
     conn.close()
@@ -653,66 +660,147 @@ def upload_manifest_excel():
 # trailer and so is NOT direct delivery even though it's heavy/oversize.
 # A BL can span several sub-sheets in the packing list (e.g. 004A-004I are
 # all BL "004"), so classification is done BL-wise after grouping, not
-# per sub-sheet.
+# per sub-sheet. Completely separate feature from DO Tracker - it classifies
+# whatever BLs are in the packing list, whether or not they're on the board.
+#
+# Real packing lists from different mills/suppliers vary wildly (English or
+# Chinese headers, a per-piece table or a per-BL summary table, weight given
+# per-piece or as a lot/BL total, a combined "size" column instead of a
+# separate length column, sometimes several tables stacked in one sheet, and
+# occasionally no table at all - just labelled cells). The parsing below is
+# written to cope with all of those rather than one fixed template.
 
 DD_WEIGHT_MT_THRESHOLD = 30.0
 DD_LENGTH_M_THRESHOLD = 12.0
 
-DD_WEIGHT_HEADER_WORDS = ["weight", "grossweight", "gw", "gwkgs", "gwmt", "totalweight", "wt", "kgs", "kg", "mt", "tons", "ton"]
-DD_LENGTH_HEADER_WORDS = ["length", "dimension", "dimensions", "size", "lwh", "l", "lm", "cargodimension", "dims"]
-DD_DESC_HEADER_WORDS = ["description", "desc", "cargo", "commodity", "itemdescription", "goodsdescription", "cargodescription"]
+# Keyword lists are matched as SUBSTRINGS of the (normalized) header text,
+# not exact matches - real headers are things like "GROSS WEIGHT/MT" or
+# "毛重(MT)", never a bare "weight". English keywords are matched against an
+# a-z0-9-only normalization; Chinese keywords are matched against the header
+# with whitespace/punctuation stripped but characters kept as-is.
+DD_WEIGHT_GROSS_WORDS = ["grossweight", "grosswt", "gw", "毛重"]
+DD_WEIGHT_NET_WORDS = ["netweight", "networt", "nw", "净重"]
+DD_WEIGHT_GENERIC_WORDS = ["weight", "wt", "重量"]
+DD_LENGTH_WORDS = ["length", "长度"]
+DD_SPEC_WORDS = ["size", "spec", "specification", "dimension", "dimensions", "规格", "尺寸"]
+DD_QTY_WORDS = ["noofpc", "noofpcs", "noofcoils", "noofcoil", "qnty", "qty", "quantity", "pcs", "pieces", "件数", "数量"]
+DD_DESC_HEADER_WORDS = ["description", "desc", "cargo", "commodity", "itemdescription", "goodsdescription", "cargodescription", "货名", "品名", "货物名称"]
+DD_BL_HEADER_WORDS = ["blnumber", "bl", "billoflading", "billofladingno", "blno", "提单号"]
 
-# Exception keywords (English + common Chinese) - if the item description
-# contains any of these, it's excluded from Direct Delivery even if it
-# trips the weight/length threshold.
+# Exception keywords (English + common Chinese) - if the item's description
+# (or the sheet's overall "GOODS:" line) contains any of these, it's
+# excluded from Direct Delivery even if it trips the weight/length
+# threshold. Wire rod and coiled steel are always shipped as coils.
 DD_EXCEPTION_WORDS = [
     "wheel", "wheels", "self-propelled", "self propelled", "tyre", "tire", "tyres", "tires",
-    "trailer mounted", "drive off", "roll on", "coil", "coils",
-    "轮", "车轮", "自走", "自行", "钢卷", "卷材", "卷",
+    "trailer mounted", "drive off", "roll on", "coil", "coils", "wire rod", "wire rods",
+    "hrc", "crc", "hot rolled coil", "cold rolled coil", "steel coil",
+    "轮", "车轮", "自走", "自行", "钢卷", "卷材", "卷", "线材",
 ]
 
 
+def _dd_norm_ascii(text):
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+def _dd_norm_raw(text):
+    """Keeps non-ASCII characters (Chinese headers) intact, strips the
+    whitespace/punctuation that varies between files."""
+    return re.sub(r"[\s.\-_:：（）()/\\]+", "", str(text or ""))
+
+
+def _dd_header_matches(cell, keywords):
+    """True if this header cell names one of the given columns. `keywords`
+    can mix plain-English words (matched as a substring of the a-z0-9
+    normalization) and Chinese terms (matched as a substring with
+    whitespace/punctuation stripped but characters preserved)."""
+    if not isinstance(cell, str) or not cell.strip():
+        return False
+    ascii_norm = _dd_norm_ascii(cell)
+    raw_norm = _dd_norm_raw(cell)
+    for kw in keywords:
+        if kw.isascii():
+            k = _dd_norm_ascii(kw)
+            if k and k in ascii_norm:
+                return True
+        elif kw in raw_norm:
+            return True
+    return False
+
+
 def _dd_is_exception(description):
-    text = str(description or "").lower()
-    return any(w.lower() in text for w in DD_EXCEPTION_WORDS)
+    text = str(description or "")
+    text_lower = text.lower()
+    for w in DD_EXCEPTION_WORDS:
+        if w.isascii():
+            if w.lower() in text_lower:
+                return True
+        elif w in text:
+            return True
+    return False
+
+
+def _dd_parse_number(raw):
+    if raw is None:
+        return None
+    try:
+        return float(str(raw).replace(",", "").strip())
+    except (TypeError, ValueError):
+        m = re.search(r"[\d.]+", str(raw).replace(",", ""))
+        if not m:
+            return None
+        try:
+            return float(m.group())
+        except ValueError:
+            return None
 
 
 def _dd_parse_weight_mt(raw):
     """Best-effort: a bare number is assumed to already be in MT if it's
     under 1000, or in KG (divided down to MT) if 1000 or over - this holds
     for realistic single-item cargo weights either way it's written."""
-    try:
-        v = float(str(raw).replace(",", "").strip())
-    except (TypeError, ValueError):
-        return None
-    if v <= 0:
+    v = _dd_parse_number(raw)
+    if v is None or v <= 0:
         return None
     return v / 1000.0 if v >= 1000 else v
 
 
 def _dd_parse_length_m(raw):
-    """Takes the first number out of a dimension cell (packing lists commonly
-    list Length x Width x Height, in that order) and scales it to meters:
-    >1000 assumed mm, 100-1000 assumed cm, otherwise assumed already meters."""
+    """Takes a number out of a dedicated length cell and scales it to
+    meters: explicit "mm"/"cm" in the text wins, otherwise falls back to a
+    magnitude guess (packing lists almost always give length in mm)."""
     text = str(raw or "")
-    m = re.search(r"[\d.]+", text.replace(",", ""))
-    if not m:
+    v = _dd_parse_number(text)
+    if v is None or v <= 0:
         return None
-    try:
-        v = float(m.group())
-    except ValueError:
-        return None
-    if v <= 0:
-        return None
-    if "mm" in text.lower():
+    lower = text.lower()
+    if "mm" in lower:
         return v / 1000.0
-    if "cm" in text.lower():
+    if "cm" in lower:
         return v / 100.0
-    if v > 1000:
+    if "mm" not in lower and "cm" not in lower and v > 1000:
         return v / 1000.0
     if v > 100:
         return v / 100.0
     return v
+
+
+def _dd_parse_spec_length_mm(raw):
+    """A combined "size"/"规格" cell like "20*2440*4880" (thickness x width x
+    length, mm) or "0.35*1000" (thickness x width only - a coil, no length).
+    Returns the length in meters only when THREE numbers are present; two
+    numbers means there's no length dimension at all (typical for coils)."""
+    text = str(raw or "")
+    nums = re.findall(r"[\d.]+", text.replace(",", ""))
+    if len(nums) < 3:
+        return None
+    try:
+        length_mm = float(nums[2])
+    except ValueError:
+        return None
+    if length_mm <= 0:
+        return None
+    return length_mm / 1000.0
 
 
 def _dd_bl_root(text):
@@ -724,48 +812,136 @@ def _dd_bl_root(text):
     return m.group(1) if m else s
 
 
+def _dd_find_goods_line(rows, max_scan=20):
+    """Packing lists sometimes name the cargo once in a "GOODS:..." label
+    line above the table (e.g. "GOODS:HOT ROLLED STEEL COIL") rather than
+    in a per-row description column. Used as a sheet-wide fallback."""
+    for row in rows[:max_scan]:
+        for cell in row:
+            if isinstance(cell, str) and "GOODS" in cell.upper() and ":" in cell:
+                return cell.split(":", 1)[1].strip()
+    return ""
+
+
 def _extract_classification_rows(rows, sheet_bl_hint=None):
-    """Scans a grid of cell values for BL/weight/length/description columns
-    (first 5 rows, same tolerant approach as the BL-only extractor) and
-    returns one {bl, weight_mt, length_m, description} dict per data row.
-    Weight/length end up None where no matching column was found - those
-    rows simply can't be classified, rather than guessing."""
+    """Scans a grid of cell values for one or more tables (a sheet can have
+    several header+data blocks stacked on top of each other) and returns
+    one {bl, weight_mt, length_m, description} dict per usable data row.
+
+    A row is treated as a new header whenever its string cells name a
+    weight/spec/qty/BL column - this re-reads the column layout each time
+    it changes, rather than assuming one fixed table per sheet."""
     if not rows:
         return []
-    bl_col = weight_col = length_col = desc_col = None
-    header_row_index = None
-    for i, row in enumerate(rows[:5]):
-        for col_index, cell in enumerate(row):
-            norm = _normalize_header(cell)
-            if not norm:
-                continue
-            if bl_col is None and any(norm == w.replace(" ", "") for w in BL_HEADER_WORDS):
-                bl_col = col_index
-            if weight_col is None and any(norm == w for w in DD_WEIGHT_HEADER_WORDS):
-                weight_col = col_index
-            if length_col is None and any(norm == w for w in DD_LENGTH_HEADER_WORDS):
-                length_col = col_index
-            if desc_col is None and any(norm == w for w in DD_DESC_HEADER_WORDS):
-                desc_col = col_index
-        if weight_col is not None or length_col is not None:
-            header_row_index = i
-            break
 
-    if header_row_index is None:
-        return []  # no recognizable weight/length column on this sheet at all
+    goods_line = _dd_find_goods_line(rows)
 
     out = []
-    for row in rows[header_row_index + 1:]:
-        bl = str(row[bl_col]).strip().upper() if bl_col is not None and bl_col < len(row) and row[bl_col] else (sheet_bl_hint or "")
+    cols = None  # current column mapping, or None until a header is found
+
+    def try_header(row):
+        found = {}
+        for col_index, cell in enumerate(row):
+            if not isinstance(cell, str):
+                continue
+            if "bl" not in found and _dd_header_matches(cell, DD_BL_HEADER_WORDS):
+                found["bl"] = col_index
+            if "weight_gross" not in found and _dd_header_matches(cell, DD_WEIGHT_GROSS_WORDS):
+                found["weight_gross"] = col_index
+            if "weight_net" not in found and _dd_header_matches(cell, DD_WEIGHT_NET_WORDS):
+                found["weight_net"] = col_index
+            if "weight_generic" not in found and _dd_header_matches(cell, DD_WEIGHT_GENERIC_WORDS):
+                found["weight_generic"] = col_index
+            if "length" not in found and _dd_header_matches(cell, DD_LENGTH_WORDS):
+                found["length"] = col_index
+            if "spec" not in found and _dd_header_matches(cell, DD_SPEC_WORDS):
+                found["spec"] = col_index
+            if "qty" not in found and _dd_header_matches(cell, DD_QTY_WORDS):
+                found["qty"] = col_index
+            if "desc" not in found and _dd_header_matches(cell, DD_DESC_HEADER_WORDS):
+                found["desc"] = col_index
+        has_weight = "weight_gross" in found or "weight_net" in found or "weight_generic" in found
+        has_other = "length" in found or "spec" in found or "qty" in found or "bl" in found
+        return found if (has_weight and has_other) else None
+
+    for row in rows:
+        header = try_header(row)
+        if header is not None:
+            cols = header
+            continue
+        if cols is None:
+            continue
+
+        def cell_at(key):
+            idx = cols.get(key)
+            return row[idx] if idx is not None and idx < len(row) and row[idx] not in (None, "") else None
+
+        bl_cell = cell_at("bl")
+        if bl_cell is not None:
+            bl = str(bl_cell).strip().upper()
+        elif "bl" in cols:
+            # This table has its own per-row BL column, but this row's cell
+            # is blank - almost always a subtotal/blank row, not real cargo.
+            continue
+        else:
+            bl = sheet_bl_hint or ""
         if not bl:
             continue
-        weight_mt = _dd_parse_weight_mt(row[weight_col]) if weight_col is not None and weight_col < len(row) else None
-        length_m = _dd_parse_length_m(row[length_col]) if length_col is not None and length_col < len(row) else None
-        description = str(row[desc_col]).strip() if desc_col is not None and desc_col < len(row) and row[desc_col] else ""
+        # Skip subtotal/grand-total rows ("合计", "总计", "汇总", "小计",
+        # "TOTAL") that show up in the BL column of summary tables - they
+        # aren't a real BL.
+        bl_check = re.sub(r"\s+", "", bl)
+        if any(w in bl_check for w in ("合计", "总计", "汇总", "小计")) or "TOTAL" in bl_check.upper():
+            continue
+
+        weight_cell = cell_at("weight_gross") or cell_at("weight_net") or cell_at("weight_generic")
+        weight_mt = _dd_parse_weight_mt(weight_cell)
+
+        length_m = None
+        length_cell = cell_at("length")
+        if length_cell is not None:
+            length_m = _dd_parse_length_m(length_cell)
+        elif cell_at("spec") is not None:
+            length_m = _dd_parse_spec_length_mm(cell_at("spec"))
+
+        qty = _dd_parse_number(cell_at("qty"))
+        if weight_mt is not None and qty and qty > 0:
+            weight_mt = weight_mt / qty
+
+        description = str(cell_at("desc")).strip() if cell_at("desc") is not None else goods_line
+
         if weight_mt is None and length_m is None:
             continue
         out.append({"bl": _dd_bl_root(bl), "weight_mt": weight_mt, "length_m": length_m, "description": description})
+
+    if not out:
+        out = _dd_freetext_fallback(rows, sheet_bl_hint, goods_line)
     return out
+
+
+def _dd_freetext_fallback(rows, sheet_bl_hint, goods_line):
+    """Some packing lists aren't a table at all - just labelled cells like
+    "G.W.:161.261 MT" and "95 PIECES" scattered on the sheet. Scans every
+    cell's text for those patterns as a last resort."""
+    if not sheet_bl_hint:
+        return []
+    blob_cells = [str(c) for row in rows for c in row if isinstance(c, str)]
+    blob = " | ".join(blob_cells)
+
+    gw_match = re.search(r"G\.?\s*W\.?\s*[:：]?\s*([\d,]+\.?\d*)\s*MT", blob, re.IGNORECASE)
+    if not gw_match:
+        return []
+    weight_mt = _dd_parse_number(gw_match.group(1))
+    if not weight_mt:
+        return []
+
+    pieces_match = re.search(r"(\d+)\s*PIECES", blob, re.IGNORECASE)
+    qty = _dd_parse_number(pieces_match.group(1)) if pieces_match else None
+    if qty and qty > 0:
+        weight_mt = weight_mt / qty
+
+    description = goods_line or blob[:200]
+    return [{"bl": _dd_bl_root(sheet_bl_hint), "weight_mt": weight_mt, "length_m": None, "description": description}]
 
 
 def _dd_classify_groups(items):
@@ -806,10 +982,8 @@ def _dd_classify_groups(items):
 @app.route("/api/manifest/classify", methods=["POST"])
 @login_required
 def classify_manifest():
-    """Upload a packing list and this tags every matching BL already on the
-    board as Direct Delivery or not, with a short reason. BLs in the file
-    that aren't on the board yet are reported back but not created (they
-    still need a Port/Vessel, same as any other manifest upload)."""
+    """Upload a packing list and every BL in it gets classified and saved -
+    completely standalone, no dependency on DO Tracker's board at all."""
     if "file" not in request.files:
         return jsonify({"error": "No file received"}), 400
     file = request.files["file"]
@@ -844,22 +1018,19 @@ def classify_manifest():
     classified = _dd_classify_groups(items)
 
     db = get_db()
-    matched, unmatched = [], []
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    results = []
     for bl, (is_direct, reason) in classified.items():
-        row = db.execute("SELECT bl_number FROM records WHERE bl_number = ?", (bl,)).fetchone()
-        if row is None:
-            unmatched.append(bl)
-            continue
-        if not _owns_record(bl):
-            continue
         db.execute(
-            "UPDATE records SET is_direct_delivery = ?, dd_reason = ? WHERE bl_number = ?",
-            (1 if is_direct else 0, reason, bl),
+            """INSERT INTO direct_delivery (bl_number, is_direct, reason, classified_by, classified_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (bl_number) DO UPDATE SET is_direct = EXCLUDED.is_direct, reason = EXCLUDED.reason,
+                   classified_by = EXCLUDED.classified_by, classified_at = EXCLUDED.classified_at""",
+            (bl, 1 if is_direct else 0, reason, session.get("username"), now),
         )
-        matched.append({"bl": bl, "direct": is_direct, "reason": reason})
-
+        results.append({"bl": bl, "direct": is_direct, "reason": reason})
     db.commit()
-    return jsonify({"matched": matched, "unmatched": unmatched})
+    return jsonify({"classified": results})
 
 
 @app.route("/api/direct-delivery", methods=["GET"])
@@ -867,18 +1038,17 @@ def classify_manifest():
 def list_direct_delivery():
     """Every BL that's been through the classifier, for the Direct Delivery
     page's results table - so a refresh doesn't lose what was just
-    uploaded. Matches DO Tracker's own visibility rule (staff only ever
-    see their own BLs) even though this is its own separate page."""
+    uploaded. Admins see everything; staff only see what they classified."""
     db = get_db()
     if session.get("role") == "admin":
         rows = db.execute(
-            "SELECT bl_number, port, vessel, is_direct_delivery, dd_reason, created_by "
-            "FROM records WHERE is_direct_delivery IS NOT NULL ORDER BY bl_number"
+            "SELECT bl_number, is_direct, reason, classified_by, classified_at "
+            "FROM direct_delivery ORDER BY classified_at DESC, bl_number"
         ).fetchall()
     else:
         rows = db.execute(
-            "SELECT bl_number, port, vessel, is_direct_delivery, dd_reason, created_by "
-            "FROM records WHERE is_direct_delivery IS NOT NULL AND created_by = ? ORDER BY bl_number",
+            "SELECT bl_number, is_direct, reason, classified_by, classified_at "
+            "FROM direct_delivery WHERE classified_by = ? ORDER BY classified_at DESC, bl_number",
             (session.get("username"),),
         ).fetchall()
     return jsonify([dict(r) for r in rows])
@@ -2815,7 +2985,7 @@ DIRECT_DELIVERY_HTML = """
   <div class="page-head">
     <div class="eyebrow">Compass</div>
     <h1>Direct Delivery Classifier</h1>
-    <p>Upload a cargo packing list and every BL over 30MT or 12m gets flagged as Direct Delivery - unless it's wheeled or a coil, in which case it doesn't need a low-bed trailer. BLs need to already be on the DO Tracker board to get tagged.</p>
+    <p>Upload a cargo packing list and every BL over 30MT or 12m gets flagged as Direct Delivery - unless it's wheeled or a coil, in which case it doesn't need a low-bed trailer. This is fully standalone - separate from DO Tracker.</p>
   </div>
 
   <div class="panel">
@@ -2892,13 +3062,12 @@ async function uploadClassify() {
       input.value = '';
       return;
     }
-    const matched = data.matched || [];
-    const direct = matched.filter(m => m.direct).length;
-    const unmatched = data.unmatched || [];
+    const classified = data.classified || [];
+    const direct = classified.filter(m => m.direct).length;
     status.className = 'status-line ok';
-    status.textContent = matched.length
-      ? `Tagged ${matched.length} BL(s) - ${direct} direct delivery.${unmatched.length ? ' ' + unmatched.length + ' BL(s) in the file aren\\'t on the DO Tracker board yet, so they were skipped.' : ''}`
-      : 'No BLs from the packing list matched anything on the DO Tracker board.';
+    status.textContent = classified.length
+      ? `Classified ${classified.length} BL(s) - ${direct} direct delivery.`
+      : 'No BLs could be read from that packing list.';
     input.value = '';
     await loadResults();
   } catch (e) {
@@ -2919,19 +3088,18 @@ async function loadResults() {
     body.innerHTML = '<div class="empty-note">Upload a packing list above to get started.</div>';
     return;
   }
-  const direct = rows.filter(r => r.is_direct_delivery === 1).length;
+  const direct = rows.filter(r => r.is_direct === 1).length;
   sub.textContent = `${rows.length} BL(s) classified - ${direct} direct delivery.`;
   body.innerHTML = `
     <table class="dd-table">
-      <thead><tr><th>BL Number</th><th>Port</th><th>Vessel</th><th>Status</th><th>Reason</th></tr></thead>
+      <thead><tr><th>BL Number</th><th>Status</th><th>Reason</th><th>Classified</th></tr></thead>
       <tbody>
         ${rows.map(r => `
           <tr>
             <td><b>${r.bl_number}</b></td>
-            <td>${r.port || '-'}</td>
-            <td>${r.vessel || '-'}</td>
-            <td>${ddBadgeHtml(r.is_direct_delivery === 1)}</td>
-            <td style="color:var(--muted);">${r.dd_reason || ''}</td>
+            <td>${ddBadgeHtml(r.is_direct === 1)}</td>
+            <td style="color:var(--muted);">${r.reason || ''}</td>
+            <td style="color:var(--muted);">${r.classified_by || ''}${r.classified_at ? ' - ' + r.classified_at : ''}</td>
           </tr>`).join('')}
       </tbody>
     </table>`;
@@ -3258,14 +3426,13 @@ PAGE_HTML = """
     </div>
   </div>
 
-  <div class="sub">{% if role == 'admin' %}Admin view - every staff member's records, all in one place. Organized by Port &rarr; Vessel. Updates automatically.{% else %}Your own board - only records you've added. Organized by Port &rarr; Vessel. Updates automatically.{% endif %}</div>
-
   <div class="card">
     <div class="card-label">Add a manifest</div>
     <div class="tag-fields">
       <div>
-        <label for="portField">Port</label>
+        <label for="portField">Discharge Port</label>
         <input type="text" id="portField" placeholder="e.g. JEDDAH PORT" style="text-transform:uppercase;" oninput="this.value = this.value.toUpperCase();">
+        <div style="font-size:11px; color:var(--muted); margin-top:4px;">Where it's being delivered to - not the Chinese loading port. Keep this the same for every BL going to the same place so they group together.</div>
       </div>
       <div>
         <label for="vesselField">Vessel</label>
