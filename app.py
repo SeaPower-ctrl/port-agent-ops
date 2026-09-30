@@ -1129,8 +1129,65 @@ ANCHOR_CURSOR_SNIPPET = """
   @media (hover: hover) and (pointer: fine) {
     * { cursor: none !important; }
   }
+
+  /* Shown the moment a real page navigation or form submit is under way,
+     so there's never a stretch where the anchor cursor has vanished and
+     the browser's bare default cursor is sitting there instead. */
+  #anchorLoadingOverlay {
+    position: fixed; inset: 0; z-index: 2147483646;
+    background: var(--bg); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+    opacity: 0; pointer-events: none; transition: opacity .2s ease;
+  }
+  #anchorLoadingOverlay.show { opacity: 1; }
+  #anchorLoadingOverlay svg { width: 34px; height: 34px; color: var(--gold-light); animation: anchor-bob 1.1s ease-in-out infinite; }
+  #anchorLoadingOverlay span { font-size: 12px; letter-spacing: .04em; color: var(--muted); }
+  @keyframes anchor-bob {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(7px); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    #anchorLoadingOverlay svg { animation: none; }
+  }
 </style>
 <script>
+(function initPageLoadingOverlay() {
+  var overlay = null, timer = null;
+  function show() {
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'anchorLoadingOverlay';
+      overlay.innerHTML =
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">' +
+        '<circle cx="12" cy="5" r="2.1"/><line x1="12" y1="7.1" x2="12" y2="19"/>' +
+        '<line x1="8" y1="10" x2="16" y2="10"/><path d="M4.3 13a7.7 7.7 0 0 0 15.4 0"/>' +
+        '</svg><span>Loading&hellip;</span>';
+      document.body.appendChild(overlay);
+    }
+    requestAnimationFrame(function () { overlay.classList.add('show'); });
+  }
+  function armed() {
+    clearTimeout(timer);
+    timer = setTimeout(show, 150);
+  }
+  document.addEventListener('click', function (e) {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    var a = e.target.closest && e.target.closest('a[href]');
+    if (!a) return;
+    if (a.target && a.target !== '_self') return;
+    if (a.hasAttribute('download')) return;
+    var href = a.getAttribute('href') || '';
+    if (!href || href.charAt(0) === '#' || href.indexOf('javascript:') === 0 ||
+        href.indexOf('mailto:') === 0 || href.indexOf('tel:') === 0) return;
+    armed();
+  }, true);
+  document.addEventListener('submit', function (e) {
+    var f = e.target;
+    if (!f || f.tagName !== 'FORM' || e.defaultPrevented) return;
+    if (f.checkValidity && !f.checkValidity()) return;
+    armed();
+  }, true);
+})();
+
 (function initAnchorCursor() {
   if (!window.matchMedia || !window.matchMedia('(hover: hover) and (pointer: fine)').matches) return;
   var reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
