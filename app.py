@@ -658,20 +658,31 @@ def upload_manifest_excel():
 # (heavy lift) or over 12m long (oversize) - UNLESS that item has wheels it
 # can drive off on, or is a coil, in which case it doesn't need a low-bed
 # trailer and so is NOT direct delivery even though it's heavy/oversize.
-# A BL can span several sub-sheets in the packing list (e.g. 004A-004I are
-# all BL "004"), so classification is done BL-wise after grouping, not
-# per sub-sheet. Completely separate feature from DO Tracker - it classifies
-# whatever BLs are in the packing list, whether or not they're on the board.
+# A BL can span several sub-sheets/files in the packing list (e.g.
+# ...103____1.xlsx through ...103____4.xlsx are all one BL "103"), so
+# classification is done BL-wise after grouping ACROSS every file/sheet in
+# one upload, not per sub-sheet. Completely separate feature from DO
+# Tracker - it classifies whatever BLs are in the packing list, whether or
+# not they're on the board.
 #
 # Real packing lists from different mills/suppliers vary wildly (English or
 # Chinese headers, a per-piece table or a per-BL summary table, weight given
 # per-piece or as a lot/BL total, a combined "size" column instead of a
-# separate length column, sometimes several tables stacked in one sheet, and
-# occasionally no table at all - just labelled cells). The parsing below is
-# written to cope with all of those rather than one fixed template.
+# separate length column, a two-row header where the units (MT/PCS/etc) are
+# on the row under the labels, sometimes several tables stacked in one
+# sheet, letterhead/cover blocks repeated mid-sheet on multi-page exports,
+# and occasionally no table at all - just labelled cells). The parsing
+# below is written to cope with all of that rather than one fixed template.
 
 DD_WEIGHT_MT_THRESHOLD = 30.0
 DD_LENGTH_M_THRESHOLD = 12.0
+
+# A single packing-list line item this heavy/long is never real - it means
+# a header got misread and some unrelated number (an invoice number, a
+# date serial, a lot subtotal) was picked up as if it were the weight or
+# length of one piece. Anything past this is dropped rather than trusted.
+DD_SANITY_MAX_WEIGHT_MT = 500.0
+DD_SANITY_MAX_LENGTH_M = 100.0
 
 # Keyword lists are matched as SUBSTRINGS of the (normalized) header text,
 # not exact matches - real headers are things like "GROSS WEIGHT/MT" or
@@ -683,19 +694,70 @@ DD_WEIGHT_NET_WORDS = ["netweight", "networt", "nw", "净重"]
 DD_WEIGHT_GENERIC_WORDS = ["weight", "wt", "重量"]
 DD_LENGTH_WORDS = ["length", "长度"]
 DD_SPEC_WORDS = ["size", "spec", "specification", "dimension", "dimensions", "规格", "尺寸"]
-DD_QTY_WORDS = ["noofpc", "noofpcs", "noofcoils", "noofcoil", "qnty", "qty", "quantity", "pcs", "pieces", "件数", "数量"]
+DD_QTY_WORDS = [
+    "noofpc", "noofpcs", "noofcoils", "noofcoil", "numberofcoils", "numberofcoil",
+    "numberofpcs", "numberofpc", "numberofbundles", "numberofbundle", "bundles", "bundle",
+    "qnty", "qty", "quantity", "pcs", "pieces", "件数", "数量", "支数",
+]
 DD_DESC_HEADER_WORDS = ["description", "desc", "cargo", "commodity", "itemdescription", "goodsdescription", "cargodescription", "货名", "品名", "货物名称"]
-DD_BL_HEADER_WORDS = ["blnumber", "bl", "billoflading", "billofladingno", "blno", "提单号"]
+# NOTE: deliberately no bare "bl" here - as a raw substring it false-matches
+# ordinary words like "TABLE" or "DOUBLE". A short B/L-style token is
+# matched separately by _DD_BL_HEADER_RE below.
+DD_BL_HEADER_WORDS = ["blnumber", "billoflading", "billofladingno", "blno", "提单号"]
+_DD_BL_HEADER_RE = re.compile(r"^B[./]?\s?L[./]?\s?(NO|NUMBER|#|$)", re.IGNORECASE)
 
 # Exception keywords (English + common Chinese) - if the item's description
-# (or the sheet's overall "GOODS:" line) contains any of these, it's
-# excluded from Direct Delivery even if it trips the weight/length
-# threshold. Wire rod and coiled steel are always shipped as coils.
+# (or the sheet's overall goods/product-description line) contains any of
+# these, it's excluded from Direct Delivery even if it trips the
+# weight/length threshold. Wire rod and coiled steel are always shipped as
+# coils.
 DD_EXCEPTION_WORDS = [
     "wheel", "wheels", "self-propelled", "self propelled", "tyre", "tire", "tyres", "tires",
     "trailer mounted", "drive off", "roll on", "coil", "coils", "wire rod", "wire rods",
     "hrc", "crc", "hot rolled coil", "cold rolled coil", "steel coil",
     "轮", "车轮", "自走", "自行", "钢卷", "卷材", "卷", "线材",
+]
+
+# Short unit tokens on a "units row" directly under the real header (e.g.
+# "(MT)" under a column literally labelled "QUANTITY" - some suppliers use
+# "quantity" to mean the tonnage, not a piece count). A confirmed unit
+# always wins over a guess from the label text above it.
+_DD_WEIGHT_UNIT_RE = re.compile(r"(?<![A-Za-z])(MT|M\s?\.?\s?T|TONNES?|TONS?|KGS?)(?![A-Za-z])", re.IGNORECASE)
+_DD_QTY_UNIT_RE = re.compile(r"(?<![A-Za-z])(PCS?|SETS?|NOS?|COILS?|BDLS?|BUNDLES?)(?![A-Za-z])", re.IGNORECASE)
+DD_QTY_UNIT_CHINESE = ("支数", "件数", "卷数", "支", "件")
+
+# A header like "Package(COIL)" or "Packing(PCS)" - the unit named in the
+# parentheses makes it a qty column, but a bare "PACKAGE NO." (an ID/serial
+# column, not a count) must NOT match, so this needs the parenthesised
+# unit specifically rather than the word "package" alone.
+_DD_QTY_PAREN_RE = re.compile(r"PACKAGE\S*\s*\(\s*(COILS?|PCS?|BDLS?|BUNDLES?|SETS?|NOS?)\s*\)", re.IGNORECASE)
+
+# Rows that are pure letterhead/cover-page metadata (invoice no, contract
+# no, shipping marks, page numbers...) rather than cargo data. These show
+# up ABOVE a table's real header, but on multi-page exports the whole
+# cover block repeats again mid-sheet before every new page's header - if
+# not skipped, whatever happens to sit in the old table's weight/length
+# column positions on those rows gets misread as a cargo line.
+DD_NOISE_ROW_WORDS = [
+    "invoiceno", "contractno", "poinvoiceno", "pocontractno", "lcno", "lc/no",
+    "shippingmark", "invoicedate", "shipmentfrom", "shipmentto",
+    "portofloading", "portofdischarg", "descriptionofgoods", "shippingterms",
+    "towhomitmayconcern", "foraccountandrisk", "termsofprice", "countryoforigin",
+    "deliveryinvoicing", "packinglistno", "packinglistdate", "mainconslygroup",
+]
+
+# A discharge port naming one of these countries/hubs means the sheet is
+# for an entirely different shipment that happens to share the workbook
+# (suppliers sometimes leave old tabs for other consignees in a reused
+# file) - not a Saudi-bound BL at all, so its numbers shouldn't be mixed
+# into this classification.
+DD_NON_SAUDI_DISCHARGE_MARKERS = [
+    "IRAQ", "UMM QASR", "KUWAIT", "QATAR", "DOHA", "BAHRAIN", "OMAN", "SOHAR",
+    "UAE", "DUBAI", "ABU DHABI", "JEBEL ALI", "EGYPT", "INDIA", "PAKISTAN",
+]
+DD_SAUDI_DISCHARGE_MARKERS = [
+    "SAUDI", "KSA", "JEDDAH", "JEDDA", "DAMMAM", "JUBAIL", "YANBU", "RIYADH",
+    "RAS TANURA", "DUBA", "KING ABDUL",
 ]
 
 
@@ -758,7 +820,10 @@ def _dd_parse_number(raw):
 def _dd_parse_weight_mt(raw):
     """Best-effort: a bare number is assumed to already be in MT if it's
     under 1000, or in KG (divided down to MT) if 1000 or over - this holds
-    for realistic single-item cargo weights either way it's written."""
+    for realistic single-item cargo weights either way it's written. Note:
+    this may still be a LOT total awaiting division by a qty column - the
+    sanity cap is applied by the caller only once the final per-item
+    figure is known, not here."""
     v = _dd_parse_number(raw)
     if v is None or v <= 0:
         return None
@@ -775,14 +840,16 @@ def _dd_parse_length_m(raw):
         return None
     lower = text.lower()
     if "mm" in lower:
-        return v / 1000.0
-    if "cm" in lower:
-        return v / 100.0
-    if "mm" not in lower and "cm" not in lower and v > 1000:
-        return v / 1000.0
-    if v > 100:
-        return v / 100.0
-    return v
+        m = v / 1000.0
+    elif "cm" in lower:
+        m = v / 100.0
+    elif v > 1000:
+        m = v / 1000.0
+    elif v > 100:
+        m = v / 100.0
+    else:
+        m = v
+    return m if m <= DD_SANITY_MAX_LENGTH_M else None
 
 
 def _dd_parse_spec_length_mm(raw):
@@ -800,7 +867,8 @@ def _dd_parse_spec_length_mm(raw):
         return None
     if length_mm <= 0:
         return None
-    return length_mm / 1000.0
+    m = length_mm / 1000.0
+    return m if m <= DD_SANITY_MAX_LENGTH_M else None
 
 
 def _dd_bl_root(text):
@@ -812,64 +880,289 @@ def _dd_bl_root(text):
     return m.group(1) if m else s
 
 
-def _dd_find_goods_line(rows, max_scan=20):
-    """Packing lists sometimes name the cargo once in a "GOODS:..." label
-    line above the table (e.g. "GOODS:HOT ROLLED STEEL COIL") rather than
-    in a per-row description column. Used as a sheet-wide fallback."""
+def _dd_filename_bl_hint(filename):
+    """Many real packing lists don't have a BL column in the table at all -
+    the BL/reference number is only ever written in the FILE NAME (e.g.
+    "ZSM2603XGJD103____1.xlsx" -> the BL is "ZSM2603XGJD103", the trailing
+    "____1" is just that file's part/page number). The real reference is
+    always the clean token before the first run of junk - underscores,
+    the file extension, or a "-1"/"-2" suffix appended after more
+    underscores/words. Falls back to the bare filename stem if nothing
+    looks like a clean token."""
+    stem = re.sub(r"\.(xlsx|xlsm|xls|csv|pdf|docx)$", "", str(filename or ""), flags=re.IGNORECASE)
+    stem = stem.strip()
+    if not stem:
+        return ""
+    head = re.split(r"[_\s]", stem, 1)[0].strip()
+    return (head or stem).upper()
+
+
+_DD_GENERIC_SHEET_RE = re.compile(
+    r"^(SHEET\s*\d*|PAGE\s*\d*|PACKING\s*LIST\s*\d*|COMMERCIAL\s*INVOICE|INVOICE\s*\d*|"
+    r"DETAILED\s*PACKING\s*LIST\s*REFER(ENCE)?\s*\(?\d*\)?|SHIPPING\s*MARKS?|信息|箱单|装箱单|packing)$",
+    re.IGNORECASE,
+)
+
+
+def _dd_is_generic_sheet_name(name):
+    """True for a sheet/tab name that's just a template placeholder
+    ("Sheet1", "PAGE 2", "INVOICE"...) rather than a real per-sheet BL or
+    reference number. A workbook where every sheet is named like this is
+    one BL split across pages/sections, so the file NAME should be used as
+    the BL hint instead; a workbook with real per-sheet names (each one a
+    distinct BL, e.g. "CH26207BJED028") should keep using those."""
+    s = str(name or "").strip()
+    return bool(_DD_GENERIC_SHEET_RE.match(s))
+
+
+_DD_GOODS_LABEL_RE = re.compile(
+    r"(?:PRODUCT\s*DESCRIPTION|DESCRIPTION\s*OF\s*GOODS|GOODS|COMMODITY|CARGO)\s*[:：]\s*([^\n\r]+)",
+    re.IGNORECASE,
+)
+_DD_GOODS_BARE_LABEL_RE = re.compile(
+    r"^(?:PRODUCT\s*DESCRIPTION|DESCRIPTION\s*OF\s*GOODS|NAME\s*OF\s*COMMODITY|GOODS|COMMODITY|CARGO)\s*:?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _dd_find_goods_line(rows, max_scan=30):
+    """Packing lists sometimes name the cargo once in a label line above
+    the table rather than in a per-row description column. Used as a
+    sheet-wide fallback so the coil/wheeled exception can still be
+    checked. Handles the label and the value being in the same cell
+    ("GOODS:HOT ROLLED STEEL COIL", or buried inside a longer multi-line
+    cell like "PRODUCT DESCRIPTION: HOT ROLLED STEEL COILS") AND the label
+    sitting alone in one cell with the value in the next cell along in the
+    same row (a common layout: col A = "DESCRIPTION OF GOODS", col C =
+    the actual product name, with an empty col B between them)."""
     for row in rows[:max_scan]:
         for cell in row:
-            if isinstance(cell, str) and "GOODS" in cell.upper() and ":" in cell:
-                return cell.split(":", 1)[1].strip()
+            if not isinstance(cell, str):
+                continue
+            m = _DD_GOODS_LABEL_RE.search(cell)
+            if m:
+                line = m.group(1).strip()
+                if line:
+                    return line
+        # Label-alone-in-its-own-cell layout: take the next non-empty cell
+        # in the same row as the value.
+        cells = list(row)
+        for idx, cell in enumerate(cells):
+            if not isinstance(cell, str) or not _DD_GOODS_BARE_LABEL_RE.match(cell.strip()):
+                continue
+            for later in cells[idx + 1:]:
+                if isinstance(later, str) and later.strip():
+                    return later.strip()
     return ""
+
+
+def _dd_is_totals_row(row):
+    """A subtotal/grand-total row ("TOTAL", "SUBTOTAL", "合计", "总计",
+    "汇总", "小计") - these carry a LOT total, not one item's figures, and
+    mark the end of that table segment."""
+    for cell in row:
+        if not isinstance(cell, str) or not cell.strip():
+            continue
+        text = cell.strip()
+        if re.match(r"^(GRAND\s+)?(SUB)?\s*TOTAL\s*:?\s*$", text, re.IGNORECASE):
+            return True
+        compact = re.sub(r"\s+", "", text)
+        if compact in ("合计", "总计", "汇总", "小计"):
+            return True
+        return False  # only the row's first non-empty cell counts
+    return False
+
+
+def _dd_is_noise_row(row):
+    """A pure letterhead/cover-page row (invoice no, contract no, shipping
+    marks, page x/y...) rather than a cargo data row. These repeat mid-sheet
+    on multi-page packing lists, between one page's table and the next."""
+    cells = [c for c in row if isinstance(c, str) and c.strip()]
+    if not cells:
+        return False
+    label_like = 0
+    for c in cells:
+        norm = _dd_norm_ascii(c)
+        if any(w in norm for w in DD_NOISE_ROW_WORDS):
+            return True
+        if re.match(r"^[A-Za-z][A-Za-z /]{1,30}:\s*$", c.strip()):
+            label_like += 1
+    return label_like >= 2
+
+
+def _dd_scan_unit_row(row):
+    """Reads a "units" row sitting directly under a table's label row (e.g.
+    "(MT)"/"(M)"/"(MM)" or "PCS"/"COILS" under COMMODITY/LENGTH/QUANTITY
+    labels). Returns {column_index: "weight"|"qty"} for confirmed unit
+    tokens only - this is used to override an ambiguous label-only guess
+    such as a "QUANTITY" column that's actually the tonnage."""
+    out = {}
+    for col_index, cell in enumerate(row):
+        if not isinstance(cell, str) or not cell.strip():
+            continue
+        text = re.sub(r"[.,]", "", cell.strip())
+        if _DD_WEIGHT_UNIT_RE.search(text):
+            out[col_index] = "weight"
+        elif _DD_QTY_UNIT_RE.search(text) or any(w in cell for w in DD_QTY_UNIT_CHINESE):
+            out[col_index] = "qty"
+    return out
+
+
+def _dd_sheet_is_non_saudi(rows, max_scan=25):
+    """Some supplier workbooks leave tabs from a completely different
+    shipment/consignee mixed into the same file (a reused template). If a
+    sheet's own "PORT OF DISCHARG(E/ING)" line names a non-Saudi country or
+    hub, its cargo has nothing to do with this BL and shouldn't be counted.
+    Only acts when a discharge port is explicitly found and it clearly
+    names a non-Saudi place; otherwise (no such line, or it's ambiguous)
+    the sheet is processed as normal."""
+    for row in rows[:max_scan]:
+        row_has_label = False
+        row_text_parts = []
+        for cell in row:
+            if not isinstance(cell, str):
+                continue
+            row_text_parts.append(cell)
+            if "DISCHARG" in cell.upper():
+                row_has_label = True
+        if not row_has_label:
+            continue
+        # The port name is sometimes in the SAME cell as the label
+        # ("PORT OF DISCHARGE: JEDDAH") and sometimes in a separate cell
+        # further along the same row ("PORT OF DISCHARGING:", then later,
+        # "UMM QASR,IRAQ") - checking the whole row's text covers both.
+        upper = " ".join(row_text_parts).upper()
+        if any(m in upper for m in DD_SAUDI_DISCHARGE_MARKERS):
+            return False
+        if any(m in upper for m in DD_NON_SAUDI_DISCHARGE_MARKERS):
+            return True
+    return False
+
+
+def _dd_build_header_candidates(row):
+    """Scans one row's string cells for every column that NAMES a tracked
+    field, returning {category: [column_index, ...]} - every match is kept
+    (not just the first) so a later resolution step can correctly hand a
+    column to the right category even when two categories' keywords both
+    landed on it (e.g. "QUANTITY" meaning tonnage, see _dd_scan_unit_row)."""
+    cats = {"bl": [], "weight_gross": [], "weight_net": [], "weight_generic": [],
+            "length": [], "spec": [], "qty": [], "desc": []}
+    for col_index, cell in enumerate(row):
+        if not isinstance(cell, str) or not cell.strip():
+            continue
+        if _dd_header_matches(cell, DD_BL_HEADER_WORDS) or _DD_BL_HEADER_RE.match(cell.strip()):
+            cats["bl"].append(col_index)
+        if _dd_header_matches(cell, DD_WEIGHT_GROSS_WORDS):
+            cats["weight_gross"].append(col_index)
+        if _dd_header_matches(cell, DD_WEIGHT_NET_WORDS):
+            cats["weight_net"].append(col_index)
+        if _dd_header_matches(cell, DD_WEIGHT_GENERIC_WORDS):
+            cats["weight_generic"].append(col_index)
+        if _dd_header_matches(cell, DD_LENGTH_WORDS):
+            cats["length"].append(col_index)
+        if _dd_header_matches(cell, DD_SPEC_WORDS):
+            cats["spec"].append(col_index)
+        if _dd_header_matches(cell, DD_QTY_WORDS) or _DD_QTY_PAREN_RE.search(cell):
+            cats["qty"].append(col_index)
+        if _dd_header_matches(cell, DD_DESC_HEADER_WORDS):
+            cats["desc"].append(col_index)
+    return cats
+
+
+def _dd_is_header_row(cats):
+    has_weight = bool(cats["weight_gross"] or cats["weight_net"] or cats["weight_generic"])
+    has_other = bool(cats["length"] or cats["spec"] or cats["qty"] or cats["bl"])
+    return has_weight and has_other
+
+
+def _dd_resolve_header(cats, unit_overrides):
+    """Turns the raw candidate lists (plus any confirmed units-row signal)
+    into one final {category: column_index} mapping, each column used at
+    most once. A units-row signal for a column overrides a conflicting
+    label-only guess for that SAME column (e.g. "QUANTITY" mislabeled as
+    qty gets corrected to weight), while other label matches (e.g. a
+    genuinely separate "NUMBER OF BUNDLES" column) are unaffected."""
+    cats = {k: list(v) for k, v in cats.items()}
+    for col, kind in unit_overrides.items():
+        if kind == "weight":
+            cats["qty"] = [c for c in cats["qty"] if c != col]
+        elif kind == "qty":
+            cats["weight_generic"] = [c for c in cats["weight_generic"] if c != col]
+            cats["weight_net"] = [c for c in cats["weight_net"] if c != col]
+            cats["weight_gross"] = [c for c in cats["weight_gross"] if c != col]
+
+    found = {}
+    used = set()
+    for cat in ("bl", "weight_gross", "weight_net", "length", "spec", "qty", "weight_generic", "desc"):
+        for col in cats[cat]:
+            if col not in used:
+                found[cat] = col
+                used.add(col)
+                break
+
+    for col, kind in unit_overrides.items():
+        if col in used:
+            continue
+        if kind == "weight" and not any(k in found for k in ("weight_gross", "weight_net", "weight_generic")):
+            found["weight_generic"] = col
+            used.add(col)
+        elif kind == "qty" and "qty" not in found:
+            found["qty"] = col
+            used.add(col)
+    return found
 
 
 def _extract_classification_rows(rows, sheet_bl_hint=None):
     """Scans a grid of cell values for one or more tables (a sheet can have
-    several header+data blocks stacked on top of each other) and returns
-    one {bl, weight_mt, length_m, description} dict per usable data row.
+    several header+data blocks stacked on top of each other, e.g. once per
+    page of a multi-page export) and returns one {bl, weight_mt, length_m,
+    description} dict per usable data row.
 
     A row is treated as a new header whenever its string cells name a
     weight/spec/qty/BL column - this re-reads the column layout each time
-    it changes, rather than assuming one fixed table per sheet."""
+    it changes, rather than assuming one fixed table per sheet. Right after
+    a header is found, the next row is checked for unit tokens (MT/PCS/...)
+    that refine or correct the column mapping before any data is read."""
     if not rows:
+        return []
+    if _dd_sheet_is_non_saudi(rows):
         return []
 
     goods_line = _dd_find_goods_line(rows)
 
     out = []
     cols = None  # current column mapping, or None until a header is found
-
-    def try_header(row):
-        found = {}
-        for col_index, cell in enumerate(row):
-            if not isinstance(cell, str):
-                continue
-            if "bl" not in found and _dd_header_matches(cell, DD_BL_HEADER_WORDS):
-                found["bl"] = col_index
-            if "weight_gross" not in found and _dd_header_matches(cell, DD_WEIGHT_GROSS_WORDS):
-                found["weight_gross"] = col_index
-            if "weight_net" not in found and _dd_header_matches(cell, DD_WEIGHT_NET_WORDS):
-                found["weight_net"] = col_index
-            if "weight_generic" not in found and _dd_header_matches(cell, DD_WEIGHT_GENERIC_WORDS):
-                found["weight_generic"] = col_index
-            if "length" not in found and _dd_header_matches(cell, DD_LENGTH_WORDS):
-                found["length"] = col_index
-            if "spec" not in found and _dd_header_matches(cell, DD_SPEC_WORDS):
-                found["spec"] = col_index
-            if "qty" not in found and _dd_header_matches(cell, DD_QTY_WORDS):
-                found["qty"] = col_index
-            if "desc" not in found and _dd_header_matches(cell, DD_DESC_HEADER_WORDS):
-                found["desc"] = col_index
-        has_weight = "weight_gross" in found or "weight_net" in found or "weight_generic" in found
-        has_other = "length" in found or "spec" in found or "qty" in found or "bl" in found
-        return found if (has_weight and has_other) else None
-
-    for row in rows:
-        header = try_header(row)
-        if header is not None:
-            cols = header
+    i = 0
+    n = len(rows)
+    while i < n:
+        row = rows[i]
+        cats = _dd_build_header_candidates(row)
+        # Peek at the next row for unit tokens (MT/PCS/...) BEFORE deciding
+        # whether this row even qualifies as a header - some templates put
+        # the weight/qty units on that row and leave the label row itself
+        # with no weight-sounding word at all (e.g. "QUANTITY"/"(MT)" split
+        # across the two rows).
+        unit_overrides = {}
+        if i + 1 < n:
+            next_cats = _dd_build_header_candidates(rows[i + 1])
+            if not _dd_is_header_row(next_cats):
+                unit_overrides = _dd_scan_unit_row(rows[i + 1])
+        has_weight = bool(cats["weight_gross"] or cats["weight_net"] or cats["weight_generic"]) or "weight" in unit_overrides.values()
+        has_other = bool(cats["length"] or cats["spec"] or cats["qty"] or cats["bl"]) or "qty" in unit_overrides.values()
+        if has_weight and has_other:
+            cols = _dd_resolve_header(cats, unit_overrides)
+            i += 2 if unit_overrides else 1
             continue
+
         if cols is None:
+            i += 1
+            continue
+        if _dd_is_totals_row(row):
+            cols = None
+            i += 1
+            continue
+        if _dd_is_noise_row(row):
+            i += 1
             continue
 
         def cell_at(key):
@@ -882,16 +1175,16 @@ def _extract_classification_rows(rows, sheet_bl_hint=None):
         elif "bl" in cols:
             # This table has its own per-row BL column, but this row's cell
             # is blank - almost always a subtotal/blank row, not real cargo.
+            i += 1
             continue
         else:
             bl = sheet_bl_hint or ""
         if not bl:
+            i += 1
             continue
-        # Skip subtotal/grand-total rows ("合计", "总计", "汇总", "小计",
-        # "TOTAL") that show up in the BL column of summary tables - they
-        # aren't a real BL.
         bl_check = re.sub(r"\s+", "", bl)
         if any(w in bl_check for w in ("合计", "总计", "汇总", "小计")) or "TOTAL" in bl_check.upper():
+            i += 1
             continue
 
         weight_cell = cell_at("weight_gross") or cell_at("weight_net") or cell_at("weight_generic")
@@ -907,12 +1200,18 @@ def _extract_classification_rows(rows, sheet_bl_hint=None):
         qty = _dd_parse_number(cell_at("qty"))
         if weight_mt is not None and qty and qty > 0:
             weight_mt = weight_mt / qty
+        # Sanity check the FINAL per-item weight only, once any lot-total
+        # has already been divided down by its piece/bundle/coil count.
+        if weight_mt is not None and weight_mt > DD_SANITY_MAX_WEIGHT_MT:
+            weight_mt = None
 
         description = str(cell_at("desc")).strip() if cell_at("desc") is not None else goods_line
 
         if weight_mt is None and length_m is None:
+            i += 1
             continue
         out.append({"bl": _dd_bl_root(bl), "weight_mt": weight_mt, "length_m": length_m, "description": description})
+        i += 1
 
     if not out:
         out = _dd_freetext_fallback(rows, sheet_bl_hint, goods_line)
@@ -932,7 +1231,7 @@ def _dd_freetext_fallback(rows, sheet_bl_hint, goods_line):
     if not gw_match:
         return []
     weight_mt = _dd_parse_number(gw_match.group(1))
-    if not weight_mt:
+    if not weight_mt or weight_mt > DD_SANITY_MAX_WEIGHT_MT:
         return []
 
     pieces_match = re.search(r"(\d+)\s*PIECES", blob, re.IGNORECASE)
@@ -979,41 +1278,118 @@ def _dd_classify_groups(items):
     return results
 
 
+def _dd_sheet_bl_hint(sheet_name, filename_hint):
+    """The BL hint to fall back on when a table has no per-row BL column of
+    its own. Real, distinct per-sheet names (one BL per tab) win; a generic
+    template name ("Sheet1", "PAGE 2"...) means the whole file is one BL,
+    so the file name is used instead."""
+    if not _dd_is_generic_sheet_name(sheet_name):
+        root = _dd_bl_root(sheet_name)
+        if root:
+            return root
+    return filename_hint
+
+
+def _dd_is_invoice_only_sheet_name(name):
+    n = str(name or "").upper()
+    return "INVOICE" in n and "PACKING" not in n
+
+
+def _dd_skip_redundant_invoice_sheets(names):
+    """A workbook that has BOTH a commercial-invoice tab and a packing-list
+    tab is describing the same shipment twice - the invoice tab often has
+    no reliable per-piece/per-bundle count for its lot-total weight (it's a
+    pricing document, not a packaging one), which can turn a whole lot's
+    weight into a phantom single-item weight. When a real packing-list tab
+    is present, the invoice-only tabs are skipped in favor of it. Returns
+    the set of sheet names (as given) to skip."""
+    has_packing = any("PACKING" in str(n or "").upper() for n in names)
+    if not has_packing:
+        return set()
+    return {n for n in names if _dd_is_invoice_only_sheet_name(n)}
+
+
+def _dd_extract_from_upload(file_storage):
+    """Reads every sheet/page of one uploaded file and returns its
+    classification rows. Raises on a file that can't be read at all, but
+    an unsupported extension or an empty result just yields no rows so one
+    bad file in a multi-file upload doesn't sink the rest."""
+    filename = (file_storage.filename or "").strip()
+    lower = filename.lower()
+    filename_hint = _dd_filename_bl_hint(filename)
+    items = []
+
+    if lower.endswith((".xlsx", ".xlsm")):
+        wb = openpyxl.load_workbook(file_storage, data_only=True)
+        skip_names = _dd_skip_redundant_invoice_sheets([s.title for s in wb.worksheets])
+        for sheet in wb.worksheets:
+            if sheet.title in skip_names:
+                continue
+            rows = list(sheet.iter_rows(values_only=True))
+            items.extend(_extract_classification_rows(rows, sheet_bl_hint=_dd_sheet_bl_hint(sheet.title, filename_hint)))
+    elif lower.endswith(".xls"):
+        book = xlrd.open_workbook(file_contents=file_storage.read())
+        skip_names = _dd_skip_redundant_invoice_sheets([s.name for s in book.sheets()])
+        for sheet in book.sheets():
+            if sheet.name in skip_names:
+                continue
+            rows = [sheet.row_values(r) for r in range(sheet.nrows)]
+            items.extend(_extract_classification_rows(rows, sheet_bl_hint=_dd_sheet_bl_hint(sheet.name, filename_hint)))
+    elif lower.endswith(".csv"):
+        text = file_storage.read().decode("utf-8-sig", errors="ignore")
+        rows = list(csv.reader(io.StringIO(text)))
+        items.extend(_extract_classification_rows(rows, sheet_bl_hint=filename_hint))
+    elif lower.endswith(".pdf"):
+        import pdfplumber
+        with pdfplumber.open(file_storage) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables() or []
+                if tables:
+                    for table in tables:
+                        items.extend(_extract_classification_rows(table, sheet_bl_hint=filename_hint))
+                else:
+                    text = page.extract_text() or ""
+                    rows = [[line] for line in text.split("\n")]
+                    items.extend(_extract_classification_rows(rows, sheet_bl_hint=filename_hint))
+    else:
+        raise ValueError(f"Unsupported file type: {filename}")
+    return items
+
+
 @app.route("/api/manifest/classify", methods=["POST"])
 @login_required
 def classify_manifest():
-    """Upload a packing list and every BL in it gets classified and saved -
-    completely standalone, no dependency on DO Tracker's board at all."""
-    if "file" not in request.files:
+    """Upload one or more packing lists and every BL across all of them
+    gets classified and saved - completely standalone, no dependency on DO
+    Tracker's board at all. A BL that's split across several files (e.g.
+    the same reference number's pages 1-4 uploaded as separate files) is
+    still classified as ONE BL, since every file's items are pooled before
+    grouping."""
+    files = request.files.getlist("file")
+    if not files or all(not f.filename for f in files):
         return jsonify({"error": "No file received"}), 400
-    file = request.files["file"]
-    if not file.filename:
-        return jsonify({"error": "No file selected"}), 400
-    filename = file.filename.lower()
 
     items = []
-    try:
-        if filename.endswith((".xlsx", ".xlsm")):
-            wb = openpyxl.load_workbook(file, data_only=True)
-            for sheet in wb.worksheets:
-                rows = list(sheet.iter_rows(values_only=True))
-                items.extend(_extract_classification_rows(rows, sheet_bl_hint=_dd_bl_root(sheet.title)))
-        elif filename.endswith(".xls"):
-            book = xlrd.open_workbook(file_contents=file.read())
-            for sheet in book.sheets():
-                rows = [sheet.row_values(r) for r in range(sheet.nrows)]
-                items.extend(_extract_classification_rows(rows, sheet_bl_hint=_dd_bl_root(sheet.name)))
-        elif filename.endswith(".csv"):
-            text = file.read().decode("utf-8-sig", errors="ignore")
-            rows = list(csv.reader(io.StringIO(text)))
-            items.extend(_extract_classification_rows(rows))
-        else:
-            return jsonify({"error": "Please upload the packing list as .xlsx, .xls or .csv."}), 400
-    except Exception:
-        return jsonify({"error": "Couldn't read that file. Make sure it isn't corrupted or password-protected."}), 400
+    failed = []
+    for file in files:
+        if not file.filename:
+            continue
+        filename = file.filename
+        try:
+            file_items = _dd_extract_from_upload(file)
+        except ValueError:
+            failed.append(filename)
+            continue
+        except Exception:
+            failed.append(filename)
+            continue
+        items.extend(file_items)
 
     if not items:
-        return jsonify({"error": "Couldn't find a weight or length column in that file - classification needs at least one of those."}), 400
+        msg = "Couldn't find a weight or length column in " + ("that file" if len(files) == 1 else "any of those files") + " - classification needs at least one of those."
+        if failed:
+            msg = f"Couldn't read {', '.join(failed)}. " + msg
+        return jsonify({"error": msg}), 400
 
     classified = _dd_classify_groups(items)
 
@@ -1030,7 +1406,7 @@ def classify_manifest():
         )
         results.append({"bl": bl, "direct": is_direct, "reason": reason})
     db.commit()
-    return jsonify({"classified": results})
+    return jsonify({"classified": results, "failed": failed})
 
 
 @app.route("/api/direct-delivery", methods=["GET"])
@@ -2990,8 +3366,8 @@ DIRECT_DELIVERY_HTML = """
   </div>
 
   <div class="panel">
-    <h2>Classify a packing list</h2>
-    <p class="panel-sub">.xlsx, .xls or .csv - reads the weight/length/description columns automatically.</p>
+    <h2>Classify packing lists</h2>
+    <p class="panel-sub">.xlsx, .xls, .csv or .pdf - select or drop as many files as you have at once. Reads the weight/length/description columns automatically, and a BL split across several files (same reference number, different pages) is grouped back into one BL.</p>
     <label class="dropzone" id="dropzone" for="classifyFile">
       <div class="dropzone-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8">
@@ -2999,10 +3375,10 @@ DIRECT_DELIVERY_HTML = """
         </svg>
       </div>
       <div>
-        <div class="dropzone-text"><b>Click to upload</b> or drag &amp; drop the packing list</div>
-        <div class="dropzone-sub">.xlsx, .xls or .csv</div>
+        <div class="dropzone-text"><b>Click to upload</b> or drag &amp; drop your packing lists</div>
+        <div class="dropzone-sub">.xlsx, .xls, .csv or .pdf - multiple files at once is fine</div>
       </div>
-      <input type="file" id="classifyFile" accept=".xlsx,.xlsm,.xls,.csv" style="display:none" onchange="uploadClassify()">
+      <input type="file" id="classifyFile" accept=".xlsx,.xlsm,.xls,.csv,.pdf" multiple style="display:none" onchange="uploadClassify()">
     </label>
     <div class="status-line" id="statusLine"></div>
   </div>
@@ -3037,8 +3413,7 @@ const dropzone = document.getElementById('dropzone');
   dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.remove('dragover'); });
 });
 dropzone.addEventListener('drop', e => {
-  const f = e.dataTransfer.files[0];
-  if (f) { document.getElementById('classifyFile').files = e.dataTransfer.files; uploadClassify(); }
+  if (e.dataTransfer.files.length) { document.getElementById('classifyFile').files = e.dataTransfer.files; uploadClassify(); }
 });
 
 function ddBadgeHtml(direct) {
@@ -3047,33 +3422,36 @@ function ddBadgeHtml(direct) {
 
 async function uploadClassify() {
   const input = document.getElementById('classifyFile');
-  const file = input.files[0];
-  if (!file) return;
+  const files = input.files;
+  if (!files || !files.length) return;
   const status = document.getElementById('statusLine');
   status.className = 'status-line';
-  status.textContent = 'Classifying...';
+  status.textContent = files.length === 1 ? 'Classifying...' : `Classifying ${files.length} files...`;
   const fd = new FormData();
-  fd.append('file', file);
+  for (const f of files) fd.append('file', f);
   try {
     const res = await fetch('/api/manifest/classify', {method: 'POST', body: fd});
     const data = await res.json();
     if (!res.ok) {
       status.className = 'status-line error';
-      status.textContent = data.error || 'Could not classify that file.';
+      status.textContent = data.error || 'Could not classify those files.';
       input.value = '';
       return;
     }
     const classified = data.classified || [];
+    const failed = data.failed || [];
     const direct = classified.filter(m => m.direct).length;
-    status.className = 'status-line ok';
-    status.textContent = classified.length
+    status.className = failed.length ? 'status-line error' : 'status-line ok';
+    let msg = classified.length
       ? `Classified ${classified.length} BL(s) - ${direct} direct delivery.`
-      : 'No BLs could be read from that packing list.';
+      : 'No BLs could be read from those files.';
+    if (failed.length) msg += ` Couldn't read: ${failed.join(', ')}.`;
+    status.textContent = msg;
     input.value = '';
     await loadResults();
   } catch (e) {
     status.className = 'status-line error';
-    status.textContent = 'Could not classify that file.';
+    status.textContent = 'Could not classify those files.';
     input.value = '';
   }
 }
