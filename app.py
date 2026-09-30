@@ -1054,8 +1054,8 @@ SETUP_HTML = """
 <div class="box">
   <div class="brand-mark">
     <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
-    <span class="co">Sea Power</span>
-    <span class="tag">Compass</span>
+    <span class="co">Compass</span>
+    <span class="tag">Sea Power Marine Services Co. Ltd</span>
   </div>
   <h1>Welcome to Compass</h1>
   <div class="sub">First time here - create the Admin account to get started.</div>
@@ -1080,11 +1080,11 @@ LOGIN_HTML = """
 <div class="box">
   <div class="brand-mark">
     <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
-    <span class="co">Sea Power</span>
-    <span class="tag">Compass</span>
+    <span class="co">Compass</span>
+    <span class="tag">Sea Power Marine Services Co. Ltd</span>
   </div>
   <h1>Sign in to Compass</h1>
-  <div class="sub">Your shared Sea Power workspace.</div>
+  <div class="sub">Your shared workspace.</div>
   {% if error %}<div class="error">{{ error }}</div>{% endif %}
   <form method="post">
     <label>Username</label>
