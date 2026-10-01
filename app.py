@@ -4587,22 +4587,46 @@ PAGE_HTML = """
   .stat-icon svg { width: 19px; height: 19px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
   .stat b { display: block; font-size: 21px; font-weight: 700; color: var(--text); letter-spacing: -0.01em; line-height: 1.2; }
 
-  /* Port tab bar - sits above #groups, lets you jump straight to one
-     port's vessels instead of scrolling the stacked port sections. Built
-     fresh in render() from whatever ports currently exist (same pattern
-     as jumpSelect/operatorFilter), so it never needs its own data fetch. */
-  .port-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
-  .port-tab {
-    display: inline-flex; align-items: center; gap: 6px;
-    font-size: 12.5px; font-weight: 600; font-family: inherit;
-    padding: 7px 14px; border-radius: 999px; cursor: pointer;
-    background: var(--card); color: var(--text); border: 1px solid var(--border);
-    transition: background-color .15s ease, color .15s ease, border-color .15s ease;
+  /* Port landing nav - sits above #groups. In the "All ports" state
+     (selectedPortTab === '') it's a clickable card grid, one card per
+     port, each a drill-in into that port's vessels; once a port is
+     selected it becomes a small breadcrumb/back control instead, and
+     #groups shows just that port. Built fresh in render() from whatever
+     ports currently exist (same pattern as jumpSelect/operatorFilter),
+     so it never needs its own data fetch. */
+  .port-card-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 14px; margin-bottom: 14px;
   }
-  .port-tab:hover { background: var(--border); }
-  .port-tab.active { background: var(--navy); color: #fff; border-color: var(--navy); }
-  .port-tab.active:hover { background: var(--navy); }
-  .port-tab-count { font-size: 11px; font-weight: 700; opacity: .65; }
+  .port-card {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
+    text-align: left; font-family: inherit; cursor: pointer;
+    background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 14px;
+    padding: 16px; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+  }
+  .port-card:hover { background: var(--card); color: var(--text); border-color: var(--navy-light); box-shadow: var(--shadow-sm); transform: translateY(-1px); }
+  .port-card-icon {
+    width: 34px; height: 34px; border-radius: 10px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: color-mix(in srgb, var(--navy-light) 12%, transparent); color: var(--navy-light);
+  }
+  .port-card-icon svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .port-card-name { font-size: 14.5px; font-weight: 700; color: var(--text); letter-spacing: -0.01em; }
+  .port-card-meta { font-size: 12px; color: var(--muted); margin-top: -4px; }
+  .port-card-progress { width: 100%; height: 6px; }
+  .port-card-pct { font-size: 11.5px; font-weight: 600; color: var(--navy-light); }
+  .port-card-pct.done { color: var(--success); }
+
+  .port-breadcrumb { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+  .port-back-btn {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 12.5px; font-weight: 700; font-family: inherit;
+    padding: 7px 14px; border-radius: 999px; cursor: pointer;
+    background: var(--card); color: var(--navy-light); border: 1px solid var(--border);
+    transition: background-color .15s ease;
+  }
+  .port-back-btn:hover { background: var(--border); color: var(--navy-light); }
+  .port-breadcrumb-heading { font-size: 15px; font-weight: 700; color: var(--text); margin: 0; }
 
   /* Port / Vessel group structure */
   .port-group { margin-bottom: 18px; }
@@ -4968,7 +4992,7 @@ PAGE_HTML = """
       <button type="button" class="btn-neutral" onclick="setAllGroupsCollapsed(true)">Collapse all</button>
       <button type="button" id="clearAllBtn" class="btn-danger" style="margin-left:auto;" onclick="clearAllRecords()">Clear board</button>
     </div>
-    <div class="port-tabs" id="portTabs"></div>
+    <div id="portTabs"></div>
     <div id="groups"></div>
   </div>
 
@@ -5735,7 +5759,7 @@ function render() {
   const ports = groupRecordsByPortVessel(activeList);
   const portNames = sortedPortNames(ports);
 
-  // Port tab bar - rebuilt fresh every render from whatever ports are
+  // Port landing nav - rebuilt fresh every render from whatever ports are
   // currently on the board (post search/operator filter), same pattern
   // as jumpSelect/operatorFilter just above. If the previously-selected
   // port disappeared (renamed away, last BL removed, etc.) fall back to
@@ -5745,18 +5769,47 @@ function render() {
   if (portTabsEl) {
     if (portNames.length === 0) {
       portTabsEl.innerHTML = '';
-    } else {
-      const allTab = `<button type="button" class="port-tab ${selectedPortTab === '' ? 'active' : ''}" onclick="selectPortTab('')">All ports <span class="port-tab-count">${activeList.length}</span></button>`;
-      const portTabs = portNames.map(portName => {
-        const count = Object.values(ports[portName]).reduce((sum, list) => sum + list.length, 0);
+    } else if (selectedPortTab === '') {
+      // Landing state: one clickable card per port, each summarizing that
+      // port's vessel/BL counts and completion progress.
+      const anchorIcon = '<svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="3"></circle><line x1="12" y1="22" x2="12" y2="8"></line><path d="M5 12H2a10 10 0 0020 0h-3"></path></svg>';
+      const cards = portNames.map(portName => {
+        const vessels = ports[portName];
+        const vesselCount = Object.keys(vessels).length;
+        const portRecords = Object.values(vessels).reduce((all, list) => all.concat(list), []);
+        const blCount = portRecords.length;
+        const completeCount = portRecords.filter(r => r.invoice_issued && r.approval_received && r.do_issued).length;
+        const pct = blCount ? Math.round(completeCount / blCount * 100) : 0;
+        const done = pct >= 100;
         const label = portName.replace(/</g, '&lt;').replace(/>/g, '&gt;');
         const pEsc = portName.replace(/'/g, "\\'");
-        return `<button type="button" class="port-tab ${selectedPortTab === portName ? 'active' : ''}" onclick="selectPortTab('${pEsc}')">${label} <span class="port-tab-count">${count}</span></button>`;
+        return `<button type="button" class="port-card" onclick="selectPortTab('${pEsc}')">
+          <div class="port-card-icon">${anchorIcon}</div>
+          <div class="port-card-name">${label}</div>
+          <div class="port-card-meta">${vesselCount} vessel${vesselCount === 1 ? '' : 's'} &middot; ${blCount} BL${blCount === 1 ? '' : 's'}</div>
+          <span class="vessel-progress port-card-progress ${done ? 'done' : ''}"><span class="vessel-progress-fill" style="width:${pct}%"></span></span>
+          <div class="port-card-pct ${done ? 'done' : ''}">${done ? 'All done' : pct + '% complete'}</div>
+        </button>`;
       }).join('');
-      portTabsEl.innerHTML = allTab + portTabs;
+      portTabsEl.innerHTML = `<div class="port-card-grid">${cards}</div>`;
+    } else {
+      // Drilled-in state: a port is selected, so the card grid is hidden
+      // and replaced by a small breadcrumb/back control + heading above
+      // that one port's (unchanged) groups.
+      const label = selectedPortTab.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      portTabsEl.innerHTML = `<div class="port-breadcrumb">
+        <button type="button" class="port-back-btn" onclick="selectPortTab('')">&larr; All Ports</button>
+        <h2 class="port-breadcrumb-heading">${label}</h2>
+      </div>`;
     }
   }
-  const displayPortNames = selectedPortTab ? portNames.filter(p => p === selectedPortTab) : portNames;
+  // Landing state (no port selected) shows only the card grid above - the
+  // whole point of drilling in is that the board isn't also dumped below
+  // it. The one exception is an active search: if the person is searching
+  // for a BL, the grid cards don't show BL numbers, so bypass the
+  // grid-only restriction and surface matching results across all ports
+  // (same ports/groups the grid itself was just filtered down to above).
+  const displayPortNames = selectedPortTab ? portNames.filter(p => p === selectedPortTab) : (q ? portNames : []);
 
   const groupsEl = document.getElementById('groups');
   if (portNames.length === 0) {
@@ -5842,16 +5895,24 @@ async function setVesselArchived(blNumbers, archived) {
 function selectPortTab(port) {
   selectedPortTab = port;
   render();
+  // The grid and the drilled-in groups are never shown at once any more,
+  // so bring whichever one is now visible (the breadcrumb+groups, or back
+  // up to the card grid) into view.
+  requestAnimationFrame(() => {
+    const el = document.getElementById('portTabs');
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
 }
 
 function jumpToVessel(key) {
   if (!key) return;
   const parts = key.split(':');
   const portKey = 'port:' + parts[1];
-  // Jumping to a vessel always lands on it regardless of which port tab
-  // is currently selected - simpler and more predictable than silently
-  // switching tabs to match the vessel's port.
-  selectedPortTab = '';
+  // Jumping to a vessel should land on that vessel's own groups, which
+  // only render when its port is the selected (drilled-in) one - so
+  // switch to that vessel's actual port rather than resetting to the
+  // "All ports" grid, which wouldn't show the vessel at all.
+  selectedPortTab = parts[1];
   collapsedGroups[portKey] = false;
   collapsedGroups[key] = false;
   // Reset the dropdown's value before re-rendering (which would otherwise
