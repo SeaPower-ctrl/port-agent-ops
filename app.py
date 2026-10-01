@@ -4242,34 +4242,48 @@ PAGE_HTML = """
     outline: none; border-color: var(--navy-light); background: var(--card);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 20%, transparent);
   }
-  select.nice-select {
-    appearance: none; -webkit-appearance: none; -moz-appearance: none;
+  /* Native <select> elements largely ignore/flatten backdrop-filter and
+     translucent backgrounds (esp. Chromium), painting an opaque native
+     control instead. So the frosted-glass look lives on this wrapper div
+     (which DOES get backdrop-filter applied by the browser), and the
+     select itself sits on top with a transparent background so the glass
+     behind it shows through. */
+  .glass-select-wrap {
+    position: relative; display: inline-block; width: 100%;
+    border-radius: 10px;
     border: 1px solid color-mix(in srgb, #ffffff 45%, var(--border));
-    border-radius: 10px; padding: 10px 34px 10px 12px;
-    font-size: 14px; font-family: inherit; width: 100%;
     background-color: color-mix(in srgb, var(--card) 55%, transparent);
     backdrop-filter: blur(14px) saturate(180%);
     -webkit-backdrop-filter: blur(14px) saturate(180%);
-    color: var(--text); cursor: pointer;
     box-shadow: 0 4px 16px rgba(20,30,45,0.08), inset 0 1px 0 rgba(255,255,255,0.5);
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%237a8794' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6 9l6 6 6-6'/></svg>");
-    background-repeat: no-repeat; background-position: right 12px center; background-size: 14px;
     transition: border-color .15s ease, background-color .15s ease, box-shadow .15s ease;
   }
-  select.nice-select:focus {
-    outline: none; border-color: var(--navy-light);
+  .glass-select-wrap:focus-within {
+    border-color: var(--navy-light);
     background-color: color-mix(in srgb, var(--card) 78%, transparent);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 20%, transparent);
   }
-  :root[data-theme="dark"] select.nice-select {
+  :root[data-theme="dark"] .glass-select-wrap {
     background-color: color-mix(in srgb, var(--card) 50%, transparent);
     border-color: color-mix(in srgb, #ffffff 16%, var(--border));
     box-shadow: 0 4px 18px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.07);
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2393a1b1' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6 9l6 6 6-6'/></svg>");
   }
-  :root[data-theme="dark"] select.nice-select:focus {
+  :root[data-theme="dark"] .glass-select-wrap:focus-within {
     background-color: color-mix(in srgb, var(--card) 72%, transparent);
     border-color: var(--navy-light);
+  }
+  select.nice-select {
+    appearance: none; -webkit-appearance: none; -moz-appearance: none;
+    border: none; border-radius: 10px; padding: 10px 34px 10px 12px;
+    font-size: 14px; font-family: inherit; width: 100%;
+    background-color: transparent;
+    color: var(--text); cursor: pointer;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%237a8794' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6 9l6 6 6-6'/></svg>");
+    background-repeat: no-repeat; background-position: right 12px center; background-size: 14px;
+  }
+  select.nice-select:focus { outline: none; }
+  :root[data-theme="dark"] select.nice-select {
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2393a1b1' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6 9l6 6 6-6'/></svg>");
   }
   select.nice-select option { background: var(--card); color: var(--text); }
   .tag-fields { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
@@ -4573,15 +4587,17 @@ PAGE_HTML = """
     <div class="tag-fields">
       <div>
         <label for="portField">Discharge Port</label>
-        <select id="portField" class="nice-select">
-          <option value="">Select a port...</option>
-          <option value="DAMMAM PORT">Dammam Port</option>
-          <option value="JUBAIL COMMERCIAL PORT">Jubail Commercial Port</option>
-          <option value="JEDDAH PORT">Jeddah Port</option>
-          <option value="YANBU COMMERCIAL PORT">Yanbu Commercial Port</option>
-          <option value="YANBU INDUSTRIAL PORT">Yanbu Industrial Port</option>
-          <option value="KAP">KAP</option>
-        </select>
+        <div class="glass-select-wrap">
+          <select id="portField" class="nice-select">
+            <option value="">Select a port...</option>
+            <option value="DAMMAM PORT">Dammam Port</option>
+            <option value="JUBAIL COMMERCIAL PORT">Jubail Commercial Port</option>
+            <option value="JEDDAH PORT">Jeddah Port</option>
+            <option value="YANBU COMMERCIAL PORT">Yanbu Commercial Port</option>
+            <option value="YANBU INDUSTRIAL PORT">Yanbu Industrial Port</option>
+            <option value="KAP">KAP</option>
+          </select>
+        </div>
       </div>
       <div>
         <label for="vesselField">Vessel</label>
@@ -4611,9 +4627,13 @@ PAGE_HTML = """
   <div class="card">
     <div class="row" style="margin-bottom:14px; flex-wrap:wrap;">
       <input type="text" id="searchBox" placeholder="Search BL number..." oninput="render()" style="flex:1; min-width:180px;">
-      <select id="jumpSelect" class="nice-select" onchange="jumpToVessel(this.value)" style="width:auto; min-width:200px;"><option value="">Select a vessel to view</option></select>
+      <div class="glass-select-wrap" style="width:auto; min-width:200px;">
+        <select id="jumpSelect" class="nice-select" onchange="jumpToVessel(this.value)"><option value="">Select a vessel to view</option></select>
+      </div>
       {% if role == 'admin' %}
-      <select id="operatorFilter" class="nice-select" onchange="render()" style="width:auto; min-width:140px;"><option value="">All operators</option></select>
+      <div class="glass-select-wrap" style="width:auto; min-width:140px;">
+        <select id="operatorFilter" class="nice-select" onchange="render()"><option value="">All operators</option></select>
+      </div>
       {% endif %}
       <button type="button" onclick="setAllGroupsCollapsed(false)" style="background:none; color:var(--text); border:1px solid var(--border);">Expand all</button>
       <button type="button" onclick="setAllGroupsCollapsed(true)" style="background:none; color:var(--text); border:1px solid var(--border);">Collapse all</button>
@@ -5166,6 +5186,19 @@ function updateBulkBars() {
     if (label) label.textContent = count ? `${count} selected` : '';
     bar.classList.toggle('active', count > 0);
   });
+  // Keep each vessel group's "select all" header checkbox in sync with the
+  // actual selection: unchecked when none selected, checked when every BL
+  // in the group is selected, indeterminate when only some are - so the
+  // same control always does the obvious next thing (select all / clear all)
+  // instead of only ever being able to check itself.
+  document.querySelectorAll('.select-all-vessel').forEach(cb => {
+    const key = cb.dataset.barKey;
+    const bar = document.querySelector(`.bulk-bar[data-bar-key="${CSS.escape(key)}"]`);
+    const scope = bar ? (bar.dataset.bls || '').split('|').filter(Boolean) : [];
+    const count = scope.filter(bl => selectedBLs.has(bl)).length;
+    cb.checked = scope.length > 0 && count === scope.length;
+    cb.indeterminate = count > 0 && count < scope.length;
+  });
 }
 
 async function bulkSetField(vesselKey, field, value) {
@@ -5231,13 +5264,14 @@ function bulkBarHtml(vesselKey, list) {
 }
 
 function tableHtml(list, vesselKey) {
+  const key = vesselKey.replace(/"/g, '&quot;');
   return `
     ${bulkBarHtml(vesselKey, list)}
     <div class="overflow">
       <table>
         <thead>
           <tr>
-            <th class="select-col"><input type="checkbox" title="Select all in this vessel" onchange="list_selectAllVessel('${vesselKey.replace(/'/g,"\\'")}', this.checked)"></th>
+            <th class="select-col"><input type="checkbox" class="select-all-vessel" data-bar-key="${key}" title="Select/deselect all in this vessel" onchange="list_selectAllVessel('${vesselKey.replace(/'/g,"\\'")}', this.checked)"></th>
             <th>BL Number</th>
             <th>Invoice Issued</th>
             <th>Approval Received</th>
