@@ -565,6 +565,37 @@ def _extract_bl_numbers_from_lines(text):
     return _extract_bl_numbers_from_rows(rows)
 
 
+_ZIP_MAGIC = b"PK\x03\x04"
+_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _load_excel_sheets_by_content(raw_bytes, filename):
+    """Reads an Excel file's sheets as [(sheet_name, rows), ...], trusting
+    the file's actual bytes over its extension. A very common real-world
+    mismatch: a modern .xlsx (which is really a ZIP archive) gets
+    saved/forwarded/attached with an old ".xls" name - email clients and
+    "Save As" dialogs do this constantly - and a strict extension check
+    then hands it to the wrong library (xlrd, which only reads the old
+    binary format) and fails outright with an unhelpful error, even though
+    the file is perfectly readable. This checks the real file signature
+    first and only falls back to the extension if the content doesn't
+    look like either known format."""
+    if raw_bytes[:4] == _ZIP_MAGIC:
+        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+        return [(s.title, list(s.iter_rows(values_only=True))) for s in wb.worksheets]
+    if raw_bytes[:8] == _OLE_MAGIC:
+        book = xlrd.open_workbook(file_contents=raw_bytes)
+        return [(s.name, [s.row_values(r) for r in range(s.nrows)]) for s in book.sheets()]
+    lower = filename.lower()
+    if lower.endswith((".xlsx", ".xlsm")):
+        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+        return [(s.title, list(s.iter_rows(values_only=True))) for s in wb.worksheets]
+    if lower.endswith(".xls"):
+        book = xlrd.open_workbook(file_contents=raw_bytes)
+        return [(s.name, [s.row_values(r) for r in range(s.nrows)]) for s in book.sheets()]
+    raise ValueError(f"{filename} isn't a recognizable Excel file")
+
+
 @app.route("/api/manifest/upload", methods=["POST"])
 @login_required
 def upload_manifest_excel():
@@ -585,8 +616,7 @@ def upload_manifest_excel():
     bl_numbers = []
 
     try:
-        if filename.endswith((".xlsx", ".xlsm")):
-            wb = openpyxl.load_workbook(file, data_only=True)
+        if filename.endswith((".xlsx", ".xlsm", ".xls")):
             # Go through every sheet (not just the first/active one) so BLs
             # aren't missed if the file has multiple tabs or was last saved
             # on a different sheet. Only the FIRST sheet gets the "no
@@ -595,15 +625,12 @@ def upload_manifest_excel():
             # sheets (e.g. a vehicle's chassis/engine-number list) that
             # have their own ITEM/serial column but no BL data at all -
             # falling back on those would read "1, 2, 3, 4..." as BL
-            # numbers.
-            for i, sheet in enumerate(wb.worksheets):
-                rows = list(sheet.iter_rows(values_only=True))
-                bl_numbers.extend(_extract_bl_numbers_from_rows(rows, allow_no_header_fallback=(i == 0)))
-
-        elif filename.endswith(".xls"):
-            book = xlrd.open_workbook(file_contents=file.read())
-            for i, sheet in enumerate(book.sheets()):
-                rows = [sheet.row_values(r) for r in range(sheet.nrows)]
+            # numbers. The sheets are read by sniffing the file's real
+            # content rather than trusting its extension - a very common
+            # mismatch is a modern .xlsx saved/forwarded with an old .xls
+            # name, which would otherwise fail outright.
+            sheets = _load_excel_sheets_by_content(file.read(), filename)
+            for i, (sheet_name, rows) in enumerate(sheets):
                 bl_numbers.extend(_extract_bl_numbers_from_rows(rows, allow_no_header_fallback=(i == 0)))
 
         elif filename.endswith(".csv"):
@@ -1578,22 +1605,16 @@ def _dd_extract_from_upload(file_storage):
     filename_hint = _dd_filename_bl_hint(filename)
     items = []
 
-    if lower.endswith((".xlsx", ".xlsm")):
-        wb = openpyxl.load_workbook(file_storage, data_only=True)
-        skip_names = _dd_skip_redundant_invoice_sheets([s.title for s in wb.worksheets])
-        for sheet in wb.worksheets:
-            if sheet.title in skip_names:
+    if lower.endswith((".xlsx", ".xlsm", ".xls")):
+        # Sniff the real file content rather than trusting the extension -
+        # a modern .xlsx saved/forwarded with an old .xls name (or vice
+        # versa) is common in practice and would otherwise fail outright.
+        sheets = _load_excel_sheets_by_content(file_storage.read(), filename)
+        skip_names = _dd_skip_redundant_invoice_sheets([name for name, _ in sheets])
+        for sheet_name, rows in sheets:
+            if sheet_name in skip_names:
                 continue
-            rows = list(sheet.iter_rows(values_only=True))
-            items.extend(_extract_classification_rows(rows, sheet_bl_hint=_dd_sheet_bl_hint(sheet.title, filename_hint)))
-    elif lower.endswith(".xls"):
-        book = xlrd.open_workbook(file_contents=file_storage.read())
-        skip_names = _dd_skip_redundant_invoice_sheets([s.name for s in book.sheets()])
-        for sheet in book.sheets():
-            if sheet.name in skip_names:
-                continue
-            rows = [sheet.row_values(r) for r in range(sheet.nrows)]
-            items.extend(_extract_classification_rows(rows, sheet_bl_hint=_dd_sheet_bl_hint(sheet.name, filename_hint)))
+            items.extend(_extract_classification_rows(rows, sheet_bl_hint=_dd_sheet_bl_hint(sheet_name, filename_hint)))
     elif lower.endswith(".csv"):
         text = file_storage.read().decode("utf-8-sig", errors="ignore")
         rows = list(csv.reader(io.StringIO(text)))
