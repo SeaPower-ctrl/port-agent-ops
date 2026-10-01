@@ -4224,12 +4224,16 @@ PAGE_HTML = """
     <div class="tag-fields">
       <div>
         <label for="portField">Discharge Port</label>
-        <input type="text" id="portField" placeholder="e.g. JEDDAH PORT" style="text-transform:uppercase;" oninput="this.value = this.value.toUpperCase();">
-        <div style="font-size:11px; color:var(--muted); margin-top:4px;">Where it's being delivered to - not the Chinese loading port. Keep this the same for every BL going to the same place so they group together.</div>
+        <input type="text" id="portField" list="portDatalist" placeholder="e.g. JEDDAH PORT" style="text-transform:uppercase;"
+          oninput="this.value = this.value.toUpperCase(); checkPortSimilar();" onblur="checkPortSimilar()">
+        <datalist id="portDatalist"></datalist>
+        <div style="font-size:11px; color:var(--muted); margin-top:4px;">Where it's being delivered to - not the Chinese loading port. Pick an existing port from the list so every BL going there lands in the same group.</div>
+        <div id="portWarning" style="display:none; font-size:11.5px; color:#9a6b00; background:#fff7e6; border:1px solid #f1d28a; border-radius:6px; padding:6px 9px; margin-top:6px;"></div>
       </div>
       <div>
         <label for="vesselField">Vessel</label>
-        <input type="text" id="vesselField" placeholder="e.g. TAI KNIGHT" style="text-transform:uppercase;" oninput="this.value = this.value.toUpperCase();">
+        <input type="text" id="vesselField" list="vesselDatalist" placeholder="e.g. TAI KNIGHT" style="text-transform:uppercase;" oninput="this.value = this.value.toUpperCase();">
+        <datalist id="vesselDatalist"></datalist>
       </div>
     </div>
     <label class="dropzone" id="dropzone" for="manifestFile">
@@ -4360,7 +4364,60 @@ async function fetchRecords() {
   });
   const changed = JSON.stringify(fresh) !== JSON.stringify(records);
   records = fresh;
+  if (changed) refreshFieldSuggestions();
   if (editingCount === 0 && changed) render();
+}
+
+/* ---------- Port/vessel autocomplete + duplicate-group warning ----------
+   With 20-25 manifests a month, retyping the discharge port/vessel by hand
+   every time is exactly how "JEDDAH" and "JEDDAH PORT" end up as two
+   separate board groups for the same place - a human typo, not a parsing
+   bug, but the UI should make it hard to make rather than relying on
+   everyone remembering the exact spelling used last time. Two guards:
+   1) a <datalist> of every port/vessel already on the board, so picking
+      an existing one is a dropdown click instead of retyping it, and
+   2) a live warning if what's typed LOOKS like an existing port under a
+      different spelling (extra "PORT" word, punctuation, spacing) -
+      with a one-click button to adopt the existing spelling exactly. */
+function refreshFieldSuggestions() {
+  const portField = document.getElementById('portField');
+  const vesselField = document.getElementById('vesselField');
+  if (!portField || !vesselField) return;
+
+  const ports = [...new Set(records.map(r => r.port).filter(Boolean))].sort(naturalCompare);
+  const vessels = [...new Set(records.map(r => r.vessel).filter(Boolean))].sort(naturalCompare);
+
+  document.getElementById('portDatalist').innerHTML = ports.map(p => `<option value="${p.replace(/"/g, '&quot;')}">`).join('');
+  document.getElementById('vesselDatalist').innerHTML = vessels.map(v => `<option value="${v.replace(/"/g, '&quot;')}">`).join('');
+}
+
+function normPortName(s) {
+  // Collapses spelling variants of the "same" port down to one key: splits
+  // into alphanumeric tokens and drops the generic token "PORT", so
+  // "JEDDAH", "JEDDAH PORT" and "JEDDAH-PORT" all normalize the same way.
+  // (Deliberately not a word-boundary regex around PORT - this file is a
+  // plain, non-raw Python triple-quoted string, so that particular escape
+  // sequence is read by Python as a backspace character before the JS
+  // ever reaches the browser, silently breaking the match. Token-splitting
+  // sidesteps that whole class of mistake.)
+  return String(s || '').toUpperCase().split(/[^A-Z0-9]+/).filter(t => t && t !== 'PORT').join('');
+}
+
+function checkPortSimilar() {
+  const warnEl = document.getElementById('portWarning');
+  const typed = document.getElementById('portField').value.trim();
+  if (!typed) { warnEl.style.display = 'none'; return; }
+
+  const existingPorts = [...new Set(records.map(r => r.port).filter(Boolean))];
+  const typedNorm = normPortName(typed);
+  const match = existingPorts.find(p => p !== typed && normPortName(p) === typedNorm);
+
+  if (match) {
+    warnEl.innerHTML = `This looks like <b>${match}</b>, already on the board - use that exact spelling so this manifest joins the same group instead of starting a new one. <button type="button" style="margin-left:4px; font-size:11px; padding:2px 8px;" onclick="document.getElementById('portField').value='${match.replace(/'/g, "\\'")}'; checkPortSimilar();">Use "${match}"</button>`;
+    warnEl.style.display = 'block';
+  } else {
+    warnEl.style.display = 'none';
+  }
 }
 
 /* ---------- Manifest upload (drag & drop) ----------
