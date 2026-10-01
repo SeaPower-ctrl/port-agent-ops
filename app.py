@@ -4257,8 +4257,11 @@ PAGE_HTML = """
   <div class="summary" id="summary"></div>
 
   <div class="card">
-    <div class="row" style="margin-bottom:14px;">
+    <div class="row" style="margin-bottom:14px; flex-wrap:wrap;">
       <input type="text" id="searchBox" placeholder="Search BL number..." oninput="render()" style="flex:1; min-width:180px;">
+      <select id="jumpSelect" onchange="jumpToVessel(this.value)" style="min-width:200px;"><option value="">Jump to a vessel...</option></select>
+      <button type="button" onclick="setAllGroupsCollapsed(false)" style="background:none; color:var(--text); border:1px solid var(--border);">Expand all</button>
+      <button type="button" onclick="setAllGroupsCollapsed(true)" style="background:none; color:var(--text); border:1px solid var(--border);">Collapse all</button>
       <button type="button" id="clearAllBtn" onclick="clearAllRecords()" style="background:none; color:var(--danger); border:1px solid var(--border);">Clear board</button>
     </div>
     <div id="groups"></div>
@@ -4379,12 +4382,17 @@ async function fetchRecords() {
    2) a live warning if what's typed LOOKS like an existing port under a
       different spelling (extra "PORT" word, punctuation, spacing) -
       with a one-click button to adopt the existing spelling exactly. */
+// Every discharge port Sea Power regularly handles, so the dropdown offers
+// the full list from day one - not just ports a manifest has already been
+// uploaded under. Send the real list and this gets hardcoded here instead.
+const KNOWN_PORTS = ['JEDDAH', 'DAMMAM', 'JUBAIL', 'YANBU', 'KING ABDULLAH PORT', 'RIYADH DRY PORT'];
+
 function refreshFieldSuggestions() {
   const portField = document.getElementById('portField');
   const vesselField = document.getElementById('vesselField');
   if (!portField || !vesselField) return;
 
-  const ports = [...new Set(records.map(r => r.port).filter(Boolean))].sort(naturalCompare);
+  const ports = [...new Set([...KNOWN_PORTS, ...records.map(r => r.port).filter(Boolean)])].sort(naturalCompare);
   const vessels = [...new Set(records.map(r => r.vessel).filter(Boolean))].sort(naturalCompare);
 
   document.getElementById('portDatalist').innerHTML = ports.map(p => `<option value="${p.replace(/"/g, '&quot;')}">`).join('');
@@ -4713,8 +4721,11 @@ function summaryHtml() {
     check: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12l3 3 5-6"/></svg>'
   };
 
+  const remaining = total - complete;
+
   return `
     <div class="stat"><div class="stat-icon">${icons.total}</div><div><b>${total}</b>Total BLs</div></div>
+    <div class="stat ${remaining ? 'gold' : 'done'}"><div class="stat-icon">${icons.check}</div><div><b>${remaining}</b>Remaining</div></div>
     <div class="stat gold"><div class="stat-icon">${icons.invoice}</div><div><b>${invoicePending}</b>Invoice Pending</div></div>
     <div class="stat gold"><div class="stat-icon">${icons.approval}</div><div><b>${approvalPending}</b>Approval Pending</div></div>
     <div class="stat gold"><div class="stat-icon">${icons.box}</div><div><b>${doPending}</b>DO Pending</div></div>
@@ -4792,9 +4803,33 @@ function render() {
     return;
   }
 
+  // Vessel/port jump menu - with 20-25 manifests a month, scrolling down
+  // the whole board to find one vessel doesn't scale. Built fresh every
+  // render so it always reflects what's actually on the board right now.
+  const jumpEl = document.getElementById('jumpSelect');
+  if (jumpEl) {
+    const current = jumpEl.value;
+    let options = '<option value="">Jump to a vessel...</option>';
+    portNames.forEach(portName => {
+      const vessels = ports[portName];
+      Object.keys(vessels).sort((a, b) => {
+        if (a === 'Unassigned') return 1;
+        if (b === 'Unassigned') return -1;
+        return naturalCompare(a, b);
+      }).forEach(vesselName => {
+        const list = vessels[vesselName];
+        const left = list.filter(r => !(r.invoice_issued && r.approval_received && r.do_issued)).length;
+        const key = 'vessel:' + portName + ':' + vesselName;
+        const label = `${vesselName} - ${portName} (${list.length} BL${list.length === 1 ? '' : 's'}${left ? ', ' + left + ' left' : ', done'})`;
+        options += `<option value="${key.replace(/"/g, '&quot;')}">${label}</option>`;
+      });
+    });
+    jumpEl.innerHTML = options;
+    if ([...jumpEl.options].some(o => o.value === current)) jumpEl.value = current;
+  }
+
   groupsEl.innerHTML = portNames.map(portName => {
     const portKey = 'port:' + portName;
-    const portCollapsed = !!collapsedGroups[portKey];
     const vessels = ports[portName];
     const vesselNames = Object.keys(vessels).sort((a, b) => {
       if (a === 'Unassigned') return 1;
@@ -4802,21 +4837,31 @@ function render() {
       return naturalCompare(a, b);
     });
     const portTotal = vesselNames.reduce((sum, v) => sum + vessels[v].length, 0);
+    const portLeft = vesselNames.reduce((sum, v) => sum + vessels[v].filter(r => !(r.invoice_issued && r.approval_received && r.do_issued)).length, 0);
+    // Default state (only applies the first time a group is seen - once a
+    // person manually expands/collapses it, collapsedGroups remembers
+    // their choice and this default is never forced back on them): a
+    // port/vessel group with nothing left to do starts collapsed, so a
+    // long board folds down to just the groups that still need work
+    // instead of everything piled up needing a scroll through finished
+    // ones to reach the next open item.
+    const portCollapsed = portKey in collapsedGroups ? !!collapsedGroups[portKey] : (portTotal > 0 && portLeft === 0);
 
     const vesselsHtml = vesselNames.map(vesselName => {
       const vesselKey = 'vessel:' + portName + ':' + vesselName;
-      const vesselCollapsed = !!collapsedGroups[vesselKey];
       const list = vessels[vesselName]
         .slice()
         .sort((a, b) => naturalCompare(a.bl_number, b.bl_number));
+      const left = list.filter(r => !(r.invoice_issued && r.approval_received && r.do_issued)).length;
+      const vesselCollapsed = vesselKey in collapsedGroups ? !!collapsedGroups[vesselKey] : (left === 0);
       return `
-        <div class="vessel-group">
+        <div class="vessel-group" id="group_${cssEscape(vesselKey)}">
           <div class="vessel-header ${vesselCollapsed ? 'collapsed' : ''}" onclick="if(event.target.tagName!=='INPUT') toggleGroup('${vesselKey.replace(/'/g,"\\'")}')">
             ${CHEVRON}
             <input class="group-name" value="${vesselName === 'Unassigned' ? '' : vesselName}" placeholder="Unassigned vessel"
               onclick="event.stopPropagation()"
               onchange="renameGroup('vessel', '${portName.replace(/'/g,"\\'")}', '${vesselName.replace(/'/g,"\\'")}', this.value, 'Unassigned')">
-            <span class="group-count">${list.length} BL${list.length === 1 ? '' : 's'}</span>
+            <span class="group-count">${list.length} BL${list.length === 1 ? '' : 's'}${left ? ` &middot; ${left} left` : ' &middot; done'}</span>
             <button type="button" class="group-remove" onclick="event.stopPropagation(); removeVesselGroup('${portName.replace(/'/g,"\\'")}', '${vesselName.replace(/'/g,"\\'")}')">Remove all</button>
           </div>
           <div class="vessel-body ${vesselCollapsed ? 'collapsed' : ''}">
@@ -4832,7 +4877,7 @@ function render() {
           <input class="group-name" value="${portName === 'Unassigned' ? '' : portName}" placeholder="Unassigned port"
             onclick="event.stopPropagation()"
             onchange="renameGroup('port', '${portName.replace(/'/g,"\\'")}', '', this.value, 'Unassigned')">
-          <span class="group-count">${portTotal} BL${portTotal === 1 ? '' : 's'}</span>
+          <span class="group-count">${portTotal} BL${portTotal === 1 ? '' : 's'}${portLeft ? ` &middot; ${portLeft} left` : ' &middot; done'}</span>
           <button type="button" class="group-remove" onclick="event.stopPropagation(); removePortGroup('${portName.replace(/'/g,"\\'")}')">Remove all</button>
         </div>
         <div class="port-body ${portCollapsed ? 'collapsed' : ''}">${vesselsHtml}</div>
@@ -4842,6 +4887,31 @@ function render() {
   updateSummaryOnly();
 }
 
+function jumpToVessel(key) {
+  if (!key) return;
+  const parts = key.split(':');
+  const portKey = 'port:' + parts[1];
+  collapsedGroups[portKey] = false;
+  collapsedGroups[key] = false;
+  render();
+  requestAnimationFrame(() => {
+    const el = document.getElementById('group_' + cssEscape(key));
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+}
+
+function setAllGroupsCollapsed(collapsed) {
+  const q = document.getElementById('searchBox').value.trim().toLowerCase();
+  records.filter(r => r.bl_number.toLowerCase().includes(q)).forEach(r => {
+    const port = r.port || 'Unassigned';
+    const vessel = r.vessel || 'Unassigned';
+    collapsedGroups['port:' + port] = collapsed;
+    collapsedGroups['vessel:' + port + ':' + vessel] = collapsed;
+  });
+  render();
+}
+
+refreshFieldSuggestions();
 fetchRecords();
 setInterval(fetchRecords, 4000);
 </script>
