@@ -533,11 +533,16 @@ def _extract_bl_numbers_from_rows(rows, allow_no_header_fallback=True):
         if raw_bl is None or str(raw_bl).strip() == "":
             continue
         candidate = str(raw_bl).strip().upper()
-        # Skip a trailing "TOTAL:" / "GRAND TOTAL" summary row - manifests
-        # commonly have one at the bottom of the same column as the BL
-        # numbers, and it isn't a real BL.
+        # Skip a summary row ("TOTAL:", "GRAND TOTAL", "SUB TOTAL",
+        # "VOYAGE TOTAL", "PAGE TOTAL"...) sitting in the same column as
+        # the real BL numbers - manifests commonly have one or more of
+        # these (a running subtotal per page, plus a grand/voyage total at
+        # the end), and none of them are real BLs. A substring check
+        # catches every "___ TOTAL" variant rather than only the exact
+        # phrases seen so far.
         norm_candidate = _normalize_header(candidate)
-        if norm_candidate in ("total", "totals", "grandtotal"):
+        candidate_check = re.sub(r"\s+", "", candidate)
+        if "total" in norm_candidate or any(w in candidate_check for w in ("合计", "总计", "汇总", "小计")):
             continue
         out.append(candidate)
 
