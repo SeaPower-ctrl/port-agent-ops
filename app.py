@@ -22,7 +22,7 @@ import csv
 import io
 from datetime import datetime
 from functools import wraps
-from flask import Flask, request, jsonify, g, render_template_string, session, redirect, url_for, send_file
+from flask import Flask, request, jsonify, g, render_template_string, session, redirect, url_for, send_file, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 import openpyxl
 import xlrd
@@ -110,6 +110,27 @@ def init_db():
     # Each record is owned by whichever staff account created it - DO Tracker
     # is per-staff (admin sees everything, staff only see their own).
     cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS created_by TEXT DEFAULT ''")
+    # Set per-vessel (same value on every BL in that vessel's group), not
+    # per-BL - lets the board sort "arriving soonest first" instead of
+    # alphabetically, and surfaces an ETA without a separate vessels table.
+    cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS eta TEXT DEFAULT ''")
+    # A vessel group that's fully complete and old can be archived off the
+    # main board (manually, from the UI) without deleting its data - it's
+    # still searchable/exportable, just out of the day-to-day view.
+    cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS archived INTEGER DEFAULT 0")
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS audit_log (
+            id SERIAL PRIMARY KEY,
+            bl_number TEXT NOT NULL,
+            action TEXT NOT NULL,
+            field TEXT DEFAULT '',
+            old_value TEXT DEFAULT '',
+            new_value TEXT DEFAULT '',
+            by_user TEXT DEFAULT '',
+            at TEXT DEFAULT ''
+        )"""
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_bl ON audit_log (bl_number)")
     cur.execute(
         """CREATE TABLE IF NOT EXISTS vessels (
             name TEXT PRIMARY KEY,
@@ -439,6 +460,21 @@ def _owns_record(bl_number):
     return row is not None and row["created_by"] == session.get("username")
 
 
+def _log_audit(bl_number, action, field="", old_value="", new_value=""):
+    """Appends one row to audit_log - who did what, when, to which BL.
+    Shares the caller's transaction (no commit here), so it only actually
+    lands if the caller's own db.commit() goes through right after."""
+    db = get_db()
+    db.execute(
+        "INSERT INTO audit_log (bl_number, action, field, old_value, new_value, by_user, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            bl_number, action, field, "" if old_value is None else str(old_value),
+            "" if new_value is None else str(new_value),
+            session.get("username", ""), datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+        ),
+    )
+
+
 @app.route("/api/manifest", methods=["POST"])
 @login_required
 def submit_manifest():
@@ -710,21 +746,36 @@ def upload_manifest_excel():
     db = get_db()
     added = 0
     skipped = 0
+    # A BL number is unique board-wide (it's the primary key), so a manifest
+    # that re-lists a BL already on the board just gets silently skipped as
+    # "already there" - correct when it's the same shipment uploaded twice,
+    # but if that existing row is sitting under a DIFFERENT vessel, this is
+    # actually a real collision worth a human looking at (either a genuine
+    # data error, or a BL number a shipper has reused for a new shipment),
+    # not a routine duplicate. Collected separately and surfaced in the
+    # response instead of disappearing into the plain "skipped" count.
+    duplicate_elsewhere = []
     for bl_number in bl_numbers:
         if not bl_number:
             continue
-        existing = db.execute("SELECT 1 FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
+        existing = db.execute("SELECT vessel, port FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
         if existing:
             skipped += 1
+            if (existing["vessel"] or "") != vessel or (existing["port"] or "") != port:
+                duplicate_elsewhere.append({
+                    "bl_number": bl_number,
+                    "existing_port": existing["port"], "existing_vessel": existing["vessel"],
+                })
             continue
         db.execute(
             "INSERT INTO records (bl_number, port, vessel, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
             (bl_number, port, vessel, datetime.utcnow().strftime("%Y-%m-%d %H:%M"), session.get("username")),
         )
+        _log_audit(bl_number, "added", "", "", f"{port} / {vessel}")
         added += 1
 
     db.commit()
-    return jsonify({"added": added, "skipped": skipped})
+    return jsonify({"added": added, "skipped": skipped, "duplicate_elsewhere": duplicate_elsewhere})
 
 
 # ---------- Direct Delivery Classifier ----------
@@ -1829,6 +1880,7 @@ def toggle_status(bl_number):
         f"UPDATE records SET {field} = ?, {by_field} = ?, {at_field} = ? WHERE bl_number = ?",
         (value, by_val, now, bl_number.upper()),
     )
+    _log_audit(bl_number.upper(), "toggle", field, "" if value else "1", "1" if value else "")
     db.commit()
     return jsonify({"ok": True})
 
@@ -1841,7 +1893,9 @@ def update_remarks(bl_number):
     data = request.get_json(force=True)
     remarks = data.get("remarks", "")
     db = get_db()
+    old = db.execute("SELECT remarks FROM records WHERE bl_number = ?", (bl_number.upper(),)).fetchone()
     db.execute("UPDATE records SET remarks = ? WHERE bl_number = ?", (remarks, bl_number.upper()))
+    _log_audit(bl_number.upper(), "remarks", "remarks", old["remarks"] if old else "", remarks)
     db.commit()
     return jsonify({"ok": True})
 
@@ -1853,6 +1907,7 @@ def delete_record(bl_number):
         return "Not your record.", 403
     db = get_db()
     db.execute("DELETE FROM records WHERE bl_number = ?", (bl_number.upper(),))
+    _log_audit(bl_number.upper(), "deleted")
     db.commit()
     return jsonify({"ok": True})
 
@@ -1910,6 +1965,8 @@ def restore_record():
     if not str(data.get("bl_number", "")).strip():
         return jsonify({"error": "missing bl_number"}), 400
     inserted = _restore_one_record(db, data)
+    if inserted:
+        _log_audit(str(data.get("bl_number", "")).strip().upper(), "restored")
     db.commit()
     return jsonify({"ok": True, "note": None if inserted else "already exists"})
 
@@ -1939,6 +1996,7 @@ def bulk_delete_records():
             continue
         deleted.append(dict(row))
         db.execute("DELETE FROM records WHERE bl_number = ?", (bl_number,))
+        _log_audit(bl_number, "deleted", "", "", "bulk")
     db.commit()
     return jsonify({"deleted": deleted})
 
@@ -1955,6 +2013,7 @@ def bulk_restore_records():
     for item in items:
         if _restore_one_record(db, item):
             restored += 1
+            _log_audit(str(item.get("bl_number", "")).strip().upper(), "restored", "", "", "bulk")
     db.commit()
     return jsonify({"restored": restored})
 
@@ -1995,6 +2054,169 @@ def rename_group():
         return jsonify({"error": "invalid type"}), 400
     db.commit()
     return jsonify({"ok": True})
+
+
+@app.route("/api/records/bulk-toggle", methods=["POST"])
+@login_required
+def bulk_toggle_records():
+    """Sets one status field (invoice/approval/DO) for many BLs at once -
+    the board's row-select checkboxes + action bar use this so clearing a
+    whole lot that came in together is one click instead of one toggle per
+    row. Staff can only touch their own records, same as every other write
+    here; rows they don't own are silently skipped rather than failing the
+    whole batch."""
+    data = request.get_json(force=True)
+    bl_numbers = [str(b).strip().upper() for b in data.get("bl_numbers", []) if str(b).strip()]
+    field = data.get("field")
+    value = 1 if data.get("value") else 0
+    allowed = {
+        "invoice_issued": ("invoice_by", "invoice_at"),
+        "approval_received": ("approval_by", "approval_at"),
+        "do_issued": ("do_by", "do_at"),
+    }
+    if field not in allowed or not bl_numbers:
+        return jsonify({"error": "invalid request"}), 400
+
+    by_field, at_field = allowed[field]
+    user = session.get("username", "Unknown")
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M") if value else ""
+    by_val = user if value else ""
+
+    db = get_db()
+    updated = []
+    for bl_number in bl_numbers:
+        if not _owns_record(bl_number):
+            continue
+        db.execute(
+            f"UPDATE records SET {field} = ?, {by_field} = ?, {at_field} = ? WHERE bl_number = ?",
+            (value, by_val, now, bl_number),
+        )
+        _log_audit(bl_number, "toggle", field, "" if value else "1", "1" if value else "")
+        updated.append(bl_number)
+    db.commit()
+    return jsonify({"updated": updated})
+
+
+@app.route("/api/vessel/eta", methods=["POST"])
+@login_required
+def set_vessel_eta():
+    """Sets the expected-arrival date for a whole vessel group at once -
+    it's a property of the vessel's call, not of any one BL, so it's stored
+    the same way on every row in the group rather than needing a separate
+    vessels table. Takes an explicit bl_numbers list (like bulk-delete)
+    rather than matching on the port/vessel text - a blank/"Unassigned"
+    port or vessel is stored as '' in the database but shown as the literal
+    word "Unassigned" in the UI, so matching by that text would silently
+    match nothing for any unassigned group."""
+    data = request.get_json(force=True)
+    bl_numbers = [str(b).strip().upper() for b in data.get("bl_numbers", []) if str(b).strip()]
+    eta = str(data.get("eta", "")).strip()
+    if not bl_numbers:
+        return jsonify({"error": "No BL numbers given"}), 400
+    db = get_db()
+    updated = 0
+    for bl_number in bl_numbers:
+        if not _owns_record(bl_number):
+            continue
+        db.execute("UPDATE records SET eta = ? WHERE bl_number = ?", (eta, bl_number))
+        updated += 1
+    db.commit()
+    return jsonify({"updated": updated})
+
+
+@app.route("/api/vessel/archive", methods=["POST"])
+@login_required
+def set_vessel_archived():
+    """Archives (or restores) a whole vessel group - takes a finished
+    vessel off the main board without deleting its data; archived records
+    are still searchable/exportable, just filtered out of the day-to-day
+    view by default. Same explicit bl_numbers-list approach as the ETA
+    route above, for the same reason."""
+    data = request.get_json(force=True)
+    bl_numbers = [str(b).strip().upper() for b in data.get("bl_numbers", []) if str(b).strip()]
+    archived = 1 if data.get("archived") else 0
+    if not bl_numbers:
+        return jsonify({"error": "No BL numbers given"}), 400
+    db = get_db()
+    updated = 0
+    for bl_number in bl_numbers:
+        if not _owns_record(bl_number):
+            continue
+        db.execute("UPDATE records SET archived = ? WHERE bl_number = ?", (archived, bl_number))
+        updated += 1
+    db.commit()
+    return jsonify({"updated": updated})
+
+
+@app.route("/api/records/<path:bl_number>/history", methods=["GET"])
+@login_required
+def record_history(bl_number):
+    if not _owns_record(bl_number.upper()):
+        return "Not your record.", 403
+    db = get_db()
+    rows = db.execute(
+        "SELECT * FROM audit_log WHERE bl_number = ? ORDER BY id DESC", (bl_number.upper(),)
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/export", methods=["GET"])
+@login_required
+def export_records():
+    """Downloads the board (or one port/vessel group, via ?port=&vessel=)
+    as an .xlsx - for handing a status report to the principal or
+    management without them needing a login."""
+    port = request.args.get("port", "")
+    vessel = request.args.get("vessel", "")
+    db = get_db()
+    is_admin = session.get("role") == "admin"
+    sql = "SELECT * FROM records"
+    clauses, params = [], []
+    if port:
+        clauses.append("port = ?")
+        params.append(port)
+    if vessel:
+        clauses.append("vessel = ?")
+        params.append(vessel)
+    if not is_admin:
+        clauses.append("created_by = ?")
+        params.append(session.get("username"))
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY port, vessel, bl_number"
+    rows = [dict(r) for r in db.execute(sql, tuple(params)).fetchall()]
+
+    import openpyxl
+    from openpyxl.styles import Font
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "DO Tracker"
+    headers = ["Port", "Vessel", "ETA", "BL Number", "Invoice Issued", "Approval Received", "DO Issued", "Remarks", "Created"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for r in rows:
+        ws.append([
+            r.get("port", ""), r.get("vessel", ""), r.get("eta", ""), r.get("bl_number", ""),
+            "Yes" if r.get("invoice_issued") else "No",
+            "Yes" if r.get("approval_received") else "No",
+            "Yes" if r.get("do_issued") else "No",
+            r.get("remarks", ""), r.get("created_at", ""),
+        ])
+    for col_cells in ws.columns:
+        width = max((len(str(c.value)) for c in col_cells if c.value is not None), default=8)
+        ws.column_dimensions[col_cells[0].column_letter].width = min(width + 2, 40)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    fname_bits = [b for b in (port, vessel) if b] or ["board"]
+    fname = "do_tracker_" + "_".join(fname_bits).replace(" ", "_") + ".xlsx"
+    return Response(
+        buf.read(),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 # ---------- Vessel Tracker (standalone list, live positions via MarineTraffic's free embed) ----------
@@ -4093,13 +4315,25 @@ PAGE_HTML = """
   .port-header .group-name:focus { outline: none; border-color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.08); }
   .port-header .group-count { font-size: 11.5px; color: rgba(255,255,255,0.7); font-weight: 500; }
   .group-remove {
-    margin-left: auto; background: none; border: none; cursor: pointer;
+    background: none; border: none; cursor: pointer;
     font-size: 11px; font-weight: 700; padding: 5px 11px; border-radius: 999px; flex-shrink: 0;
   }
   .port-header .group-remove { color: rgba(255,255,255,0.75); }
   .port-header .group-remove:hover { background: rgba(255,255,255,0.14); color: #fff; }
   .vessel-header .group-remove { color: var(--danger); }
   .vessel-header .group-remove:hover { background: var(--danger-bg); }
+  .group-export {
+    margin-left: auto; font-size: 11px; font-weight: 700; padding: 5px 11px;
+    border-radius: 999px; flex-shrink: 0; text-decoration: none;
+  }
+  .port-header .group-export { color: rgba(255,255,255,0.75); }
+  .port-header .group-export:hover { background: rgba(255,255,255,0.14); color: #fff; }
+  .vessel-header .group-export { color: var(--navy-light); }
+  .vessel-header .group-export:hover { background: color-mix(in srgb, var(--navy-light) 14%, transparent); }
+  .eta-input {
+    font-size: 11.5px; font-family: inherit; border: 1px solid var(--border); border-radius: 6px;
+    padding: 3px 6px; background: var(--card); color: var(--text); flex-shrink: 0;
+  }
   .port-body { border: 1px solid var(--border); border-top: none; border-radius: 0 0 14px 14px; overflow: hidden; background: var(--card); }
   .port-body.collapsed { display: none; }
 
@@ -4121,14 +4355,17 @@ PAGE_HTML = """
 
   /* Table */
   .overflow { overflow-x: auto; }
-  table { width: 100%; min-width: 720px; border-collapse: collapse; font-size: 13.5px; table-layout: fixed; }
-  th:nth-child(1), td:nth-child(1) { width: 16%; }
-  th:nth-child(2), td:nth-child(2) { width: 16%; }
-  th:nth-child(3), td:nth-child(3) { width: 16%; }
-  th:nth-child(4), td:nth-child(4) { width: 16%; }
-  th:nth-child(5), td:nth-child(5) { width: 26%; }
-  th:nth-child(6), td:nth-child(6) { width: 10%; }
+  table { width: 100%; min-width: 760px; border-collapse: collapse; font-size: 13.5px; table-layout: fixed; }
+  th:nth-child(1), td:nth-child(1) { width: 4%; }
+  th:nth-child(2), td:nth-child(2) { width: 15%; }
+  th:nth-child(3), td:nth-child(3) { width: 14%; }
+  th:nth-child(4), td:nth-child(4) { width: 14%; }
+  th:nth-child(5), td:nth-child(5) { width: 14%; }
+  th:nth-child(6), td:nth-child(6) { width: 23%; }
+  th:nth-child(7), td:nth-child(7) { width: 6%; }
+  th:nth-child(8), td:nth-child(8) { width: 10%; }
   th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid var(--border); overflow: hidden; }
+  .select-col { text-align: center; }
   th {
     color: var(--muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase;
     letter-spacing: .05em; background: color-mix(in srgb, var(--border) 40%, transparent);
@@ -4143,6 +4380,70 @@ PAGE_HTML = """
     display: inline-flex; align-items: center; gap: 3px;
     background: var(--success-bg); color: var(--success); font-size: 10.5px; font-weight: 700;
     padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: .03em;
+  }
+  .badge-aging {
+    display: inline-flex; align-items: center; gap: 3px;
+    background: #fff1e0; color: #b45f06; font-size: 10.5px; font-weight: 700;
+    padding: 2px 8px; border-radius: 999px;
+  }
+  :root[data-theme="dark"] .badge-aging { background: #4a3315; color: #ffb866; }
+
+  .hist-btn {
+    background: none; color: var(--muted); font-size: 16px; font-weight: 700;
+    padding: 4px 8px; border-radius: 999px; line-height: 1;
+  }
+  .hist-btn:hover { background: var(--border); color: var(--text); }
+
+  .bulk-bar {
+    display: none; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 8px 14px; background: color-mix(in srgb, var(--gold) 12%, transparent);
+    border-bottom: 1px solid var(--border); font-size: 12.5px;
+  }
+  .bulk-bar.active { display: flex; }
+  .bulk-bar .bulk-count { font-weight: 700; margin-right: 4px; }
+  .bulk-bar button { font-size: 11.5px; padding: 6px 12px; }
+
+  .history-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 60;
+    display: flex; align-items: center; justify-content: center; padding: 20px;
+  }
+  .history-modal {
+    background: var(--card); border-radius: 14px; max-width: 480px; width: 100%;
+    max-height: 70vh; display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  }
+  .history-modal-head {
+    display: flex; align-items: center; gap: 10px; padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .history-modal-body { padding: 10px 18px; overflow-y: auto; }
+  .history-row { padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 12.5px; }
+  .history-row:last-child { border-bottom: none; }
+  .history-row .when { color: var(--muted); font-size: 11px; }
+
+  /* Mobile - below this width, each row becomes a stacked card instead of
+     a table row (a wide table just forces sideways scrolling on a phone,
+     which is exactly what you don't want checking a BL at the port). */
+  @media (max-width: 700px) {
+    table, thead, tbody, th, td, tr { display: block; width: 100% !important; min-width: 0 !important; }
+    thead { display: none; }
+    tbody tr {
+      border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; padding: 8px 10px;
+    }
+    tbody tr td { border-bottom: none; padding: 7px 2px; }
+    tbody tr td[data-label]::before {
+      content: attr(data-label); display: block; font-size: 10px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 3px;
+    }
+    .select-col { display: flex; justify-content: flex-end; }
+    .tag-fields { flex-direction: column; }
+    /* Group headers pack a name, ETA, counts and three buttons into one
+       row - fine on a desktop width, but forced onto one line on a phone
+       it pushes the page wider than the screen. Let them wrap instead. */
+    .port-header, .vessel-header { flex-wrap: wrap; row-gap: 6px; }
+    .group-export { margin-left: 0; }
+    .group-remove:last-of-type { margin-left: auto; }
+    .row { flex-wrap: wrap; }
   }
 
   .checkwrap { display: flex; flex-direction: column; gap: 3px; align-items: flex-start; min-height: 34px; justify-content: center; max-width: 100%; }
@@ -4260,14 +4561,35 @@ PAGE_HTML = """
     <div class="row" style="margin-bottom:14px; flex-wrap:wrap;">
       <input type="text" id="searchBox" placeholder="Search BL number..." oninput="render()" style="flex:1; min-width:180px;">
       <select id="jumpSelect" onchange="jumpToVessel(this.value)" style="min-width:200px;"><option value="">Jump to a vessel...</option></select>
+      {% if role == 'admin' %}
+      <select id="agentFilter" onchange="render()" style="min-width:140px;"><option value="">All agents</option></select>
+      {% endif %}
       <button type="button" onclick="setAllGroupsCollapsed(false)" style="background:none; color:var(--text); border:1px solid var(--border);">Expand all</button>
       <button type="button" onclick="setAllGroupsCollapsed(true)" style="background:none; color:var(--text); border:1px solid var(--border);">Collapse all</button>
+      <a href="/api/export" style="background:none; color:var(--text); border:1px solid var(--border); border-radius:999px; padding:10px 18px; font-size:13px; font-weight:600; text-decoration:none;">Export all</a>
       <button type="button" id="clearAllBtn" onclick="clearAllRecords()" style="background:none; color:var(--danger); border:1px solid var(--border);">Clear board</button>
     </div>
     <div id="groups"></div>
   </div>
 
+  <div class="card" id="archivedCard" style="display:none;">
+    <div class="row" style="margin-bottom:14px; cursor:pointer;" onclick="archivedSectionOpen = !archivedSectionOpen; render();">
+      <b style="flex:1;">Archived vessels</b>
+      <span class="group-count" id="archivedCount"></span>
+    </div>
+    <div id="archivedGroups"></div>
+  </div>
+
   <div id="toastHost"></div>
+  <div id="historyOverlay" class="history-overlay" style="display:none;" onclick="if(event.target===this) closeHistory()">
+    <div class="history-modal">
+      <div class="history-modal-head">
+        <b id="historyTitle"></b>
+        <button type="button" onclick="closeHistory()" style="background:none; color:var(--text); padding:4px 10px;">&times;</button>
+      </div>
+      <div id="historyBody" class="history-modal-body"></div>
+    </div>
+  </div>
 
 <script>
 /* ---------- Theme (light/dark, sun/moon toggle) ---------- */
@@ -4291,6 +4613,7 @@ let records = [];
 let suppressPollUntil = 0;
 let editingCount = 0;
 let collapsedGroups = {};
+let archivedSectionOpen = false;
 
 function markEditing(delta) {
   editingCount = Math.max(0, editingCount + delta);
@@ -4494,6 +4817,19 @@ async function uploadExcel() {
 
   await fetchRecords();
   showToast(data.added + ' new BL record(s) added' + (data.skipped ? `, ${data.skipped} already on the board (skipped)` : '') + '.');
+
+  // A BL that's already on the board under a DIFFERENT vessel than the one
+  // just uploaded is worth a second look - either this file re-lists a BL
+  // that's really a different shipment (a shipper reusing a number), or a
+  // genuine mistake. Either way, silently skipping it like an ordinary
+  // repeat-upload duplicate would hide it.
+  if (data.duplicate_elsewhere && data.duplicate_elsewhere.length) {
+    const lines = data.duplicate_elsewhere.slice(0, 5).map(d =>
+      `${d.bl_number} (already under ${d.existing_vessel || 'Unassigned'} / ${d.existing_port || 'Unassigned'})`
+    ).join('; ');
+    const more = data.duplicate_elsewhere.length > 5 ? ` and ${data.duplicate_elsewhere.length - 5} more` : '';
+    showToast(`Heads up - ${data.duplicate_elsewhere.length} BL(s) already exist under a different vessel: ${lines}${more}.`, {duration: 9000});
+  }
 }
 
 function nowLabel() {
@@ -4597,6 +4933,49 @@ function onRemarksInput(bl, value) {
       body: JSON.stringify({remarks: value})
     });
   }, 500);
+}
+
+/* ---------- Per-BL history ---------- */
+const AUDIT_ACTION_LABELS = {
+  added: 'Added to board', deleted: 'Removed', restored: 'Restored',
+  toggle: 'status changed', remarks: 'Remarks edited',
+};
+
+function historyFieldLabel(field) {
+  return {invoice_issued: 'Invoice Issued', approval_received: 'Approval Received', do_issued: 'DO Issued', remarks: 'Remarks'}[field] || field;
+}
+
+async function showHistory(bl) {
+  const overlay = document.getElementById('historyOverlay');
+  const body = document.getElementById('historyBody');
+  document.getElementById('historyTitle').textContent = 'History - ' + bl;
+  body.innerHTML = '<div style="color:var(--muted); padding:10px 0;">Loading...</div>';
+  overlay.style.display = 'flex';
+
+  const res = await fetch(`/api/records/${encodeURIComponent(bl)}/history`);
+  if (!res.ok) { body.innerHTML = '<div style="color:var(--muted); padding:10px 0;">Could not load history.</div>'; return; }
+  const entries = await res.json();
+  if (!entries.length) {
+    body.innerHTML = '<div style="color:var(--muted); padding:10px 0;">No history recorded yet.</div>';
+    return;
+  }
+  body.innerHTML = entries.map(e => {
+    let line;
+    if (e.action === 'toggle') {
+      line = `<b>${e.by_user || 'Unknown'}</b> set ${historyFieldLabel(e.field)} to ${e.new_value ? 'Yes' : 'No'}`;
+    } else if (e.action === 'remarks') {
+      line = `<b>${e.by_user || 'Unknown'}</b> edited remarks${e.new_value ? ': "' + e.new_value + '"' : ' (cleared)'}`;
+    } else if (e.action === 'added') {
+      line = `<b>${e.by_user || 'Unknown'}</b> added this BL${e.new_value ? ' (' + e.new_value + ')' : ''}`;
+    } else {
+      line = `<b>${e.by_user || 'Unknown'}</b> ${AUDIT_ACTION_LABELS[e.action] || e.action}`;
+    }
+    return `<div class="history-row"><div>${line}</div><div class="when">${formatLocalTime(e.at)}</div></div>`;
+  }).join('');
+}
+
+function closeHistory() {
+  document.getElementById('historyOverlay').style.display = 'none';
 }
 
 function deleteRecord(bl) {
@@ -4706,6 +5085,28 @@ function checkbox(bl, field, checked, by, at) {
     </div>`;
 }
 
+/* ---------- Aging / overdue badge ----------
+   A BL that's sat with nothing ticked for too long is easy to lose track
+   of on a board with hundreds of entries - a small badge surfaces it
+   without needing a separate report. Threshold is in days; change this
+   one constant to tune it. */
+const AGING_DAYS_THRESHOLD = 7;
+
+function daysOpen(createdAt) {
+  if (!createdAt) return null;
+  const iso = createdAt.includes('T') ? createdAt : createdAt.replace(' ', 'T') + ':00Z';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return null;
+  return Math.floor((Date.now() - d.getTime()) / 86400000);
+}
+
+function agingBadgeHtml(r, complete) {
+  if (complete) return '';
+  const days = daysOpen(r.created_at);
+  if (days === null || days < AGING_DAYS_THRESHOLD) return '';
+  return `<span class="badge-aging" title="No movement in ${days} days">&#9888; ${days}d</span>`;
+}
+
 function summaryHtml() {
   const total = records.length;
   const invoicePending = records.filter(r => !r.invoice_issued).length;
@@ -4735,39 +5136,102 @@ function summaryHtml() {
 
 const CHEVRON = '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
 
+let selectedBLs = new Set();
+
 function rowsHtml(list) {
   return list.map(r => {
     const complete = !!(r.invoice_issued && r.approval_received && r.do_issued);
     return `
     <tr id="row_${cssEscape(r.bl_number)}">
+      <td class="select-col"><input type="checkbox" class="row-select" ${selectedBLs.has(r.bl_number) ? 'checked' : ''}
+            onchange="toggleRowSelect('${r.bl_number}', this.checked)"></td>
       <td>
         <div class="bl-cell">
           <b>${r.bl_number}</b>
           ${complete ? '<span class="badge-complete">&check; Complete</span>' : ''}
+          ${agingBadgeHtml(r, complete)}
         </div>
       </td>
-      <td>${checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at)}</td>
-      <td>${checkbox(r.bl_number, 'approval_received', !!r.approval_received, r.approval_by, r.approval_at)}</td>
-      <td>${checkbox(r.bl_number, 'do_issued', !!r.do_issued, r.do_by, r.do_at)}</td>
-      <td><input class="remarks-input" type="text" value="${(r.remarks || '').replace(/"/g,'&quot;')}"
+      <td data-label="Invoice Issued">${checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at)}</td>
+      <td data-label="Approval Received">${checkbox(r.bl_number, 'approval_received', !!r.approval_received, r.approval_by, r.approval_at)}</td>
+      <td data-label="DO Issued">${checkbox(r.bl_number, 'do_issued', !!r.do_issued, r.do_by, r.do_at)}</td>
+      <td data-label="Remarks"><input class="remarks-input" type="text" value="${(r.remarks || '').replace(/"/g,'&quot;')}"
             oninput="onRemarksInput('${r.bl_number}', this.value)"
             onfocus="markEditing(1)" onblur="markEditing(-1)" placeholder="notes..."></td>
+      <td><button type="button" class="hist-btn" title="History" onclick="showHistory('${r.bl_number}')">&#8942;</button></td>
       <td><button class="del" onclick="deleteRecord('${r.bl_number}')">Remove</button></td>
     </tr>`;
   }).join('');
 }
 
-function tableHtml(list) {
+function toggleRowSelect(bl, checked) {
+  if (checked) selectedBLs.add(bl); else selectedBLs.delete(bl);
+  updateBulkBars();
+}
+
+function updateBulkBars() {
+  document.querySelectorAll('.bulk-bar').forEach(bar => {
+    const scope = (bar.dataset.bls || '').split('|').filter(Boolean);
+    const count = scope.filter(bl => selectedBLs.has(bl)).length;
+    const label = bar.querySelector('.bulk-count');
+    if (label) label.textContent = count ? `${count} selected` : '';
+    bar.classList.toggle('active', count > 0);
+  });
+}
+
+async function bulkSetField(vesselKey, field, value) {
+  const listEl = document.querySelector(`[data-bar-key="${CSS.escape(vesselKey)}"]`);
+  const scope = listEl ? (listEl.dataset.bls || '').split('|').filter(Boolean) : [];
+  const blNumbers = scope.filter(bl => selectedBLs.has(bl));
+  if (!blNumbers.length) { showToast('Select at least one BL first.'); return; }
+
+  blNumbers.forEach(bl => {
+    const rec = records.find(r => r.bl_number === bl);
+    if (rec) {
+      rec[field] = value ? 1 : 0;
+      const byField = field.replace('_issued', '_by').replace('_received', '_by');
+      const atField = field.replace('_issued', '_at').replace('_received', '_at');
+      rec[byField] = value ? CURRENT_USER : '';
+      rec[atField] = value ? nowLabel() : '';
+    }
+  });
+  suppressPollUntil = Date.now() + 2000;
+  render();
+
+  await fetch('/api/records/bulk-toggle', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({bl_numbers: blNumbers, field, value})
+  });
+  showToast(`${blNumbers.length} BL(s) updated.`);
+  await fetchRecords();
+}
+
+function bulkBarHtml(vesselKey, list) {
+  const key = vesselKey.replace(/"/g, '&quot;');
+  const blsAttr = list.map(r => r.bl_number).join('|');
   return `
+    <div class="bulk-bar" data-bar-key="${key}" data-bls="${blsAttr}">
+      <span class="bulk-count"></span>
+      <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'invoice_issued', true)">Mark Invoice Issued</button>
+      <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'approval_received', true)">Mark Approval Received</button>
+      <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'do_issued', true)">Mark DO Issued</button>
+    </div>`;
+}
+
+function tableHtml(list, vesselKey) {
+  return `
+    ${bulkBarHtml(vesselKey, list)}
     <div class="overflow">
       <table>
         <thead>
           <tr>
+            <th class="select-col"><input type="checkbox" title="Select all in this vessel" onchange="list_selectAllVessel('${vesselKey.replace(/'/g,"\\'")}', this.checked)"></th>
             <th>BL Number</th>
             <th>Invoice Issued</th>
             <th>Approval Received</th>
             <th>DO Issued</th>
             <th>Remarks</th>
+            <th></th>
             <th></th>
           </tr>
         </thead>
@@ -4776,115 +5240,210 @@ function tableHtml(list) {
     </div>`;
 }
 
-function render() {
-  const q = document.getElementById('searchBox').value.trim().toLowerCase();
-  const filtered = records.filter(r => r.bl_number.toLowerCase().includes(q));
+function list_selectAllVessel(vesselKey, checked) {
+  const bar = document.querySelector(`[data-bar-key="${CSS.escape(vesselKey)}"]`);
+  const bls = bar ? (bar.dataset.bls || '').split('|').filter(Boolean) : [];
+  bls.forEach(bl => { if (checked) selectedBLs.add(bl); else selectedBLs.delete(bl); });
+  render();
+}
 
-  // Group by Port, then by Vessel within each port.
+function groupRecordsByPortVessel(list) {
   const ports = {};
-  filtered.forEach(r => {
+  list.forEach(r => {
     const port = r.port || 'Unassigned';
     const vessel = r.vessel || 'Unassigned';
     if (!ports[port]) ports[port] = {};
     if (!ports[port][vessel]) ports[port][vessel] = [];
     ports[port][vessel].push(r);
   });
+  return ports;
+}
 
-  const portNames = Object.keys(ports).sort((a, b) => {
+function sortedPortNames(ports) {
+  return Object.keys(ports).sort((a, b) => {
     if (a === 'Unassigned') return 1;
     if (b === 'Unassigned') return -1;
     return naturalCompare(a, b);
   });
+}
+
+function sortedVesselNames(vessels) {
+  // A vessel with an ETA set sorts soonest-first (the next ship in is the
+  // one you'd actually work first); vessels with no ETA fall after,
+  // alphabetically.
+  return Object.keys(vessels).sort((a, b) => {
+    if (a === 'Unassigned') return 1;
+    if (b === 'Unassigned') return -1;
+    const etaA = (vessels[a][0] && vessels[a][0].eta) || '';
+    const etaB = (vessels[b][0] && vessels[b][0].eta) || '';
+    if (etaA && etaB && etaA !== etaB) return etaA < etaB ? -1 : 1;
+    if (etaA && !etaB) return -1;
+    if (!etaA && etaB) return 1;
+    return naturalCompare(a, b);
+  });
+}
+
+function vesselGroupHtml(portName, vesselName, list, archivedView) {
+  const vesselKey = 'vessel:' + portName + ':' + vesselName;
+  const collapseKey = archivedView ? vesselKey + ':archived' : vesselKey;
+  const sortedList = list.slice().sort((a, b) => naturalCompare(a.bl_number, b.bl_number));
+  const left = sortedList.filter(r => !(r.invoice_issued && r.approval_received && r.do_issued)).length;
+  const vesselCollapsed = collapseKey in collapsedGroups ? !!collapsedGroups[collapseKey] : (archivedView ? true : left === 0);
+  const eta = (sortedList[0] && sortedList[0].eta) || '';
+  const rawPort = (sortedList[0] && sortedList[0].port) || '';
+  const rawVessel = (sortedList[0] && sortedList[0].vessel) || '';
+  const blList = sortedList.map(r => r.bl_number);
+  const pEsc = portName.replace(/'/g, "\\'");
+  const vEsc = vesselName.replace(/'/g, "\\'");
+  const blsJson = JSON.stringify(blList).replace(/'/g, "&#39;");
+  return `
+    <div class="vessel-group" id="group_${cssEscape(vesselKey)}">
+      <div class="vessel-header ${vesselCollapsed ? 'collapsed' : ''}" onclick="if(event.target.tagName!=='INPUT' && event.target.tagName!=='BUTTON' && event.target.tagName!=='A') toggleGroup('${collapseKey.replace(/'/g,"\\'")}')">
+        ${CHEVRON}
+        <input class="group-name" value="${vesselName === 'Unassigned' ? '' : vesselName}" placeholder="Unassigned vessel"
+          onclick="event.stopPropagation()"
+          onchange="renameGroup('vessel', '${pEsc}', '${vEsc}', this.value, 'Unassigned')">
+        ${archivedView ? '' : `<input type="date" class="eta-input" value="${eta}" title="Expected arrival"
+          onclick="event.stopPropagation()" onchange="setVesselEta(JSON.parse(this.dataset.bls), this.value)" data-bls='${blsJson}'>`}
+        <span class="group-count">${sortedList.length} BL${sortedList.length === 1 ? '' : 's'}${left ? ` &middot; ${left} left` : ' &middot; done'}</span>
+        <a onclick="event.stopPropagation()" href="/api/export?port=${encodeURIComponent(rawPort)}&vessel=${encodeURIComponent(rawVessel)}" class="group-export" title="Export this vessel to Excel">Export</a>
+        <button type="button" class="group-remove" onclick='event.stopPropagation(); setVesselArchived(${blsJson}, ${archivedView ? 'false' : 'true'})'>${archivedView ? 'Unarchive' : 'Archive'}</button>
+        <button type="button" class="group-remove" onclick="event.stopPropagation(); removeVesselGroup('${pEsc}', '${vEsc}')">Remove all</button>
+      </div>
+      <div class="vessel-body ${vesselCollapsed ? 'collapsed' : ''}">
+        ${tableHtml(sortedList, vesselKey)}
+      </div>
+    </div>`;
+}
+
+function portGroupHtml(portName, vesselNames, vessels, archivedView) {
+  const portKey = archivedView ? 'port:' + portName + ':archived' : 'port:' + portName;
+  const portTotal = vesselNames.reduce((sum, v) => sum + vessels[v].length, 0);
+  const portLeft = vesselNames.reduce((sum, v) => sum + vessels[v].filter(r => !(r.invoice_issued && r.approval_received && r.do_issued)).length, 0);
+  // Default state (only applies the first time a group is seen - once a
+  // person manually expands/collapses it, collapsedGroups remembers their
+  // choice and this default is never forced back on them): a port group
+  // with nothing left to do starts collapsed, so a long board folds down
+  // to just the groups that still need work. Archived ports always start
+  // collapsed - that section is for reference, not day-to-day work.
+  const portCollapsed = portKey in collapsedGroups ? !!collapsedGroups[portKey] : (archivedView ? true : (portTotal > 0 && portLeft === 0));
+  const rawPort = (vessels[vesselNames[0]] && vessels[vesselNames[0]][0] && vessels[vesselNames[0]][0].port) || '';
+  const vesselsHtml = vesselNames.map(vesselName => vesselGroupHtml(portName, vesselName, vessels[vesselName], archivedView)).join('');
+  const pEsc = portName.replace(/'/g, "\\'");
+  return `
+    <div class="port-group">
+      <div class="port-header ${portCollapsed ? 'collapsed' : ''}" onclick="if(event.target.tagName!=='INPUT' && event.target.tagName!=='A') toggleGroup('${portKey.replace(/'/g,"\\'")}')">
+        ${CHEVRON}
+        <input class="group-name" value="${portName === 'Unassigned' ? '' : portName}" placeholder="Unassigned port"
+          onclick="event.stopPropagation()"
+          onchange="renameGroup('port', '${pEsc}', '', this.value, 'Unassigned')">
+        <span class="group-count">${portTotal} BL${portTotal === 1 ? '' : 's'}${portLeft ? ` &middot; ${portLeft} left` : ' &middot; done'}</span>
+        <a onclick="event.stopPropagation()" href="/api/export?port=${encodeURIComponent(rawPort)}" class="group-export" title="Export this port to Excel">Export</a>
+        ${archivedView ? '' : `<button type="button" class="group-remove" onclick="event.stopPropagation(); removePortGroup('${pEsc}')">Remove all</button>`}
+      </div>
+      <div class="port-body ${portCollapsed ? 'collapsed' : ''}">${vesselsHtml}</div>
+    </div>`;
+}
+
+function render() {
+  const q = document.getElementById('searchBox').value.trim().toLowerCase();
+  const agentFilterEl = document.getElementById('agentFilter');
+  if (agentFilterEl) {
+    const agents = [...new Set(records.map(r => r.created_by).filter(Boolean))].sort();
+    const current = agentFilterEl.value;
+    agentFilterEl.innerHTML = '<option value="">All agents</option>' + agents.map(a => `<option value="${a.replace(/"/g,'&quot;')}">${a}</option>`).join('');
+    if (agents.includes(current)) agentFilterEl.value = current;
+  }
+  const agentFilter = agentFilterEl ? agentFilterEl.value : '';
+
+  const base = records.filter(r => r.bl_number.toLowerCase().includes(q) && (!agentFilter || r.created_by === agentFilter));
+  const activeList = base.filter(r => !r.archived);
+  const archivedList = base.filter(r => !!r.archived);
+
+  const ports = groupRecordsByPortVessel(activeList);
+  const portNames = sortedPortNames(ports);
 
   const groupsEl = document.getElementById('groups');
   if (portNames.length === 0) {
     groupsEl.innerHTML = '<div style="color:var(--muted); padding:24px 4px;">No BLs on the board yet. Upload an Excel manifest above to get started.</div>';
-    updateSummaryOnly();
-    return;
-  }
-
-  // Vessel/port jump menu - with 20-25 manifests a month, scrolling down
-  // the whole board to find one vessel doesn't scale. Built fresh every
-  // render so it always reflects what's actually on the board right now.
-  const jumpEl = document.getElementById('jumpSelect');
-  if (jumpEl) {
-    const current = jumpEl.value;
-    let options = '<option value="">Jump to a vessel...</option>';
-    portNames.forEach(portName => {
-      const vessels = ports[portName];
-      Object.keys(vessels).sort((a, b) => {
-        if (a === 'Unassigned') return 1;
-        if (b === 'Unassigned') return -1;
-        return naturalCompare(a, b);
-      }).forEach(vesselName => {
-        const list = vessels[vesselName];
-        const left = list.filter(r => !(r.invoice_issued && r.approval_received && r.do_issued)).length;
-        const key = 'vessel:' + portName + ':' + vesselName;
-        const label = `${vesselName} - ${portName} (${list.length} BL${list.length === 1 ? '' : 's'}${left ? ', ' + left + ' left' : ', done'})`;
-        options += `<option value="${key.replace(/"/g, '&quot;')}">${label}</option>`;
+  } else {
+    // Vessel/port jump menu - with 20-25 manifests a month, scrolling down
+    // the whole board to find one vessel doesn't scale. Built fresh every
+    // render so it always reflects what's actually on the board right now.
+    const jumpEl = document.getElementById('jumpSelect');
+    if (jumpEl) {
+      const current = jumpEl.value;
+      let options = '<option value="">Jump to a vessel...</option>';
+      portNames.forEach(portName => {
+        const vessels = ports[portName];
+        sortedVesselNames(vessels).forEach(vesselName => {
+          const list = vessels[vesselName];
+          const left = list.filter(r => !(r.invoice_issued && r.approval_received && r.do_issued)).length;
+          const key = 'vessel:' + portName + ':' + vesselName;
+          const label = `${vesselName} - ${portName} (${list.length} BL${list.length === 1 ? '' : 's'}${left ? ', ' + left + ' left' : ', done'})`;
+          options += `<option value="${key.replace(/"/g, '&quot;')}">${label}</option>`;
+        });
       });
-    });
-    jumpEl.innerHTML = options;
-    if ([...jumpEl.options].some(o => o.value === current)) jumpEl.value = current;
+      jumpEl.innerHTML = options;
+      if ([...jumpEl.options].some(o => o.value === current)) jumpEl.value = current;
+    }
+
+    groupsEl.innerHTML = portNames.map(portName => {
+      const vessels = ports[portName];
+      return portGroupHtml(portName, sortedVesselNames(vessels), vessels, false);
+    }).join('');
   }
 
-  groupsEl.innerHTML = portNames.map(portName => {
-    const portKey = 'port:' + portName;
-    const vessels = ports[portName];
-    const vesselNames = Object.keys(vessels).sort((a, b) => {
-      if (a === 'Unassigned') return 1;
-      if (b === 'Unassigned') return -1;
-      return naturalCompare(a, b);
-    });
-    const portTotal = vesselNames.reduce((sum, v) => sum + vessels[v].length, 0);
-    const portLeft = vesselNames.reduce((sum, v) => sum + vessels[v].filter(r => !(r.invoice_issued && r.approval_received && r.do_issued)).length, 0);
-    // Default state (only applies the first time a group is seen - once a
-    // person manually expands/collapses it, collapsedGroups remembers
-    // their choice and this default is never forced back on them): a
-    // port/vessel group with nothing left to do starts collapsed, so a
-    // long board folds down to just the groups that still need work
-    // instead of everything piled up needing a scroll through finished
-    // ones to reach the next open item.
-    const portCollapsed = portKey in collapsedGroups ? !!collapsedGroups[portKey] : (portTotal > 0 && portLeft === 0);
-
-    const vesselsHtml = vesselNames.map(vesselName => {
-      const vesselKey = 'vessel:' + portName + ':' + vesselName;
-      const list = vessels[vesselName]
-        .slice()
-        .sort((a, b) => naturalCompare(a.bl_number, b.bl_number));
-      const left = list.filter(r => !(r.invoice_issued && r.approval_received && r.do_issued)).length;
-      const vesselCollapsed = vesselKey in collapsedGroups ? !!collapsedGroups[vesselKey] : (left === 0);
-      return `
-        <div class="vessel-group" id="group_${cssEscape(vesselKey)}">
-          <div class="vessel-header ${vesselCollapsed ? 'collapsed' : ''}" onclick="if(event.target.tagName!=='INPUT') toggleGroup('${vesselKey.replace(/'/g,"\\'")}')">
-            ${CHEVRON}
-            <input class="group-name" value="${vesselName === 'Unassigned' ? '' : vesselName}" placeholder="Unassigned vessel"
-              onclick="event.stopPropagation()"
-              onchange="renameGroup('vessel', '${portName.replace(/'/g,"\\'")}', '${vesselName.replace(/'/g,"\\'")}', this.value, 'Unassigned')">
-            <span class="group-count">${list.length} BL${list.length === 1 ? '' : 's'}${left ? ` &middot; ${left} left` : ' &middot; done'}</span>
-            <button type="button" class="group-remove" onclick="event.stopPropagation(); removeVesselGroup('${portName.replace(/'/g,"\\'")}', '${vesselName.replace(/'/g,"\\'")}')">Remove all</button>
-          </div>
-          <div class="vessel-body ${vesselCollapsed ? 'collapsed' : ''}">
-            ${tableHtml(list)}
-          </div>
-        </div>`;
-    }).join('');
-
-    return `
-      <div class="port-group">
-        <div class="port-header ${portCollapsed ? 'collapsed' : ''}" onclick="if(event.target.tagName!=='INPUT') toggleGroup('${portKey.replace(/'/g,"\\'")}')">
-          ${CHEVRON}
-          <input class="group-name" value="${portName === 'Unassigned' ? '' : portName}" placeholder="Unassigned port"
-            onclick="event.stopPropagation()"
-            onchange="renameGroup('port', '${portName.replace(/'/g,"\\'")}', '', this.value, 'Unassigned')">
-          <span class="group-count">${portTotal} BL${portTotal === 1 ? '' : 's'}${portLeft ? ` &middot; ${portLeft} left` : ' &middot; done'}</span>
-          <button type="button" class="group-remove" onclick="event.stopPropagation(); removePortGroup('${portName.replace(/'/g,"\\'")}')">Remove all</button>
-        </div>
-        <div class="port-body ${portCollapsed ? 'collapsed' : ''}">${vesselsHtml}</div>
-      </div>`;
-  }).join('');
+  const archivedCard = document.getElementById('archivedCard');
+  if (archivedCard) {
+    if (archivedList.length === 0) {
+      archivedCard.style.display = 'none';
+    } else {
+      archivedCard.style.display = '';
+      document.getElementById('archivedCount').textContent = archivedList.length + ' BL' + (archivedList.length === 1 ? '' : 's');
+      const archivedGroupsEl = document.getElementById('archivedGroups');
+      archivedGroupsEl.style.display = archivedSectionOpen ? '' : 'none';
+      if (archivedSectionOpen) {
+        const archivedPorts = groupRecordsByPortVessel(archivedList);
+        archivedGroupsEl.innerHTML = sortedPortNames(archivedPorts).map(portName => {
+          const vessels = archivedPorts[portName];
+          return portGroupHtml(portName, sortedVesselNames(vessels), vessels, true);
+        }).join('');
+      }
+    }
+  }
 
   updateSummaryOnly();
+  updateBulkBars();
+}
+
+async function setVesselEta(blNumbers, eta) {
+  blNumbers.forEach(bl => {
+    const rec = records.find(r => r.bl_number === bl);
+    if (rec) rec.eta = eta;
+  });
+  suppressPollUntil = Date.now() + 1500;
+  render();
+  await fetch('/api/vessel/eta', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({bl_numbers: blNumbers, eta})
+  });
+  await fetchRecords();
+}
+
+async function setVesselArchived(blNumbers, archived) {
+  blNumbers.forEach(bl => {
+    const rec = records.find(r => r.bl_number === bl);
+    if (rec) rec.archived = archived ? 1 : 0;
+  });
+  suppressPollUntil = Date.now() + 1500;
+  render();
+  await fetch('/api/vessel/archive', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({bl_numbers: blNumbers, archived})
+  });
+  showToast(archived ? 'Vessel archived - find it under "Archived vessels" below.' : 'Vessel restored to the board.');
+  await fetchRecords();
 }
 
 function jumpToVessel(key) {
