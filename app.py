@@ -4252,31 +4252,31 @@ PAGE_HTML = """
     position: relative; display: inline-block; width: 100%;
     border-radius: 10px;
     overflow: hidden;
-    border: 1.5px solid color-mix(in srgb, var(--navy-light) 48%, transparent);
+    border: 1.5px solid color-mix(in srgb, var(--navy-light) 70%, transparent);
     background:
-      linear-gradient(165deg, rgba(255,255,255,0.92) 0%, rgba(255,255,255,0.30) 38%, rgba(255,255,255,0.68) 100%),
-      linear-gradient(135deg, color-mix(in srgb, var(--navy-light) 26%, transparent), color-mix(in srgb, var(--gold) 16%, transparent) 75%);
+      linear-gradient(160deg, color-mix(in srgb, #ffffff 65%, var(--navy-light) 10%) 0%, color-mix(in srgb, var(--navy-light) 22%, white) 55%, color-mix(in srgb, #ffffff 70%, var(--navy-light) 14%) 100%);
     backdrop-filter: blur(14px) saturate(200%);
     -webkit-backdrop-filter: blur(14px) saturate(200%);
     box-shadow:
-      0 14px 30px -8px color-mix(in srgb, var(--navy) 50%, transparent),
-      0 3px 8px rgba(18,58,86,0.18),
-      inset 0 1.5px 0 rgba(255,255,255,1),
-      inset 0 -1.5px 0 color-mix(in srgb, var(--navy) 16%, transparent);
+      0 10px 22px -6px color-mix(in srgb, var(--navy) 42%, transparent),
+      0 2px 6px color-mix(in srgb, var(--navy) 22%, transparent),
+      inset 0 1.5px 0 rgba(255,255,255,0.95),
+      inset 0 -1.5px 0 color-mix(in srgb, var(--navy) 22%, transparent);
     transition: border-color .15s ease, background .15s ease, box-shadow .15s ease, transform .15s ease;
   }
   .glass-select-wrap::before {
     content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
-    background: linear-gradient(115deg, rgba(255,255,255,0.85) 0%, rgba(255,255,255,0) 24%, rgba(255,255,255,0) 64%, rgba(255,255,255,0.45) 100%);
+    background: linear-gradient(115deg, rgba(255,255,255,0.9) 0%, rgba(255,255,255,0.05) 30%, rgba(255,255,255,0.05) 60%, rgba(255,255,255,0.6) 100%);
+    mix-blend-mode: overlay;
   }
   .glass-select-wrap:hover {
-    border-color: color-mix(in srgb, var(--navy-light) 65%, transparent);
+    border-color: color-mix(in srgb, var(--navy-light) 85%, transparent);
     transform: translateY(-1px);
     box-shadow:
-      0 18px 34px -8px color-mix(in srgb, var(--navy) 58%, transparent),
-      0 4px 10px rgba(18,58,86,0.2),
-      inset 0 1.5px 0 rgba(255,255,255,1),
-      inset 0 -1.5px 0 color-mix(in srgb, var(--navy) 18%, transparent);
+      0 14px 26px -6px color-mix(in srgb, var(--navy) 50%, transparent),
+      0 3px 8px color-mix(in srgb, var(--navy) 26%, transparent),
+      inset 0 1.5px 0 rgba(255,255,255,0.95),
+      inset 0 -1.5px 0 color-mix(in srgb, var(--navy) 24%, transparent);
   }
   .glass-select-wrap:focus-within {
     border-color: var(--navy-light);
@@ -4327,6 +4327,67 @@ PAGE_HTML = """
     background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2393a1b1' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6 9l6 6 6-6'/></svg>");
   }
   select.nice-select option { background: var(--card); color: var(--text); }
+
+  /* ---------- Custom glass dropdown (replaces the native <select> popup,
+     which cannot be styled in any browser) for portField/jumpSelect/
+     operatorFilter. The real <select> stays in the DOM (visually hidden)
+     so all existing .value reads/writes and onchange handlers keep
+     working unchanged - see initGlassSelects() in the script below. ---------- */
+  select.nice-select.cs-native-hidden {
+    opacity: 0; pointer-events: none;
+  }
+  .cs-trigger {
+    position: absolute; inset: 0; z-index: 1;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 10px 12px; font-size: 14px; font-family: inherit;
+    color: var(--text); cursor: pointer; user-select: none; outline: none;
+  }
+  .cs-trigger-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cs-trigger .cs-chevron {
+    width: 14px; height: 14px; flex-shrink: 0; color: #7a8794;
+    transition: transform .15s ease;
+  }
+  .cs-trigger.cs-open .cs-chevron { transform: rotate(180deg); }
+  :root[data-theme="dark"] .cs-trigger .cs-chevron { color: #93a1b1; }
+  .cs-panel {
+    position: fixed; z-index: 3000; min-width: 160px;
+    border-radius: 12px;
+    border: 1.5px solid color-mix(in srgb, var(--navy-light) 70%, transparent);
+    background:
+      linear-gradient(160deg, color-mix(in srgb, #ffffff 90%, var(--navy-light) 6%) 0%, color-mix(in srgb, var(--navy-light) 14%, white) 60%, color-mix(in srgb, #ffffff 92%, var(--navy-light) 8%) 100%);
+    backdrop-filter: blur(18px) saturate(200%);
+    -webkit-backdrop-filter: blur(18px) saturate(200%);
+    box-shadow:
+      0 18px 40px -10px color-mix(in srgb, var(--navy) 45%, transparent),
+      0 4px 14px color-mix(in srgb, var(--navy) 25%, transparent),
+      inset 0 1.5px 0 rgba(255,255,255,0.9);
+    padding: 6px; max-height: 280px; overflow-y: auto;
+    display: none;
+    scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--navy-light) 55%, transparent) transparent;
+  }
+  .cs-panel.cs-open { display: block; }
+  .cs-panel::-webkit-scrollbar { width: 8px; }
+  .cs-panel::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--navy-light) 55%, transparent); border-radius: 8px; }
+  :root[data-theme="dark"] .cs-panel {
+    border-color: color-mix(in srgb, #ffffff 30%, transparent);
+    background:
+      linear-gradient(165deg, rgba(255,255,255,0.16) 0%, rgba(255,255,255,0.02) 40%, rgba(255,255,255,0.09) 100%),
+      linear-gradient(135deg, color-mix(in srgb, var(--navy-light) 38%, var(--card)), color-mix(in srgb, var(--card) 65%, black) 85%);
+    box-shadow:
+      0 20px 44px -8px rgba(0,0,0,0.65),
+      0 4px 14px rgba(0,0,0,0.4),
+      inset 0 1.5px 0 rgba(255,255,255,0.2);
+  }
+  .cs-option {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 9px 10px; border-radius: 8px; font-size: 14px; color: var(--text);
+    cursor: pointer;
+  }
+  .cs-option:hover, .cs-option.cs-highlight { background: color-mix(in srgb, var(--navy-light) 22%, transparent); }
+  :root[data-theme="dark"] .cs-option:hover, :root[data-theme="dark"] .cs-option.cs-highlight { background: rgba(255,255,255,0.12); }
+  .cs-option.cs-selected { font-weight: 600; }
+  .cs-option .cs-check { width: 14px; height: 14px; flex-shrink: 0; opacity: 0; color: var(--navy-light); }
+  .cs-option.cs-selected .cs-check { opacity: 1; }
   .tag-fields { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
   .tag-fields > div { flex: 1; min-width: 180px; }
   .tag-fields label { display: block; font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; margin-bottom: 5px; }
@@ -5441,6 +5502,7 @@ function render() {
     const current = operatorFilterEl.value;
     operatorFilterEl.innerHTML = '<option value="">All operators</option>' + operators.map(a => `<option value="${a.replace(/"/g,'&quot;')}">${a}</option>`).join('');
     if (operators.includes(current)) operatorFilterEl.value = current;
+    syncGlassSelectLabel('operatorFilter');
   }
   const operatorFilter = operatorFilterEl ? operatorFilterEl.value : '';
 
@@ -5474,6 +5536,7 @@ function render() {
       });
       jumpEl.innerHTML = options;
       if ([...jumpEl.options].some(o => o.value === current)) jumpEl.value = current;
+      syncGlassSelectLabel('jumpSelect');
     }
 
     groupsEl.innerHTML = portNames.map(portName => {
@@ -5546,6 +5609,7 @@ function jumpToVessel(key) {
   // in a row would do nothing the second time.
   const jumpEl = document.getElementById('jumpSelect');
   if (jumpEl) jumpEl.value = '';
+  syncGlassSelectLabel('jumpSelect');
   render();
   requestAnimationFrame(() => {
     const el = document.getElementById('group_' + cssEscape(key));
@@ -5563,6 +5627,196 @@ function setAllGroupsCollapsed(collapsed) {
   });
   render();
 }
+
+/* ---------- Custom glass dropdowns ----------
+   Native <select> popups (the list that appears when you click a <select>)
+   cannot be styled with CSS in any browser - the OS/browser paints its own
+   plain popup no matter what. So for portField/jumpSelect/operatorFilter we
+   build a custom trigger+panel on top of the real <select>, which stays in
+   the DOM (just visually hidden via the cs-native-hidden class) so every
+   existing .value read/write, onchange="..." handler, and the dynamic
+   innerHTML option-rebuilding for jumpSelect/operatorFilter in render()
+   keep working completely unchanged. The custom panel's rows are rebuilt
+   from the real select's current <option> list every time it's opened, so
+   they can never go stale relative to whatever render() last put there. */
+const customSelects = {};
+
+function initGlassSelects() {
+  ['portField', 'jumpSelect', 'operatorFilter'].forEach(id => {
+    const select = document.getElementById(id);
+    if (!select || customSelects[id]) return;
+    const wrap = select.closest('.glass-select-wrap');
+    if (!wrap) return;
+
+    select.classList.add('cs-native-hidden');
+    select.setAttribute('tabindex', '-1');
+
+    const trigger = document.createElement('div');
+    trigger.className = 'cs-trigger';
+    trigger.tabIndex = 0;
+    trigger.setAttribute('role', 'button');
+    trigger.setAttribute('aria-haspopup', 'listbox');
+    trigger.setAttribute('aria-expanded', 'false');
+    trigger.innerHTML =
+      '<span class="cs-trigger-label"></span>' +
+      '<svg class="cs-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+      'stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
+    wrap.appendChild(trigger);
+
+    const panel = document.createElement('div');
+    panel.className = 'cs-panel';
+    panel.setAttribute('role', 'listbox');
+    panel.dataset.for = id;
+    document.body.appendChild(panel);
+
+    const state = { select, wrap, trigger, panel, highlight: -1, open: false };
+    customSelects[id] = state;
+
+    trigger.addEventListener('click', () => toggleGlassSelect(id));
+    trigger.addEventListener('keydown', e => onGlassTriggerKeydown(id, e));
+
+    syncGlassSelectLabel(id);
+  });
+}
+
+function syncGlassSelectLabel(id) {
+  const state = customSelects[id];
+  if (!state) return;
+  const { select, trigger } = state;
+  const opt = select.options[select.selectedIndex];
+  trigger.querySelector('.cs-trigger-label').textContent = opt ? opt.textContent : '';
+}
+
+function positionGlassPanel(id) {
+  const { wrap, panel } = customSelects[id];
+  const r = wrap.getBoundingClientRect();
+  panel.style.left = r.left + 'px';
+  panel.style.top = (r.bottom + 6) + 'px';
+  panel.style.width = Math.max(r.width, 160) + 'px';
+  // Flip above the trigger if there isn't room below (e.g. jumpSelect's
+  // panel can be long and the search row sits mid-page).
+  const estHeight = Math.min(panel.scrollHeight || 280, 280);
+  if (r.bottom + 6 + estHeight > window.innerHeight && r.top - 6 - estHeight > 0) {
+    panel.style.top = (r.top - 6 - estHeight) + 'px';
+    panel.style.transform = 'translateY(-100%)';
+  } else {
+    panel.style.transform = 'none';
+  }
+}
+
+function buildGlassPanelOptions(id) {
+  const state = customSelects[id];
+  const { select, panel } = state;
+  panel.innerHTML = '';
+  state.highlight = -1;
+  [...select.options].forEach((opt, i) => {
+    const row = document.createElement('div');
+    row.className = 'cs-option';
+    row.setAttribute('role', 'option');
+    row.dataset.value = opt.value;
+    const selected = i === select.selectedIndex;
+    row.setAttribute('aria-selected', selected ? 'true' : 'false');
+    if (selected) { row.classList.add('cs-selected'); state.highlight = i; }
+    row.innerHTML =
+      '<span class="cs-option-label"></span>' +
+      '<svg class="cs-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" ' +
+      'stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+    row.querySelector('.cs-option-label').textContent = opt.textContent;
+    row.addEventListener('mousedown', e => e.preventDefault()); // keep focus on trigger, not the row
+    row.addEventListener('click', () => chooseGlassOption(id, i));
+    row.addEventListener('mouseenter', () => setGlassHighlight(id, i));
+    panel.appendChild(row);
+  });
+}
+
+function setGlassHighlight(id, index) {
+  const { panel } = customSelects[id];
+  customSelects[id].highlight = index;
+  [...panel.children].forEach((row, i) => row.classList.toggle('cs-highlight', i === index));
+  const row = panel.children[index];
+  if (row) row.scrollIntoView({ block: 'nearest' });
+}
+
+function chooseGlassOption(id, index) {
+  const { select } = customSelects[id];
+  const opt = select.options[index];
+  if (!opt) return;
+  select.value = opt.value;
+  select.dispatchEvent(new Event('change'));
+  syncGlassSelectLabel(id);
+  closeGlassSelect(id);
+  customSelects[id].trigger.focus();
+}
+
+function openGlassSelect(id) {
+  const state = customSelects[id];
+  if (!state || state.open) return;
+  Object.keys(customSelects).forEach(other => { if (other !== id) closeGlassSelect(other); });
+  buildGlassPanelOptions(id);
+  state.panel.classList.add('cs-open');
+  positionGlassPanel(id);
+  // scrollHeight is only known once it's visible, so position once more now that it's rendered
+  positionGlassPanel(id);
+  state.trigger.classList.add('cs-open');
+  state.trigger.setAttribute('aria-expanded', 'true');
+  state.open = true;
+  if (state.highlight >= 0) setGlassHighlight(id, state.highlight);
+  document.addEventListener('mousedown', glassOutsideHandler, true);
+  window.addEventListener('scroll', glassScrollHandler, true);
+  window.addEventListener('resize', glassScrollHandler, true);
+}
+
+function closeGlassSelect(id) {
+  const state = customSelects[id];
+  if (!state || !state.open) return;
+  state.panel.classList.remove('cs-open');
+  state.trigger.classList.remove('cs-open');
+  state.trigger.setAttribute('aria-expanded', 'false');
+  state.open = false;
+  document.removeEventListener('mousedown', glassOutsideHandler, true);
+  window.removeEventListener('scroll', glassScrollHandler, true);
+  window.removeEventListener('resize', glassScrollHandler, true);
+}
+
+function toggleGlassSelect(id) {
+  if (customSelects[id] && customSelects[id].open) closeGlassSelect(id); else openGlassSelect(id);
+}
+
+function glassOutsideHandler(e) {
+  Object.keys(customSelects).forEach(id => {
+    const state = customSelects[id];
+    if (state.open && !state.trigger.contains(e.target) && !state.panel.contains(e.target)) closeGlassSelect(id);
+  });
+}
+
+function glassScrollHandler() {
+  Object.keys(customSelects).forEach(id => { if (customSelects[id].open) positionGlassPanel(id); });
+}
+
+function onGlassTriggerKeydown(id, e) {
+  const state = customSelects[id];
+  if (!state) return;
+  if (e.key === 'Escape') { if (state.open) { e.preventDefault(); closeGlassSelect(id); } return; }
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault();
+    if (!state.open) { openGlassSelect(id); return; }
+    if (state.highlight >= 0) chooseGlassOption(id, state.highlight);
+    return;
+  }
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (!state.open) { openGlassSelect(id); return; }
+    const count = state.panel.children.length;
+    if (!count) return;
+    let next = state.highlight + (e.key === 'ArrowDown' ? 1 : -1);
+    next = Math.max(0, Math.min(count - 1, next));
+    setGlassHighlight(id, next);
+    return;
+  }
+  if (e.key === 'Tab' && state.open) closeGlassSelect(id);
+}
+
+initGlassSelects();
 
 fetchRecords();
 setInterval(fetchRecords, 4000);
