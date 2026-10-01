@@ -4244,17 +4244,34 @@ PAGE_HTML = """
   }
   select.nice-select {
     appearance: none; -webkit-appearance: none; -moz-appearance: none;
-    border: 1px solid var(--border); border-radius: 10px; padding: 10px 34px 10px 12px;
-    font-size: 14px; font-family: inherit; width: 100%; background-color: var(--bg);
+    border: 1px solid color-mix(in srgb, #ffffff 45%, var(--border));
+    border-radius: 10px; padding: 10px 34px 10px 12px;
+    font-size: 14px; font-family: inherit; width: 100%;
+    background-color: color-mix(in srgb, var(--card) 55%, transparent);
+    backdrop-filter: blur(14px) saturate(180%);
+    -webkit-backdrop-filter: blur(14px) saturate(180%);
     color: var(--text); cursor: pointer;
+    box-shadow: 0 4px 16px rgba(20,30,45,0.08), inset 0 1px 0 rgba(255,255,255,0.5);
     background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%237a8794' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6 9l6 6 6-6'/></svg>");
     background-repeat: no-repeat; background-position: right 12px center; background-size: 14px;
     transition: border-color .15s ease, background-color .15s ease, box-shadow .15s ease;
   }
   select.nice-select:focus {
-    outline: none; border-color: var(--navy-light); background-color: var(--card);
+    outline: none; border-color: var(--navy-light);
+    background-color: color-mix(in srgb, var(--card) 78%, transparent);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 20%, transparent);
   }
+  :root[data-theme="dark"] select.nice-select {
+    background-color: color-mix(in srgb, var(--card) 50%, transparent);
+    border-color: color-mix(in srgb, #ffffff 16%, var(--border));
+    box-shadow: 0 4px 18px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.07);
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2393a1b1' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6 9l6 6 6-6'/></svg>");
+  }
+  :root[data-theme="dark"] select.nice-select:focus {
+    background-color: color-mix(in srgb, var(--card) 72%, transparent);
+    border-color: var(--navy-light);
+  }
+  select.nice-select option { background: var(--card); color: var(--text); }
   .tag-fields { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
   .tag-fields > div { flex: 1; min-width: 180px; }
   .tag-fields label { display: block; font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; margin-bottom: 5px; }
@@ -4414,6 +4431,21 @@ PAGE_HTML = """
     font-size: 11.5px; padding: 6px 13px; background: var(--navy); color: #fff;
   }
   .bulk-bar button:hover { background: var(--navy-light); }
+  .bulk-bar .bulk-group {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    padding: 3px 6px 3px 3px; border-radius: 999px;
+    background: color-mix(in srgb, var(--card) 60%, transparent);
+    border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  }
+  .bulk-bar .bulk-divider {
+    width: 1px; align-self: stretch; margin: 2px 0;
+    background: color-mix(in srgb, var(--gold) 35%, var(--border));
+  }
+  .bulk-bar button.bulk-unmark-btn {
+    background: none; color: var(--navy); border: 1px solid var(--border);
+  }
+  :root[data-theme="dark"] .bulk-bar button.bulk-unmark-btn { color: var(--navy-light); }
+  .bulk-bar button.bulk-unmark-btn:hover { background: color-mix(in srgb, var(--navy-light) 16%, transparent); }
   .bulk-bar button.bulk-remove-btn {
     background: none; color: var(--danger); border: 1px solid var(--border); margin-left: auto;
   }
@@ -5182,9 +5214,18 @@ function bulkBarHtml(vesselKey, list) {
   return `
     <div class="bulk-bar" data-bar-key="${key}" data-bls="${blsAttr}">
       <span class="bulk-count"></span>
-      <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'invoice_issued', true)">Mark Invoice Issued</button>
-      <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'approval_received', true)">Mark Approval Received</button>
-      <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'do_issued', true)">Mark DO Issued</button>
+      <span class="bulk-group">
+        <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'invoice_issued', true)">Mark Invoice Issued</button>
+        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'invoice_issued', false)">Unmark</button>
+      </span>
+      <span class="bulk-group">
+        <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'approval_received', true)">Mark Approval Received</button>
+        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'approval_received', false)">Unmark</button>
+      </span>
+      <span class="bulk-group">
+        <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'do_issued', true)">Mark DO Issued</button>
+        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'do_issued', false)">Unmark</button>
+      </span>
       <button type="button" class="bulk-remove-btn" onclick="bulkRemoveSelected('${vesselKey.replace(/'/g,"\\'")}')">Remove</button>
     </div>`;
 }
