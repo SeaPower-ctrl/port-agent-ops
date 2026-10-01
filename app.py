@@ -4251,26 +4251,67 @@ PAGE_HTML = """
   .glass-select-wrap {
     position: relative; display: inline-block; width: 100%;
     border-radius: 10px;
-    border: 1px solid color-mix(in srgb, #ffffff 45%, var(--border));
-    background-color: color-mix(in srgb, var(--card) 55%, transparent);
-    backdrop-filter: blur(14px) saturate(180%);
-    -webkit-backdrop-filter: blur(14px) saturate(180%);
-    box-shadow: 0 4px 16px rgba(20,30,45,0.08), inset 0 1px 0 rgba(255,255,255,0.5);
-    transition: border-color .15s ease, background-color .15s ease, box-shadow .15s ease;
+    overflow: hidden;
+    border: 1.5px solid color-mix(in srgb, var(--navy-light) 48%, transparent);
+    background:
+      linear-gradient(165deg, rgba(255,255,255,0.92) 0%, rgba(255,255,255,0.30) 38%, rgba(255,255,255,0.68) 100%),
+      linear-gradient(135deg, color-mix(in srgb, var(--navy-light) 26%, transparent), color-mix(in srgb, var(--gold) 16%, transparent) 75%);
+    backdrop-filter: blur(14px) saturate(200%);
+    -webkit-backdrop-filter: blur(14px) saturate(200%);
+    box-shadow:
+      0 14px 30px -8px color-mix(in srgb, var(--navy) 50%, transparent),
+      0 3px 8px rgba(18,58,86,0.18),
+      inset 0 1.5px 0 rgba(255,255,255,1),
+      inset 0 -1.5px 0 color-mix(in srgb, var(--navy) 16%, transparent);
+    transition: border-color .15s ease, background .15s ease, box-shadow .15s ease, transform .15s ease;
+  }
+  .glass-select-wrap::before {
+    content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+    background: linear-gradient(115deg, rgba(255,255,255,0.85) 0%, rgba(255,255,255,0) 24%, rgba(255,255,255,0) 64%, rgba(255,255,255,0.45) 100%);
+  }
+  .glass-select-wrap:hover {
+    border-color: color-mix(in srgb, var(--navy-light) 65%, transparent);
+    transform: translateY(-1px);
+    box-shadow:
+      0 18px 34px -8px color-mix(in srgb, var(--navy) 58%, transparent),
+      0 4px 10px rgba(18,58,86,0.2),
+      inset 0 1.5px 0 rgba(255,255,255,1),
+      inset 0 -1.5px 0 color-mix(in srgb, var(--navy) 18%, transparent);
   }
   .glass-select-wrap:focus-within {
     border-color: var(--navy-light);
-    background-color: color-mix(in srgb, var(--card) 78%, transparent);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 20%, transparent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 30%, transparent),
+      0 14px 30px -8px color-mix(in srgb, var(--navy) 50%, transparent),
+      inset 0 1.5px 0 rgba(255,255,255,1);
   }
   :root[data-theme="dark"] .glass-select-wrap {
-    background-color: color-mix(in srgb, var(--card) 50%, transparent);
-    border-color: color-mix(in srgb, #ffffff 16%, var(--border));
-    box-shadow: 0 4px 18px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.07);
+    border-color: color-mix(in srgb, #ffffff 30%, transparent);
+    background:
+      linear-gradient(165deg, rgba(255,255,255,0.22) 0%, rgba(255,255,255,0.02) 40%, rgba(255,255,255,0.10) 100%),
+      linear-gradient(135deg, color-mix(in srgb, var(--navy-light) 42%, var(--card)), color-mix(in srgb, var(--card) 60%, black) 80%);
+    box-shadow:
+      0 14px 32px -6px rgba(0,0,0,0.6),
+      0 3px 10px rgba(0,0,0,0.35),
+      inset 0 1.5px 0 rgba(255,255,255,0.22),
+      inset 0 -1.5px 0 rgba(0,0,0,0.35);
+  }
+  :root[data-theme="dark"] .glass-select-wrap::before {
+    background: linear-gradient(115deg, rgba(255,255,255,0.22) 0%, rgba(255,255,255,0) 24%, rgba(255,255,255,0) 64%, rgba(255,255,255,0.12) 100%);
+  }
+  :root[data-theme="dark"] .glass-select-wrap:hover {
+    border-color: color-mix(in srgb, #ffffff 42%, transparent);
+    transform: translateY(-1px);
+    box-shadow:
+      0 18px 36px -6px rgba(0,0,0,0.65),
+      0 4px 12px rgba(0,0,0,0.4),
+      inset 0 1.5px 0 rgba(255,255,255,0.28),
+      inset 0 -1.5px 0 rgba(0,0,0,0.4);
   }
   :root[data-theme="dark"] .glass-select-wrap:focus-within {
-    background-color: color-mix(in srgb, var(--card) 72%, transparent);
     border-color: var(--navy-light);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 35%, transparent),
+      0 14px 32px -6px rgba(0,0,0,0.6),
+      inset 0 1.5px 0 rgba(255,255,255,0.26);
   }
   select.nice-select {
     appearance: none; -webkit-appearance: none; -moz-appearance: none;
