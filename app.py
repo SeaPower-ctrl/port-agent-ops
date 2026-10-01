@@ -2151,6 +2151,8 @@ def set_vessel_archived():
 @app.route("/api/records/<path:bl_number>/history", methods=["GET"])
 @login_required
 def record_history(bl_number):
+    if session.get("role") != "admin":
+        return "Admins only.", 403
     if not _owns_record(bl_number.upper()):
         return "Not your record.", 403
     db = get_db()
@@ -2163,27 +2165,21 @@ def record_history(bl_number):
 @app.route("/api/export", methods=["GET"])
 @login_required
 def export_records():
-    """Downloads the board (or one port/vessel group, via ?port=&vessel=)
-    as an .xlsx - for handing a status report to the principal or
-    management without them needing a login."""
+    """Downloads one vessel group's BLs as an .xlsx, via ?port=&vessel= -
+    for handing a status report to the principal or management without
+    them needing a login. Vessel-wise only (there's no board- or
+    port-level export anymore): different vessels can have different
+    cargo owners, so a combined export doesn't make sense here."""
     port = request.args.get("port", "")
     vessel = request.args.get("vessel", "")
     db = get_db()
     is_admin = session.get("role") == "admin"
-    sql = "SELECT * FROM records"
-    clauses, params = [], []
-    if port:
-        clauses.append("port = ?")
-        params.append(port)
-    if vessel:
-        clauses.append("vessel = ?")
-        params.append(vessel)
+    sql = "SELECT * FROM records WHERE port = ? AND vessel = ?"
+    params = [port, vessel]
     if not is_admin:
-        clauses.append("created_by = ?")
+        sql += " AND created_by = ?"
         params.append(session.get("username"))
-    if clauses:
-        sql += " WHERE " + " AND ".join(clauses)
-    sql += " ORDER BY port, vessel, bl_number"
+    sql += " ORDER BY bl_number"
     rows = [dict(r) for r in db.execute(sql, tuple(params)).fetchall()]
 
     import openpyxl
@@ -2191,17 +2187,14 @@ def export_records():
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "DO Tracker"
-    headers = ["Port", "Vessel", "ETA", "BL Number", "Invoice Issued", "Approval Received", "DO Issued", "Remarks", "Created"]
+    headers = ["BL Number", "DO Issued"]
     ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True)
     for r in rows:
         ws.append([
-            r.get("port", ""), r.get("vessel", ""), r.get("eta", ""), r.get("bl_number", ""),
-            "Yes" if r.get("invoice_issued") else "No",
-            "Yes" if r.get("approval_received") else "No",
+            r.get("bl_number", ""),
             "Yes" if r.get("do_issued") else "No",
-            r.get("remarks", ""), r.get("created_at", ""),
         ])
     for col_cells in ws.columns:
         width = max((len(str(c.value)) for c in col_cells if c.value is not None), default=8)
@@ -2210,8 +2203,7 @@ def export_records():
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
-    fname_bits = [b for b in (port, vessel) if b] or ["board"]
-    fname = "do_tracker_" + "_".join(fname_bits).replace(" ", "_") + ".xlsx"
+    fname = (vessel.strip().upper() or "UNASSIGNED") + ".xlsx"
     return Response(
         buf.read(),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -4250,6 +4242,19 @@ PAGE_HTML = """
     outline: none; border-color: var(--navy-light); background: var(--card);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 20%, transparent);
   }
+  select.nice-select {
+    appearance: none; -webkit-appearance: none; -moz-appearance: none;
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px 34px 10px 12px;
+    font-size: 14px; font-family: inherit; width: 100%; background-color: var(--bg);
+    color: var(--text); cursor: pointer;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%237a8794' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6 9l6 6 6-6'/></svg>");
+    background-repeat: no-repeat; background-position: right 12px center; background-size: 14px;
+    transition: border-color .15s ease, background-color .15s ease, box-shadow .15s ease;
+  }
+  select.nice-select:focus {
+    outline: none; border-color: var(--navy-light); background-color: var(--card);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 20%, transparent);
+  }
   .tag-fields { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
   .tag-fields > div { flex: 1; min-width: 180px; }
   .tag-fields label { display: block; font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; margin-bottom: 5px; }
@@ -4330,6 +4335,11 @@ PAGE_HTML = """
   .port-header .group-export:hover { background: rgba(255,255,255,0.14); color: #fff; }
   .vessel-header .group-export { color: var(--navy-light); }
   .vessel-header .group-export:hover { background: color-mix(in srgb, var(--navy-light) 14%, transparent); }
+  .eta-wrap { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
+  .eta-label {
+    font-size: 10px; font-weight: 700; color: var(--muted); text-transform: uppercase;
+    letter-spacing: .04em;
+  }
   .eta-input {
     font-size: 11.5px; font-family: inherit; border: 1px solid var(--border); border-radius: 6px;
     padding: 3px 6px; background: var(--card); color: var(--text); flex-shrink: 0;
@@ -4381,13 +4391,6 @@ PAGE_HTML = """
     background: var(--success-bg); color: var(--success); font-size: 10.5px; font-weight: 700;
     padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: .03em;
   }
-  .badge-aging {
-    display: inline-flex; align-items: center; gap: 3px;
-    background: #fff1e0; color: #b45f06; font-size: 10.5px; font-weight: 700;
-    padding: 2px 8px; border-radius: 999px;
-  }
-  :root[data-theme="dark"] .badge-aging { background: #4a3315; color: #ffb866; }
-
   .hist-btn {
     background: none; color: var(--muted); font-size: 16px; font-weight: 700;
     padding: 4px 8px; border-radius: 999px; line-height: 1;
@@ -4396,12 +4399,25 @@ PAGE_HTML = """
 
   .bulk-bar {
     display: none; align-items: center; gap: 8px; flex-wrap: wrap;
-    padding: 8px 14px; background: color-mix(in srgb, var(--gold) 12%, transparent);
-    border-bottom: 1px solid var(--border); font-size: 12.5px;
+    padding: 10px 14px; margin: 0 0 1px;
+    background: color-mix(in srgb, var(--gold) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--gold) 30%, var(--border));
+    border-radius: 10px; font-size: 12.5px;
   }
   .bulk-bar.active { display: flex; }
-  .bulk-bar .bulk-count { font-weight: 700; margin-right: 4px; }
-  .bulk-bar button { font-size: 11.5px; padding: 6px 12px; }
+  .bulk-bar .bulk-count {
+    font-weight: 700; color: var(--navy); background: color-mix(in srgb, var(--gold) 22%, transparent);
+    padding: 3px 10px; border-radius: 999px; margin-right: 2px;
+  }
+  :root[data-theme="dark"] .bulk-bar .bulk-count { color: var(--gold-light); }
+  .bulk-bar button {
+    font-size: 11.5px; padding: 6px 13px; background: var(--navy); color: #fff;
+  }
+  .bulk-bar button:hover { background: var(--navy-light); }
+  .bulk-bar button.bulk-remove-btn {
+    background: none; color: var(--danger); border: 1px solid var(--border); margin-left: auto;
+  }
+  .bulk-bar button.bulk-remove-btn:hover { background: var(--danger-bg); }
 
   .history-overlay {
     position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 60;
@@ -4525,16 +4541,19 @@ PAGE_HTML = """
     <div class="tag-fields">
       <div>
         <label for="portField">Discharge Port</label>
-        <input type="text" id="portField" list="portDatalist" placeholder="e.g. JEDDAH PORT" style="text-transform:uppercase;"
-          oninput="this.value = this.value.toUpperCase(); checkPortSimilar();" onblur="checkPortSimilar()">
-        <datalist id="portDatalist"></datalist>
-        <div style="font-size:11px; color:var(--muted); margin-top:4px;">Where it's being delivered to - not the Chinese loading port. Pick an existing port from the list so every BL going there lands in the same group.</div>
-        <div id="portWarning" style="display:none; font-size:11.5px; color:#9a6b00; background:#fff7e6; border:1px solid #f1d28a; border-radius:6px; padding:6px 9px; margin-top:6px;"></div>
+        <select id="portField" class="nice-select">
+          <option value="">Select a port...</option>
+          <option value="DAMMAM PORT">Dammam Port</option>
+          <option value="JUBAIL COMMERCIAL PORT">Jubail Commercial Port</option>
+          <option value="JEDDAH PORT">Jeddah Port</option>
+          <option value="YANBU COMMERCIAL PORT">Yanbu Commercial Port</option>
+          <option value="YANBU INDUSTRIAL PORT">Yanbu Industrial Port</option>
+          <option value="KAP">KAP</option>
+        </select>
       </div>
       <div>
         <label for="vesselField">Vessel</label>
-        <input type="text" id="vesselField" list="vesselDatalist" placeholder="e.g. TAI KNIGHT" style="text-transform:uppercase;" oninput="this.value = this.value.toUpperCase();">
-        <datalist id="vesselDatalist"></datalist>
+        <input type="text" id="vesselField" placeholder="e.g. TAI KNIGHT" style="text-transform:uppercase;" oninput="this.value = this.value.toUpperCase();">
       </div>
     </div>
     <label class="dropzone" id="dropzone" for="manifestFile">
@@ -4560,13 +4579,12 @@ PAGE_HTML = """
   <div class="card">
     <div class="row" style="margin-bottom:14px; flex-wrap:wrap;">
       <input type="text" id="searchBox" placeholder="Search BL number..." oninput="render()" style="flex:1; min-width:180px;">
-      <select id="jumpSelect" onchange="jumpToVessel(this.value)" style="min-width:200px;"><option value="">Jump to a vessel...</option></select>
+      <select id="jumpSelect" class="nice-select" onchange="jumpToVessel(this.value)" style="width:auto; min-width:200px;"><option value="">Select a vessel to view</option></select>
       {% if role == 'admin' %}
-      <select id="agentFilter" onchange="render()" style="min-width:140px;"><option value="">All agents</option></select>
+      <select id="operatorFilter" class="nice-select" onchange="render()" style="width:auto; min-width:140px;"><option value="">All operators</option></select>
       {% endif %}
       <button type="button" onclick="setAllGroupsCollapsed(false)" style="background:none; color:var(--text); border:1px solid var(--border);">Expand all</button>
       <button type="button" onclick="setAllGroupsCollapsed(true)" style="background:none; color:var(--text); border:1px solid var(--border);">Collapse all</button>
-      <a href="/api/export" style="background:none; color:var(--text); border:1px solid var(--border); border-radius:999px; padding:10px 18px; font-size:13px; font-weight:600; text-decoration:none;">Export all</a>
       <button type="button" id="clearAllBtn" onclick="clearAllRecords()" style="background:none; color:var(--danger); border:1px solid var(--border);">Clear board</button>
     </div>
     <div id="groups"></div>
@@ -4690,65 +4708,7 @@ async function fetchRecords() {
   });
   const changed = JSON.stringify(fresh) !== JSON.stringify(records);
   records = fresh;
-  if (changed) refreshFieldSuggestions();
   if (editingCount === 0 && changed) render();
-}
-
-/* ---------- Port/vessel autocomplete + duplicate-group warning ----------
-   With 20-25 manifests a month, retyping the discharge port/vessel by hand
-   every time is exactly how "JEDDAH" and "JEDDAH PORT" end up as two
-   separate board groups for the same place - a human typo, not a parsing
-   bug, but the UI should make it hard to make rather than relying on
-   everyone remembering the exact spelling used last time. Two guards:
-   1) a <datalist> of every port/vessel already on the board, so picking
-      an existing one is a dropdown click instead of retyping it, and
-   2) a live warning if what's typed LOOKS like an existing port under a
-      different spelling (extra "PORT" word, punctuation, spacing) -
-      with a one-click button to adopt the existing spelling exactly. */
-// Every discharge port Sea Power regularly handles, so the dropdown offers
-// the full list from day one - not just ports a manifest has already been
-// uploaded under. Send the real list and this gets hardcoded here instead.
-const KNOWN_PORTS = ['JEDDAH', 'DAMMAM', 'JUBAIL', 'YANBU', 'KING ABDULLAH PORT', 'RIYADH DRY PORT'];
-
-function refreshFieldSuggestions() {
-  const portField = document.getElementById('portField');
-  const vesselField = document.getElementById('vesselField');
-  if (!portField || !vesselField) return;
-
-  const ports = [...new Set([...KNOWN_PORTS, ...records.map(r => r.port).filter(Boolean)])].sort(naturalCompare);
-  const vessels = [...new Set(records.map(r => r.vessel).filter(Boolean))].sort(naturalCompare);
-
-  document.getElementById('portDatalist').innerHTML = ports.map(p => `<option value="${p.replace(/"/g, '&quot;')}">`).join('');
-  document.getElementById('vesselDatalist').innerHTML = vessels.map(v => `<option value="${v.replace(/"/g, '&quot;')}">`).join('');
-}
-
-function normPortName(s) {
-  // Collapses spelling variants of the "same" port down to one key: splits
-  // into alphanumeric tokens and drops the generic token "PORT", so
-  // "JEDDAH", "JEDDAH PORT" and "JEDDAH-PORT" all normalize the same way.
-  // (Deliberately not a word-boundary regex around PORT - this file is a
-  // plain, non-raw Python triple-quoted string, so that particular escape
-  // sequence is read by Python as a backspace character before the JS
-  // ever reaches the browser, silently breaking the match. Token-splitting
-  // sidesteps that whole class of mistake.)
-  return String(s || '').toUpperCase().split(/[^A-Z0-9]+/).filter(t => t && t !== 'PORT').join('');
-}
-
-function checkPortSimilar() {
-  const warnEl = document.getElementById('portWarning');
-  const typed = document.getElementById('portField').value.trim();
-  if (!typed) { warnEl.style.display = 'none'; return; }
-
-  const existingPorts = [...new Set(records.map(r => r.port).filter(Boolean))];
-  const typedNorm = normPortName(typed);
-  const match = existingPorts.find(p => p !== typed && normPortName(p) === typedNorm);
-
-  if (match) {
-    warnEl.innerHTML = `This looks like <b>${match}</b>, already on the board - use that exact spelling so this manifest joins the same group instead of starting a new one. <button type="button" style="margin-left:4px; font-size:11px; padding:2px 8px;" onclick="document.getElementById('portField').value='${match.replace(/'/g, "\\'")}'; checkPortSimilar();">Use "${match}"</button>`;
-    warnEl.style.display = 'block';
-  } else {
-    warnEl.style.display = 'none';
-  }
 }
 
 /* ---------- Manifest upload (drag & drop) ----------
@@ -4898,6 +4858,20 @@ function updateSummaryOnly() {
   document.getElementById('summary').innerHTML = summaryHtml();
 }
 
+// Rapid clicking on the same slider used to be able to "undo" an earlier
+// click: toggle() fired its own POST immediately on every call, so a quick
+// burst of clicks put several requests for the same bl+field in flight at
+// once, with nothing guaranteeing they reached (or were processed by) the
+// server in the same order they were sent - whichever one the server
+// happened to finish last would win, which wasn't necessarily the one
+// matching the final click. Debouncing the actual network send below - so
+// a burst of clicks on the same bl+field within a short window results in
+// exactly one request, carrying whatever the latest click's value was -
+// removes that race instead of trying to patch it up after the fact. The
+// on-screen state is still updated on every single click, so it never
+// feels laggy; only the save to the server is coalesced.
+let toggleSendTimers = {};
+
 function toggle(bl, field, value) {
   const rec = records.find(r => r.bl_number === bl);
   if (rec) {
@@ -4914,11 +4888,17 @@ function toggle(bl, field, value) {
     updateToggleUI(bl, field, value, rec[byField], rec[atField]);
     updateSummaryOnly();
   }
-  suppressPollUntil = Date.now() + 1500;
-  fetch(`/api/records/${encodeURIComponent(bl)}/toggle`, {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({field, value})
-  }).then(() => fetchRecords()).catch(() => { showToast('Could not save that change - retrying...'); fetchRecords(); });
+  suppressPollUntil = Date.now() + 2000;
+
+  const key = bl + '::' + field;
+  clearTimeout(toggleSendTimers[key]);
+  toggleSendTimers[key] = setTimeout(() => {
+    delete toggleSendTimers[key];
+    fetch(`/api/records/${encodeURIComponent(bl)}/toggle`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({field, value})
+    }).then(() => fetchRecords()).catch(() => { showToast('Could not save that change - retrying...'); fetchRecords(); });
+  }, 350);
 }
 
 let remarksTimers = {};
@@ -5085,28 +5065,6 @@ function checkbox(bl, field, checked, by, at) {
     </div>`;
 }
 
-/* ---------- Aging / overdue badge ----------
-   A BL that's sat with nothing ticked for too long is easy to lose track
-   of on a board with hundreds of entries - a small badge surfaces it
-   without needing a separate report. Threshold is in days; change this
-   one constant to tune it. */
-const AGING_DAYS_THRESHOLD = 7;
-
-function daysOpen(createdAt) {
-  if (!createdAt) return null;
-  const iso = createdAt.includes('T') ? createdAt : createdAt.replace(' ', 'T') + ':00Z';
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return null;
-  return Math.floor((Date.now() - d.getTime()) / 86400000);
-}
-
-function agingBadgeHtml(r, complete) {
-  if (complete) return '';
-  const days = daysOpen(r.created_at);
-  if (days === null || days < AGING_DAYS_THRESHOLD) return '';
-  return `<span class="badge-aging" title="No movement in ${days} days">&#9888; ${days}d</span>`;
-}
-
 function summaryHtml() {
   const total = records.length;
   const invoicePending = records.filter(r => !r.invoice_issued).length;
@@ -5149,7 +5107,6 @@ function rowsHtml(list) {
         <div class="bl-cell">
           <b>${r.bl_number}</b>
           ${complete ? '<span class="badge-complete">&check; Complete</span>' : ''}
-          ${agingBadgeHtml(r, complete)}
         </div>
       </td>
       <td data-label="Invoice Issued">${checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at)}</td>
@@ -5158,7 +5115,7 @@ function rowsHtml(list) {
       <td data-label="Remarks"><input class="remarks-input" type="text" value="${(r.remarks || '').replace(/"/g,'&quot;')}"
             oninput="onRemarksInput('${r.bl_number}', this.value)"
             onfocus="markEditing(1)" onblur="markEditing(-1)" placeholder="notes..."></td>
-      <td><button type="button" class="hist-btn" title="History" onclick="showHistory('${r.bl_number}')">&#8942;</button></td>
+      <td>{% if role == 'admin' %}<button type="button" class="hist-btn" title="History" onclick="showHistory('${r.bl_number}')">&#8942;</button>{% endif %}</td>
       <td><button class="del" onclick="deleteRecord('${r.bl_number}')">Remove</button></td>
     </tr>`;
   }).join('');
@@ -5206,6 +5163,19 @@ async function bulkSetField(vesselKey, field, value) {
   await fetchRecords();
 }
 
+function bulkRemoveSelected(vesselKey) {
+  // Scoped to only the checked BLs in this vessel's bar - NOT the whole
+  // vessel group (that's what the header's "Remove all" button is for) -
+  // and passes an explicit bl_numbers list to the backend, same as every
+  // other per-group bulk action here.
+  const listEl = document.querySelector(`[data-bar-key="${CSS.escape(vesselKey)}"]`);
+  const scope = listEl ? (listEl.dataset.bls || '').split('|').filter(Boolean) : [];
+  const blNumbers = scope.filter(bl => selectedBLs.has(bl));
+  if (!blNumbers.length) { showToast('Select at least one BL first.'); return; }
+  const list = blNumbers.map(bl => records.find(r => r.bl_number === bl)).filter(Boolean);
+  confirmBulkRemove(null, list);
+}
+
 function bulkBarHtml(vesselKey, list) {
   const key = vesselKey.replace(/"/g, '&quot;');
   const blsAttr = list.map(r => r.bl_number).join('|');
@@ -5215,6 +5185,7 @@ function bulkBarHtml(vesselKey, list) {
       <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'invoice_issued', true)">Mark Invoice Issued</button>
       <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'approval_received', true)">Mark Approval Received</button>
       <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'do_issued', true)">Mark DO Issued</button>
+      <button type="button" class="bulk-remove-btn" onclick="bulkRemoveSelected('${vesselKey.replace(/'/g,"\\'")}')">Remove</button>
     </div>`;
 }
 
@@ -5303,8 +5274,11 @@ function vesselGroupHtml(portName, vesselName, list, archivedView) {
         <input class="group-name" value="${vesselName === 'Unassigned' ? '' : vesselName}" placeholder="Unassigned vessel"
           onclick="event.stopPropagation()"
           onchange="renameGroup('vessel', '${pEsc}', '${vEsc}', this.value, 'Unassigned')">
-        ${archivedView ? '' : `<input type="date" class="eta-input" value="${eta}" title="Expected arrival"
-          onclick="event.stopPropagation()" onchange="setVesselEta(JSON.parse(this.dataset.bls), this.value)" data-bls='${blsJson}'>`}
+        ${archivedView ? '' : `<span class="eta-wrap" onclick="event.stopPropagation()">
+          <span class="eta-label">ETA</span>
+          <input type="date" class="eta-input" value="${eta}" title="Expected arrival"
+            onchange="setVesselEta(JSON.parse(this.dataset.bls), this.value)" data-bls='${blsJson}'>
+        </span>`}
         <span class="group-count">${sortedList.length} BL${sortedList.length === 1 ? '' : 's'}${left ? ` &middot; ${left} left` : ' &middot; done'}</span>
         <a onclick="event.stopPropagation()" href="/api/export?port=${encodeURIComponent(rawPort)}&vessel=${encodeURIComponent(rawVessel)}" class="group-export" title="Export this vessel to Excel">Export</a>
         <button type="button" class="group-remove" onclick='event.stopPropagation(); setVesselArchived(${blsJson}, ${archivedView ? 'false' : 'true'})'>${archivedView ? 'Unarchive' : 'Archive'}</button>
@@ -5327,7 +5301,6 @@ function portGroupHtml(portName, vesselNames, vessels, archivedView) {
   // to just the groups that still need work. Archived ports always start
   // collapsed - that section is for reference, not day-to-day work.
   const portCollapsed = portKey in collapsedGroups ? !!collapsedGroups[portKey] : (archivedView ? true : (portTotal > 0 && portLeft === 0));
-  const rawPort = (vessels[vesselNames[0]] && vessels[vesselNames[0]][0] && vessels[vesselNames[0]][0].port) || '';
   const vesselsHtml = vesselNames.map(vesselName => vesselGroupHtml(portName, vesselName, vessels[vesselName], archivedView)).join('');
   const pEsc = portName.replace(/'/g, "\\'");
   return `
@@ -5338,7 +5311,6 @@ function portGroupHtml(portName, vesselNames, vessels, archivedView) {
           onclick="event.stopPropagation()"
           onchange="renameGroup('port', '${pEsc}', '', this.value, 'Unassigned')">
         <span class="group-count">${portTotal} BL${portTotal === 1 ? '' : 's'}${portLeft ? ` &middot; ${portLeft} left` : ' &middot; done'}</span>
-        <a onclick="event.stopPropagation()" href="/api/export?port=${encodeURIComponent(rawPort)}" class="group-export" title="Export this port to Excel">Export</a>
         ${archivedView ? '' : `<button type="button" class="group-remove" onclick="event.stopPropagation(); removePortGroup('${pEsc}')">Remove all</button>`}
       </div>
       <div class="port-body ${portCollapsed ? 'collapsed' : ''}">${vesselsHtml}</div>
@@ -5347,16 +5319,16 @@ function portGroupHtml(portName, vesselNames, vessels, archivedView) {
 
 function render() {
   const q = document.getElementById('searchBox').value.trim().toLowerCase();
-  const agentFilterEl = document.getElementById('agentFilter');
-  if (agentFilterEl) {
-    const agents = [...new Set(records.map(r => r.created_by).filter(Boolean))].sort();
-    const current = agentFilterEl.value;
-    agentFilterEl.innerHTML = '<option value="">All agents</option>' + agents.map(a => `<option value="${a.replace(/"/g,'&quot;')}">${a}</option>`).join('');
-    if (agents.includes(current)) agentFilterEl.value = current;
+  const operatorFilterEl = document.getElementById('operatorFilter');
+  if (operatorFilterEl) {
+    const operators = [...new Set(records.map(r => r.created_by).filter(Boolean))].sort();
+    const current = operatorFilterEl.value;
+    operatorFilterEl.innerHTML = '<option value="">All operators</option>' + operators.map(a => `<option value="${a.replace(/"/g,'&quot;')}">${a}</option>`).join('');
+    if (operators.includes(current)) operatorFilterEl.value = current;
   }
-  const agentFilter = agentFilterEl ? agentFilterEl.value : '';
+  const operatorFilter = operatorFilterEl ? operatorFilterEl.value : '';
 
-  const base = records.filter(r => r.bl_number.toLowerCase().includes(q) && (!agentFilter || r.created_by === agentFilter));
+  const base = records.filter(r => r.bl_number.toLowerCase().includes(q) && (!operatorFilter || r.created_by === operatorFilter));
   const activeList = base.filter(r => !r.archived);
   const archivedList = base.filter(r => !!r.archived);
 
@@ -5373,7 +5345,7 @@ function render() {
     const jumpEl = document.getElementById('jumpSelect');
     if (jumpEl) {
       const current = jumpEl.value;
-      let options = '<option value="">Jump to a vessel...</option>';
+      let options = '<option value="">Select a vessel to view</option>';
       portNames.forEach(portName => {
         const vessels = ports[portName];
         sortedVesselNames(vessels).forEach(vesselName => {
@@ -5452,6 +5424,12 @@ function jumpToVessel(key) {
   const portKey = 'port:' + parts[1];
   collapsedGroups[portKey] = false;
   collapsedGroups[key] = false;
+  // Reset the dropdown's value before re-rendering (which would otherwise
+  // restore it to this same key) - a <select> only fires 'change' when its
+  // value actually changes, so without this, picking the same vessel twice
+  // in a row would do nothing the second time.
+  const jumpEl = document.getElementById('jumpSelect');
+  if (jumpEl) jumpEl.value = '';
   render();
   requestAnimationFrame(() => {
     const el = document.getElementById('group_' + cssEscape(key));
@@ -5470,7 +5448,6 @@ function setAllGroupsCollapsed(collapsed) {
   render();
 }
 
-refreshFieldSuggestions();
 fetchRecords();
 setInterval(fetchRecords, 4000);
 </script>
