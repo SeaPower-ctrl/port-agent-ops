@@ -4587,6 +4587,23 @@ PAGE_HTML = """
   .stat-icon svg { width: 19px; height: 19px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
   .stat b { display: block; font-size: 21px; font-weight: 700; color: var(--text); letter-spacing: -0.01em; line-height: 1.2; }
 
+  /* Port tab bar - sits above #groups, lets you jump straight to one
+     port's vessels instead of scrolling the stacked port sections. Built
+     fresh in render() from whatever ports currently exist (same pattern
+     as jumpSelect/operatorFilter), so it never needs its own data fetch. */
+  .port-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .port-tab {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12.5px; font-weight: 600; font-family: inherit;
+    padding: 7px 14px; border-radius: 999px; cursor: pointer;
+    background: var(--card); color: var(--text); border: 1px solid var(--border);
+    transition: background-color .15s ease, color .15s ease, border-color .15s ease;
+  }
+  .port-tab:hover { background: var(--border); }
+  .port-tab.active { background: var(--navy); color: #fff; border-color: var(--navy); }
+  .port-tab.active:hover { background: var(--navy); }
+  .port-tab-count { font-size: 11px; font-weight: 700; opacity: .65; }
+
   /* Port / Vessel group structure */
   .port-group { margin-bottom: 18px; }
   .port-header {
@@ -4951,6 +4968,7 @@ PAGE_HTML = """
       <button type="button" class="btn-neutral" onclick="setAllGroupsCollapsed(true)">Collapse all</button>
       <button type="button" id="clearAllBtn" class="btn-danger" style="margin-left:auto;" onclick="clearAllRecords()">Clear board</button>
     </div>
+    <div class="port-tabs" id="portTabs"></div>
     <div id="groups"></div>
   </div>
 
@@ -4996,6 +5014,7 @@ let suppressPollUntil = 0;
 let editingCount = 0;
 let collapsedGroups = {};
 let archivedSectionOpen = false;
+let selectedPortTab = '';
 
 function markEditing(delta) {
   editingCount = Math.max(0, editingCount + delta);
@@ -5716,6 +5735,29 @@ function render() {
   const ports = groupRecordsByPortVessel(activeList);
   const portNames = sortedPortNames(ports);
 
+  // Port tab bar - rebuilt fresh every render from whatever ports are
+  // currently on the board (post search/operator filter), same pattern
+  // as jumpSelect/operatorFilter just above. If the previously-selected
+  // port disappeared (renamed away, last BL removed, etc.) fall back to
+  // "All ports" rather than showing an empty board.
+  if (selectedPortTab && !portNames.includes(selectedPortTab)) selectedPortTab = '';
+  const portTabsEl = document.getElementById('portTabs');
+  if (portTabsEl) {
+    if (portNames.length === 0) {
+      portTabsEl.innerHTML = '';
+    } else {
+      const allTab = `<button type="button" class="port-tab ${selectedPortTab === '' ? 'active' : ''}" onclick="selectPortTab('')">All ports <span class="port-tab-count">${activeList.length}</span></button>`;
+      const portTabs = portNames.map(portName => {
+        const count = Object.values(ports[portName]).reduce((sum, list) => sum + list.length, 0);
+        const label = portName.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const pEsc = portName.replace(/'/g, "\\'");
+        return `<button type="button" class="port-tab ${selectedPortTab === portName ? 'active' : ''}" onclick="selectPortTab('${pEsc}')">${label} <span class="port-tab-count">${count}</span></button>`;
+      }).join('');
+      portTabsEl.innerHTML = allTab + portTabs;
+    }
+  }
+  const displayPortNames = selectedPortTab ? portNames.filter(p => p === selectedPortTab) : portNames;
+
   const groupsEl = document.getElementById('groups');
   if (portNames.length === 0) {
     groupsEl.innerHTML = '<div style="color:var(--muted); padding:24px 4px;">No BLs on the board yet. Upload an Excel manifest above to get started.</div>';
@@ -5739,7 +5781,7 @@ function render() {
       syncGlassSelectLabel('jumpSelect');
     }
 
-    groupsEl.innerHTML = portNames.map(portName => {
+    groupsEl.innerHTML = displayPortNames.map(portName => {
       const vessels = ports[portName];
       return portGroupHtml(portName, sortedVesselNames(vessels), vessels, false);
     }).join('');
@@ -5797,10 +5839,19 @@ async function setVesselArchived(blNumbers, archived) {
   await fetchRecords();
 }
 
+function selectPortTab(port) {
+  selectedPortTab = port;
+  render();
+}
+
 function jumpToVessel(key) {
   if (!key) return;
   const parts = key.split(':');
   const portKey = 'port:' + parts[1];
+  // Jumping to a vessel always lands on it regardless of which port tab
+  // is currently selected - simpler and more predictable than silently
+  // switching tabs to match the vessel's port.
+  selectedPortTab = '';
   collapsedGroups[portKey] = false;
   collapsedGroups[key] = false;
   // Reset the dropdown's value before re-rendering (which would otherwise
