@@ -1853,6 +1853,40 @@ def delete_direct_delivery(bl):
     return jsonify({"ok": True})
 
 
+@app.route("/api/direct-delivery/restore", methods=["POST"])
+@login_required
+def restore_direct_delivery():
+    """Used by the 'Undo' toast after a row is removed from the Direct
+    Delivery results/review list - re-inserts it with its original
+    classification fields, same pattern as DO Tracker's record restore.
+    A no-op (not an error) if that BL already exists, so Undo stays safe
+    to click more than once."""
+    data = request.get_json(force=True)
+    bl_number = str(data.get("bl_number", "")).strip()
+    if not bl_number:
+        return jsonify({"error": "missing bl_number"}), 400
+    db = get_db()
+    existing = db.execute("SELECT 1 FROM direct_delivery WHERE bl_number = ?", (bl_number,)).fetchone()
+    if existing:
+        return jsonify({"ok": True, "note": "already exists"})
+    db.execute(
+        """INSERT INTO direct_delivery
+           (bl_number, is_direct, reason, classified_by, classified_at, needs_review, review_note)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            bl_number,
+            1 if data.get("is_direct") else 0,
+            data.get("reason", ""),
+            data.get("classified_by") or session.get("username"),
+            data.get("classified_at", ""),
+            1 if data.get("needs_review") else 0,
+            data.get("review_note", ""),
+        ),
+    )
+    db.commit()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/records/<path:bl_number>/toggle", methods=["POST"])
 @login_required
 def toggle_status(bl_number):
@@ -2249,6 +2283,36 @@ def add_vessel():
 def delete_vessel(name):
     db = get_db()
     db.execute("DELETE FROM vessels WHERE name = ?", (name,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/vessels/restore", methods=["POST"])
+@login_required
+def restore_vessel():
+    """Used by the 'Undo' toast after a vessel is removed from the
+    tracker - re-inserts it with its original MMSI/operator, same pattern
+    as the DO Tracker record restore. A no-op (not an error) if a vessel
+    with that name already exists, so Undo stays safe to click more than
+    once."""
+    data = request.get_json(force=True)
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "missing name"}), 400
+    db = get_db()
+    existing = db.execute("SELECT 1 FROM vessels WHERE name = ?", (name,)).fetchone()
+    if existing:
+        return jsonify({"ok": True, "note": "already exists"})
+    db.execute(
+        "INSERT INTO vessels (name, mmsi, operator, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (
+            name,
+            data.get("mmsi", ""),
+            data.get("operator", ""),
+            data.get("updated_by") or session.get("username"),
+            data.get("updated_at", ""),
+        ),
+    )
     db.commit()
     return jsonify({"ok": True})
 
@@ -3161,18 +3225,11 @@ VESSEL_TRACKER_HTML = """
     border-radius: 12px; cursor: pointer; transition: background .12s ease; margin-bottom: 2px;
   }
   .vessel-row:hover { background: var(--bg); }
-  .vessel-row:hover .row-del { opacity: 1; }
   .vessel-row.active { background: color-mix(in srgb, var(--navy) 12%, transparent); }
   :root[data-theme="dark"] .vessel-row.active { background: color-mix(in srgb, var(--navy-light) 20%, transparent); }
   .vname-wrap { overflow: hidden; min-width: 0; }
   .vessel-row .vname { display: block; font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .vessel-row .voperator { display: block; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .row-del {
-    flex-shrink: 0; width: 20px; height: 20px; border-radius: 50%; border: none; background: transparent;
-    color: var(--muted); font-size: 15px; line-height: 1; cursor: pointer; opacity: 0; transition: opacity .12s ease, background .12s ease, color .12s ease;
-    display: flex; align-items: center; justify-content: center;
-  }
-  .row-del:hover { background: var(--danger-bg); color: var(--danger); opacity: 1; }
   .pill { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; padding: 3px 8px; border-radius: 999px; white-space: nowrap; flex-shrink: 0; }
   .pill.live { background: var(--ok-bg); color: var(--ok); }
   .pill.live::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); margin-right: 5px; animation: pulse 1.8s ease-in-out infinite; }
@@ -3220,6 +3277,7 @@ VESSEL_TRACKER_HTML = """
   #toastHost { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; pointer-events: none; max-width: min(320px, calc(100vw - 40px)); }
   #toastHost .toast { pointer-events: auto; }
   .toast { background: var(--navy-deep); color: #fff; padding: 11px 16px; border-radius: 12px; font-size: 13px; display: flex; align-items: center; gap: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); animation: toast-in .18s ease-out; max-width: 320px; }
+  .toast a { color: var(--gold-light); font-weight: 700; text-decoration: none; cursor: pointer; flex-shrink: 0; }
   .toast.error { background: var(--danger); }
   .toast.fading { animation: toast-out .2s ease-in forwards; }
   @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
@@ -3256,7 +3314,7 @@ VESSEL_TRACKER_HTML = """
   <div class="page-head">
     <div class="eyebrow">Live AIS</div>
     <h1>Vessel Tracker</h1>
-    <p>Real-time positions for the vessels you're tracking, pulled straight from MarineTraffic. Its own list - separate from DO Tracker.</p>
+    <p>Real-time positions for the vessels you're tracking, pulled straight from MarineTraffic.</p>
   </div>
 
   <div class="layout">
@@ -3386,7 +3444,6 @@ function renderList() {
       '<div class="vname-wrap"><span class="vname">' + escapeHtml(v) + '</span>' +
       (info.operator ? '<span class="voperator">Operator: ' + escapeHtml(info.operator) + '</span>' : '') + '</div>' +
       (info.mmsi ? '<span class="pill live">Live</span>' : '<span class="pill none">No MMSI</span>') +
-      '<button class="row-del" data-del="' + escapeHtml(v) + '" title="Remove vessel">&times;</button>' +
       '</div>';
   }).join('');
 }
@@ -3396,12 +3453,6 @@ function escapeHtml(s) {
 }
 
 document.getElementById('vesselList').addEventListener('click', (e) => {
-  const delBtn = e.target.closest('.row-del');
-  if (delBtn) {
-    e.stopPropagation();
-    removeVessel(delBtn.dataset.del);
-    return;
-  }
   const row = e.target.closest('.vessel-row');
   if (!row) return;
   selectVessel(row.dataset.vessel);
@@ -3443,11 +3494,25 @@ async function addVessel() {
 }
 
 async function removeVessel(name) {
-  if (!confirm('Remove ' + name + ' from the tracker? This cannot be undone.')) return;
+  // Instant delete + Undo toast, same pattern as DO Tracker - no blocking
+  // confirm() dialog.
+  const info = vessels[name] || { mmsi: '', operator: '' };
+  const removed = { name, mmsi: info.mmsi || '', operator: info.operator || '' };
   await fetch('/api/vessels/' + encodeURIComponent(name), {method: 'DELETE'});
   if (selected === name) selected = null;
   await loadData();
-  showToast('Removed ' + name + '.');
+  showToast('Removed ' + name + '.', {
+    actionLabel: 'Undo',
+    duration: 5000,
+    onAction: async () => {
+      await fetch('/api/vessels/restore', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(removed)
+      });
+      await loadData();
+      showToast('Restored ' + name + '.');
+    }
+  });
 }
 
 function removeSelectedVessel() {
@@ -3542,17 +3607,28 @@ async function saveMmsi() {
   showMap(val);
 }
 
-function showToast(msg, opts) {
+function showToast(message, opts) {
   opts = opts || {};
   const host = document.getElementById('toastHost');
   const el = document.createElement('div');
   el.className = 'toast' + (opts.error ? ' error' : '');
-  el.textContent = msg;
+  const text = document.createElement('span');
+  text.textContent = message;
+  el.appendChild(text);
+  if (opts.actionLabel && typeof opts.onAction === 'function') {
+    const a = document.createElement('a');
+    a.textContent = opts.actionLabel;
+    a.onclick = () => { opts.onAction(); dismiss(); };
+    el.appendChild(a);
+  }
   host.appendChild(el);
-  setTimeout(() => {
+  const duration = opts.duration || 3200;
+  const timer = setTimeout(dismiss, duration);
+  function dismiss() {
+    clearTimeout(timer);
     el.classList.add('fading');
     setTimeout(() => el.remove(), 220);
-  }, opts.duration || 3200);
+  }
 }
 
 (function initTheme() {
@@ -3913,6 +3989,15 @@ DIRECT_DELIVERY_HTML = """
 
   .empty-note { color: var(--muted); font-size: 13px; padding: 10px 2px; }
   .unmatched-note { font-size: 12.5px; color: var(--muted); margin-top: 10px; padding: 10px 12px; background: var(--bg); border-radius: 10px; }
+
+  #toastHost { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; pointer-events: none; max-width: min(320px, calc(100vw - 40px)); }
+  #toastHost .toast { pointer-events: auto; }
+  .toast { background: var(--navy-deep); color: #fff; padding: 11px 16px; border-radius: 12px; font-size: 13px; display: flex; align-items: center; gap: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); animation: toast-in .18s ease-out; max-width: 320px; }
+  .toast a { color: var(--gold-light); font-weight: 700; text-decoration: none; cursor: pointer; flex-shrink: 0; }
+  .toast.error { background: var(--danger); }
+  .toast.fading { animation: toast-out .2s ease-in forwards; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes toast-out { to { opacity: 0; transform: translateY(8px); } }
 </style>
 </head>
 <body>
@@ -3947,7 +4032,7 @@ DIRECT_DELIVERY_HTML = """
   <div class="page-head">
     <div class="eyebrow">Compass</div>
     <h1>Direct Delivery Classifier</h1>
-    <p>Upload a cargo packing list and every BL over 30MT or 12m gets flagged as Direct Delivery - unless it's wheeled or a coil, in which case it doesn't need a low-bed trailer. This is fully standalone - separate from DO Tracker.</p>
+    <p>Upload a cargo packing list and every BL over 30MT or 12m gets flagged as Direct Delivery - unless it's wheeled or a coil, in which case it doesn't need a low-bed trailer.</p>
   </div>
 
   <div class="panel">
@@ -3967,6 +4052,8 @@ DIRECT_DELIVERY_HTML = """
     </label>
     <div class="status-line" id="statusLine"></div>
   </div>
+
+  <div id="toastHost"></div>
 
   <div class="panel" id="reviewPanel" style="display:none;">
     <h2>⚠ Needs a quick check</h2>
@@ -4050,10 +4137,38 @@ async function uploadClassify() {
   }
 }
 
+let lastResultsRows = [];
+let lastReviewRows = [];
+
+function showToast(message, opts) {
+  opts = opts || {};
+  const host = document.getElementById('toastHost');
+  const el = document.createElement('div');
+  el.className = 'toast' + (opts.error ? ' error' : '');
+  const text = document.createElement('span');
+  text.textContent = message;
+  el.appendChild(text);
+  if (opts.actionLabel && typeof opts.onAction === 'function') {
+    const a = document.createElement('a');
+    a.textContent = opts.actionLabel;
+    a.onclick = () => { opts.onAction(); dismiss(); };
+    el.appendChild(a);
+  }
+  host.appendChild(el);
+  const duration = opts.duration || 3500;
+  const timer = setTimeout(dismiss, duration);
+  function dismiss() {
+    clearTimeout(timer);
+    el.classList.add('fading');
+    setTimeout(() => el.remove(), 220);
+  }
+}
+
 async function loadResults() {
   const res = await fetch('/api/direct-delivery');
   if (res.status === 401 || res.redirected) { location.reload(); return; }
   const rows = await res.json();
+  lastResultsRows = rows;
   const sub = document.getElementById('resultsSub');
   const body = document.getElementById('resultsBody');
   if (!rows.length) {
@@ -4081,6 +4196,7 @@ async function loadReview() {
   const res = await fetch('/api/direct-delivery/review');
   if (res.status === 401 || res.redirected) return;
   const rows = await res.json();
+  lastReviewRows = rows;
   const panel = document.getElementById('reviewPanel');
   const sub = document.getElementById('reviewSub');
   const body = document.getElementById('reviewBody');
@@ -4103,12 +4219,31 @@ async function loadReview() {
 }
 
 async function removeDirectDelivery(bl, fromReview) {
-  if (!confirm(`Remove ${bl} from this list? This won't affect the source files, only this table.`)) return;
+  const removed = (fromReview ? lastReviewRows : lastResultsRows).find(r => r.bl_number === bl)
+    || lastResultsRows.find(r => r.bl_number === bl) || lastReviewRows.find(r => r.bl_number === bl)
+    || { bl_number: bl };
+
+  // Instant delete + Undo toast, same pattern as DO Tracker - no blocking
+  // confirm() dialog.
   try {
     await fetch(`/api/direct-delivery/${encodeURIComponent(bl)}`, {method: 'DELETE'});
   } catch (e) {}
   await loadResults();
   await loadReview();
+
+  showToast('Removed BL ' + bl + '.', {
+    actionLabel: 'Undo',
+    duration: 5000,
+    onAction: async () => {
+      await fetch('/api/direct-delivery/restore', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(removed)
+      });
+      await loadResults();
+      await loadReview();
+      showToast('Restored BL ' + bl + '.');
+    }
+  });
 }
 
 loadResults();
@@ -4439,7 +4574,7 @@ PAGE_HTML = """
   .summary { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
   .stat {
     background: var(--card); border: 1px solid var(--border); border-radius: 14px;
-    padding: 14px 16px; font-size: 12px; color: var(--muted); flex: 1; min-width: 130px;
+    padding: 14px 16px; font-size: 12px; color: var(--muted); flex: 1 1 200px; max-width: 260px; min-width: 130px;
     box-shadow: var(--shadow-sm); display: flex; align-items: center; gap: 12px;
   }
   .stat-icon {
@@ -4506,6 +4641,8 @@ PAGE_HTML = """
     font-size: 11.5px; font-family: inherit; border: 1px solid var(--border); border-radius: 6px;
     padding: 3px 6px; background: var(--card); color: var(--text); flex-shrink: 0;
   }
+  .eta-input.eta-unset { border-style: dashed; border-color: var(--muted); }
+  .eta-unset-hint { font-size: 10px; color: var(--muted); font-style: italic; }
   .port-body { border: 1px solid var(--border); border-top: none; border-radius: 0 0 14px 14px; overflow: hidden; background: var(--card); }
   .port-body.collapsed { display: none; }
 
@@ -4595,8 +4732,9 @@ PAGE_HTML = """
     padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: .03em;
   }
   .hist-btn {
-    background: none; color: var(--muted); font-size: 16px; font-weight: 700;
-    padding: 4px 8px; border-radius: 999px; line-height: 1;
+    background: none; color: var(--muted); font-size: 11.5px; font-weight: 600;
+    padding: 5px 10px; border-radius: 999px; line-height: 1;
+    border: 1px solid var(--border); white-space: nowrap;
   }
   .hist-btn:hover { background: var(--border); color: var(--text); }
 
@@ -4811,7 +4949,7 @@ PAGE_HTML = """
       {% endif %}
       <button type="button" class="btn-neutral" onclick="setAllGroupsCollapsed(false)">Expand all</button>
       <button type="button" class="btn-neutral" onclick="setAllGroupsCollapsed(true)">Collapse all</button>
-      <button type="button" id="clearAllBtn" class="btn-danger" onclick="clearAllRecords()">Clear board</button>
+      <button type="button" id="clearAllBtn" class="btn-danger" style="margin-left:auto;" onclick="clearAllRecords()">Clear board</button>
     </div>
     <div id="groups"></div>
   </div>
@@ -5294,16 +5432,10 @@ function checkbox(bl, field, checked, by, at) {
 
 function summaryHtml() {
   const total = records.length;
-  const invoicePending = records.filter(r => !r.invoice_issued).length;
-  const approvalPending = records.filter(r => !r.approval_received).length;
-  const doPending = records.filter(r => !r.do_issued).length;
   const complete = records.filter(r => r.invoice_issued && r.approval_received && r.do_issued).length;
 
   const icons = {
     total: '<svg viewBox="0 0 24 24"><path d="M7 3h7l5 5v13a1 1 0 01-1 1H7a1 1 0 01-1-1V4a1 1 0 011-1z"/><path d="M14 3v5h5"/></svg>',
-    invoice: '<svg viewBox="0 0 24 24"><path d="M6 3h12v18l-2.5-1.5L13 21l-2.5-1.5L8 21l-2-1.5V3z"/><path d="M9 8h6M9 12h6M9 16h4"/></svg>',
-    approval: '<svg viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/><path d="M9 12l2 2 4-4"/></svg>',
-    box: '<svg viewBox="0 0 24 24"><path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/></svg>',
     check: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12l3 3 5-6"/></svg>'
   };
 
@@ -5312,9 +5444,6 @@ function summaryHtml() {
   return `
     <div class="stat"><div class="stat-icon">${icons.total}</div><div><b>${total}</b>Total BLs</div></div>
     <div class="stat ${remaining ? 'gold' : 'done'}"><div class="stat-icon">${icons.check}</div><div><b>${remaining}</b>Remaining</div></div>
-    <div class="stat gold"><div class="stat-icon">${icons.invoice}</div><div><b>${invoicePending}</b>Invoice Pending</div></div>
-    <div class="stat gold"><div class="stat-icon">${icons.approval}</div><div><b>${approvalPending}</b>Approval Pending</div></div>
-    <div class="stat gold"><div class="stat-icon">${icons.box}</div><div><b>${doPending}</b>DO Pending</div></div>
     <div class="stat done"><div class="stat-icon">${icons.check}</div><div><b>${complete}</b>Fully Complete</div></div>
   `;
 }
@@ -5342,7 +5471,7 @@ function rowsHtml(list) {
       <td data-label="Remarks"><input class="remarks-input" type="text" value="${(r.remarks || '').replace(/"/g,'&quot;')}"
             oninput="onRemarksInput('${r.bl_number}', this.value)"
             onfocus="markEditing(1)" onblur="markEditing(-1)" placeholder="notes..."></td>
-      <td>{% if role == 'admin' %}<button type="button" class="hist-btn" title="History" onclick="showHistory('${r.bl_number}')">&#8942;</button>{% endif %}</td>
+      <td>{% if role == 'admin' %}<button type="button" class="hist-btn" title="History" onclick="showHistory('${r.bl_number}')">History</button>{% endif %}</td>
       <td><button class="del" onclick="deleteRecord('${r.bl_number}')">Remove</button></td>
     </tr>`;
   }).join('');
@@ -5527,8 +5656,9 @@ function vesselGroupHtml(portName, vesselName, list, archivedView) {
           onchange="renameGroup('vessel', '${pEsc}', '${vEsc}', this.value, 'Unassigned')">
         ${archivedView ? '' : `<span class="eta-wrap" onclick="event.stopPropagation()">
           <span class="eta-label">ETA</span>
-          <input type="date" class="eta-input" value="${eta}" title="Expected arrival"
-            onchange="setVesselEta(JSON.parse(this.dataset.bls), this.value)" data-bls='${blsJson}'>
+          <input type="date" class="eta-input${eta ? '' : ' eta-unset'}" value="${eta}" title="Expected arrival"
+            onchange="this.classList.toggle('eta-unset', !this.value); setVesselEta(JSON.parse(this.dataset.bls), this.value)" data-bls='${blsJson}'>
+          ${eta ? '' : '<span class="eta-unset-hint">Not set</span>'}
         </span>`}
         <span class="group-count">${sortedList.length} BL${sortedList.length === 1 ? '' : 's'}${left ? ` &middot; ${left} left` : ' &middot; done'}</span>
         <span class="vessel-progress ${pct >= 100 ? 'done' : ''}" title="${pct}% complete"><span class="vessel-progress-fill" style="width:${pct}%"></span></span>
@@ -5562,8 +5692,6 @@ function portGroupHtml(portName, vesselNames, vessels, archivedView) {
         <input class="group-name" value="${portName === 'Unassigned' ? '' : portName}" placeholder="Unassigned port"
           onclick="event.stopPropagation()"
           onchange="renameGroup('port', '${pEsc}', '', this.value, 'Unassigned')">
-        <span class="group-count">${portTotal} BL${portTotal === 1 ? '' : 's'}${portLeft ? ` &middot; ${portLeft} left` : ' &middot; done'}</span>
-        ${archivedView ? '' : `<button type="button" class="group-remove" onclick="event.stopPropagation(); removePortGroup('${pEsc}')">Remove all</button>`}
       </div>
       <div class="port-body ${portCollapsed ? 'collapsed' : ''}">${vesselsHtml}</div>
     </div>`;
@@ -5602,11 +5730,8 @@ function render() {
       portNames.forEach(portName => {
         const vessels = ports[portName];
         sortedVesselNames(vessels).forEach(vesselName => {
-          const list = vessels[vesselName];
-          const left = list.filter(r => !(r.invoice_issued && r.approval_received && r.do_issued)).length;
           const key = 'vessel:' + portName + ':' + vesselName;
-          const label = `${vesselName} - ${portName} (${list.length} BL${list.length === 1 ? '' : 's'}${left ? ', ' + left + ' left' : ', done'})`;
-          options += `<option value="${key.replace(/"/g, '&quot;')}">${label}</option>`;
+          options += `<option value="${key.replace(/"/g, '&quot;')}">${vesselName.replace(/"/g, '&quot;')}</option>`;
         });
       });
       jumpEl.innerHTML = options;
