@@ -532,19 +532,29 @@ def _extract_bl_numbers_from_rows(rows, allow_no_header_fallback=True):
         raw_bl = row[bl_col]
         if raw_bl is None or str(raw_bl).strip() == "":
             continue
-        candidate = str(raw_bl).strip().upper()
-        # Skip a summary row ("TOTAL:", "GRAND TOTAL", "SUB TOTAL",
-        # "VOYAGE TOTAL", "PAGE TOTAL"...) sitting in the same column as
-        # the real BL numbers - manifests commonly have one or more of
-        # these (a running subtotal per page, plus a grand/voyage total at
-        # the end), and none of them are real BLs. A substring check
-        # catches every "___ TOTAL" variant rather than only the exact
-        # phrases seen so far.
-        norm_candidate = _normalize_header(candidate)
-        candidate_check = re.sub(r"\s+", "", candidate)
-        if "total" in norm_candidate or any(w in candidate_check for w in ("合计", "总计", "汇总", "小计")):
-            continue
-        out.append(candidate)
+        raw_text = str(raw_bl).strip()
+        # A cell occasionally lists more than one BL number stacked on
+        # separate lines inside it (e.g. a shared-contact/remarks row that
+        # covers two BLs handled by the same person) - split those apart
+        # rather than keeping the newline embedded in one garbled
+        # "BL1\nBL2" record, which would land on the board as its own
+        # fake, unmatched entry alongside the two real ones.
+        for line in raw_text.splitlines():
+            candidate = line.strip().upper()
+            if not candidate:
+                continue
+            # Skip a summary row ("TOTAL:", "GRAND TOTAL", "SUB TOTAL",
+            # "VOYAGE TOTAL", "PAGE TOTAL"...) sitting in the same column as
+            # the real BL numbers - manifests commonly have one or more of
+            # these (a running subtotal per page, plus a grand/voyage total
+            # at the end), and none of them are real BLs. A substring check
+            # catches every "___ TOTAL" variant rather than only the exact
+            # phrases seen so far.
+            norm_candidate = _normalize_header(candidate)
+            candidate_check = re.sub(r"\s+", "", candidate)
+            if "total" in norm_candidate or any(w in candidate_check for w in ("合计", "总计", "汇总", "小计")):
+                continue
+            out.append(candidate)
 
     if header_row_index is None:
         sample = out[:5]
@@ -552,6 +562,23 @@ def _extract_bl_numbers_from_rows(rows, allow_no_header_fallback=True):
             return []
 
     return out
+
+
+_DTRKR_NON_MANIFEST_SHEET_RE = re.compile(
+    r"CONTACT|REMARK|NOTES?\b|ADDRESS", re.IGNORECASE
+)
+
+
+def _dtrkr_is_non_manifest_sheet_name(name):
+    """A sheet whose own name marks it as per-BL reference info (a contact
+    list, remarks, notes...) rather than the shipment's actual BL data.
+    These sheets commonly reuse a "BL NO." column just to key their rows to
+    a BL, which would otherwise look exactly like a real manifest table and
+    get re-extracted as if it were one - at best adding nothing but repeat
+    work (the same BL numbers already found on the main sheet), at worst
+    adding garbage (one shared-contact row can cover two BLs via a
+    multi-line cell, or append extra text like "BL085(085 123-125)")."""
+    return bool(_DTRKR_NON_MANIFEST_SHEET_RE.search(str(name or "")))
 
 
 def _extract_bl_numbers_from_lines(text):
@@ -636,6 +663,12 @@ def upload_manifest_excel():
             # name, which would otherwise fail outright.
             sheets = _load_excel_sheets_by_content(file.read(), filename)
             for i, (sheet_name, rows) in enumerate(sheets):
+                # A per-BL contact/remarks tab (beyond the main sheet) is
+                # reference info, not shipment data - skip it entirely so it
+                # can't re-add (or garble) BLs already found on the main
+                # sheet. See _dtrkr_is_non_manifest_sheet_name.
+                if i > 0 and _dtrkr_is_non_manifest_sheet_name(sheet_name):
+                    continue
                 bl_numbers.extend(_extract_bl_numbers_from_rows(rows, allow_no_header_fallback=(i == 0)))
 
         elif filename.endswith(".csv"):
