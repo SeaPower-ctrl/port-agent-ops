@@ -4142,6 +4142,7 @@ PAGE_HTML = """
     --success-bg: #eaf7ef;
     --danger: #d1483f;
     --danger-bg: #fbeceb;
+    --topbar-h: 64px;
     --shadow-sm: 0 1px 2px rgba(18,58,86,0.05);
     --shadow-md: 0 10px 30px rgba(18,58,86,0.10);
     color-scheme: light;
@@ -4402,6 +4403,19 @@ PAGE_HTML = """
   button:disabled { background: var(--border); color: var(--muted); cursor: not-allowed; }
   button:disabled:hover { background: var(--border); }
 
+  /* Toolbar button hierarchy: the plain navy `button` above is for
+     primary/constructive actions (Add to board, Mark buttons). Neutral and
+     destructive toolbar actions get their own consistent outline styles
+     instead of one-off inline styles, so every "remove"-type control in the
+     app (toolbar, bulk bar, group header, row) looks the same. */
+  .btn-neutral { background: none; color: var(--text); border: 1px solid var(--border); }
+  .btn-neutral:hover { background: var(--border); }
+  .btn-danger {
+    background: none; color: var(--danger);
+    border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  }
+  .btn-danger:hover { background: var(--danger-bg); }
+
   /* Excel dropzone */
   .dropzone {
     display: flex; align-items: center; gap: 14px; cursor: pointer;
@@ -4453,13 +4467,28 @@ PAGE_HTML = """
   .port-header .group-name:focus { outline: none; border-color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.08); }
   .port-header .group-count { font-size: 11.5px; color: rgba(255,255,255,0.7); font-weight: 500; }
   .group-remove {
-    background: none; border: none; cursor: pointer;
+    background: none; border: 1px solid transparent; cursor: pointer;
     font-size: 11px; font-weight: 700; padding: 5px 11px; border-radius: 999px; flex-shrink: 0;
   }
   .port-header .group-remove { color: rgba(255,255,255,0.75); }
-  .port-header .group-remove:hover { background: rgba(255,255,255,0.14); color: #fff; }
-  .vessel-header .group-remove { color: var(--danger); }
+  .port-header .group-remove:hover { background: color-mix(in srgb, var(--danger) 55%, transparent); color: #fff; }
+  /* Destructive ("Remove all") gets the same red outline as every other
+     destructive control in the app (.del, bulk Remove, Clear board) -
+     see the button-hierarchy notes near .btn-danger below. */
+  .vessel-header .group-remove {
+    color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  }
   .vessel-header .group-remove:hover { background: var(--danger-bg); }
+  /* Neutral/secondary group-header action (Archive / Unarchive) - same pill
+     sizing as .group-remove/.group-export, but colored like the toolbar's
+     neutral buttons (Expand all / Collapse all) so it reads as "secondary",
+     not destructive and not primary. */
+  .group-neutral {
+    background: none; border: 1px solid var(--border); cursor: pointer;
+    font-size: 11px; font-weight: 700; padding: 5px 11px; border-radius: 999px; flex-shrink: 0;
+    color: var(--text);
+  }
+  .group-neutral:hover { background: color-mix(in srgb, var(--border) 70%, transparent); }
   .group-export {
     margin-left: auto; font-size: 11px; font-weight: 700; padding: 5px 11px;
     border-radius: 999px; flex-shrink: 0; text-decoration: none;
@@ -4496,8 +4525,34 @@ PAGE_HTML = """
   .vessel-header .group-count { font-size: 11px; color: var(--muted); }
   .vessel-body.collapsed { display: none; }
 
+  /* Per-vessel progress bar - % of this vessel's BLs fully complete, next
+     to the existing "N BLs - N left" text. Recomputed every render(), same
+     cadence as that text, so it updates on the same toggles already do. */
+  .vessel-progress {
+    position: relative; width: 64px; height: 6px; border-radius: 999px;
+    background: color-mix(in srgb, var(--border) 85%, transparent); overflow: hidden; flex-shrink: 0;
+  }
+  .vessel-progress-fill {
+    position: absolute; inset: 0; width: 0; border-radius: 999px;
+    background: linear-gradient(90deg, var(--gold), var(--navy-light));
+    transition: width .25s ease;
+  }
+  .vessel-progress.done .vessel-progress-fill { background: var(--success); }
+
   /* Table */
-  .overflow { overflow-x: auto; }
+  /* This is the real scroll container for a vessel's table: bounded height
+     + overflow-y:auto on purpose, so a long BL list scrolls inside its own
+     card instead of the whole page, and the sticky <th> below sticks to
+     THIS box's scrollport (its nearest actual scrolling ancestor), which
+     works reliably everywhere. (Earlier this only had overflow-x:auto for
+     horizontal scroll on narrow screens; that alone forces the browser to
+     also treat overflow-y as a scroll container per the CSS overflow spec,
+     but with no bounded height it never actually scrolled - so the sticky
+     header had no real scrollport to stick within and just scrolled away
+     with the page. Giving it a real max-height fixes that at the root.)
+     A short vessel (fits within max-height) just renders in full with no
+     scrollbar, exactly as before. */
+  .overflow { overflow-x: auto; overflow-y: auto; max-height: 65vh; }
   table { width: 100%; min-width: 760px; border-collapse: collapse; font-size: 13.5px; table-layout: fixed; }
   th:nth-child(1), td:nth-child(1) { width: 4%; }
   th:nth-child(2), td:nth-child(2) { width: 15%; }
@@ -4511,11 +4566,26 @@ PAGE_HTML = """
   .select-col { text-align: center; }
   th {
     color: var(--muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase;
-    letter-spacing: .05em; background: color-mix(in srgb, var(--border) 40%, transparent);
+    letter-spacing: .05em; background: color-mix(in srgb, var(--border) 40%, var(--card));
+    /* Sticky column header: .overflow (its scrolling parent) now has a
+       bounded max-height + overflow-y:auto, so it's the real scroll
+       container a long vessel's rows scroll inside - this sticks to ITS
+       top, not the page. Needs an opaque-ish background (above, mixed onto
+       --card instead of transparent) so rows don't show through as they
+       scroll underneath it. */
+    position: sticky; top: 0; z-index: 10;
   }
-  tbody tr { transition: background .12s ease; }
+  tbody tr { transition: background .12s ease, opacity .15s ease; }
   tbody tr:hover { background: color-mix(in srgb, var(--navy-light) 4%, transparent); }
   tbody tr:last-child td { border-bottom: none; }
+
+  /* De-emphasize fully-complete rows so the eye skips them while scanning -
+     subtle, not celebratory: slightly muted + a thin green accent on the BL
+     number cell, not a full highlight. */
+  tbody tr.row-complete { opacity: .6; }
+  tbody tr.row-complete:hover { opacity: .85; }
+  tbody tr.row-complete td { color: var(--muted); }
+  tbody tr.row-complete td:nth-child(2) { box-shadow: inset 3px 0 0 var(--success); }
 
   .bl-cell { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; overflow: hidden; }
   .bl-cell b { font-weight: 700; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; }
@@ -4563,7 +4633,8 @@ PAGE_HTML = """
   :root[data-theme="dark"] .bulk-bar button.bulk-unmark-btn { color: var(--navy-light); }
   .bulk-bar button.bulk-unmark-btn:hover { background: color-mix(in srgb, var(--navy-light) 16%, transparent); }
   .bulk-bar button.bulk-remove-btn {
-    background: none; color: var(--danger); border: 1px solid var(--border); margin-left: auto;
+    background: none; color: var(--danger); margin-left: auto;
+    border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
   }
   .bulk-bar button.bulk-remove-btn:hover { background: var(--danger-bg); }
 
@@ -4620,6 +4691,7 @@ PAGE_HTML = """
   .del {
     background: none; color: var(--danger); font-size: 12px; font-weight: 600;
     padding: 5px 10px; border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
   }
   .del:hover { background: var(--danger-bg); }
 
@@ -4737,9 +4809,9 @@ PAGE_HTML = """
         <select id="operatorFilter" class="nice-select" onchange="render()"><option value="">All operators</option></select>
       </div>
       {% endif %}
-      <button type="button" onclick="setAllGroupsCollapsed(false)" style="background:none; color:var(--text); border:1px solid var(--border);">Expand all</button>
-      <button type="button" onclick="setAllGroupsCollapsed(true)" style="background:none; color:var(--text); border:1px solid var(--border);">Collapse all</button>
-      <button type="button" id="clearAllBtn" onclick="clearAllRecords()" style="background:none; color:var(--danger); border:1px solid var(--border);">Clear board</button>
+      <button type="button" class="btn-neutral" onclick="setAllGroupsCollapsed(false)">Expand all</button>
+      <button type="button" class="btn-neutral" onclick="setAllGroupsCollapsed(true)">Collapse all</button>
+      <button type="button" id="clearAllBtn" class="btn-danger" onclick="clearAllRecords()">Clear board</button>
     </div>
     <div id="groups"></div>
   </div>
@@ -5002,6 +5074,7 @@ function updateCompleteBadge(bl) {
   } else if (!complete && badge) {
     badge.remove();
   }
+  row.classList.toggle('row-complete', complete);
 }
 
 function cssEscape(s) {
@@ -5254,7 +5327,7 @@ function rowsHtml(list) {
   return list.map(r => {
     const complete = !!(r.invoice_issued && r.approval_received && r.do_issued);
     return `
-    <tr id="row_${cssEscape(r.bl_number)}">
+    <tr id="row_${cssEscape(r.bl_number)}" class="${complete ? 'row-complete' : ''}">
       <td class="select-col"><input type="checkbox" class="row-select" ${selectedBLs.has(r.bl_number) ? 'checked' : ''}
             onchange="toggleRowSelect('${r.bl_number}', this.checked)"></td>
       <td>
@@ -5436,6 +5509,7 @@ function vesselGroupHtml(portName, vesselName, list, archivedView) {
   const collapseKey = archivedView ? vesselKey + ':archived' : vesselKey;
   const sortedList = list.slice().sort((a, b) => naturalCompare(a.bl_number, b.bl_number));
   const left = sortedList.filter(r => !(r.invoice_issued && r.approval_received && r.do_issued)).length;
+  const pct = sortedList.length ? Math.round(((sortedList.length - left) / sortedList.length) * 100) : 0;
   const vesselCollapsed = collapseKey in collapsedGroups ? !!collapsedGroups[collapseKey] : (archivedView ? true : left === 0);
   const eta = (sortedList[0] && sortedList[0].eta) || '';
   const rawPort = (sortedList[0] && sortedList[0].port) || '';
@@ -5457,8 +5531,9 @@ function vesselGroupHtml(portName, vesselName, list, archivedView) {
             onchange="setVesselEta(JSON.parse(this.dataset.bls), this.value)" data-bls='${blsJson}'>
         </span>`}
         <span class="group-count">${sortedList.length} BL${sortedList.length === 1 ? '' : 's'}${left ? ` &middot; ${left} left` : ' &middot; done'}</span>
+        <span class="vessel-progress ${pct >= 100 ? 'done' : ''}" title="${pct}% complete"><span class="vessel-progress-fill" style="width:${pct}%"></span></span>
         <a onclick="event.stopPropagation()" href="/api/export?port=${encodeURIComponent(rawPort)}&vessel=${encodeURIComponent(rawVessel)}" class="group-export" title="Export this vessel to Excel">Export</a>
-        <button type="button" class="group-remove" onclick='event.stopPropagation(); setVesselArchived(${blsJson}, ${archivedView ? 'false' : 'true'})'>${archivedView ? 'Unarchive' : 'Archive'}</button>
+        <button type="button" class="group-neutral" onclick='event.stopPropagation(); setVesselArchived(${blsJson}, ${archivedView ? 'false' : 'true'})'>${archivedView ? 'Unarchive' : 'Archive'}</button>
         <button type="button" class="group-remove" onclick="event.stopPropagation(); removeVesselGroup('${pEsc}', '${vEsc}')">Remove all</button>
       </div>
       <div class="vessel-body ${vesselCollapsed ? 'collapsed' : ''}">
@@ -5796,7 +5871,7 @@ function glassScrollHandler() {
 function onGlassTriggerKeydown(id, e) {
   const state = customSelects[id];
   if (!state) return;
-  if (e.key === 'Escape') { if (state.open) { e.preventDefault(); closeGlassSelect(id); } return; }
+  if (e.key === 'Escape') { if (state.open) { e.preventDefault(); e.stopPropagation(); closeGlassSelect(id); } return; }
   if (e.key === 'Enter' || e.key === ' ') {
     e.preventDefault();
     if (!state.open) { openGlassSelect(id); return; }
@@ -5815,6 +5890,35 @@ function onGlassTriggerKeydown(id, e) {
   }
   if (e.key === 'Tab' && state.open) closeGlassSelect(id);
 }
+
+// Keyboard shortcuts: "/" focuses search, Escape collapses all groups -
+// both no-ops while the person is actually typing, and Escape defers to
+// whatever more specific thing (a glass-dropdown panel, the history modal)
+// is already open, so it never fights with that control's own handling.
+document.addEventListener('keydown', (e) => {
+  const active = document.activeElement;
+  const tag = active ? active.tagName : '';
+  const isTyping = tag === 'INPUT' || tag === 'TEXTAREA' || (active && active.isContentEditable);
+
+  if (e.key === '/' && !isTyping) {
+    e.preventDefault();
+    const box = document.getElementById('searchBox');
+    if (box) box.focus();
+    return;
+  }
+
+  if (e.key === 'Escape') {
+    if (isTyping) return;
+    // A glass-select panel being open means its own trigger keydown
+    // handler (onGlassTriggerKeydown) already closed it and stopped this
+    // keystroke from bubbling here - this is just a safety net.
+    if (Object.values(customSelects).some(s => s.open)) return;
+    const historyOverlay = document.getElementById('historyOverlay');
+    if (historyOverlay && historyOverlay.style.display !== 'none') { closeHistory(); return; }
+    if (document.querySelector('.bulk-bar.active')) return;
+    setAllGroupsCollapsed(true);
+  }
+});
 
 initGlassSelects();
 
