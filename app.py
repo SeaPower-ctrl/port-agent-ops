@@ -33,6 +33,7 @@ import xlrd
 import psycopg2
 import psycopg2.extras
 from fpdf import FPDF
+from fpdf.enums import XPos, YPos
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
@@ -75,6 +76,40 @@ def close_db(exception=None):
     db = g.pop("db", None)
     if db is not None:
         db.close()
+
+
+# Field-for-field match to the company's actual Statement of Facts Word
+# template (vessel/voyage/port through to the master/agent sign-off),
+# shared between the DB schema, the API and the PDF builder so the three
+# never drift out of sync with each other.
+SOF_COLUMNS = [
+    "vessel", "voyage", "port", "berth", "owners", "charterer",
+    "end_of_sea_passage", "customs_cleared",
+    "nor_tendered", "commenced_discharge",
+    "nor_accepted", "completed_discharge",
+    "anchored", "documents_on_board",
+    "left_anchorage", "clearance_delivered",
+    "pilot_boarded_arrival", "pilot_boarded_departure",
+    "first_line_to_shore", "left_berth",
+    "berthed_all_fast",
+    "cargo_discharge_mtons",
+    "rob_arrival_ifo", "rob_arrival_mdo", "rob_arrival_lubs", "rob_arrival_fwater",
+    "rob_departure_ifo", "rob_departure_mdo", "rob_departure_lubs", "rob_departure_fwater",
+    "arrival_draft_fwd", "arrival_draft_aft", "departure_draft_fwd", "departure_draft_aft",
+    "delays_remarks", "masters_remarks",
+]
+
+# (left_column, left_label, right_column, right_label) - the paired
+# two-column timeline exactly as laid out in the source template.
+SOF_TIMELINE_PAIRS = [
+    ("end_of_sea_passage", "End of Sea Passage", "customs_cleared", "Customs Cleared"),
+    ("nor_tendered", "NOR Tendered", "commenced_discharge", "Commenced Discharge"),
+    ("nor_accepted", "NOR Accepted", "completed_discharge", "Completed Discharge"),
+    ("anchored", "Anchored", "documents_on_board", "Documents on Board"),
+    ("left_anchorage", "Left Anchorage", "clearance_delivered", "Clearance Delivered"),
+    ("pilot_boarded_arrival", "Pilot Boarded (Arrival)", "pilot_boarded_departure", "Pilot Boarded (Departure)"),
+    ("first_line_to_shore", "First Line to Shore", "left_berth", "Left Berth"),
+]
 
 
 def init_db():
@@ -222,6 +257,26 @@ def init_db():
             value TEXT DEFAULT ''
         )"""
     )
+
+    # Statement of Facts - one row per vessel call, matching the company's
+    # actual SOF template field-for-field (see SOF_COLUMNS) rather than a
+    # generic event log, so the PDF this produces is a drop-in replacement
+    # for the Word template, not an approximation of it. Every field is
+    # plain text (not a real timestamp column) because the source document
+    # itself writes times as free text ("26.06.26 AT 0648 HRS") and is
+    # routinely saved with some of them still blank while the port call is
+    # in progress - a strict datetime type would reject exactly the
+    # half-filled state this form normally sits in.
+    sof_cols_sql = ",\n            ".join(f"{col} TEXT DEFAULT ''" for col in SOF_COLUMNS)
+    cur.execute(
+        f"""CREATE TABLE IF NOT EXISTS sof_documents (
+            id SERIAL PRIMARY KEY,
+            {sof_cols_sql},
+            created_by TEXT DEFAULT '',
+            created_at TEXT DEFAULT '',
+            updated_at TEXT DEFAULT ''
+        )"""
+    )
     conn.commit()
     cur.close()
     conn.close()
@@ -336,6 +391,170 @@ def build_pda_pdf(doc, items):
         pdf.cell(0, 6, "Notes", ln=1)
         pdf.set_font("Helvetica", "", 10)
         pdf.multi_cell(0, 6, str(doc.get("notes")))
+
+    out = pdf.output(dest="S")
+    return bytes(out)
+
+
+def _sof_val(doc, key):
+    v = (doc.get(key) or "").strip()
+    return v if v else "-"
+
+
+def build_sof_pdf(doc):
+    """Mirrors the company's own Statement of Facts template field-for-
+    field (see SOF_COLUMNS/SOF_TIMELINE_PAIRS), with the header restyled
+    to match the Daily Vessel Line-Up report's look - logo + bold navy
+    company name + muted subtitle + a right-aligned date block, under a
+    gold divider - rather than the plain centered letterhead the original
+    .doc used."""
+    pdf = FPDF(format="A4")
+    pdf.set_auto_page_break(auto=True, margin=16)
+    pdf.add_page()
+    pdf.set_margins(15, 12, 15)
+
+    try:
+        logo_bytes = base64.b64decode(LOGO_B64)
+        pdf.image(io.BytesIO(logo_bytes), x=15, y=12, w=18)
+    except Exception:
+        pass
+
+    pdf.set_xy(37, 13)
+    pdf.set_font("Helvetica", "B", 15)
+    pdf.set_text_color(18, 58, 86)
+    pdf.cell(130, 7, "SEA POWER FOR MARINE SERVICES CO LTD", ln=1)
+    pdf.set_x(37)
+    pdf.set_font("Helvetica", "B", 10.5)
+    pdf.set_text_color(110, 120, 130)
+    pdf.cell(130, 5.5, "Statement of Facts", ln=1)
+    pdf.set_text_color(0, 0, 0)
+
+    pdf.set_xy(150, 13)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(18, 58, 86)
+    pdf.cell(45, 5, "Prepared", align="R", ln=1)
+    pdf.set_x(150)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(0, 0, 0)
+    pdf.cell(45, 5, str(doc.get("created_at") or "-"), align="R", ln=1)
+
+    pdf.set_y(32)
+    pdf.set_draw_color(201, 162, 39)
+    pdf.set_line_width(0.6)
+    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+    pdf.ln(6)
+
+    def field_row(pairs, col_w=(32, 58, 32, 58)):
+        """pairs: list of (label, value) - 1 or 2 per row. Fixed-width
+        columns, for short fields that are known to fit (vessel/voyage,
+        port/berth) - a long value here would run into the next column,
+        which is exactly what wrap_row (below) is for."""
+        pdf.set_font("Helvetica", "B", 9.5)
+        for i, (label, value) in enumerate(pairs):
+            lw, vw = col_w[i * 2], col_w[i * 2 + 1]
+            pdf.set_font("Helvetica", "B", 9.5)
+            pdf.cell(lw, 6.5, label, border=0)
+            pdf.set_font("Helvetica", "", 9.5)
+            pdf.cell(vw, 6.5, value, border=0)
+        pdf.ln(6.5)
+
+    def wrap_row(label, value, label_w=32):
+        """Full-width label + value, wrapping the value across lines when
+        it's too long for one row - owning companies' registered names
+        routinely run past what a shared two-column row can hold (this is
+        also how the source template itself lays out Owners, wrapping it
+        onto a second line rather than sharing a row with Charterer).
+        multi_cell's default cursor landing (right edge of the cell, same
+        line) is for flowing more content right after it - explicitly pin
+        it back to the left margin on the next line so the following row
+        doesn't end up stranded off the right edge of the page."""
+        pdf.set_font("Helvetica", "B", 9.5)
+        pdf.cell(label_w, 6.5, label, border=0)
+        pdf.set_font("Helvetica", "", 9.5)
+        avail_w = (210 - 15 - 15) - label_w
+        pdf.multi_cell(avail_w, 6.5, value, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    field_row([("Vessel", _sof_val(doc, "vessel")), ("Voyage", _sof_val(doc, "voyage"))])
+    field_row([("Port", _sof_val(doc, "port")), ("Berth", _sof_val(doc, "berth"))])
+    wrap_row("Owners", _sof_val(doc, "owners"))
+    wrap_row("Charterer", _sof_val(doc, "charterer"))
+    pdf.ln(3)
+
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(18, 58, 86)
+    pdf.cell(0, 7, "Event Timeline", ln=1)
+    pdf.set_text_color(0, 0, 0)
+    fill = False
+    for left_col, left_label, right_col, right_label in SOF_TIMELINE_PAIRS:
+        pdf.set_fill_color(246, 248, 250)
+        field_row(
+            [(left_label, _sof_val(doc, left_col)), (right_label, _sof_val(doc, right_col))],
+            col_w=(42, 53, 42, 53),
+        )
+        fill = not fill
+    field_row(
+        [("Berthed (All Fast)", _sof_val(doc, "berthed_all_fast")), ("Cargo Discharged (Final)", _sof_val(doc, "cargo_discharge_mtons"))],
+        col_w=(42, 53, 42, 53),
+    )
+    pdf.ln(3)
+
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(18, 58, 86)
+    pdf.cell(0, 7, "Remaining On Board / Draft", ln=1)
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Helvetica", "B", 9.5)
+    pdf.cell(32, 6.5, "ROB Arrival", border=0)
+    pdf.set_font("Helvetica", "", 9.5)
+    pdf.cell(
+        0, 6.5,
+        f"IFO: {_sof_val(doc,'rob_arrival_ifo')}   MDO: {_sof_val(doc,'rob_arrival_mdo')}   "
+        f"LUBS: {_sof_val(doc,'rob_arrival_lubs')}   F/Water: {_sof_val(doc,'rob_arrival_fwater')}",
+        ln=1,
+    )
+    pdf.set_font("Helvetica", "B", 9.5)
+    pdf.cell(32, 6.5, "ROB Departure", border=0)
+    pdf.set_font("Helvetica", "", 9.5)
+    pdf.cell(
+        0, 6.5,
+        f"IFO: {_sof_val(doc,'rob_departure_ifo')}   MDO: {_sof_val(doc,'rob_departure_mdo')}   "
+        f"LUBS: {_sof_val(doc,'rob_departure_lubs')}   F/Water: {_sof_val(doc,'rob_departure_fwater')}",
+        ln=1,
+    )
+    pdf.set_font("Helvetica", "B", 9.5)
+    pdf.cell(32, 6.5, "Arrival Draft", border=0)
+    pdf.set_font("Helvetica", "", 9.5)
+    pdf.cell(0, 6.5, f"FWD: {_sof_val(doc,'arrival_draft_fwd')}   AFT: {_sof_val(doc,'arrival_draft_aft')}", ln=1)
+    pdf.set_font("Helvetica", "B", 9.5)
+    pdf.cell(32, 6.5, "Departure Draft", border=0)
+    pdf.set_font("Helvetica", "", 9.5)
+    pdf.cell(0, 6.5, f"FWD: {_sof_val(doc,'departure_draft_fwd')}   AFT: {_sof_val(doc,'departure_draft_aft')}", ln=1)
+    pdf.ln(3)
+
+    if (doc.get("delays_remarks") or "").strip():
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(18, 58, 86)
+        pdf.cell(0, 7, "Delays / Remarks", ln=1)
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", "", 9.5)
+        pdf.multi_cell(0, 6, doc.get("delays_remarks"))
+        pdf.ln(2)
+
+    if (doc.get("masters_remarks") or "").strip():
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(18, 58, 86)
+        pdf.cell(0, 7, "Master's Remarks", ln=1)
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", "", 9.5)
+        pdf.multi_cell(0, 6, doc.get("masters_remarks"))
+        pdf.ln(4)
+
+    pdf.ln(10)
+    y = pdf.get_y()
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_xy(15, y)
+    pdf.cell(80, 6, "MASTER", border="T")
+    pdf.set_xy(130, y)
+    pdf.cell(65, 6, "AGENT", border="T", align="R")
 
     out = pdf.output(dest="S")
     return bytes(out)
@@ -517,6 +736,12 @@ def direct_delivery_page():
 @login_required
 def pda_page():
     return render_template_string(PDA_HTML, username=session.get("username"), role=session.get("role"))
+
+
+@app.route("/sof")
+@login_required
+def sof_page():
+    return render_template_string(SOF_HTML, username=session.get("username"), role=session.get("role"))
 
 
 @app.route("/users")
@@ -3029,6 +3254,103 @@ def check_overdue_now():
     return jsonify({"ok": ok, "overdue_count": len(overdue), "sent": ok, "error": err})
 
 
+# ---------- SOF (Statement of Facts) ----------
+
+@app.route("/api/sof/documents", methods=["GET"])
+@login_required
+def list_sof_documents():
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, vessel, voyage, port, berth, created_by, created_at, updated_at FROM sof_documents ORDER BY created_at DESC, id DESC"
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/sof/documents", methods=["POST"])
+@login_required
+def create_sof_document():
+    data = request.get_json(force=True)
+    vessel = (data.get("vessel") or "").strip()
+    port = (data.get("port") or "").strip()
+    if not vessel or not port:
+        return jsonify({"error": "Vessel and port are required."}), 400
+    db = get_db()
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    cols = list(SOF_COLUMNS) + ["created_by", "created_at", "updated_at"]
+    vals = [(data.get(col) or "").strip() if isinstance(data.get(col), str) else (data.get(col) or "") for col in SOF_COLUMNS]
+    vals += [session.get("username"), now, now]
+    col_sql = ", ".join(cols)
+    placeholders = ", ".join("?" for _ in cols)
+    row = db.execute(
+        f"INSERT INTO sof_documents ({col_sql}) VALUES ({placeholders}) RETURNING id",
+        tuple(vals),
+    ).fetchone()
+    db.commit()
+    return jsonify({"ok": True, "id": row["id"]})
+
+
+@app.route("/api/sof/documents/<int:doc_id>", methods=["GET"])
+@login_required
+def get_sof_document(doc_id):
+    db = get_db()
+    doc = db.execute("SELECT * FROM sof_documents WHERE id = ?", (doc_id,)).fetchone()
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    return jsonify(dict(doc))
+
+
+@app.route("/api/sof/documents/<int:doc_id>", methods=["PUT"])
+@login_required
+def update_sof_document(doc_id):
+    data = request.get_json(force=True)
+    db = get_db()
+    doc = db.execute("SELECT * FROM sof_documents WHERE id = ?", (doc_id,)).fetchone()
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    updates = {}
+    for col in SOF_COLUMNS:
+        if col in data:
+            val = data.get(col)
+            updates[col] = val.strip() if isinstance(val, str) else (val or "")
+    if "vessel" in updates and not updates["vessel"]:
+        return jsonify({"error": "Vessel can't be empty."}), 400
+    if "port" in updates and not updates["port"]:
+        return jsonify({"error": "Port can't be empty."}), 400
+    if not updates:
+        return jsonify({"ok": True})
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    updates["updated_at"] = now
+    set_clause = ", ".join(k + " = ?" for k in updates)
+    db.execute(f"UPDATE sof_documents SET {set_clause} WHERE id = ?", (*updates.values(), doc_id))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/sof/documents/<int:doc_id>", methods=["DELETE"])
+@login_required
+def delete_sof_document(doc_id):
+    db = get_db()
+    db.execute("DELETE FROM sof_documents WHERE id = ?", (doc_id,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/sof/documents/<int:doc_id>/pdf", methods=["GET"])
+@login_required
+def export_sof_pdf(doc_id):
+    db = get_db()
+    doc = db.execute("SELECT * FROM sof_documents WHERE id = ?", (doc_id,)).fetchone()
+    if not doc:
+        return "Not found.", 404
+    pdf_bytes = build_sof_pdf(dict(doc))
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", f"SOF_{doc['port']}_{doc['vessel']}_{doc['id']}")
+    return Response(
+        pdf_bytes,
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{safe}.pdf"'},
+    )
+
+
 # ---------- Templates ----------
 
 AUTH_STYLE = """
@@ -3695,6 +4017,15 @@ HUB_HTML = """
       </div>
       <h3>Disbursement Accounts</h3>
       <p>Build a PDA from a per-port charge template, then finalize it into an FDA once actual costs are known.</p>
+      <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
+    </a>
+
+    <a class="tile" href="/sof">
+      <div class="tile-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/><path d="M9 12l2 2 4-4"/></svg>
+      </div>
+      <h3>Statement of Facts</h3>
+      <p>Log a vessel call's event timeline field-by-field and export it as a signed-off SOF.</p>
       <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
     </a>
   </div>
@@ -5464,6 +5795,456 @@ async function checkOverdueNow() {
 loadTemplates();
 loadAlertSettings();
 {% endif %}
+
+loadDocuments();
+</script>
+</body></html>
+"""
+
+SOF_HTML = """
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compass - Statement of Facts</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + """">
+<style>
+  :root {
+    --bg: #f2f4f7; --card: #ffffff; --text: #1c2b3a; --muted: #7a8794; --border: #e6e9ed;
+    --navy: #123a56; --navy-deep: #0b2740; --navy-light: #1f5c85; --gold: #c9a227; --gold-light: #e0bd53;
+    --danger: #d1483f; --danger-bg: #fbeceb; --ok: #1c8a5a; --ok-bg: #e7f5ee;
+    --warn: #8a6d1f; --warn-bg: rgba(212,160,23,0.16);
+    --shadow-sm: 0 1px 2px rgba(18,58,86,0.05); --shadow-md: 0 10px 30px rgba(18,58,86,0.10);
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --bg: #131a23; --card: #1a232f; --text: #e9eef3; --muted: #93a1b1; --border: #29323f;
+    --navy: #3f86ba; --navy-deep: #274a67; --navy-light: #5aa2d1; --gold: #e3bb4c; --gold-light: #f0cf72;
+    --danger: #e2685f; --danger-bg: #3a2220; --ok: #3ecb8e; --ok-bg: #163329;
+    --warn: var(--gold-light); --warn-bg: rgba(227,187,76,0.16);
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.25); --shadow-md: 0 10px 30px rgba(0,0,0,0.35);
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif;
+    background: var(--bg); color: var(--text); margin: 0; padding: 0 16px 40px;
+    transition: background-color .25s ease, color .25s ease;
+  }
+  .topbar {
+    position: sticky; top: 0; z-index: 50; display: flex; justify-content: space-between; align-items: center;
+    gap: 12px; flex-wrap: wrap; padding: 14px 16px; margin: 0 -16px 20px;
+    background: color-mix(in srgb, var(--bg) 86%, transparent);
+    backdrop-filter: saturate(180%) blur(14px); -webkit-backdrop-filter: saturate(180%) blur(14px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+  .brand img { height: 32px; width: auto; }
+  .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
+  .brand-text .app-name { font-size: 14.5px; font-weight: 700; color: var(--text); }
+  .brand-text .app-tag { font-size: 11px; color: var(--muted); }
+  .topbar-right { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+  .topbar-right a { color: var(--navy); text-decoration: none; font-weight: 600; font-size: 13px; padding: 6px 12px; border-radius: 20px; transition: background .15s ease; }
+  :root[data-theme="dark"] .topbar-right a { color: var(--navy-light); }
+  .topbar-right a:hover { background: var(--border); }
+
+  .theme-switch { position: relative; display: inline-flex; width: 54px; height: 29px; cursor: pointer; }
+  .theme-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .theme-track { position: absolute; inset: 0; border-radius: 999px; display: flex; align-items: center; justify-content: space-between; padding: 0 7px; background: linear-gradient(135deg,#8fcaf0,#f4d58d); transition: background .3s ease; }
+  :root[data-theme="dark"] .theme-track { background: linear-gradient(135deg,#1f2b42,#33456a); }
+  .theme-icon { width: 13px; height: 13px; color: #fff; opacity: .9; z-index: 1; }
+  .theme-icon svg { width: 100%; height: 100%; }
+  .theme-knob { position: absolute; top: 3px; left: 3px; width: 23px; height: 23px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.3); transition: transform .3s cubic-bezier(.4,0,.2,1); }
+  input:checked + .theme-track .theme-knob { transform: translateX(25px); background: #0b2740; }
+
+  .page-head { padding: 4px 4px 18px; }
+  .page-head .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--gold); margin-bottom: 6px; }
+  :root[data-theme="dark"] .page-head .eyebrow { color: var(--gold-light); }
+  .page-head h1 { font-size: 22px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  .page-head p { color: var(--muted); margin: 0; font-size: 13.5px; max-width: 680px; }
+
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 18px; box-shadow: var(--shadow-sm); padding: 18px 20px; margin-bottom: 18px; }
+  .panel h2 { font-size: 15px; margin: 0 0 2px; }
+  .panel .panel-sub { font-size: 12px; color: var(--muted); margin: 0 0 14px; }
+
+  label.field-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); display: block; margin-bottom: 5px; }
+  input[type=text], input[type=number], input[type=email], select, textarea {
+    width: 100%; padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px;
+    font-size: 13.5px; font-family: inherit; background: var(--bg); color: var(--text);
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--navy-light); }
+  textarea { resize: vertical; min-height: 56px; }
+
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+
+  .btn { background: var(--navy); color: #fff; border: none; border-radius: 999px; padding: 9px 17px; font-size: 12.5px; font-weight: 600; cursor: pointer; transition: background .15s ease, transform .08s ease; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+  .btn:hover { background: var(--navy-light); }
+  .btn:active { transform: scale(.97); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.ghost { background: none; color: var(--navy); border: 1px solid var(--border); }
+  :root[data-theme="dark"] .btn.ghost { color: var(--navy-light); }
+  .btn.ghost:hover { background: var(--border); }
+  .btn.ghost.danger { color: var(--danger); }
+  .btn.ghost.danger:hover { background: var(--danger-bg); }
+  .btn.small { padding: 5px 11px; font-size: 11.5px; }
+
+  table.doc-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.doc-table th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  table.doc-table td { padding: 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  table.doc-table tr:last-child td { border-bottom: none; }
+  table.doc-table tr.doc-row { cursor: pointer; }
+  table.doc-table tr.doc-row:hover td { background: color-mix(in srgb, var(--navy-light) 5%, transparent); }
+
+  .empty-note { color: var(--muted); font-size: 13px; padding: 10px 2px; }
+
+  #docDetail { display: none; }
+  .detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  .detail-title { font-size: 16px; font-weight: 700; margin: 0 0 2px; }
+  .detail-sub { font-size: 12px; color: var(--muted); }
+  .detail-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  .field-section { margin-top: 20px; margin-bottom: 6px; }
+  .field-section h3 { font-size: 13px; margin: 0 0 10px; color: var(--navy-light); text-transform: uppercase; letter-spacing: .04em; }
+  .field-section:first-of-type { margin-top: 0; }
+
+  .timeline-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; margin-bottom: 4px; }
+  @media (max-width: 560px) { .timeline-grid { grid-template-columns: 1fr; } }
+
+  #toastHost { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; pointer-events: none; max-width: min(340px, calc(100vw - 40px)); }
+  #toastHost .toast { pointer-events: auto; }
+  .toast { background: var(--navy-deep); color: #fff; padding: 11px 16px; border-radius: 12px; font-size: 13px; display: flex; align-items: center; gap: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); animation: toast-in .18s ease-out; max-width: 340px; }
+  .toast.error { background: var(--danger); }
+  .toast.fading { animation: toast-out .2s ease-in forwards; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes toast-out { to { opacity: 0; transform: translateY(8px); } }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <a href="/" class="brand">
+      <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
+      <div class="brand-text">
+        <span class="app-name">Compass</span>
+        <span class="app-tag">Statement of Facts</span>
+      </div>
+    </a>
+    <div class="topbar-right">
+      <label class="theme-switch" title="Toggle dark mode">
+        <input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')">
+        <span class="theme-track">
+          <span class="theme-icon sun">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg>
+          </span>
+          <span class="theme-icon moon">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg>
+          </span>
+          <span class="theme-knob"></span>
+        </span>
+      </label>
+      <a href="/pda">Disbursement Accounts</a>
+      <a href="/do-tracker">DO Tracker</a>
+      {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
+      <span style="padding:6px 4px;">Signed in as <b>{{ username }}</b></span>
+      <a href="/logout">Log out</a>
+    </div>
+  </div>
+
+  <div class="page-head">
+    <div class="eyebrow">Compass</div>
+    <h1>Statement of Facts</h1>
+    <p>Record a vessel call's event timeline field-by-field, the same way the paper SOF is filled in over the course of the call, then export it as a finished document once the call is complete.</p>
+  </div>
+
+  <div id="toastHost"></div>
+
+  <div class="panel" id="listPanel">
+    <h2>New Statement of Facts</h2>
+    <p class="panel-sub">Start with what you know now - vessel and port are required, everything else (including the whole timeline) can be filled in as the call progresses.</p>
+    <div class="form-grid">
+      <div>
+        <label class="field-label" for="newVessel">Vessel</label>
+        <input type="text" id="newVessel" placeholder="e.g. M.V. RICH GLORY">
+      </div>
+      <div>
+        <label class="field-label" for="newVoyage">Voyage</label>
+        <input type="text" id="newVoyage" placeholder="e.g. MAC015">
+      </div>
+      <div>
+        <label class="field-label" for="newPort">Port</label>
+        <select id="newPort">
+          <option value="DAMMAM PORT">Dammam Port</option>
+          <option value="JUBAIL COMMERCIAL PORT">Jubail Commercial Port</option>
+          <option value="JEDDAH PORT">Jeddah Port</option>
+          <option value="YANBU COMMERCIAL PORT">Yanbu Commercial Port</option>
+          <option value="YANBU INDUSTRIAL PORT">Yanbu Industrial Port</option>
+          <option value="KAP">KAP</option>
+        </select>
+      </div>
+      <div>
+        <label class="field-label" for="newBerth">Berth</label>
+        <input type="text" id="newBerth" placeholder="e.g. Berth 22">
+      </div>
+    </div>
+    <div class="form-actions">
+      <button class="btn" onclick="createDocument()">Create SOF</button>
+    </div>
+  </div>
+
+  <div class="panel" id="docsListPanel">
+    <h2>Documents</h2>
+    <p class="panel-sub" id="docsSub">Loading...</p>
+    <div id="docsBody"></div>
+  </div>
+
+  <div class="panel" id="docDetail">
+    <div class="detail-head">
+      <div>
+        <button class="btn ghost small" onclick="closeDocument()" style="margin-bottom:8px;">&larr; All documents</button>
+        <div class="detail-title" id="detailTitle"></div>
+        <div class="detail-sub" id="detailSub"></div>
+      </div>
+      <div class="detail-actions" id="detailActions"></div>
+    </div>
+
+    <div class="field-section">
+      <h3>Vessel Particulars</h3>
+      <div class="form-grid" id="particularsGrid"></div>
+    </div>
+
+    <div class="field-section">
+      <h3>Event Timeline</h3>
+      <div class="timeline-grid" id="timelineGrid"></div>
+    </div>
+
+    <div class="field-section">
+      <h3>Remaining On Board</h3>
+      <div class="form-grid" id="robGrid"></div>
+    </div>
+
+    <div class="field-section">
+      <h3>Draft</h3>
+      <div class="form-grid" id="draftGrid"></div>
+    </div>
+
+    <div class="field-section">
+      <h3>Delays / Remarks</h3>
+      <textarea id="detDelays" onchange="saveField('delays_remarks', this.value)" placeholder="Any delays worth recording, with reasons and durations..."></textarea>
+    </div>
+
+    <div class="field-section">
+      <h3>Master's Remarks</h3>
+      <textarea id="detMastersRemarks" onchange="saveField('masters_remarks', this.value)" placeholder="Remarks for the master's signature section..."></textarea>
+    </div>
+  </div>
+
+<script>
+(function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem('theme'); } catch (e) {}
+  const mode = saved || 'light';
+  document.documentElement.setAttribute('data-theme', mode);
+  window.addEventListener('DOMContentLoaded', () => {
+    const cb = document.getElementById('themeToggle');
+    if (cb) cb.checked = mode === 'dark';
+  });
+})();
+function setTheme(mode) {
+  document.documentElement.setAttribute('data-theme', mode);
+  try { localStorage.setItem('theme', mode); } catch (e) {}
+}
+
+function showToast(message, opts) {
+  opts = opts || {};
+  const host = document.getElementById('toastHost');
+  const el = document.createElement('div');
+  el.className = 'toast' + (opts.error ? ' error' : '');
+  const text = document.createElement('span');
+  text.textContent = message;
+  el.appendChild(text);
+  host.appendChild(el);
+  const duration = opts.duration || 4000;
+  const timer = setTimeout(dismiss, duration);
+  function dismiss() {
+    clearTimeout(timer);
+    el.classList.add('fading');
+    setTimeout(() => el.remove(), 220);
+  }
+}
+
+function escHtml(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+const SOF_PARTICULARS = [
+  ['vessel', 'Vessel', ''], ['voyage', 'Voyage', ''],
+  ['berth', 'Berth', ''], ['owners', 'Owners', ''], ['charterer', 'Charterer', '']
+];
+const SOF_TIMELINE_FIELDS = [
+  ['end_of_sea_passage', 'End of Sea Passage', 'DD.MM.YY AT HHMM HRS'],
+  ['customs_cleared', 'Customs Cleared', 'DD.MM.YY AT HHMM HRS'],
+  ['nor_tendered', 'NOR Tendered', 'DD.MM.YY AT HHMM HRS'],
+  ['commenced_discharge', 'Commenced Discharge', 'DD.MM.YY AT HHMM HRS'],
+  ['nor_accepted', 'NOR Accepted', 'DD.MM.YY AT HHMM HRS'],
+  ['completed_discharge', 'Completed Discharge', 'DD.MM.YY AT HHMM HRS'],
+  ['anchored', 'Anchored', 'DD.MM.YY AT HHMM HRS'],
+  ['documents_on_board', 'Documents on Board', 'DD.MM.YY AT HHMM HRS'],
+  ['left_anchorage', 'Left Anchorage', 'DD.MM.YY AT HHMM HRS'],
+  ['clearance_delivered', 'Clearance Delivered', 'DD.MM.YY AT HHMM HRS'],
+  ['pilot_boarded_arrival', 'Pilot Boarded (Arrival)', 'DD.MM.YY AT HHMM HRS'],
+  ['pilot_boarded_departure', 'Pilot Boarded (Departure)', 'DD.MM.YY AT HHMM HRS'],
+  ['first_line_to_shore', 'First Line to Shore', 'DD.MM.YY AT HHMM HRS'],
+  ['left_berth', 'Left Berth', 'DD.MM.YY AT HHMM HRS'],
+  ['berthed_all_fast', 'Berthed (All Fast)', 'DD.MM.YY AT HHMM HRS'],
+  ['cargo_discharge_mtons', 'Cargo Discharged (M.Tons)', 'e.g. 12,500.00']
+];
+const SOF_ROB_FIELDS = [
+  ['rob_arrival_ifo', 'ROB Arrival - IFO', 'e.g. 180.5 MT'], ['rob_arrival_mdo', 'ROB Arrival - MDO', 'e.g. 45.0 MT'],
+  ['rob_arrival_lubs', 'ROB Arrival - LUBS', 'e.g. 8.2 MT'], ['rob_arrival_fwater', 'ROB Arrival - F.Water', 'e.g. 60.0 MT'],
+  ['rob_departure_ifo', 'ROB Departure - IFO', 'e.g. 170.0 MT'], ['rob_departure_mdo', 'ROB Departure - MDO', 'e.g. 43.0 MT'],
+  ['rob_departure_lubs', 'ROB Departure - LUBS', 'e.g. 8.0 MT'], ['rob_departure_fwater', 'ROB Departure - F.Water', 'e.g. 55.0 MT']
+];
+const SOF_DRAFT_FIELDS = [
+  ['arrival_draft_fwd', 'Arrival Draft - FWD', 'e.g. 8.20 M'], ['arrival_draft_aft', 'Arrival Draft - AFT', 'e.g. 9.10 M'],
+  ['departure_draft_fwd', 'Departure Draft - FWD', 'e.g. 7.50 M'], ['departure_draft_aft', 'Departure Draft - AFT', 'e.g. 8.40 M']
+];
+
+function fieldBlock(col, label, placeholder) {
+  return `<div>
+    <label class="field-label" for="f_${col}">${label}</label>
+    <input type="text" id="f_${col}" onchange="saveField('${col}', this.value)" placeholder="${placeholder || ''}">
+  </div>`;
+}
+
+function portFieldBlock() {
+  return `<div>
+    <label class="field-label" for="f_port">Port</label>
+    <select id="f_port" onchange="saveField('port', this.value)">
+      <option value="DAMMAM PORT">Dammam Port</option>
+      <option value="JUBAIL COMMERCIAL PORT">Jubail Commercial Port</option>
+      <option value="JEDDAH PORT">Jeddah Port</option>
+      <option value="YANBU COMMERCIAL PORT">Yanbu Commercial Port</option>
+      <option value="YANBU INDUSTRIAL PORT">Yanbu Industrial Port</option>
+      <option value="KAP">KAP</option>
+    </select>
+  </div>`;
+}
+
+document.getElementById('particularsGrid').innerHTML =
+  fieldBlock('vessel', 'Vessel') + fieldBlock('voyage', 'Voyage') + portFieldBlock() +
+  fieldBlock('berth', 'Berth') + fieldBlock('owners', 'Owners') + fieldBlock('charterer', 'Charterer');
+document.getElementById('timelineGrid').innerHTML = SOF_TIMELINE_FIELDS.map(([c, l, p]) => fieldBlock(c, l, p)).join('');
+document.getElementById('robGrid').innerHTML = SOF_ROB_FIELDS.map(([c, l, p]) => fieldBlock(c, l, p)).join('');
+document.getElementById('draftGrid').innerHTML = SOF_DRAFT_FIELDS.map(([c, l, p]) => fieldBlock(c, l, p)).join('');
+
+const SOF_ALL_FIELDS = ['vessel', 'voyage', 'port', 'berth', 'owners', 'charterer']
+  .concat(SOF_TIMELINE_FIELDS.map(f => f[0]))
+  .concat(SOF_ROB_FIELDS.map(f => f[0]))
+  .concat(SOF_DRAFT_FIELDS.map(f => f[0]));
+
+let currentDocId = null;
+let currentDoc = null;
+
+async function loadDocuments() {
+  const res = await fetch('/api/sof/documents');
+  if (res.status === 401 || res.redirected) { location.reload(); return; }
+  const rows = await res.json();
+  const sub = document.getElementById('docsSub');
+  const body = document.getElementById('docsBody');
+  if (!rows.length) {
+    sub.textContent = 'No Statements of Facts yet.';
+    body.innerHTML = '<div class="empty-note">Create one above once you have a vessel and port to work from.</div>';
+    return;
+  }
+  sub.textContent = rows.length + ' document(s).';
+  body.innerHTML = `
+    <table class="doc-table">
+      <thead><tr><th>Vessel</th><th>Voyage</th><th>Port</th><th>Berth</th><th>Created</th><th></th></tr></thead>
+      <tbody>
+        ${rows.map(d => `
+          <tr class="doc-row" onclick="openDocument(${d.id})">
+            <td>${escHtml(d.vessel)}</td>
+            <td style="color:var(--muted);">${escHtml(d.voyage) || '-'}</td>
+            <td>${escHtml(d.port)}</td>
+            <td style="color:var(--muted);">${escHtml(d.berth) || '-'}</td>
+            <td style="color:var(--muted);font-size:12px;">${escHtml(d.created_by)}${d.created_at ? ' - ' + escHtml(d.created_at) : ''}</td>
+            <td><button class="btn ghost danger small" onclick="event.stopPropagation(); deleteDocument(${d.id})">Delete</button></td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+async function createDocument() {
+  const vessel = document.getElementById('newVessel').value.trim();
+  const voyage = document.getElementById('newVoyage').value.trim();
+  const port = document.getElementById('newPort').value;
+  const berth = document.getElementById('newBerth').value.trim();
+  if (!vessel) { showToast('Enter a vessel name.', {error:true}); return; }
+  const res = await fetch('/api/sof/documents', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({vessel, voyage, port, berth})
+  });
+  const data = await res.json();
+  if (!res.ok || data.error) { showToast(data.error || 'Could not create that document.', {error:true}); return; }
+  document.getElementById('newVessel').value = '';
+  document.getElementById('newVoyage').value = '';
+  document.getElementById('newBerth').value = '';
+  await loadDocuments();
+  openDocument(data.id);
+}
+
+async function deleteDocument(id) {
+  if (!confirm('Delete this Statement of Facts? This cannot be undone.')) return;
+  await fetch('/api/sof/documents/' + id, {method: 'DELETE'});
+  if (currentDocId === id) closeDocument();
+  await loadDocuments();
+  showToast('Document deleted.');
+}
+
+async function openDocument(id) {
+  const res = await fetch('/api/sof/documents/' + id);
+  if (!res.ok) { showToast('Could not load that document.', {error:true}); return; }
+  const doc = await res.json();
+  currentDocId = id;
+  currentDoc = doc;
+  document.getElementById('listPanel').style.display = 'none';
+  document.getElementById('docsListPanel').style.display = 'none';
+  document.getElementById('docDetail').style.display = 'block';
+  renderDetail();
+}
+
+function closeDocument() {
+  currentDocId = null;
+  document.getElementById('docDetail').style.display = 'none';
+  document.getElementById('listPanel').style.display = '';
+  document.getElementById('docsListPanel').style.display = '';
+}
+
+function renderDetail() {
+  const doc = currentDoc;
+  document.getElementById('detailTitle').textContent = 'SOF - ' + (doc.vessel || '-') + (doc.port ? ' / ' + doc.port : '');
+  document.getElementById('detailSub').textContent =
+    'Prepared by ' + (doc.created_by || '-') + (doc.created_at ? ' on ' + doc.created_at : '') +
+    (doc.updated_at && doc.updated_at !== doc.created_at ? ' - last updated ' + doc.updated_at : '');
+  document.getElementById('detailActions').innerHTML =
+    '<a class="btn ghost small" href="/api/sof/documents/' + doc.id + '/pdf">Export PDF</a>' +
+    '<button class="btn ghost danger small" onclick="deleteDocument(' + doc.id + ')">Delete</button>';
+
+  SOF_ALL_FIELDS.forEach(c => {
+    const el = document.getElementById('f_' + c);
+    if (el) el.value = doc[c] || '';
+  });
+  document.getElementById('detDelays').value = doc.delays_remarks || '';
+  document.getElementById('detMastersRemarks').value = doc.masters_remarks || '';
+}
+
+async function saveField(col, value) {
+  if (!currentDocId) return;
+  const res = await fetch('/api/sof/documents/' + currentDocId, {
+    method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({[col]: value})
+  });
+  const data = await res.json();
+  if (!res.ok || data.error) { showToast((data && data.error) || 'Could not save that change.', {error:true}); return; }
+  currentDoc[col] = value;
+  if (col === 'vessel' || col === 'port' || col === 'voyage' || col === 'berth') loadDocuments();
+}
 
 loadDocuments();
 </script>
