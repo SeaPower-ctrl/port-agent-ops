@@ -20,7 +20,11 @@ import os
 import re
 import csv
 import io
-from datetime import datetime
+import base64
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from datetime import datetime, date
 from functools import wraps
 from flask import Flask, request, jsonify, g, render_template_string, session, redirect, url_for, send_file, Response
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -28,6 +32,7 @@ import openpyxl
 import xlrd
 import psycopg2
 import psycopg2.extras
+from fpdf import FPDF
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
@@ -163,9 +168,244 @@ def init_db():
     # human glance rather than blind trust.
     cur.execute("ALTER TABLE direct_delivery ADD COLUMN IF NOT EXISTS needs_review INTEGER DEFAULT 0")
     cur.execute("ALTER TABLE direct_delivery ADD COLUMN IF NOT EXISTS review_note TEXT DEFAULT ''")
+
+    # PDA / FDA (Proforma / Final Disbursement Account) - a per-port charge
+    # template (port dues, pilotage, towage, agency fee, ...) that pre-fills
+    # a new PDA for a vessel call; the agent adjusts amounts per vessel.
+    # When the vessel sails, the same document is "finalized" into an FDA by
+    # filling in actual amounts alongside the original estimate - one record
+    # carries both, rather than two documents that can drift apart.
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS pda_templates (
+            id SERIAL PRIMARY KEY,
+            port TEXT NOT NULL,
+            name TEXT NOT NULL,
+            default_amount NUMERIC DEFAULT 0,
+            sort_order INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT ''
+        )"""
+    )
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS pda_documents (
+            id SERIAL PRIMARY KEY,
+            port TEXT DEFAULT '',
+            vessel TEXT DEFAULT '',
+            reference TEXT DEFAULT '',
+            currency TEXT DEFAULT 'SAR',
+            status TEXT DEFAULT 'draft',
+            notes TEXT DEFAULT '',
+            created_by TEXT DEFAULT '',
+            created_at TEXT DEFAULT '',
+            sent_at TEXT DEFAULT '',
+            finalized_by TEXT DEFAULT '',
+            finalized_at TEXT DEFAULT ''
+        )"""
+    )
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS pda_line_items (
+            id SERIAL PRIMARY KEY,
+            pda_id INTEGER NOT NULL REFERENCES pda_documents(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            estimated_amount NUMERIC DEFAULT 0,
+            actual_amount NUMERIC,
+            sort_order INTEGER DEFAULT 0
+        )"""
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pda_line_items_pda ON pda_line_items (pda_id)")
+
+    # Small generic key/value store - currently just the overdue-ETA alert
+    # settings (recipient list + on/off), so it doesn't need its own table
+    # and its own migration every time a new setting shows up.
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT DEFAULT ''
+        )"""
+    )
     conn.commit()
     cur.close()
     conn.close()
+
+
+def fmt_money(value):
+    try:
+        return "{:,.2f}".format(float(value or 0))
+    except (TypeError, ValueError):
+        return "0.00"
+
+
+def build_pda_pdf(doc, items):
+    """Renders a PDA (while draft/sent) or FDA (once finalized) as a PDF,
+    reusing the Sea Power logo already embedded in the app. Finalized
+    documents get an extra Actual + Variance column so the agent can see
+    at a glance where the final cost diverged from the estimate."""
+    is_fda = doc["status"] == "finalized"
+    pdf = FPDF(format="A4")
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.add_page()
+
+    try:
+        logo_bytes = base64.b64decode(LOGO_B64)
+        pdf.image(io.BytesIO(logo_bytes), x=15, y=12, w=20)
+    except Exception:
+        pass
+
+    pdf.set_xy(40, 14)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 7, "Sea Power Marine Services Co. Ltd", ln=1)
+    pdf.set_x(40)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(110, 120, 130)
+    pdf.cell(0, 5, "Compass - Disbursement Account", ln=1)
+    pdf.set_text_color(0, 0, 0)
+
+    pdf.ln(10)
+    pdf.set_font("Helvetica", "B", 16)
+    title = "FINAL DISBURSEMENT ACCOUNT (FDA)" if is_fda else "PROFORMA DISBURSEMENT ACCOUNT (PDA)"
+    pdf.cell(0, 9, title, ln=1)
+
+    pdf.set_font("Helvetica", "", 10.5)
+    pdf.ln(2)
+    meta_rows = [
+        ("Port", doc.get("port") or "-"),
+        ("Vessel", doc.get("vessel") or "-"),
+        ("Reference", doc.get("reference") or "-"),
+        ("Currency", doc.get("currency") or "SAR"),
+        ("Status", (doc.get("status") or "draft").capitalize()),
+        ("Prepared by", doc.get("created_by") or "-"),
+        ("Date", doc.get("created_at") or "-"),
+    ]
+    if is_fda:
+        meta_rows.append(("Finalized by", doc.get("finalized_by") or "-"))
+        meta_rows.append(("Finalized", doc.get("finalized_at") or "-"))
+    for label, value in meta_rows:
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(38, 6.5, label + ":", border=0)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 6.5, str(value), ln=1)
+
+    pdf.ln(4)
+    currency = doc.get("currency") or "SAR"
+    if is_fda:
+        col_w = [84, 32, 32, 32]
+        headers = ["Charge", "Estimate", "Actual", "Variance"]
+    else:
+        col_w = [116, 64]
+        headers = ["Charge", "Estimate"]
+
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_fill_color(18, 58, 86)
+    pdf.set_text_color(255, 255, 255)
+    for w, h in zip(col_w, headers):
+        align = "L" if h == "Charge" else "R"
+        pdf.cell(w, 8, h, border=1, align=align, fill=True)
+    pdf.ln()
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Helvetica", "", 10)
+
+    est_total = 0.0
+    act_total = 0.0
+    fill = False
+    for item in items:
+        est = float(item.get("estimated_amount") or 0)
+        est_total += est
+        pdf.set_fill_color(246, 248, 250)
+        pdf.cell(col_w[0], 7.5, str(item.get("name") or ""), border=1, align="L", fill=fill)
+        pdf.cell(col_w[1], 7.5, fmt_money(est), border=1, align="R", fill=fill)
+        if is_fda:
+            act = item.get("actual_amount")
+            act = float(act) if act is not None else est
+            act_total += act
+            variance = act - est
+            pdf.cell(col_w[2], 7.5, fmt_money(act), border=1, align="R", fill=fill)
+            pdf.cell(col_w[3], 7.5, ("+" if variance > 0 else "") + fmt_money(variance), border=1, align="R", fill=fill)
+        pdf.ln()
+        fill = not fill
+
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(col_w[0], 8, "Total (" + currency + ")", border=1, align="L")
+    pdf.cell(col_w[1], 8, fmt_money(est_total), border=1, align="R")
+    if is_fda:
+        variance_total = act_total - est_total
+        pdf.cell(col_w[2], 8, fmt_money(act_total), border=1, align="R")
+        pdf.cell(col_w[3], 8, ("+" if variance_total > 0 else "") + fmt_money(variance_total), border=1, align="R")
+    pdf.ln(12)
+
+    if doc.get("notes"):
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, "Notes", ln=1)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.multi_cell(0, 6, str(doc.get("notes")))
+
+    out = pdf.output(dest="S")
+    return bytes(out)
+
+
+def send_email(to_addrs, subject, body):
+    """Sends through SMTP creds in the environment (SMTP_HOST/PORT/USER/
+    PASSWORD/FROM) - nothing is hardcoded here, same pattern as
+    DATABASE_URL/APP_SECRET_KEY. Returns (ok, error_message) instead of
+    raising, so a missing/misconfigured mail account degrades to "alert
+    not sent" rather than a 500 on whatever triggered it."""
+    host = os.environ.get("SMTP_HOST", "")
+    port = os.environ.get("SMTP_PORT", "587")
+    user = os.environ.get("SMTP_USER", "")
+    password = os.environ.get("SMTP_PASSWORD", "")
+    sender = os.environ.get("SMTP_FROM", user)
+    if not host or not user or not password:
+        return False, "Email isn't configured yet (SMTP_HOST/SMTP_USER/SMTP_PASSWORD missing)."
+    if not to_addrs:
+        return False, "No recipient configured."
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = sender
+        msg["To"] = ", ".join(to_addrs)
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+        with smtplib.SMTP(host, int(port), timeout=20) as server:
+            server.starttls()
+            server.login(user, password)
+            server.sendmail(sender, to_addrs, msg.as_string())
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def get_setting(key, default=""):
+    db = get_db()
+    row = db.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+    db = get_db()
+    db.execute(
+        "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (key, value),
+    )
+    db.commit()
+
+
+def find_overdue_vessel_groups():
+    """A vessel group is overdue once its ETA has passed and at least one
+    of its BLs still isn't fully through invoice/approval/DO - the same
+    "left" count already shown on the DO Tracker board, just filtered to
+    ETA < today and rolled up per port/vessel instead of per BL."""
+    db = get_db()
+    rows = db.execute(
+        "SELECT * FROM records WHERE archived = 0 AND eta != '' ORDER BY port, vessel"
+    ).fetchall()
+    today = date.today().isoformat()
+    groups = {}
+    for r in rows:
+        if r["eta"] >= today:
+            continue
+        key = (r["port"], r["vessel"])
+        g_ = groups.setdefault(key, {"port": r["port"], "vessel": r["vessel"], "eta": r["eta"], "total": 0, "left": 0})
+        g_["total"] += 1
+        if not (r["invoice_issued"] and r["approval_received"] and r["do_issued"]):
+            g_["left"] += 1
+    return [g_ for g_ in groups.values() if g_["left"] > 0]
 
 
 def any_users_exist():
@@ -271,6 +511,12 @@ def kpi_page():
 @login_required
 def direct_delivery_page():
     return render_template_string(DIRECT_DELIVERY_HTML, username=session.get("username"), role=session.get("role"))
+
+
+@app.route("/pda")
+@login_required
+def pda_page():
+    return render_template_string(PDA_HTML, username=session.get("username"), role=session.get("role"))
 
 
 @app.route("/users")
@@ -2447,6 +2693,342 @@ def set_vessel_mmsi():
     return jsonify({"ok": True, "vessel": name, "mmsi": mmsi})
 
 
+# ---------- PDA / FDA (Disbursement Accounts) ----------
+
+def _num_row(row, fields):
+    d = dict(row)
+    for k in fields:
+        if d.get(k) is not None:
+            d[k] = float(d[k])
+    return d
+
+
+@app.route("/api/pda/templates", methods=["GET"])
+@login_required
+def list_pda_templates():
+    db = get_db()
+    rows = db.execute("SELECT * FROM pda_templates ORDER BY port, sort_order, id").fetchall()
+    templates = {}
+    for r in rows:
+        templates.setdefault(r["port"], []).append(_num_row(r, ["default_amount"]))
+    return jsonify(templates)
+
+
+@app.route("/api/pda/templates", methods=["POST"])
+@login_required
+@admin_required
+def add_pda_template():
+    data = request.get_json(force=True)
+    port = (data.get("port") or "").strip()
+    name = (data.get("name") or "").strip()
+    if not port or not name:
+        return jsonify({"error": "Port and charge name are required."}), 400
+    try:
+        amount = float(data.get("default_amount") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Default amount must be a number."}), 400
+    db = get_db()
+    order_row = db.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM pda_templates WHERE port = ?", (port,)).fetchone()
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    row = db.execute(
+        "INSERT INTO pda_templates (port, name, default_amount, sort_order, created_at) VALUES (?, ?, ?, ?, ?) RETURNING *",
+        (port, name, amount, order_row["n"], now),
+    ).fetchone()
+    db.commit()
+    return jsonify(_num_row(row, ["default_amount"]))
+
+
+@app.route("/api/pda/templates/<int:template_id>", methods=["PUT"])
+@login_required
+@admin_required
+def update_pda_template(template_id):
+    data = request.get_json(force=True)
+    db = get_db()
+    existing = db.execute("SELECT * FROM pda_templates WHERE id = ?", (template_id,)).fetchone()
+    if not existing:
+        return jsonify({"error": "Not found."}), 404
+    name = existing["name"]
+    if "name" in data:
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "Charge name can't be empty."}), 400
+    amount = existing["default_amount"]
+    if "default_amount" in data:
+        try:
+            amount = float(data.get("default_amount") or 0)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Default amount must be a number."}), 400
+    db.execute("UPDATE pda_templates SET name = ?, default_amount = ? WHERE id = ?", (name, amount, template_id))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pda/templates/<int:template_id>", methods=["DELETE"])
+@login_required
+@admin_required
+def delete_pda_template(template_id):
+    db = get_db()
+    db.execute("DELETE FROM pda_templates WHERE id = ?", (template_id,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pda/documents", methods=["GET"])
+@login_required
+def list_pda_documents():
+    db = get_db()
+    rows = db.execute("SELECT * FROM pda_documents ORDER BY created_at DESC, id DESC").fetchall()
+    docs = []
+    for r in rows:
+        d = dict(r)
+        items = db.execute(
+            "SELECT estimated_amount, actual_amount FROM pda_line_items WHERE pda_id = ?", (r["id"],)
+        ).fetchall()
+        d["estimated_total"] = round(sum(float(i["estimated_amount"] or 0) for i in items), 2)
+        d["actual_total"] = (
+            round(sum(float(i["actual_amount"]) if i["actual_amount"] is not None else float(i["estimated_amount"] or 0) for i in items), 2)
+            if d["status"] == "finalized" else None
+        )
+        d["line_item_count"] = len(items)
+        docs.append(d)
+    return jsonify(docs)
+
+
+@app.route("/api/pda/documents", methods=["POST"])
+@login_required
+def create_pda_document():
+    data = request.get_json(force=True)
+    port = (data.get("port") or "").strip()
+    vessel = (data.get("vessel") or "").strip()
+    if not port or not vessel:
+        return jsonify({"error": "Port and vessel are required."}), 400
+    reference = (data.get("reference") or "").strip()
+    currency = (data.get("currency") or "SAR").strip() or "SAR"
+    notes = data.get("notes") or ""
+    db = get_db()
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    doc = db.execute(
+        """INSERT INTO pda_documents (port, vessel, reference, currency, status, notes, created_by, created_at)
+           VALUES (?, ?, ?, ?, 'draft', ?, ?, ?) RETURNING *""",
+        (port, vessel, reference, currency, notes, session.get("username"), now),
+    ).fetchone()
+    templates = db.execute("SELECT * FROM pda_templates WHERE port = ? ORDER BY sort_order, id", (port,)).fetchall()
+    for t in templates:
+        db.execute(
+            "INSERT INTO pda_line_items (pda_id, name, estimated_amount, sort_order) VALUES (?, ?, ?, ?)",
+            (doc["id"], t["name"], t["default_amount"], t["sort_order"]),
+        )
+    db.commit()
+    return jsonify({"ok": True, "id": doc["id"]})
+
+
+@app.route("/api/pda/documents/<int:pda_id>", methods=["GET"])
+@login_required
+def get_pda_document(pda_id):
+    db = get_db()
+    doc = db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone()
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    items = db.execute("SELECT * FROM pda_line_items WHERE pda_id = ? ORDER BY sort_order, id", (pda_id,)).fetchall()
+    d = dict(doc)
+    d["items"] = [_num_row(i, ["estimated_amount", "actual_amount"]) for i in items]
+    return jsonify(d)
+
+
+@app.route("/api/pda/documents/<int:pda_id>", methods=["PUT"])
+@login_required
+def update_pda_document(pda_id):
+    data = request.get_json(force=True)
+    db = get_db()
+    doc = db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone()
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    reference = data.get("reference", doc["reference"])
+    currency = (data.get("currency", doc["currency"]) or doc["currency"])
+    notes = data.get("notes", doc["notes"])
+    vessel = (data.get("vessel", doc["vessel"]) or doc["vessel"])
+    port = (data.get("port", doc["port"]) or doc["port"])
+    db.execute(
+        "UPDATE pda_documents SET port = ?, vessel = ?, reference = ?, currency = ?, notes = ? WHERE id = ?",
+        (port, vessel, reference, currency, notes, pda_id),
+    )
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pda/documents/<int:pda_id>/mark-sent", methods=["POST"])
+@login_required
+def mark_pda_sent(pda_id):
+    db = get_db()
+    doc = db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone()
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    if doc["status"] != "draft":
+        return jsonify({"error": "Only a draft PDA can be marked as sent."}), 400
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    db.execute("UPDATE pda_documents SET status = 'sent', sent_at = ? WHERE id = ?", (now, pda_id))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pda/documents/<int:pda_id>/finalize", methods=["POST"])
+@login_required
+def finalize_pda_document(pda_id):
+    db = get_db()
+    doc = db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone()
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    if doc["status"] == "finalized":
+        return jsonify({"error": "This document is already finalized as an FDA."}), 400
+    items = db.execute("SELECT * FROM pda_line_items WHERE pda_id = ?", (pda_id,)).fetchall()
+    for item in items:
+        if item["actual_amount"] is None:
+            db.execute("UPDATE pda_line_items SET actual_amount = ? WHERE id = ?", (item["estimated_amount"], item["id"]))
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    db.execute(
+        "UPDATE pda_documents SET status = 'finalized', finalized_by = ?, finalized_at = ? WHERE id = ?",
+        (session.get("username"), now, pda_id),
+    )
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pda/documents/<int:pda_id>", methods=["DELETE"])
+@login_required
+def delete_pda_document(pda_id):
+    db = get_db()
+    db.execute("DELETE FROM pda_documents WHERE id = ?", (pda_id,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pda/documents/<int:pda_id>/line-items", methods=["POST"])
+@login_required
+def add_pda_line_item(pda_id):
+    data = request.get_json(force=True)
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Charge name is required."}), 400
+    db = get_db()
+    doc = db.execute("SELECT id FROM pda_documents WHERE id = ?", (pda_id,)).fetchone()
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    try:
+        amount = float(data.get("estimated_amount") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Amount must be a number."}), 400
+    order_row = db.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM pda_line_items WHERE pda_id = ?", (pda_id,)).fetchone()
+    item = db.execute(
+        "INSERT INTO pda_line_items (pda_id, name, estimated_amount, sort_order) VALUES (?, ?, ?, ?) RETURNING *",
+        (pda_id, name, amount, order_row["n"]),
+    ).fetchone()
+    db.commit()
+    return jsonify(_num_row(item, ["estimated_amount", "actual_amount"]))
+
+
+@app.route("/api/pda/line-items/<int:item_id>", methods=["PUT"])
+@login_required
+def update_pda_line_item(item_id):
+    data = request.get_json(force=True)
+    db = get_db()
+    item = db.execute("SELECT * FROM pda_line_items WHERE id = ?", (item_id,)).fetchone()
+    if not item:
+        return jsonify({"error": "Not found."}), 404
+    updates = {}
+    if "name" in data:
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "Charge name can't be empty."}), 400
+        updates["name"] = name
+    for field in ("estimated_amount", "actual_amount"):
+        if field in data:
+            val = data.get(field)
+            if val is None or val == "":
+                updates[field] = None
+            else:
+                try:
+                    updates[field] = float(val)
+                except (TypeError, ValueError):
+                    return jsonify({"error": field + " must be a number."}), 400
+    if not updates:
+        return jsonify({"ok": True})
+    set_clause = ", ".join(k + " = ?" for k in updates)
+    db.execute(f"UPDATE pda_line_items SET {set_clause} WHERE id = ?", (*updates.values(), item_id))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pda/line-items/<int:item_id>", methods=["DELETE"])
+@login_required
+def delete_pda_line_item(item_id):
+    db = get_db()
+    db.execute("DELETE FROM pda_line_items WHERE id = ?", (item_id,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pda/documents/<int:pda_id>/pdf", methods=["GET"])
+@login_required
+def export_pda_pdf(pda_id):
+    db = get_db()
+    doc = db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone()
+    if not doc:
+        return "Not found.", 404
+    items = db.execute("SELECT * FROM pda_line_items WHERE pda_id = ? ORDER BY sort_order, id", (pda_id,)).fetchall()
+    pdf_bytes = build_pda_pdf(dict(doc), [dict(i) for i in items])
+    kind = "FDA" if doc["status"] == "finalized" else "PDA"
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{kind}_{doc['port']}_{doc['vessel']}_{doc['id']}")
+    return Response(
+        pdf_bytes,
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{safe}.pdf"'},
+    )
+
+
+# ---------- Alerts (ETA-overdue email notifications) ----------
+
+@app.route("/api/settings/alerts", methods=["GET"])
+@login_required
+@admin_required
+def get_alert_settings():
+    return jsonify({
+        "enabled": get_setting("alerts_enabled", "") == "1",
+        "recipients": get_setting("alerts_recipients", ""),
+        "mail_configured": bool(os.environ.get("SMTP_HOST") and os.environ.get("SMTP_USER") and os.environ.get("SMTP_PASSWORD")),
+    })
+
+
+@app.route("/api/settings/alerts", methods=["POST"])
+@login_required
+@admin_required
+def update_alert_settings():
+    data = request.get_json(force=True)
+    if "enabled" in data:
+        set_setting("alerts_enabled", "1" if data.get("enabled") else "0")
+    if "recipients" in data:
+        set_setting("alerts_recipients", (data.get("recipients") or "").strip())
+    return jsonify({"ok": True})
+
+
+@app.route("/api/alerts/check-overdue", methods=["POST"])
+@login_required
+@admin_required
+def check_overdue_now():
+    overdue = find_overdue_vessel_groups()
+    recipients = [a.strip() for a in get_setting("alerts_recipients", "").split(",") if a.strip()]
+    if not overdue:
+        return jsonify({"ok": True, "overdue_count": 0, "sent": False, "note": "Nothing overdue right now."})
+    if not recipients:
+        return jsonify({"ok": True, "overdue_count": len(overdue), "sent": False, "note": "No alert recipients configured yet."})
+    lines = [f"{len(overdue)} vessel group(s) have an ETA that's passed with BLs still pending:", ""]
+    for g_ in overdue:
+        lines.append(f"- {g_['port']} / {g_['vessel']}: ETA {g_['eta']}, {g_['left']} of {g_['total']} BL(s) still pending")
+    lines.append("")
+    lines.append("- Compass (Sea Power DO Tracker)")
+    ok, err = send_email(recipients, f"Compass: {len(overdue)} vessel(s) overdue on ETA", "\n".join(lines))
+    return jsonify({"ok": ok, "overdue_count": len(overdue), "sent": ok, "error": err})
+
+
 # ---------- Templates ----------
 
 AUTH_STYLE = """
@@ -3104,6 +3686,15 @@ HUB_HTML = """
       </div>
       <h3>Direct Delivery Classifier</h3>
       <p>Upload a cargo packing list and see which BLs need direct delivery, by weight and size.</p>
+      <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
+    </a>
+
+    <a class="tile" href="/pda">
+      <div class="tile-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h8M8 17h4"/></svg>
+      </div>
+      <h3>Disbursement Accounts</h3>
+      <p>Build a PDA from a per-port charge template, then finalize it into an FDA once actual costs are known.</p>
       <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
     </a>
   </div>
@@ -4248,6 +4839,633 @@ async function removeDirectDelivery(bl, fromReview) {
 
 loadResults();
 loadReview();
+</script>
+</body></html>
+"""
+
+PDA_HTML = """
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compass - Disbursement Accounts</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + """">
+<style>
+  :root {
+    --bg: #f2f4f7; --card: #ffffff; --text: #1c2b3a; --muted: #7a8794; --border: #e6e9ed;
+    --navy: #123a56; --navy-deep: #0b2740; --navy-light: #1f5c85; --gold: #c9a227; --gold-light: #e0bd53;
+    --danger: #d1483f; --danger-bg: #fbeceb; --ok: #1c8a5a; --ok-bg: #e7f5ee;
+    --warn: #8a6d1f; --warn-bg: rgba(212,160,23,0.16);
+    --shadow-sm: 0 1px 2px rgba(18,58,86,0.05); --shadow-md: 0 10px 30px rgba(18,58,86,0.10);
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --bg: #131a23; --card: #1a232f; --text: #e9eef3; --muted: #93a1b1; --border: #29323f;
+    --navy: #3f86ba; --navy-deep: #274a67; --navy-light: #5aa2d1; --gold: #e3bb4c; --gold-light: #f0cf72;
+    --danger: #e2685f; --danger-bg: #3a2220; --ok: #3ecb8e; --ok-bg: #163329;
+    --warn: var(--gold-light); --warn-bg: rgba(227,187,76,0.16);
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.25); --shadow-md: 0 10px 30px rgba(0,0,0,0.35);
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif;
+    background: var(--bg); color: var(--text); margin: 0; padding: 0 16px 40px;
+    transition: background-color .25s ease, color .25s ease;
+  }
+  .topbar {
+    position: sticky; top: 0; z-index: 50; display: flex; justify-content: space-between; align-items: center;
+    gap: 12px; flex-wrap: wrap; padding: 14px 16px; margin: 0 -16px 20px;
+    background: color-mix(in srgb, var(--bg) 86%, transparent);
+    backdrop-filter: saturate(180%) blur(14px); -webkit-backdrop-filter: saturate(180%) blur(14px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+  .brand img { height: 32px; width: auto; }
+  .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
+  .brand-text .app-name { font-size: 14.5px; font-weight: 700; color: var(--text); }
+  .brand-text .app-tag { font-size: 11px; color: var(--muted); }
+  .topbar-right { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+  .topbar-right a { color: var(--navy); text-decoration: none; font-weight: 600; font-size: 13px; padding: 6px 12px; border-radius: 20px; transition: background .15s ease; }
+  :root[data-theme="dark"] .topbar-right a { color: var(--navy-light); }
+  .topbar-right a:hover { background: var(--border); }
+
+  .theme-switch { position: relative; display: inline-flex; width: 54px; height: 29px; cursor: pointer; }
+  .theme-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .theme-track { position: absolute; inset: 0; border-radius: 999px; display: flex; align-items: center; justify-content: space-between; padding: 0 7px; background: linear-gradient(135deg,#8fcaf0,#f4d58d); transition: background .3s ease; }
+  :root[data-theme="dark"] .theme-track { background: linear-gradient(135deg,#1f2b42,#33456a); }
+  .theme-icon { width: 13px; height: 13px; color: #fff; opacity: .9; z-index: 1; }
+  .theme-icon svg { width: 100%; height: 100%; }
+  .theme-knob { position: absolute; top: 3px; left: 3px; width: 23px; height: 23px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.3); transition: transform .3s cubic-bezier(.4,0,.2,1); }
+  input:checked + .theme-track .theme-knob { transform: translateX(25px); background: #0b2740; }
+
+  .page-head { padding: 4px 4px 18px; }
+  .page-head .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--gold); margin-bottom: 6px; }
+  :root[data-theme="dark"] .page-head .eyebrow { color: var(--gold-light); }
+  .page-head h1 { font-size: 22px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  .page-head p { color: var(--muted); margin: 0; font-size: 13.5px; max-width: 680px; }
+
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 18px; box-shadow: var(--shadow-sm); padding: 18px 20px; margin-bottom: 18px; }
+  .panel h2 { font-size: 15px; margin: 0 0 2px; }
+  .panel .panel-sub { font-size: 12px; color: var(--muted); margin: 0 0 14px; }
+
+  label.field-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); display: block; margin-bottom: 5px; }
+  input[type=text], input[type=number], input[type=email], select, textarea {
+    width: 100%; padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px;
+    font-size: 13.5px; font-family: inherit; background: var(--bg); color: var(--text);
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--navy-light); }
+  textarea { resize: vertical; min-height: 56px; }
+
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+
+  .btn { background: var(--navy); color: #fff; border: none; border-radius: 999px; padding: 9px 17px; font-size: 12.5px; font-weight: 600; cursor: pointer; transition: background .15s ease, transform .08s ease; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+  .btn:hover { background: var(--navy-light); }
+  .btn:active { transform: scale(.97); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.ghost { background: none; color: var(--navy); border: 1px solid var(--border); }
+  :root[data-theme="dark"] .btn.ghost { color: var(--navy-light); }
+  .btn.ghost:hover { background: var(--border); }
+  .btn.ghost.danger { color: var(--danger); }
+  .btn.ghost.danger:hover { background: var(--danger-bg); }
+  .btn.small { padding: 5px 11px; font-size: 11.5px; }
+
+  table.doc-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.doc-table th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  table.doc-table td { padding: 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  table.doc-table tr:last-child td { border-bottom: none; }
+  table.doc-table tr.doc-row { cursor: pointer; }
+  table.doc-table tr.doc-row:hover td { background: color-mix(in srgb, var(--navy-light) 5%, transparent); }
+
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 10.5px; font-weight: 700; letter-spacing: .3px; text-transform: uppercase; }
+  .badge.draft { background: color-mix(in srgb, var(--muted) 16%, transparent); color: var(--muted); }
+  .badge.sent { background: var(--warn-bg); color: var(--warn); }
+  .badge.finalized { background: var(--ok-bg); color: var(--ok); }
+
+  .empty-note { color: var(--muted); font-size: 13px; padding: 10px 2px; }
+
+  #docDetail { display: none; }
+  .detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  .detail-title { font-size: 16px; font-weight: 700; margin: 0 0 2px; }
+  .detail-sub { font-size: 12px; color: var(--muted); }
+  .detail-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  table.items-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 6px; }
+  table.items-table th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding: 7px 8px; border-bottom: 1px solid var(--border); }
+  table.items-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  table.items-table td input { text-align: right; }
+  table.items-table td:first-child input { text-align: left; }
+  table.items-table tr.total-row td { font-weight: 700; border-top: 2px solid var(--border); border-bottom: none; padding-top: 10px; }
+  .variance-pos { color: var(--danger); }
+  .variance-neg { color: var(--ok); }
+  .row-remove { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 15px; padding: 2px 6px; border-radius: 6px; }
+  .row-remove:hover { background: var(--danger-bg); color: var(--danger); }
+
+  .tmpl-port-group { margin-bottom: 16px; }
+  .tmpl-port-group h3 { font-size: 13px; margin: 0 0 8px; color: var(--navy-light); }
+  .tmpl-add-row { display: flex; gap: 8px; margin-top: 8px; }
+  .tmpl-add-row input[type=text] { flex: 2; }
+  .tmpl-add-row input[type=number] { flex: 1; }
+
+  .alert-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .switch-sm { position: relative; display: inline-flex; width: 38px; height: 21px; cursor: pointer; flex-shrink: 0; }
+  .switch-sm input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .switch-track-sm { position: absolute; inset: 0; border-radius: 999px; background: var(--border); transition: background .2s ease; }
+  .switch-knob-sm { position: absolute; top: 2px; left: 2px; width: 17px; height: 17px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.3); transition: transform .2s ease; }
+  input:checked + .switch-track-sm { background: var(--ok); }
+  input:checked + .switch-track-sm .switch-knob-sm { transform: translateX(17px); }
+  .mail-status { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+  .mail-status.warn { color: var(--warn); }
+  .mail-status.ok { color: var(--ok); }
+
+  #toastHost { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; pointer-events: none; max-width: min(340px, calc(100vw - 40px)); }
+  #toastHost .toast { pointer-events: auto; }
+  .toast { background: var(--navy-deep); color: #fff; padding: 11px 16px; border-radius: 12px; font-size: 13px; display: flex; align-items: center; gap: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); animation: toast-in .18s ease-out; max-width: 340px; }
+  .toast.error { background: var(--danger); }
+  .toast.fading { animation: toast-out .2s ease-in forwards; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes toast-out { to { opacity: 0; transform: translateY(8px); } }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <a href="/" class="brand">
+      <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
+      <div class="brand-text">
+        <span class="app-name">Compass</span>
+        <span class="app-tag">Disbursement Accounts</span>
+      </div>
+    </a>
+    <div class="topbar-right">
+      <label class="theme-switch" title="Toggle dark mode">
+        <input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')">
+        <span class="theme-track">
+          <span class="theme-icon sun">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg>
+          </span>
+          <span class="theme-icon moon">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg>
+          </span>
+          <span class="theme-knob"></span>
+        </span>
+      </label>
+      <a href="/do-tracker">DO Tracker</a>
+      {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
+      <span style="padding:6px 4px;">Signed in as <b>{{ username }}</b></span>
+      <a href="/logout">Log out</a>
+    </div>
+  </div>
+
+  <div class="page-head">
+    <div class="eyebrow">Compass</div>
+    <h1>Disbursement Accounts</h1>
+    <p>Build a Proforma Disbursement Account (PDA) per port call from a per-port charge template, then finalize it into an FDA once the real costs are known - estimate and actual stay on the same document so the variance is never a separate reconciliation step.</p>
+  </div>
+
+  <div id="toastHost"></div>
+
+  <div class="panel" id="listPanel">
+    <h2>New disbursement account</h2>
+    <p class="panel-sub">Pick the port and vessel - charges from that port's template are added automatically, ready to adjust.</p>
+    <div class="form-grid">
+      <div>
+        <label class="field-label" for="newPort">Port</label>
+        <select id="newPort">
+          <option value="DAMMAM PORT">Dammam Port</option>
+          <option value="JUBAIL COMMERCIAL PORT">Jubail Commercial Port</option>
+          <option value="JEDDAH PORT">Jeddah Port</option>
+          <option value="YANBU COMMERCIAL PORT">Yanbu Commercial Port</option>
+          <option value="YANBU INDUSTRIAL PORT">Yanbu Industrial Port</option>
+          <option value="KAP">KAP</option>
+        </select>
+      </div>
+      <div>
+        <label class="field-label" for="newVessel">Vessel</label>
+        <input type="text" id="newVessel" placeholder="e.g. TAI KNIGHT">
+      </div>
+      <div>
+        <label class="field-label" for="newReference">Reference (optional)</label>
+        <input type="text" id="newReference" placeholder="Voyage no. / call ref">
+      </div>
+      <div>
+        <label class="field-label" for="newCurrency">Currency</label>
+        <input type="text" id="newCurrency" value="SAR">
+      </div>
+    </div>
+    <div class="form-actions">
+      <button class="btn" onclick="createDocument()">Create PDA</button>
+    </div>
+  </div>
+
+  <div class="panel" id="docsListPanel">
+    <h2>Documents</h2>
+    <p class="panel-sub" id="docsSub">Loading...</p>
+    <div id="docsBody"></div>
+  </div>
+
+  <div class="panel" id="docDetail">
+    <div class="detail-head">
+      <div>
+        <button class="btn ghost small" onclick="closeDocument()" style="margin-bottom:8px;">&larr; All documents</button>
+        <div class="detail-title" id="detailTitle"></div>
+        <div class="detail-sub" id="detailSub"></div>
+      </div>
+      <div class="detail-actions" id="detailActions"></div>
+    </div>
+
+    <div class="form-grid">
+      <div>
+        <label class="field-label" for="detRef">Reference</label>
+        <input type="text" id="detRef" onchange="saveDocField('reference', this.value)">
+      </div>
+      <div>
+        <label class="field-label" for="detCurrency">Currency</label>
+        <input type="text" id="detCurrency" onchange="saveDocField('currency', this.value)">
+      </div>
+    </div>
+    <div style="margin-bottom:14px;">
+      <label class="field-label" for="detNotes">Notes</label>
+      <textarea id="detNotes" onchange="saveDocField('notes', this.value)" placeholder="Anything worth noting on this account..."></textarea>
+    </div>
+
+    <table class="items-table" id="itemsTable">
+      <thead><tr><th>Charge</th><th style="text-align:right;">Estimate</th><th style="text-align:right;" id="actualHeader">Actual</th><th style="text-align:right;" id="varianceHeader">Variance</th><th></th></tr></thead>
+      <tbody id="itemsBody"></tbody>
+    </table>
+    <div class="form-actions" style="margin-top:10px;">
+      <button class="btn ghost small" onclick="addLineItemRow()">+ Add charge</button>
+    </div>
+  </div>
+
+  {% if role == 'admin' %}
+  <div class="panel" id="templatesPanel">
+    <h2>Port charge templates</h2>
+    <p class="panel-sub">Default charges that pre-fill a new PDA for each port. Editing a template doesn't change documents already created from it.</p>
+    <div id="templatesBody">Loading...</div>
+  </div>
+
+  <div class="panel" id="alertsPanel">
+    <h2>Overdue ETA alerts</h2>
+    <p class="panel-sub">When a vessel's ETA has passed with BLs still pending on the DO Tracker board, send a digest email listing them.</p>
+    <div class="alert-row">
+      <label class="switch-sm">
+        <input type="checkbox" id="alertsEnabled" onchange="saveAlertSettings()">
+        <span class="switch-track-sm"><span class="switch-knob-sm"></span></span>
+      </label>
+      <span style="font-size:13px;">Enable overdue-ETA alerts</span>
+    </div>
+    <label class="field-label" for="alertsRecipients">Recipient email(s)</label>
+    <input type="text" id="alertsRecipients" placeholder="name@seapower.com, name2@seapower.com" onchange="saveAlertSettings()">
+    <div class="mail-status" id="mailStatus"></div>
+    <div class="form-actions">
+      <button class="btn ghost small" onclick="checkOverdueNow()">Check now</button>
+    </div>
+  </div>
+  {% endif %}
+
+<script>
+(function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem('theme'); } catch (e) {}
+  const mode = saved || 'light';
+  document.documentElement.setAttribute('data-theme', mode);
+  window.addEventListener('DOMContentLoaded', () => {
+    const cb = document.getElementById('themeToggle');
+    if (cb) cb.checked = mode === 'dark';
+  });
+})();
+function setTheme(mode) {
+  document.documentElement.setAttribute('data-theme', mode);
+  try { localStorage.setItem('theme', mode); } catch (e) {}
+}
+
+function showToast(message, opts) {
+  opts = opts || {};
+  const host = document.getElementById('toastHost');
+  const el = document.createElement('div');
+  el.className = 'toast' + (opts.error ? ' error' : '');
+  const text = document.createElement('span');
+  text.textContent = message;
+  el.appendChild(text);
+  host.appendChild(el);
+  const duration = opts.duration || 4000;
+  const timer = setTimeout(dismiss, duration);
+  function dismiss() {
+    clearTimeout(timer);
+    el.classList.add('fading');
+    setTimeout(() => el.remove(), 220);
+  }
+}
+
+function fmtMoney(n) {
+  n = Number(n || 0);
+  return n.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+}
+
+function escHtml(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+let currentDocId = null;
+let docsCache = [];
+
+async function loadDocuments() {
+  const res = await fetch('/api/pda/documents');
+  if (res.status === 401 || res.redirected) { location.reload(); return; }
+  const rows = await res.json();
+  docsCache = rows;
+  const sub = document.getElementById('docsSub');
+  const body = document.getElementById('docsBody');
+  if (!rows.length) {
+    sub.textContent = 'No disbursement accounts yet.';
+    body.innerHTML = '<div class="empty-note">Create one above once you have a port and vessel to work from.</div>';
+    return;
+  }
+  sub.textContent = rows.length + ' document(s).';
+  body.innerHTML = `
+    <table class="doc-table">
+      <thead><tr><th>Port</th><th>Vessel</th><th>Reference</th><th>Status</th><th style="text-align:right;">Estimate</th><th style="text-align:right;">Actual</th><th>Created</th><th></th></tr></thead>
+      <tbody>
+        ${rows.map(d => `
+          <tr class="doc-row" onclick="openDocument(${d.id})">
+            <td>${escHtml(d.port)}</td>
+            <td>${escHtml(d.vessel)}</td>
+            <td style="color:var(--muted);">${escHtml(d.reference) || '-'}</td>
+            <td><span class="badge ${d.status}">${d.status === 'finalized' ? 'FDA' : (d.status === 'sent' ? 'Sent' : 'Draft')}</span></td>
+            <td style="text-align:right;">${d.currency} ${fmtMoney(d.estimated_total)}</td>
+            <td style="text-align:right;">${d.actual_total !== null ? d.currency + ' ' + fmtMoney(d.actual_total) : '-'}</td>
+            <td style="color:var(--muted);font-size:12px;">${escHtml(d.created_by)}${d.created_at ? ' - ' + escHtml(d.created_at) : ''}</td>
+            <td><button class="btn ghost danger small" onclick="event.stopPropagation(); deleteDocument(${d.id})">Delete</button></td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+async function createDocument() {
+  const port = document.getElementById('newPort').value;
+  const vessel = document.getElementById('newVessel').value.trim();
+  const reference = document.getElementById('newReference').value.trim();
+  const currency = document.getElementById('newCurrency').value.trim() || 'SAR';
+  if (!vessel) { showToast('Enter a vessel name.', {error:true}); return; }
+  const res = await fetch('/api/pda/documents', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({port, vessel, reference, currency})
+  });
+  const data = await res.json();
+  if (!res.ok || data.error) { showToast(data.error || 'Could not create that document.', {error:true}); return; }
+  document.getElementById('newVessel').value = '';
+  document.getElementById('newReference').value = '';
+  await loadDocuments();
+  openDocument(data.id);
+}
+
+async function deleteDocument(id) {
+  if (!confirm('Delete this disbursement account? This cannot be undone.')) return;
+  await fetch('/api/pda/documents/' + id, {method: 'DELETE'});
+  if (currentDocId === id) closeDocument();
+  await loadDocuments();
+  showToast('Document deleted.');
+}
+
+let currentDoc = null;
+let currentItems = [];
+
+async function openDocument(id) {
+  const res = await fetch('/api/pda/documents/' + id);
+  if (!res.ok) { showToast('Could not load that document.', {error:true}); return; }
+  const doc = await res.json();
+  currentDocId = id;
+  currentDoc = doc;
+  currentItems = doc.items || [];
+  document.getElementById('listPanel').style.display = 'none';
+  document.getElementById('docsListPanel').style.display = 'none';
+  document.getElementById('docDetail').style.display = 'block';
+  renderDetail();
+}
+
+function closeDocument() {
+  currentDocId = null;
+  document.getElementById('docDetail').style.display = 'none';
+  document.getElementById('listPanel').style.display = '';
+  document.getElementById('docsListPanel').style.display = '';
+}
+
+function renderDetail() {
+  const doc = currentDoc;
+  const isFda = doc.status === 'finalized';
+  document.getElementById('detailTitle').textContent = (isFda ? 'FDA' : 'PDA') + ' - ' + doc.port + ' / ' + doc.vessel;
+  const statusLabel = isFda ? 'Finalized (FDA)' : (doc.status === 'sent' ? 'Sent' : 'Draft');
+  document.getElementById('detailSub').textContent = statusLabel + ' - prepared by ' + (doc.created_by || '-') + (doc.created_at ? ' on ' + doc.created_at : '');
+  document.getElementById('detRef').value = doc.reference || '';
+  document.getElementById('detCurrency').value = doc.currency || 'SAR';
+  document.getElementById('detNotes').value = doc.notes || '';
+
+  const actions = [];
+  if (doc.status === 'draft') {
+    actions.push('<button class="btn ghost small" onclick="markSent()">Mark as sent</button>');
+  }
+  if (doc.status !== 'finalized') {
+    actions.push('<button class="btn small" onclick="finalizeDoc()">Finalize as FDA</button>');
+  }
+  actions.push('<a class="btn ghost small" href="/api/pda/documents/' + doc.id + '/pdf">Export PDF</a>');
+  document.getElementById('detailActions').innerHTML = actions.join('');
+
+  document.getElementById('actualHeader').style.display = '';
+  document.getElementById('varianceHeader').style.display = isFda ? '' : 'none';
+  renderItems();
+}
+
+function renderItems() {
+  const isFda = currentDoc.status === 'finalized';
+  const body = document.getElementById('itemsBody');
+  let estTotal = 0, actTotal = 0;
+  const rows = currentItems.map(item => {
+    const est = Number(item.estimated_amount || 0);
+    estTotal += est;
+    const hasActual = item.actual_amount !== null && item.actual_amount !== undefined;
+    const act = hasActual ? Number(item.actual_amount) : null;
+    if (isFda) actTotal += (act !== null ? act : est);
+    const variance = (act !== null) ? (act - est) : null;
+    const varianceHtml = (isFda && variance !== null)
+      ? `<span class="${variance > 0 ? 'variance-pos' : (variance < 0 ? 'variance-neg' : '')}">${variance > 0 ? '+' : ''}${fmtMoney(variance)}</span>`
+      : '';
+    return `<tr>
+      <td><input type="text" value="${escHtml(item.name)}" onchange="updateLineItem(${item.id}, 'name', this.value)"></td>
+      <td><input type="number" step="0.01" value="${est}" onchange="updateLineItem(${item.id}, 'estimated_amount', this.value)"></td>
+      <td><input type="number" step="0.01" value="${act !== null ? act : ''}" placeholder="-" onchange="updateLineItem(${item.id}, 'actual_amount', this.value)"></td>
+      <td style="text-align:right;">${varianceHtml}</td>
+      <td><button class="row-remove" title="Remove charge" onclick="deleteLineItem(${item.id})">&times;</button></td>
+    </tr>`;
+  }).join('');
+  const varianceTotal = isFda ? (actTotal - estTotal) : null;
+  const totalRow = `<tr class="total-row">
+    <td>Total (${currentDoc.currency || 'SAR'})</td>
+    <td style="text-align:right;">${fmtMoney(estTotal)}</td>
+    <td style="text-align:right;">${isFda ? fmtMoney(actTotal) : ''}</td>
+    <td style="text-align:right;">${isFda ? `<span class="${varianceTotal > 0 ? 'variance-pos' : (varianceTotal < 0 ? 'variance-neg' : '')}">${varianceTotal > 0 ? '+' : ''}${fmtMoney(varianceTotal)}</span>` : ''}</td>
+    <td></td>
+  </tr>`;
+  body.innerHTML = rows + totalRow;
+}
+
+async function saveDocField(field, value) {
+  if (!currentDocId) return;
+  await fetch('/api/pda/documents/' + currentDocId, {
+    method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({[field]: value})
+  });
+  currentDoc[field] = value;
+  if (field === 'currency') renderDetail();
+}
+
+async function addLineItemRow() {
+  const res = await fetch('/api/pda/documents/' + currentDocId + '/line-items', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name: 'New charge', estimated_amount: 0})
+  });
+  const item = await res.json();
+  if (!res.ok || item.error) { showToast(item.error || 'Could not add that charge.', {error:true}); return; }
+  currentItems.push(item);
+  renderItems();
+}
+
+async function updateLineItem(itemId, field, value) {
+  const payload = {};
+  if (field === 'name') {
+    if (!value.trim()) { showToast('Charge name can\\'t be empty.', {error:true}); renderItems(); return; }
+    payload.name = value;
+  } else {
+    payload[field] = value === '' ? null : value;
+  }
+  const res = await fetch('/api/pda/line-items/' + itemId, {
+    method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) { showToast('Could not save that change.', {error:true}); return; }
+  const item = currentItems.find(i => i.id === itemId);
+  if (item) item[field] = payload[field] === null ? null : (field === 'name' ? value : Number(value));
+  renderItems();
+}
+
+async function deleteLineItem(itemId) {
+  await fetch('/api/pda/line-items/' + itemId, {method: 'DELETE'});
+  currentItems = currentItems.filter(i => i.id !== itemId);
+  renderItems();
+}
+
+async function markSent() {
+  const res = await fetch('/api/pda/documents/' + currentDocId + '/mark-sent', {method: 'POST'});
+  const data = await res.json();
+  if (!res.ok || data.error) { showToast(data.error || 'Could not update status.', {error:true}); return; }
+  currentDoc.status = 'sent';
+  renderDetail();
+  loadDocuments();
+  showToast('Marked as sent.');
+}
+
+async function finalizeDoc() {
+  if (!confirm('Finalize this as an FDA? Any charge without an actual amount yet will use its estimate. This can still be edited afterward, but the document moves out of draft/sent.')) return;
+  const res = await fetch('/api/pda/documents/' + currentDocId + '/finalize', {method: 'POST'});
+  const data = await res.json();
+  if (!res.ok || data.error) { showToast(data.error || 'Could not finalize.', {error:true}); return; }
+  await openDocument(currentDocId);
+  loadDocuments();
+  showToast('Finalized as FDA.');
+}
+
+{% if role == 'admin' %}
+let templatesCache = {};
+const TEMPLATE_PORTS = ['DAMMAM PORT', 'JUBAIL COMMERCIAL PORT', 'JEDDAH PORT', 'YANBU COMMERCIAL PORT', 'YANBU INDUSTRIAL PORT', 'KAP'];
+
+async function loadTemplates() {
+  const res = await fetch('/api/pda/templates');
+  templatesCache = await res.json();
+  renderTemplates();
+}
+
+function renderTemplates() {
+  const body = document.getElementById('templatesBody');
+  body.innerHTML = TEMPLATE_PORTS.map(port => {
+    const items = templatesCache[port] || [];
+    const rows = items.map(t => `
+      <tr>
+        <td><input type="text" value="${escHtml(t.name)}" onchange="updateTemplateItem(${t.id}, 'name', this.value)"></td>
+        <td><input type="number" step="0.01" value="${t.default_amount}" onchange="updateTemplateItem(${t.id}, 'default_amount', this.value)"></td>
+        <td><button class="row-remove" title="Remove" onclick="deleteTemplateItem(${t.id})">&times;</button></td>
+      </tr>`).join('');
+    return `<div class="tmpl-port-group">
+      <h3>${port.replace(/\\w\\S*/g, w => w.charAt(0) + w.slice(1).toLowerCase())}</h3>
+      <table class="items-table"><tbody>${rows || '<tr><td colspan="3" style="color:var(--muted);">No charges yet.</td></tr>'}</tbody></table>
+      <div class="tmpl-add-row">
+        <input type="text" id="tmplName_${port.replace(/[^A-Za-z0-9]/g, '')}" placeholder="Charge name">
+        <input type="number" step="0.01" id="tmplAmount_${port.replace(/[^A-Za-z0-9]/g, '')}" placeholder="0.00">
+        <button class="btn ghost small" onclick="addTemplateItem('${port.replace(/'/g, "\\\\'")}')">Add</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function addTemplateItem(port) {
+  const key = port.replace(/[^A-Za-z0-9]/g, '');
+  const nameEl = document.getElementById('tmplName_' + key);
+  const amountEl = document.getElementById('tmplAmount_' + key);
+  const name = nameEl.value.trim();
+  if (!name) { showToast('Enter a charge name.', {error:true}); return; }
+  const res = await fetch('/api/pda/templates', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({port, name, default_amount: amountEl.value || 0})
+  });
+  const data = await res.json();
+  if (!res.ok || data.error) { showToast(data.error || 'Could not add that charge.', {error:true}); return; }
+  nameEl.value = ''; amountEl.value = '';
+  await loadTemplates();
+}
+
+async function updateTemplateItem(id, field, value) {
+  await fetch('/api/pda/templates/' + id, {
+    method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({[field]: value})
+  });
+  await loadTemplates();
+}
+
+async function deleteTemplateItem(id) {
+  await fetch('/api/pda/templates/' + id, {method: 'DELETE'});
+  await loadTemplates();
+}
+
+async function loadAlertSettings() {
+  const res = await fetch('/api/settings/alerts');
+  const data = await res.json();
+  document.getElementById('alertsEnabled').checked = !!data.enabled;
+  document.getElementById('alertsRecipients').value = data.recipients || '';
+  const status = document.getElementById('mailStatus');
+  status.textContent = data.mail_configured
+    ? 'Email sending is configured.'
+    : 'Email isn\\'t configured on the server yet (SMTP_HOST / SMTP_USER / SMTP_PASSWORD) - alerts will be tracked but not sent until that\\'s set up.';
+  status.className = 'mail-status ' + (data.mail_configured ? 'ok' : 'warn');
+}
+
+async function saveAlertSettings() {
+  const enabled = document.getElementById('alertsEnabled').checked;
+  const recipients = document.getElementById('alertsRecipients').value.trim();
+  await fetch('/api/settings/alerts', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled, recipients})
+  });
+}
+
+async function checkOverdueNow() {
+  const res = await fetch('/api/alerts/check-overdue', {method: 'POST'});
+  const data = await res.json();
+  if (!res.ok) { showToast(data.error || 'Could not run the check.', {error:true}); return; }
+  if (data.overdue_count === 0) { showToast('Nothing overdue right now.'); return; }
+  if (data.sent) { showToast(data.overdue_count + ' vessel(s) overdue - alert emailed.'); return; }
+  showToast(data.note || data.error || (data.overdue_count + ' vessel(s) overdue, but the alert could not be sent.'), {error:true, duration: 6000});
+}
+
+loadTemplates();
+loadAlertSettings();
+{% endif %}
+
+loadDocuments();
 </script>
 </body></html>
 """
