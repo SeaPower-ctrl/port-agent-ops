@@ -111,6 +111,11 @@ SOF_TIMELINE_PAIRS = [
     ("first_line_to_shore", "First Line to Shore", "left_berth", "Left Berth"),
 ]
 
+# Invoice / DO file attachments on a DO Tracker record - kind -> display
+# label, shared between the upload/download routes and the UI.
+ATTACHMENT_KINDS = {"invoice": "Invoice", "do": "Delivery Order"}
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10MB - comfortably more than a scanned invoice PDF needs
+
 
 def init_db():
     conn = psycopg2.connect(DATABASE_URL)
@@ -203,6 +208,27 @@ def init_db():
     # human glance rather than blind trust.
     cur.execute("ALTER TABLE direct_delivery ADD COLUMN IF NOT EXISTS needs_review INTEGER DEFAULT 0")
     cur.execute("ALTER TABLE direct_delivery ADD COLUMN IF NOT EXISTS review_note TEXT DEFAULT ''")
+
+    # Invoice / Delivery Order file attachments - one PDF per BL per kind
+    # ('invoice' or 'do'), stored as bytea rather than on disk because
+    # Render's app filesystem isn't persistent across deploys/restarts, but
+    # Postgres already is. ON CONFLICT (bl_number, kind) lets a re-upload
+    # simply replace the previous file (correcting a mistake) instead of
+    # piling up duplicates. CASCADE so deleting a BL cleans up its files too.
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS record_attachments (
+            id SERIAL PRIMARY KEY,
+            bl_number TEXT NOT NULL REFERENCES records(bl_number) ON DELETE CASCADE,
+            kind TEXT NOT NULL,
+            filename TEXT DEFAULT '',
+            content_type TEXT DEFAULT 'application/pdf',
+            data BYTEA NOT NULL,
+            file_size INTEGER DEFAULT 0,
+            uploaded_by TEXT DEFAULT '',
+            uploaded_at TEXT DEFAULT '',
+            UNIQUE (bl_number, kind)
+        )"""
+    )
 
     # PDA / FDA (Proforma / Final Disbursement Account) - a per-port charge
     # template (port dues, pilotage, towage, agency fee, ...) that pre-fills
@@ -407,11 +433,27 @@ def build_sof_pdf(doc):
     to match the Daily Vessel Line-Up report's look - logo + bold navy
     company name + muted subtitle + a right-aligned date block, under a
     gold divider - rather than the plain centered letterhead the original
-    .doc used."""
+    .doc used.
+
+    The body is a real bordered table (fixed column widths, shaded label
+    cells), not loose label/value text - an earlier label-left-value-right
+    version let label width vary per field ("Anchored" vs. "Pilot Boarded
+    (Departure)"), so values never lined up from one row to the next and
+    long values (e.g. Owners) could run straight into the next column.
+    A bordered grid makes every column's width explicit, so nothing drifts
+    regardless of how long any one label or value happens to be."""
     pdf = FPDF(format="A4")
     pdf.set_auto_page_break(auto=True, margin=16)
     pdf.add_page()
     pdf.set_margins(15, 12, 15)
+    PAGE_L, PAGE_R = 15, 195
+    CONTENT_W = PAGE_R - PAGE_L  # 180mm
+
+    NAVY = (18, 58, 86)
+    GOLD = (201, 162, 39)
+    MUTED = (110, 120, 130)
+    LABEL_FILL = (238, 242, 246)
+    LINE = (210, 216, 222)
 
     try:
         logo_bytes = base64.b64decode(LOGO_B64)
@@ -421,136 +463,132 @@ def build_sof_pdf(doc):
 
     pdf.set_xy(37, 13)
     pdf.set_font("Helvetica", "B", 15)
-    pdf.set_text_color(18, 58, 86)
-    pdf.cell(130, 7, "SEA POWER FOR MARINE SERVICES CO LTD", ln=1)
+    pdf.set_text_color(*NAVY)
+    pdf.cell(130, 7, "SEA POWER FOR MARINE SERVICES CO LTD", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_x(37)
     pdf.set_font("Helvetica", "B", 10.5)
-    pdf.set_text_color(110, 120, 130)
-    pdf.cell(130, 5.5, "Statement of Facts", ln=1)
+    pdf.set_text_color(*MUTED)
+    pdf.cell(130, 5.5, "Statement of Facts", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_text_color(0, 0, 0)
 
     pdf.set_xy(150, 13)
     pdf.set_font("Helvetica", "B", 9)
-    pdf.set_text_color(18, 58, 86)
-    pdf.cell(45, 5, "Prepared", align="R", ln=1)
+    pdf.set_text_color(*NAVY)
+    pdf.cell(45, 5, "Prepared", align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_x(150)
     pdf.set_font("Helvetica", "", 9)
     pdf.set_text_color(0, 0, 0)
-    pdf.cell(45, 5, str(doc.get("created_at") or "-"), align="R", ln=1)
+    pdf.cell(45, 5, str(doc.get("created_at") or "-"), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     pdf.set_y(32)
-    pdf.set_draw_color(201, 162, 39)
+    pdf.set_draw_color(*GOLD)
     pdf.set_line_width(0.6)
     pdf.line(15, pdf.get_y(), 195, pdf.get_y())
-    pdf.ln(6)
+    pdf.ln(7)
 
-    def field_row(pairs, col_w=(32, 58, 32, 58)):
-        """pairs: list of (label, value) - 1 or 2 per row. Fixed-width
-        columns, for short fields that are known to fit (vessel/voyage,
-        port/berth) - a long value here would run into the next column,
-        which is exactly what wrap_row (below) is for."""
-        pdf.set_font("Helvetica", "B", 9.5)
-        for i, (label, value) in enumerate(pairs):
-            lw, vw = col_w[i * 2], col_w[i * 2 + 1]
-            pdf.set_font("Helvetica", "B", 9.5)
-            pdf.cell(lw, 6.5, label, border=0)
-            pdf.set_font("Helvetica", "", 9.5)
-            pdf.cell(vw, 6.5, value, border=0)
-        pdf.ln(6.5)
+    ROW_H = 7.2
 
-    def wrap_row(label, value, label_w=32):
-        """Full-width label + value, wrapping the value across lines when
-        it's too long for one row - owning companies' registered names
-        routinely run past what a shared two-column row can hold (this is
-        also how the source template itself lays out Owners, wrapping it
-        onto a second line rather than sharing a row with Charterer).
-        multi_cell's default cursor landing (right edge of the cell, same
-        line) is for flowing more content right after it - explicitly pin
-        it back to the left margin on the next line so the following row
-        doesn't end up stranded off the right edge of the page."""
-        pdf.set_font("Helvetica", "B", 9.5)
-        pdf.cell(label_w, 6.5, label, border=0)
-        pdf.set_font("Helvetica", "", 9.5)
-        avail_w = (210 - 15 - 15) - label_w
-        pdf.multi_cell(avail_w, 6.5, value, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    def cell(w, text, bold=False, fill=False, align="L", size=9.5):
+        pdf.set_font("Helvetica", "B" if bold else "", size)
+        pdf.set_text_color(0, 0, 0)
+        if fill:
+            pdf.set_fill_color(*LABEL_FILL)
+        pdf.set_draw_color(*LINE)
+        pdf.cell(w, ROW_H, ("  " + text) if align == "L" else text, border=1, align=align, fill=fill)
 
-    field_row([("Vessel", _sof_val(doc, "vessel")), ("Voyage", _sof_val(doc, "voyage"))])
-    field_row([("Port", _sof_val(doc, "port")), ("Berth", _sof_val(doc, "berth"))])
-    wrap_row("Owners", _sof_val(doc, "owners"))
-    wrap_row("Charterer", _sof_val(doc, "charterer"))
-    pdf.ln(3)
+    def section_heading(text):
+        pdf.ln(2)
+        pdf.set_font("Helvetica", "B", 11.5)
+        pdf.set_text_color(*NAVY)
+        pdf.cell(0, 7, text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(0.5)
 
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.set_text_color(18, 58, 86)
-    pdf.cell(0, 7, "Event Timeline", ln=1)
-    pdf.set_text_color(0, 0, 0)
-    fill = False
+    # ---------- Vessel Particulars ----------
+    section_heading("Vessel Particulars")
+    LW, VW = 32, (CONTENT_W / 2) - 32
+    for pair in (
+        [("Vessel", _sof_val(doc, "vessel")), ("Voyage", _sof_val(doc, "voyage"))],
+        [("Port", _sof_val(doc, "port")), ("Berth", _sof_val(doc, "berth"))],
+    ):
+        for label, value in pair:
+            cell(LW, label, bold=True, fill=True)
+            cell(VW, value)
+        pdf.ln(ROW_H)
+    # Owners/Charterer get the full row width - registered company names
+    # routinely run longer than a shared two-column cell can hold.
+    for label, value in [("Owners", _sof_val(doc, "owners")), ("Charterer", _sof_val(doc, "charterer"))]:
+        cell(LW, label, bold=True, fill=True)
+        cell(CONTENT_W - LW, value)
+        pdf.ln(ROW_H)
+
+    # ---------- Event Timeline ----------
+    section_heading("Event Timeline")
+    TLW, TVW = 44, (CONTENT_W / 2) - 44
     for left_col, left_label, right_col, right_label in SOF_TIMELINE_PAIRS:
-        pdf.set_fill_color(246, 248, 250)
-        field_row(
-            [(left_label, _sof_val(doc, left_col)), (right_label, _sof_val(doc, right_col))],
-            col_w=(42, 53, 42, 53),
-        )
-        fill = not fill
-    field_row(
-        [("Berthed (All Fast)", _sof_val(doc, "berthed_all_fast")), ("Cargo Discharged (Final)", _sof_val(doc, "cargo_discharge_mtons"))],
-        col_w=(42, 53, 42, 53),
-    )
-    pdf.ln(3)
+        cell(TLW, left_label, bold=True, fill=True)
+        cell(TVW, _sof_val(doc, left_col))
+        cell(TLW, right_label, bold=True, fill=True)
+        cell(TVW, _sof_val(doc, right_col))
+        pdf.ln(ROW_H)
+    cell(TLW, "Berthed (All Fast)", bold=True, fill=True)
+    cell(TVW, _sof_val(doc, "berthed_all_fast"))
+    cell(TLW, "Cargo Discharged (Final)", bold=True, fill=True)
+    cell(TVW, _sof_val(doc, "cargo_discharge_mtons"))
+    pdf.ln(ROW_H)
 
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.set_text_color(18, 58, 86)
-    pdf.cell(0, 7, "Remaining On Board / Draft", ln=1)
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_font("Helvetica", "B", 9.5)
-    pdf.cell(32, 6.5, "ROB Arrival", border=0)
-    pdf.set_font("Helvetica", "", 9.5)
-    pdf.cell(
-        0, 6.5,
-        f"IFO: {_sof_val(doc,'rob_arrival_ifo')}   MDO: {_sof_val(doc,'rob_arrival_mdo')}   "
-        f"LUBS: {_sof_val(doc,'rob_arrival_lubs')}   F/Water: {_sof_val(doc,'rob_arrival_fwater')}",
-        ln=1,
-    )
-    pdf.set_font("Helvetica", "B", 9.5)
-    pdf.cell(32, 6.5, "ROB Departure", border=0)
-    pdf.set_font("Helvetica", "", 9.5)
-    pdf.cell(
-        0, 6.5,
-        f"IFO: {_sof_val(doc,'rob_departure_ifo')}   MDO: {_sof_val(doc,'rob_departure_mdo')}   "
-        f"LUBS: {_sof_val(doc,'rob_departure_lubs')}   F/Water: {_sof_val(doc,'rob_departure_fwater')}",
-        ln=1,
-    )
-    pdf.set_font("Helvetica", "B", 9.5)
-    pdf.cell(32, 6.5, "Arrival Draft", border=0)
-    pdf.set_font("Helvetica", "", 9.5)
-    pdf.cell(0, 6.5, f"FWD: {_sof_val(doc,'arrival_draft_fwd')}   AFT: {_sof_val(doc,'arrival_draft_aft')}", ln=1)
-    pdf.set_font("Helvetica", "B", 9.5)
-    pdf.cell(32, 6.5, "Departure Draft", border=0)
-    pdf.set_font("Helvetica", "", 9.5)
-    pdf.cell(0, 6.5, f"FWD: {_sof_val(doc,'departure_draft_fwd')}   AFT: {_sof_val(doc,'departure_draft_aft')}", ln=1)
-    pdf.ln(3)
+    # ---------- Remaining On Board - a header row instead of cramming
+    # four readings onto one line of "IFO: x  MDO: y  ..." text ----------
+    section_heading("Remaining On Board (MT)")
+    RLW = 34
+    RCW = (CONTENT_W - RLW) / 4
+    cell(RLW, "", bold=True, fill=True)
+    for h in ["IFO", "MDO", "LUBS", "F/Water"]:
+        cell(RCW, h, bold=True, fill=True, align="C")
+    pdf.ln(ROW_H)
+    cell(RLW, "ROB Arrival", bold=True, fill=True)
+    for key in ["rob_arrival_ifo", "rob_arrival_mdo", "rob_arrival_lubs", "rob_arrival_fwater"]:
+        cell(RCW, _sof_val(doc, key), align="C")
+    pdf.ln(ROW_H)
+    cell(RLW, "ROB Departure", bold=True, fill=True)
+    for key in ["rob_departure_ifo", "rob_departure_mdo", "rob_departure_lubs", "rob_departure_fwater"]:
+        cell(RCW, _sof_val(doc, key), align="C")
+    pdf.ln(ROW_H)
+
+    # ---------- Draft ----------
+    section_heading("Draft (M)")
+    DLW = 34
+    DCW = (CONTENT_W - DLW) / 2
+    cell(DLW, "", bold=True, fill=True)
+    for h in ["Forward", "Aft"]:
+        cell(DCW, h, bold=True, fill=True, align="C")
+    pdf.ln(ROW_H)
+    cell(DLW, "Arrival Draft", bold=True, fill=True)
+    cell(DCW, _sof_val(doc, "arrival_draft_fwd"), align="C")
+    cell(DCW, _sof_val(doc, "arrival_draft_aft"), align="C")
+    pdf.ln(ROW_H)
+    cell(DLW, "Departure Draft", bold=True, fill=True)
+    cell(DCW, _sof_val(doc, "departure_draft_fwd"), align="C")
+    cell(DCW, _sof_val(doc, "departure_draft_aft"), align="C")
+    pdf.ln(ROW_H)
 
     if (doc.get("delays_remarks") or "").strip():
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.set_text_color(18, 58, 86)
-        pdf.cell(0, 7, "Delays / Remarks", ln=1)
-        pdf.set_text_color(0, 0, 0)
+        section_heading("Delays / Remarks")
         pdf.set_font("Helvetica", "", 9.5)
-        pdf.multi_cell(0, 6, doc.get("delays_remarks"))
-        pdf.ln(2)
+        pdf.multi_cell(0, 6, doc.get("delays_remarks"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(1)
 
     if (doc.get("masters_remarks") or "").strip():
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.set_text_color(18, 58, 86)
-        pdf.cell(0, 7, "Master's Remarks", ln=1)
-        pdf.set_text_color(0, 0, 0)
+        section_heading("Master's Remarks")
         pdf.set_font("Helvetica", "", 9.5)
-        pdf.multi_cell(0, 6, doc.get("masters_remarks"))
-        pdf.ln(4)
+        pdf.multi_cell(0, 6, doc.get("masters_remarks"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(2)
 
-    pdf.ln(10)
+    pdf.ln(8)
     y = pdf.get_y()
     pdf.set_font("Helvetica", "B", 10)
+    pdf.set_draw_color(*GOLD)
+    pdf.set_line_width(0.6)
     pdf.set_xy(15, y)
     pdf.cell(80, 6, "MASTER", border="T")
     pdf.set_xy(130, y)
@@ -792,15 +830,20 @@ def delete_user(user_id):
 
 # ---------- DO Tracker API ----------
 
+ATTACHMENT_FLAGS_SQL = """,
+    EXISTS(SELECT 1 FROM record_attachments a WHERE a.bl_number = r.bl_number AND a.kind = 'invoice') AS has_invoice_file,
+    EXISTS(SELECT 1 FROM record_attachments a WHERE a.bl_number = r.bl_number AND a.kind = 'do') AS has_do_file"""
+
+
 @app.route("/api/records", methods=["GET"])
 @login_required
 def list_records():
     db = get_db()
     if session.get("role") == "admin":
-        rows = db.execute("SELECT * FROM records ORDER BY created_at DESC").fetchall()
+        rows = db.execute(f"SELECT r.*{ATTACHMENT_FLAGS_SQL} FROM records r ORDER BY created_at DESC").fetchall()
     else:
         rows = db.execute(
-            "SELECT * FROM records WHERE created_by = ? ORDER BY created_at DESC",
+            f"SELECT r.*{ATTACHMENT_FLAGS_SQL} FROM records r WHERE created_by = ? ORDER BY created_at DESC",
             (session.get("username"),),
         ).fetchall()
     return jsonify([dict(r) for r in rows])
@@ -2665,6 +2708,211 @@ def record_history(bl_number):
         "SELECT * FROM audit_log WHERE bl_number = ? ORDER BY id DESC", (bl_number.upper(),)
     ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+# ---------- Invoice / DO file attachments ----------
+
+def _extract_pdf_text(data):
+    """All pages' text, concatenated. Fasah's Invoice and Delivery Order
+    PDFs are text-layer PDFs (not scans), so pdfplumber's default
+    extract_text() - the same approach already used for manifest/packing
+    list PDFs elsewhere in this app - reads them cleanly without needing
+    OCR."""
+    import pdfplumber
+    parts = []
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        for page in pdf.pages:
+            parts.append(page.extract_text() or "")
+    return "\n".join(parts)
+
+
+def _detect_fasah_doc_kind(text):
+    """Fasah's Invoice and Delivery Order documents are both fixed
+    templates - the user confirmed only the BL number/vessel/amounts
+    change between documents of the same kind - so a couple of fixed
+    anchor phrases from the real templates reliably tell them apart
+    without needing to parse the whole layout. Returns 'invoice', 'do',
+    or None if neither anchor is found (an unrecognized/different kind
+    of PDF, which gets held for manual review rather than guessed at)."""
+    upper = text.upper()
+    if "DELIVERY ORDER NUMBER" in upper or "DELIVERY ORDER SERIAL NUMBER" in upper:
+        return "do"
+    if "FASAH PAY INVOICE" in upper or "INVOICE REF" in upper:
+        return "invoice"
+    return None
+
+
+def _find_bl_in_text(text, known_bls):
+    """Which of the caller's own BL numbers appear in this document's
+    text - matched as a whole token (not a bare substring) so one BL
+    number that happens to be a prefix of another (e.g. "BO123" inside
+    "BO1234") doesn't produce a false match. Returns the list of matches;
+    the caller treats exactly one as a confident auto-match and
+    zero-or-many as needing a human to pick."""
+    upper = text.upper()
+    found = []
+    for bl in known_bls:
+        bl_u = (bl or "").strip().upper()
+        if not bl_u:
+            continue
+        if re.search(r"(?<![A-Z0-9])" + re.escape(bl_u) + r"(?![A-Z0-9])", upper):
+            found.append(bl)
+    return found
+
+
+@app.route("/api/attachments/detect", methods=["POST"])
+@login_required
+def detect_attachment():
+    """Reads one dropped PDF and reports what it probably is, without
+    saving anything - the frontend's "drop a batch of Invoices/DOs"
+    flow calls this once per file, then either auto-uploads it (via the
+    existing upload_attachment route, unique kind + unique BL match) or
+    shows it for the user to confirm/correct by hand."""
+    file = request.files.get("file")
+    if not file or not file.filename:
+        return jsonify({"error": "No file received."}), 400
+    if not file.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Only PDF files are supported."}), 400
+    data = file.read()
+    if not data:
+        return jsonify({"error": "That file is empty."}), 400
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        return jsonify({"error": "That file is larger than 10MB."}), 400
+
+    try:
+        text = _extract_pdf_text(data)
+    except Exception:
+        return jsonify({"error": "Could not read this PDF - it may be a scanned image rather than a text document."}), 400
+
+    kind = _detect_fasah_doc_kind(text)
+
+    # Only match against BLs this user could actually upload to anyway
+    # (same scope _owns_record would allow) - no point surfacing a match
+    # the uploader isn't permitted to attach to.
+    db = get_db()
+    if session.get("role") == "admin":
+        bl_rows = db.execute("SELECT bl_number FROM records").fetchall()
+    else:
+        bl_rows = db.execute(
+            "SELECT bl_number FROM records WHERE created_by = ?", (session.get("username"),)
+        ).fetchall()
+    known_bls = [r["bl_number"] for r in bl_rows]
+    matches = _find_bl_in_text(text, known_bls)
+
+    return jsonify({
+        "kind": kind,
+        "matched_bl": matches[0] if len(matches) == 1 else None,
+        "candidates": matches if len(matches) > 1 else [],
+    })
+
+
+@app.route("/api/records/<path:bl_number>/attachment/<kind>", methods=["POST"])
+@login_required
+def upload_attachment(bl_number, kind):
+    bl_number = bl_number.upper()
+    if kind not in ATTACHMENT_KINDS:
+        return jsonify({"error": "Invalid attachment kind."}), 400
+    if not _owns_record(bl_number):
+        return jsonify({"error": "Not your record."}), 403
+    file = request.files.get("file")
+    if not file or not file.filename:
+        return jsonify({"error": "No file was selected."}), 400
+    if not file.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Only PDF files are accepted."}), 400
+    data = file.read()
+    if not data:
+        return jsonify({"error": "That file is empty."}), 400
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        return jsonify({"error": "That file is larger than 10MB."}), 400
+
+    db = get_db()
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    user = session.get("username", "Unknown")
+    db.execute(
+        """INSERT INTO record_attachments (bl_number, kind, filename, content_type, data, file_size, uploaded_by, uploaded_at)
+           VALUES (?, ?, ?, 'application/pdf', ?, ?, ?, ?)
+           ON CONFLICT (bl_number, kind) DO UPDATE SET
+             filename = EXCLUDED.filename, data = EXCLUDED.data, file_size = EXCLUDED.file_size,
+             uploaded_by = EXCLUDED.uploaded_by, uploaded_at = EXCLUDED.uploaded_at""",
+        (bl_number, kind, file.filename, psycopg2.Binary(data), len(data), user, now),
+    )
+    _log_audit(bl_number, "attachment", kind, "", file.filename)
+    db.commit()
+    return jsonify({"ok": True, "filename": file.filename, "uploaded_by": user, "uploaded_at": now})
+
+
+@app.route("/api/records/<path:bl_number>/attachment/<kind>", methods=["GET"])
+@login_required
+def download_attachment(bl_number, kind):
+    """Deliberately NOT gated by _owns_record - the whole point of this
+    feature is the handoff between two different people (whoever issues
+    the invoice/DO isn't necessarily who forwards it to the customs
+    broker), so any signed-in user who already knows the BL number can
+    pull the file, same as the /lookup route below."""
+    bl_number = bl_number.upper()
+    if kind not in ATTACHMENT_KINDS:
+        return "Invalid attachment kind.", 400
+    db = get_db()
+    row = db.execute(
+        "SELECT filename, content_type, data FROM record_attachments WHERE bl_number = ? AND kind = ?",
+        (bl_number, kind),
+    ).fetchone()
+    if not row:
+        return "No file attached yet.", 404
+    filename = row["filename"] or f"{kind}_{bl_number}.pdf"
+    return Response(
+        bytes(row["data"]),
+        mimetype=row["content_type"] or "application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.route("/api/records/<path:bl_number>/attachment/<kind>", methods=["DELETE"])
+@login_required
+def delete_attachment(bl_number, kind):
+    bl_number = bl_number.upper()
+    if kind not in ATTACHMENT_KINDS:
+        return jsonify({"error": "Invalid attachment kind."}), 400
+    if not _owns_record(bl_number):
+        return jsonify({"error": "Not your record."}), 403
+    db = get_db()
+    db.execute("DELETE FROM record_attachments WHERE bl_number = ? AND kind = ?", (bl_number, kind))
+    _log_audit(bl_number, "attachment_removed", kind)
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/records/<path:bl_number>/lookup", methods=["GET"])
+@login_required
+def lookup_record(bl_number):
+    """Looks up one BL by its exact number regardless of who created it -
+    the normal board stays scoped to each staff member's own BLs, but once
+    the invoice/DO are issued, the person forwarding them to the customs
+    broker is often someone else entirely, and they need a way to find
+    that BL's files without the whole board being thrown open to everyone."""
+    bl_number = bl_number.strip().upper()
+    if not bl_number:
+        return jsonify({"error": "Enter a BL number."}), 400
+    db = get_db()
+    row = db.execute(
+        f"""SELECT bl_number, port, vessel, created_by, invoice_issued, invoice_by, invoice_at,
+                   do_issued, do_by, do_at{ATTACHMENT_FLAGS_SQL}
+            FROM records r WHERE bl_number = ?""",
+        (bl_number,),
+    ).fetchone()
+    if not row:
+        return jsonify({"error": f'No BL found matching "{bl_number}".'}), 404
+    result = dict(row)
+    # Attach filename/uploaded_by/uploaded_at per kind too - the has_invoice_file/
+    # has_do_file flags above are enough for a status dot, but the Documents
+    # modal and the Find-a-BL lookup both want to show who uploaded what and
+    # when, not just whether something's there.
+    atts = db.execute(
+        "SELECT kind, filename, uploaded_by, uploaded_at FROM record_attachments WHERE bl_number = ?",
+        (bl_number,),
+    ).fetchall()
+    result["attachments"] = {a["kind"]: dict(a) for a in atts}
+    return jsonify(result)
 
 
 @app.route("/api/export", methods=["GET"])
@@ -6834,6 +7082,58 @@ PAGE_HTML = """
   .history-row:last-child { border-bottom: none; }
   .history-row .when { color: var(--muted); font-size: 11px; }
 
+  /* Doc chips next to the BL number - small pills showing whether an
+     Invoice / DO file is attached. The native title attribute gives a real
+     hover tooltip on desktop; clicking (works on both desktop and mobile,
+     where hover doesn't exist) opens the Documents modal. */
+  .doc-chip {
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.02em;
+    padding: 1px 6px; border-radius: 5px; cursor: pointer; border: 1px solid transparent;
+    line-height: 1.5;
+  }
+  .doc-chip.has-file {
+    background: color-mix(in srgb, var(--success, #1f9d55) 16%, transparent);
+    color: var(--success, #1f9d55);
+    border-color: color-mix(in srgb, var(--success, #1f9d55) 35%, transparent);
+  }
+  .doc-chip.no-file {
+    background: var(--muted-bg, rgba(120,130,140,0.12)); color: var(--muted);
+    border-color: var(--border);
+  }
+  .doc-chip:hover { filter: brightness(0.95); }
+
+  .docs-section { padding: 12px 0; border-bottom: 1px solid var(--border); }
+  .docs-section:last-child { border-bottom: none; }
+  .docs-section .docs-section-title { font-weight: 700; font-size: 13px; margin-bottom: 6px; }
+  .docs-section .docs-status { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .docs-section .docs-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .docs-section .docs-actions label.btn-upload {
+    display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+    padding: 6px 12px; border-radius: 8px; background: var(--navy-light, #12405e);
+    color: #fff; font-size: 12.5px; font-weight: 600;
+  }
+  .docs-section .docs-actions input[type=file] { display: none; }
+  .docs-find-row { display: flex; gap: 8px; margin-bottom: 10px; }
+  .docs-find-row input { flex: 1; }
+
+  /* "Attach documents" auto-match batch rows - one per dropped file, while
+     it's being read/matched, once it's auto-attached, or (when the BL
+     couldn't be pinned down automatically) while it waits for the user to
+     pick the right one by hand. */
+  .match-row {
+    display: flex; align-items: center; gap: 10px; padding: 9px 0;
+    border-bottom: 1px solid var(--border); font-size: 12.5px;
+  }
+  .match-row:last-child { border-bottom: none; }
+  .match-row .match-file { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .match-row .match-status { font-size: 11.5px; color: var(--muted); }
+  .match-row.ok .match-status { color: var(--success, #1f9d55); }
+  .match-row.review { flex-wrap: wrap; }
+  .match-row.review .match-review-controls { display: flex; gap: 6px; align-items: center; width: 100%; margin-top: 4px; }
+  .match-row.review .match-review-controls select,
+  .match-row.review .match-review-controls input { flex: 1; min-width: 0; }
+
   /* Mobile - below this width, each row becomes a stacked card instead of
      a table row (a wide table just forces sideways scrolling on a phone,
      which is exactly what you don't want checking a BL at the port). */
@@ -6989,6 +7289,8 @@ PAGE_HTML = """
       {% endif %}
       <button type="button" class="btn-neutral" onclick="setAllGroupsCollapsed(false)">Expand all</button>
       <button type="button" class="btn-neutral" onclick="setAllGroupsCollapsed(true)">Collapse all</button>
+      <button type="button" class="btn-neutral" onclick="openFindBl()">Find a BL</button>
+      <button type="button" class="btn-neutral" onclick="openAutoMatch()">Attach documents</button>
       <button type="button" id="clearAllBtn" class="btn-danger" style="margin-left:auto;" onclick="clearAllRecords()">Clear board</button>
     </div>
     <div id="portTabs"></div>
@@ -7014,6 +7316,58 @@ PAGE_HTML = """
     </div>
   </div>
 
+  <div id="docsOverlay" class="history-overlay" style="display:none;" onclick="if(event.target===this) closeDocs()">
+    <div class="history-modal">
+      <div class="history-modal-head">
+        <b id="docsTitle">Documents</b>
+        <button type="button" onclick="closeDocs()" style="background:none; color:var(--text); padding:4px 10px;">&times;</button>
+      </div>
+      <div id="docsBody" class="history-modal-body"></div>
+    </div>
+  </div>
+
+  <div id="findBlOverlay" class="history-overlay" style="display:none;" onclick="if(event.target===this) closeFindBl()">
+    <div class="history-modal">
+      <div class="history-modal-head">
+        <b>Find a BL</b>
+        <button type="button" onclick="closeFindBl()" style="background:none; color:var(--text); padding:4px 10px;">&times;</button>
+      </div>
+      <div class="history-modal-body">
+        <div class="docs-find-row">
+          <input type="text" id="findBlInput" placeholder="Enter exact BL number..." style="text-transform:uppercase;"
+            oninput="this.value = this.value.toUpperCase();" onkeydown="if(event.key==='Enter') doFindBl();">
+          <button type="button" onclick="doFindBl()">Find</button>
+        </div>
+        <div id="findBlBody"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="autoMatchOverlay" class="history-overlay" style="display:none;" onclick="if(event.target===this) closeAutoMatch()">
+    <div class="history-modal" style="max-width:600px;">
+      <div class="history-modal-head">
+        <b>Attach documents</b>
+        <button type="button" onclick="closeAutoMatch()" style="background:none; color:var(--text); padding:4px 10px;">&times;</button>
+      </div>
+      <div class="history-modal-body">
+        <label class="dropzone" id="autoMatchDropzone" for="autoMatchFile">
+          <div class="dropzone-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8">
+              <path d="M12 16V4M12 4l-4 4M12 4l4 4"/><path d="M4 16v3a1 1 0 001 1h14a1 1 0 001-1v-3"/>
+            </svg>
+          </div>
+          <div>
+            <div class="dropzone-text"><b>Click to upload</b> or drag &amp; drop Invoice/DO PDFs</div>
+            <div class="dropzone-sub">Drop as many at once as you like - each is matched to its BL automatically</div>
+          </div>
+          <input type="file" id="autoMatchFile" accept=".pdf" multiple style="display:none" onchange="handleAutoMatchFiles(this.files)">
+        </label>
+        <div id="autoMatchSummary" style="font-size:12.5px; color:var(--muted); margin-top:10px;"></div>
+        <div id="autoMatchList" style="margin-top:6px;"></div>
+      </div>
+    </div>
+  </div>
+
 <script>
 /* ---------- Theme (light/dark, sun/moon toggle) ---------- */
 (function initTheme() {
@@ -7032,6 +7386,7 @@ function setTheme(mode) {
 }
 
 const CURRENT_USER = {{ username|tojson }};
+const IS_ADMIN = {{ (role == 'admin')|tojson }};
 let records = [];
 let suppressPollUntil = 0;
 let editingCount = 0;
@@ -7365,6 +7720,280 @@ function closeHistory() {
   document.getElementById('historyOverlay').style.display = 'none';
 }
 
+/* ---------- Invoice / DO file attachments ----------
+   Small "doc chip" badges next to the BL number show at a glance whether an
+   Invoice/DO file has been attached (native title= gives a real hover
+   tooltip on desktop, and the click handler covers mobile where hover
+   doesn't exist). Clicking either chip - or any cell in the row that opens
+   it - shows the Documents modal, which is also reused by "Find a BL" below
+   for the cross-staff handoff: the person who issues the invoice/DO isn't
+   always the person who forwards it to the customs broker, so download
+   (and this lookup) deliberately isn't limited to the BL's creator, even
+   though upload/replace/remove still are. */
+const DOC_KINDS = [['invoice', 'Invoice'], ['do', 'Delivery Order']];
+
+function docChip(bl, kind, hasFile) {
+  const label = kind === 'invoice' ? 'INV' : 'DO';
+  const full = kind === 'invoice' ? 'Invoice' : 'Delivery Order';
+  const title = hasFile ? `${full} attached - click to view` : `${full} not attached yet - click to upload`;
+  return `<span class="doc-chip ${hasFile ? 'has-file' : 'no-file'}" title="${title}"
+            onclick="event.stopPropagation(); showDocs('${bl}')">${label}</span>`;
+}
+
+function renderDocsSections(data, canManage) {
+  const atts = data.attachments || {};
+  return DOC_KINDS.map(([kind, label]) => {
+    const att = atts[kind];
+    let status, actions;
+    if (att) {
+      status = `Attached: <b>${att.filename || (kind + '.pdf')}</b><br>by ${att.uploaded_by || 'Unknown'} - ${formatLocalTime(att.uploaded_at)}`;
+      actions = `
+        <a href="/api/records/${encodeURIComponent(data.bl_number)}/attachment/${kind}" target="_blank" rel="noopener">
+          <button type="button">Download</button>
+        </a>
+        ${canManage ? `
+          <label class="btn-upload">Replace<input type="file" accept=".pdf,application/pdf" onchange="uploadAttachment('${data.bl_number}', '${kind}', this)"></label>
+          <button type="button" class="btn-danger" onclick="removeAttachment('${data.bl_number}', '${kind}')">Remove</button>
+        ` : ''}`;
+    } else {
+      status = canManage ? 'Not attached yet.' : 'Not attached yet - waiting on the issuing staff member.';
+      actions = canManage ? `
+        <label class="btn-upload">Upload PDF<input type="file" accept=".pdf,application/pdf" onchange="uploadAttachment('${data.bl_number}', '${kind}', this)"></label>
+      ` : '';
+    }
+    return `
+      <div class="docs-section">
+        <div class="docs-section-title">${label}</div>
+        <div class="docs-status">${status}</div>
+        <div class="docs-actions">${actions}</div>
+      </div>`;
+  }).join('');
+}
+
+async function showDocs(bl) {
+  const overlay = document.getElementById('docsOverlay');
+  const body = document.getElementById('docsBody');
+  document.getElementById('docsTitle').textContent = 'Documents - ' + bl;
+  body.innerHTML = '<div style="color:var(--muted); padding:10px 0;">Loading...</div>';
+  overlay.style.display = 'flex';
+  overlay.dataset.bl = bl;
+
+  const res = await fetch(`/api/records/${encodeURIComponent(bl)}/lookup`);
+  const data = await res.json();
+  if (!res.ok) { body.innerHTML = `<div style="color:var(--muted); padding:10px 0;">${data.error || 'Could not load this BL.'}</div>`; return; }
+  const canManage = IS_ADMIN || data.created_by === CURRENT_USER;
+  body.innerHTML = renderDocsSections(data, canManage);
+}
+
+function closeDocs() {
+  document.getElementById('docsOverlay').style.display = 'none';
+}
+
+async function submitAttachmentFile(bl, kind, file) {
+  // Shared by the single-file Documents-modal upload and the batch
+  // auto-match flow below - just the raw POST, no UI side effects, so
+  // each caller decides how to react to the result.
+  const form = new FormData();
+  form.append('file', file);
+  const res = await fetch(`/api/records/${encodeURIComponent(bl)}/attachment/${kind}`, {method: 'POST', body: form});
+  const data = await res.json();
+  return {ok: res.ok, data};
+}
+
+async function uploadAttachment(bl, kind, input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith('.pdf')) { showToast('Only PDF files are accepted.'); input.value = ''; return; }
+  if (file.size > 10 * 1024 * 1024) { showToast('That file is larger than 10MB.'); input.value = ''; return; }
+
+  const {ok, data} = await submitAttachmentFile(bl, kind, file);
+  if (!ok) { showToast(data.error || 'Upload failed.'); return; }
+  showToast(`${kind === 'invoice' ? 'Invoice' : 'Delivery Order'} uploaded.`);
+  await fetchRecords();
+  if (document.getElementById('docsOverlay').style.display !== 'none') await showDocs(bl);
+  if (document.getElementById('findBlOverlay').style.display !== 'none') await doFindBl();
+}
+
+/* ---------- Attach documents (batch auto-match) ----------
+   Drop a pile of Fasah Invoice/DO PDFs at once; each is sent to
+   /api/attachments/detect (reads the PDF, figures out Invoice vs DO from
+   fixed template anchors, and checks which of this user's own BLs appears
+   in it). A clean single match uploads immediately via the same route the
+   Documents modal uses; anything else (no match, more than one candidate,
+   or an unrecognized document) is left in the list for the user to assign
+   by hand rather than guessed at. */
+const autoMatchDropzone = document.getElementById('autoMatchDropzone');
+['dragenter', 'dragover'].forEach(evt => {
+  autoMatchDropzone.addEventListener(evt, e => { e.preventDefault(); autoMatchDropzone.classList.add('dragover'); });
+});
+['dragleave', 'drop'].forEach(evt => {
+  autoMatchDropzone.addEventListener(evt, e => { e.preventDefault(); autoMatchDropzone.classList.remove('dragover'); });
+});
+autoMatchDropzone.addEventListener('drop', e => {
+  if (e.dataTransfer.files && e.dataTransfer.files.length) handleAutoMatchFiles(e.dataTransfer.files);
+});
+
+function openAutoMatch() {
+  document.getElementById('autoMatchOverlay').style.display = 'flex';
+  document.getElementById('autoMatchSummary').textContent = '';
+  document.getElementById('autoMatchList').innerHTML = '';
+  document.getElementById('autoMatchFile').value = '';
+}
+
+function closeAutoMatch() {
+  document.getElementById('autoMatchOverlay').style.display = 'none';
+}
+
+function autoMatchKindLabel(kind) {
+  return kind === 'invoice' ? 'Invoice' : kind === 'do' ? 'Delivery Order' : 'Unrecognized document';
+}
+
+async function handleAutoMatchFiles(fileList) {
+  const files = Array.from(fileList || []).filter(f => f.name.toLowerCase().endsWith('.pdf'));
+  if (!files.length) { showToast('Drop PDF files only.'); return; }
+
+  const listEl = document.getElementById('autoMatchList');
+  const summaryEl = document.getElementById('autoMatchSummary');
+  let attached = 0, needsReview = 0;
+  const updateSummary = () => {
+    summaryEl.textContent = `${attached} attached automatically` + (needsReview ? `, ${needsReview} need your input` : '') +
+      ((attached + needsReview) < files.length ? ` (processing ${files.length - attached - needsReview} more...)` : '.');
+  };
+  updateSummary();
+
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    const rowId = `matchrow_${Date.now()}_${i}`;
+    const row = document.createElement('div');
+    row.className = 'match-row';
+    row.id = rowId;
+    row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">Reading...</div>`;
+    listEl.appendChild(row);
+
+    if (file.size > 10 * 1024 * 1024) {
+      row.querySelector('.match-status').textContent = 'Too large (over 10MB) - skipped.';
+      needsReview++; updateSummary();
+      continue;
+    }
+
+    let detect;
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      const res = await fetch('/api/attachments/detect', {method: 'POST', body: form});
+      detect = await res.json();
+      if (!res.ok) throw new Error(detect.error || 'Could not read this file.');
+    } catch (err) {
+      row.className = 'match-row review';
+      row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">${err.message}</div>`;
+      needsReview++; updateSummary();
+      continue;
+    }
+
+    if (detect.kind && detect.matched_bl) {
+      const {ok, data} = await submitAttachmentFile(detect.matched_bl, detect.kind, file);
+      if (ok) {
+        row.className = 'match-row ok';
+        row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">&check; ${detect.matched_bl} - ${autoMatchKindLabel(detect.kind)}</div>`;
+        attached++; updateSummary();
+        continue;
+      }
+      // Fall through to manual review if the upload itself was rejected
+      // (e.g. not the owner of that BL after all) - rare, since the
+      // candidate list was already scoped server-side, but don't just
+      // drop the file silently if it happens.
+      row.className = 'match-row review';
+      renderAutoMatchReviewRow(row, file, detect, data.error);
+      needsReview++; updateSummary();
+      continue;
+    }
+
+    row.className = 'match-row review';
+    renderAutoMatchReviewRow(row, file, detect, null);
+    needsReview++; updateSummary();
+  }
+
+  await fetchRecords();
+  if (document.getElementById('findBlOverlay').style.display !== 'none') await doFindBl();
+}
+
+function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
+  const blOptions = records.map(r => r.bl_number).sort();
+  const candidates = (detect.candidates && detect.candidates.length) ? detect.candidates : blOptions;
+  const statusText = errorMsg ? errorMsg
+    : detect.candidates && detect.candidates.length ? `Matches more than one BL - pick the right one`
+    : !detect.kind ? `Couldn't tell Invoice from Delivery Order`
+    : `No BL on your board matched this document`;
+
+  row.innerHTML = `
+    <div class="match-file" title="${file.name}">${file.name}</div>
+    <div class="match-status">${statusText}</div>
+    <div class="match-review-controls">
+      <select class="review-bl">
+        <option value="">Select BL...</option>
+        ${candidates.map(bl => `<option value="${bl}" ${bl === detect.matched_bl ? 'selected' : ''}>${bl}</option>`).join('')}
+      </select>
+      <select class="review-kind">
+        <option value="">Kind...</option>
+        <option value="invoice" ${detect.kind === 'invoice' ? 'selected' : ''}>Invoice</option>
+        <option value="do" ${detect.kind === 'do' ? 'selected' : ''}>Delivery Order</option>
+      </select>
+      <button type="button" class="review-attach-btn">Attach</button>
+    </div>`;
+
+  row.querySelector('.review-attach-btn').onclick = async () => {
+    const bl = row.querySelector('.review-bl').value;
+    const kind = row.querySelector('.review-kind').value;
+    if (!bl || !kind) { showToast('Pick both a BL number and a document kind.'); return; }
+    const btn = row.querySelector('.review-attach-btn');
+    btn.disabled = true;
+    btn.textContent = 'Attaching...';
+    const {ok, data} = await submitAttachmentFile(bl, kind, file);
+    if (!ok) { showToast(data.error || 'Attach failed.'); btn.disabled = false; btn.textContent = 'Attach'; return; }
+    row.className = 'match-row ok';
+    row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">&check; ${bl} - ${autoMatchKindLabel(kind)}</div>`;
+    await fetchRecords();
+    if (document.getElementById('findBlOverlay').style.display !== 'none') await doFindBl();
+  };
+}
+
+async function removeAttachment(bl, kind) {
+  const res = await fetch(`/api/records/${encodeURIComponent(bl)}/attachment/${kind}`, {method: 'DELETE'});
+  if (!res.ok) { showToast('Could not remove the file.'); return; }
+  showToast(`${kind === 'invoice' ? 'Invoice' : 'Delivery Order'} removed.`);
+  await fetchRecords();
+  if (document.getElementById('docsOverlay').style.display !== 'none') await showDocs(bl);
+  if (document.getElementById('findBlOverlay').style.display !== 'none') await doFindBl();
+}
+
+function openFindBl() {
+  document.getElementById('findBlOverlay').style.display = 'flex';
+  document.getElementById('findBlBody').innerHTML = '';
+  const input = document.getElementById('findBlInput');
+  input.value = '';
+  setTimeout(() => input.focus(), 50);
+}
+
+function closeFindBl() {
+  document.getElementById('findBlOverlay').style.display = 'none';
+}
+
+async function doFindBl() {
+  const bl = document.getElementById('findBlInput').value.trim().toUpperCase();
+  const body = document.getElementById('findBlBody');
+  if (!bl) { body.innerHTML = ''; return; }
+  body.innerHTML = '<div style="color:var(--muted); padding:10px 0;">Searching...</div>';
+
+  const res = await fetch(`/api/records/${encodeURIComponent(bl)}/lookup`);
+  const data = await res.json();
+  if (!res.ok) { body.innerHTML = `<div style="color:var(--muted); padding:10px 0;">${data.error || 'Not found.'}</div>`; return; }
+  const canManage = IS_ADMIN || data.created_by === CURRENT_USER;
+  body.innerHTML = `
+    <div style="margin-bottom:8px; font-size:12.5px; color:var(--muted);">
+      ${[data.port, data.vessel].filter(Boolean).join(' &middot; ') || 'No port/vessel set'}
+    </div>` + renderDocsSections(data, canManage);
+}
+
 function deleteRecord(bl) {
   const idx = records.findIndex(r => r.bl_number === bl);
   if (idx === -1) return;
@@ -7504,6 +8133,8 @@ function rowsHtml(list) {
       <td>
         <div class="bl-cell">
           <b>${r.bl_number}</b>
+          ${docChip(r.bl_number, 'invoice', r.has_invoice_file)}
+          ${docChip(r.bl_number, 'do', r.has_do_file)}
           ${complete ? '<span class="badge-complete">&check; Complete</span>' : ''}
         </div>
       </td>
