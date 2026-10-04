@@ -26,8 +26,9 @@ import base64
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from functools import wraps
+from urllib.parse import quote as url_quote
 from flask import Flask, request, jsonify, g, render_template_string, session, redirect, url_for, send_file, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 import openpyxl
@@ -214,6 +215,8 @@ const I18N = {
     action_restored: "Restored",
     action_toggle: "status changed",
     action_remarks: "Remarks edited",
+    action_attachment: "attached a document",
+    action_attachment_removed: "removed a document",
     yes: "Yes",
     no: "No",
     history_set_field: "set {field} to {value}",
@@ -363,6 +366,8 @@ const I18N = {
     action_restored: "تمت الاستعادة",
     action_toggle: "تم تغيير الحالة",
     action_remarks: "تم تعديل الملاحظات",
+    action_attachment: "أرفق مستندًا",
+    action_attachment_removed: "أزال مستندًا",
     yes: "نعم",
     no: "لا",
     history_set_field: "قام بتعيين {field} إلى {value}",
@@ -501,6 +506,26 @@ ATTACHMENT_KINDS = {"invoice": "Invoice", "do": "Delivery Order"}
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10MB - comfortably more than a scanned invoice PDF needs
 
 
+def _content_disposition(filename, fallback="download"):
+    """Builds a Content-Disposition header that works for any filename.
+    HTTP headers can only carry Latin-1 text, so a raw Arabic (or Chinese)
+    filename in the header crashed the response and the file could never
+    be downloaded. Standard fix (RFC 6266/5987): an ASCII-only filename=
+    for old clients plus a UTF-8 filename*= that every modern browser
+    prefers, so the user still gets the real name."""
+    name = str(filename or "").replace("\r", " ").replace("\n", " ").strip() or fallback
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    fb_stem, fb_dot, fb_ext = fallback.rpartition(".")
+    if not fb_dot:
+        fb_stem, fb_ext = fallback, ""
+    ascii_stem = re.sub(r"[^A-Za-z0-9_ -]+", "_", stem).strip(" _") or fb_stem
+    ascii_ext = re.sub(r"[^A-Za-z0-9]+", "", ext) or fb_ext
+    ascii_name = ascii_stem + ("." + ascii_ext if ascii_ext else "")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{url_quote(name, safe='')}"
+
+
 def init_db():
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
@@ -613,6 +638,28 @@ def init_db():
             UNIQUE (bl_number, kind)
         )"""
     )
+    # Holding area for a removed BL's Invoice/DO files. Removing a BL
+    # cascade-deletes its attachments, so "Undo" used to bring the row back
+    # with its files gone for good (while still showing Invoice/DO as
+    # issued). The files are now copied here first and moved back on Undo;
+    # anything left unclaimed is purged after 7 days. No foreign key on
+    # purpose - the parent record no longer exists while files sit here.
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS record_attachments_trash (
+            id SERIAL PRIMARY KEY,
+            bl_number TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            filename TEXT DEFAULT '',
+            content_type TEXT DEFAULT 'application/pdf',
+            data BYTEA NOT NULL,
+            file_size INTEGER DEFAULT 0,
+            uploaded_by TEXT DEFAULT '',
+            uploaded_at TEXT DEFAULT '',
+            deleted_by TEXT DEFAULT '',
+            deleted_at TEXT DEFAULT ''
+        )"""
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_attachments_trash_bl ON record_attachments_trash (bl_number)")
 
     # PDA / FDA (Proforma / Final Disbursement Account) - a per-port charge
     # template (port dues, pilotage, towage, agency fee, ...) that pre-fills
@@ -699,13 +746,36 @@ def fmt_money(value):
         return "0.00"
 
 
+class SafeFPDF(FPDF):
+    """FPDF that never crashes on text its built-in font can't draw.
+
+    The PDA/SOF PDFs use fpdf's built-in Helvetica, which only covers
+    basic Latin. Plain FPDF raised an exception - and the whole download
+    failed - on a single en dash or curly quote pasted from Word, or any
+    Arabic word. Two changes:
+      - windows-1252 encoding instead of latin-1, so the usual Word
+        punctuation (– — ‘ ’ “ ” … • €) prints correctly as-is;
+      - anything still outside that (e.g. Arabic) is swapped for "?"
+        rather than aborting the document.
+    Printing real Arabic would need a bundled Arabic font file."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.core_fonts_encoding = "windows-1252"
+
+    def normalize_text(self, text):
+        if not self.is_ttf_font and self.core_fonts_encoding:
+            text = str(text).encode(self.core_fonts_encoding, errors="replace").decode(self.core_fonts_encoding)
+        return super().normalize_text(text)
+
+
 def build_pda_pdf(doc, items):
     """Renders a PDA (while draft/sent) or FDA (once finalized) as a PDF,
     reusing the Sea Power logo already embedded in the app. Finalized
     documents get an extra Actual + Variance column so the agent can see
     at a glance where the final cost diverged from the estimate."""
     is_fda = doc["status"] == "finalized"
-    pdf = FPDF(format="A4")
+    pdf = SafeFPDF(format="A4")
     pdf.set_auto_page_break(auto=True, margin=18)
     pdf.add_page()
 
@@ -826,7 +896,7 @@ def build_sof_pdf(doc):
     long values (e.g. Owners) could run straight into the next column.
     A bordered grid makes every column's width explicit, so nothing drifts
     regardless of how long any one label or value happens to be."""
-    pdf = FPDF(format="A4")
+    pdf = SafeFPDF(format="A4")
     pdf.set_auto_page_break(auto=True, margin=16)
     pdf.add_page()
     pdf.set_margins(15, 12, 15)
@@ -1107,30 +1177,54 @@ def setup():
 # one instance/process. Not a substitute for a real WAF, but it turns
 # "try a password list all night" into "wait 15 minutes," which closes
 # off the main risk of a plain username+password login with no 2FA.
+#
+# Second, per-ACCOUNT limit: the per-IP limit depends on the client IP that
+# Render reports in X-Forwarded-For, and a client can put fake addresses in
+# that header itself - so on its own, rotating fake IPs could keep guessing
+# forever. Capping failures per username as well bounds guessing against
+# any one account no matter what IP is reported. It's set higher than the
+# per-IP limit so a colleague mistyping from the same office doesn't lock
+# the account; the trade-off is that someone deliberately spamming wrong
+# passwords can lock an account for 15 minutes.
 _LOGIN_MAX_ATTEMPTS = 8
+_LOGIN_MAX_ATTEMPTS_PER_USER = 20
 _LOGIN_WINDOW_SECONDS = 900  # 15 minutes
 _login_failures = {}  # ip -> [timestamp, ...] of recent failed attempts
+_login_failures_user = {}  # lowercased username -> [timestamp, ...]
 
 
 def _client_ip():
     # Render terminates TLS and proxies requests, so the real client IP
-    # arrives in X-Forwarded-For (first hop) rather than as the direct
-    # socket peer.
+    # arrives in X-Forwarded-For rather than as the direct socket peer.
+    # Render states it puts the real client IP first in that list.
     fwd = request.headers.get("X-Forwarded-For", "")
     if fwd:
         return fwd.split(",")[0].strip()
     return request.remote_addr or "unknown"
 
 
-def _login_locked_out(ip):
+def _recent(store, key):
     now = time.time()
-    recent = [t for t in _login_failures.get(ip, []) if now - t < _LOGIN_WINDOW_SECONDS]
-    _login_failures[ip] = recent
-    return len(recent) >= _LOGIN_MAX_ATTEMPTS
+    recent = [t for t in store.get(key, []) if now - t < _LOGIN_WINDOW_SECONDS]
+    if recent:
+        store[key] = recent
+    else:
+        store.pop(key, None)  # don't let the dict grow forever with stale keys
+    return recent
 
 
-def _record_login_failure(ip):
+def _login_locked_out(ip, username=""):
+    if len(_recent(_login_failures, ip)) >= _LOGIN_MAX_ATTEMPTS:
+        return True
+    user_key = (username or "").strip().lower()
+    return bool(user_key) and len(_recent(_login_failures_user, user_key)) >= _LOGIN_MAX_ATTEMPTS_PER_USER
+
+
+def _record_login_failure(ip, username=""):
     _login_failures.setdefault(ip, []).append(time.time())
+    user_key = (username or "").strip().lower()
+    if user_key:
+        _login_failures_user.setdefault(user_key, []).append(time.time())
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -1140,11 +1234,11 @@ def login():
     error = None
     if request.method == "POST":
         ip = _client_ip()
-        if _login_locked_out(ip):
-            error = "Too many failed attempts. Please wait 15 minutes and try again."
-            return render_template_string(LOGIN_HTML, error=error)
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
+        if _login_locked_out(ip, username):
+            error = "Too many failed attempts. Please wait 15 minutes and try again."
+            return render_template_string(LOGIN_HTML, error=error)
         db = get_db()
         user = db.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
         if user and check_password_hash(user["password_hash"], password):
@@ -1152,7 +1246,7 @@ def login():
             session["username"] = user["username"]
             session["role"] = user["role"]
             return redirect(url_for("index"))
-        _record_login_failure(ip)
+        _record_login_failure(ip, username)
         error = "Wrong username or password."
     return render_template_string(LOGIN_HTML, error=error)
 
@@ -1343,6 +1437,11 @@ def kpi_data():
                 do_hrs.append((do_at - created).total_seconds())
                 bucket["turnarounds"].append((do_at - created).total_seconds())
 
+            # Archived vessels are finished/parked by definition - counting
+            # their unticked BLs as live backlog inflated the "pending"
+            # numbers. Their timings still feed the turnaround averages.
+            if r.get("archived"):
+                continue
             days_open = round((now - created).total_seconds() / 86400.0, 1)
             entry = {
                 "bl_number": r.get("bl_number"), "port": r.get("port"), "vessel": r.get("vessel"),
@@ -2873,12 +2972,55 @@ def update_remarks(bl_number):
     return jsonify({"ok": True})
 
 
+ATTACHMENT_TRASH_DAYS = 7
+
+
+def _stash_attachments(db, bl_number):
+    """Copies a BL's attached files into record_attachments_trash right
+    before the BL itself is deleted (which cascade-deletes the originals),
+    so an Undo can put them back. Also purges stashed files older than
+    ATTACHMENT_TRASH_DAYS. Shares the caller's transaction."""
+    now_dt = datetime.utcnow()
+    cutoff = (now_dt - timedelta(days=ATTACHMENT_TRASH_DAYS)).strftime("%Y-%m-%d %H:%M")
+    db.execute("DELETE FROM record_attachments_trash WHERE deleted_at < ?", (cutoff,))
+    db.execute("DELETE FROM record_attachments_trash WHERE bl_number = ?", (bl_number,))
+    db.execute(
+        """INSERT INTO record_attachments_trash
+             (bl_number, kind, filename, content_type, data, file_size, uploaded_by, uploaded_at, deleted_by, deleted_at)
+           SELECT bl_number, kind, filename, content_type, data, file_size, uploaded_by, uploaded_at, ?, ?
+           FROM record_attachments WHERE bl_number = ?""",
+        (session.get("username", ""), now_dt.strftime("%Y-%m-%d %H:%M"), bl_number),
+    )
+
+
+def _unstash_attachments(db, bl_number):
+    """Moves a BL's stashed files back into record_attachments on Undo.
+    Only for an admin or whoever removed the BL - otherwise anyone who
+    knew a removed BL's number could "restore" it under their own name
+    and pick up someone else's files along with it."""
+    params = [bl_number]
+    owner_sql = ""
+    if session.get("role") != "admin":
+        owner_sql = " AND deleted_by = ?"
+        params.append(session.get("username", ""))
+    db.execute(
+        f"""INSERT INTO record_attachments
+              (bl_number, kind, filename, content_type, data, file_size, uploaded_by, uploaded_at)
+            SELECT bl_number, kind, filename, content_type, data, file_size, uploaded_by, uploaded_at
+            FROM record_attachments_trash WHERE bl_number = ?{owner_sql}
+            ON CONFLICT (bl_number, kind) DO NOTHING""",
+        tuple(params),
+    )
+    db.execute(f"DELETE FROM record_attachments_trash WHERE bl_number = ?{owner_sql}", tuple(params))
+
+
 @app.route("/api/records/<path:bl_number>", methods=["DELETE"])
 @login_required
 def delete_record(bl_number):
     if not _owns_record(bl_number.upper()):
         return "Not your record.", 403
     db = get_db()
+    _stash_attachments(db, bl_number.upper())
     db.execute("DELETE FROM records WHERE bl_number = ?", (bl_number.upper(),))
     _log_audit(bl_number.upper(), "deleted")
     db.commit()
@@ -2900,12 +3042,20 @@ def _restore_one_record(db, data):
     if existing:
         return False
 
+    # Staff can only ever remove their own BLs, so an Undo by staff always
+    # restores to themselves - the client-supplied created_by is only
+    # trusted from an admin (who may be restoring someone else's BL).
+    if session.get("role") == "admin":
+        owner = data.get("created_by") or session.get("username")
+    else:
+        owner = session.get("username")
+
     db.execute(
         """INSERT INTO records
            (bl_number, consignee, port, vessel, invoice_issued, invoice_by, invoice_at,
             approval_received, approval_by, approval_at, do_issued, do_by, do_at,
-            remarks, created_at, created_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            remarks, created_at, created_by, eta, archived)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             bl_number,
             data.get("consignee", ""),
@@ -2922,9 +3072,12 @@ def _restore_one_record(db, data):
             data.get("do_at", ""),
             data.get("remarks", ""),
             data.get("created_at", ""),
-            data.get("created_by") or session.get("username"),
+            owner,
+            str(data.get("eta") or ""),
+            1 if data.get("archived") else 0,
         ),
     )
+    _unstash_attachments(db, bl_number)
     return True
 
 
@@ -2968,6 +3121,7 @@ def bulk_delete_records():
         if row is None:
             continue
         deleted.append(dict(row))
+        _stash_attachments(db, bl_number)
         db.execute("DELETE FROM records WHERE bl_number = ?", (bl_number,))
         _log_audit(bl_number, "deleted", "", "", "bulk")
     db.commit()
@@ -3312,7 +3466,7 @@ def download_attachment(bl_number, kind):
     return Response(
         bytes(row["data"]),
         mimetype=row["content_type"] or "application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": _content_disposition(filename, f"{kind}_{bl_number}.pdf")},
     )
 
 
@@ -3408,7 +3562,7 @@ def export_records():
     return Response(
         buf.read(),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        headers={"Content-Disposition": _content_disposition(fname, "export.xlsx")},
     )
 
 
@@ -5416,6 +5570,14 @@ function setTheme(mode) {
 
 const IS_ADMIN = {{ (role == 'admin')|tojson }};
 
+// BL numbers, port/vessel names and usernames are user/file data - escape
+// before putting them into HTML so they can't inject markup or script.
+function esc(s) {
+  return String(s === undefined || s === null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function daysPillClass(days) {
   if (days >= 7) return 'danger';
   if (days >= 3) return 'warn';
@@ -5427,8 +5589,8 @@ function backlogRowsHtml(list, emptyMsg) {
   return list.map(e => `
     <div class="backlog-row">
       <div>
-        <div class="b-bl">${e.bl_number}</div>
-        <div class="b-meta">${[e.port, e.vessel].filter(Boolean).join(' &middot; ') || 'No port/vessel set'}${IS_ADMIN ? ' &middot; ' + (e.created_by || 'unknown') : ''}</div>
+        <div class="b-bl">${esc(e.bl_number)}</div>
+        <div class="b-meta">${[e.port, e.vessel].filter(Boolean).map(esc).join(' &middot; ') || 'No port/vessel set'}${IS_ADMIN ? ' &middot; ' + esc(e.created_by || 'unknown') : ''}</div>
       </div>
       <span class="days-pill ${daysPillClass(e.days_open)}">${e.days_open}d</span>
     </div>`).join('');
@@ -5454,7 +5616,7 @@ async function loadData() {
         <tbody>
           ${data.workload.map(w => `
             <tr>
-              <td><b>${w.agent}</b></td>
+              <td><b>${esc(w.agent)}</b></td>
               <td>${w.total}</td>
               <td>${w.complete}</td>
               <td>${w.pending}</td>
@@ -5686,6 +5848,15 @@ DIRECT_DELIVERY_HTML = """
   </div>
 
 <script>
+// BL numbers, reasons and notes come from uploaded packing lists - escape
+// them before putting them into HTML so they can't inject markup/script.
+function esc(s) {
+  return String(s === undefined || s === null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function jsq(s) { return esc(JSON.stringify(String(s === undefined || s === null ? '' : s))); }
+
 (function initTheme() {
   let saved = null;
   try { saved = localStorage.getItem('theme'); } catch (e) {}
@@ -5801,10 +5972,10 @@ async function loadResults() {
       <tbody>
         ${rows.map(r => `
           <tr>
-            <td><b>${r.bl_number}</b></td>
-            <td style="color:var(--muted);">${r.reason || ''}</td>
-            <td style="color:var(--muted);">${r.classified_by || ''}${r.classified_at ? ' - ' + r.classified_at : ''}</td>
-            <td><button class="btn ghost danger" style="padding:4px 10px;font-size:11.5px;" onclick="removeDirectDelivery('${r.bl_number.replace(/'/g, "\\\\'")}')">Remove</button></td>
+            <td><b>${esc(r.bl_number)}</b></td>
+            <td style="color:var(--muted);">${esc(r.reason || '')}</td>
+            <td style="color:var(--muted);">${esc(r.classified_by || '')}${r.classified_at ? ' - ' + esc(r.classified_at) : ''}</td>
+            <td><button class="btn ghost danger" style="padding:4px 10px;font-size:11.5px;" onclick="removeDirectDelivery(${jsq(r.bl_number)})">Remove</button></td>
           </tr>`).join('')}
       </tbody>
     </table>`;
@@ -5827,10 +5998,10 @@ async function loadReview() {
       <tbody>
         ${rows.map(r => `
           <tr>
-            <td><b>${r.bl_number}</b></td>
+            <td><b>${esc(r.bl_number)}</b></td>
             <td>${ddBadgeHtml(!!r.is_direct)}</td>
-            <td style="color:var(--muted);">${r.review_note || ''}</td>
-            <td><button class="btn ghost danger" style="padding:4px 10px;font-size:11.5px;" onclick="removeDirectDelivery('${r.bl_number.replace(/'/g, "\\\\'")}', true)">Remove</button></td>
+            <td style="color:var(--muted);">${esc(r.review_note || '')}</td>
+            <td><button class="btn ghost danger" style="padding:4px 10px;font-size:11.5px;" onclick="removeDirectDelivery(${jsq(r.bl_number)}, true)">Remove</button></td>
           </tr>`).join('')}
       </tbody>
     </table>`;
@@ -7862,6 +8033,25 @@ PAGE_HTML = """
 
 <script>
 """ + I18N_JS + """
+/* ---------- HTML escaping ----------
+   Everything on this board that came from a person or a file (BL numbers
+   from a carrier's manifest, remarks, vessel/port names, uploaded file
+   names, usernames) MUST go through esc() before being put into HTML, or
+   jsq() when it's an argument inside an inline onclick="...". Without
+   this, text like <img onerror=...> typed into a remark ran as code in
+   whoever viewed it - including an admin opening History. */
+function esc(s) {
+  return String(s === undefined || s === null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+// A JS string literal, HTML-escaped for use inside an inline handler
+// attribute: onclick="showDocs(${jsq(bl)})". Safe for both single- and
+// double-quoted attributes and for any characters in the value.
+function jsq(s) {
+  return esc(JSON.stringify(String(s === undefined || s === null ? '' : s)));
+}
+
 /* ---------- Theme (light/dark, sun/moon toggle) ---------- */
 (function initTheme() {
   let saved = null;
@@ -7887,9 +8077,21 @@ let collapsedGroups = {};
 let archivedSectionOpen = false;
 let selectedPortTab = '';
 
+// Set when a background refresh brought new data while someone was typing
+// in a Remarks box (the board isn't redrawn mid-typing, or it would wipe
+// their cursor). Leaving the box used to redraw the whole board instantly,
+// every time - and since leaving the box happens on mouse-DOWN of whatever
+// they clicked next, the button under the mouse was replaced before the
+// click landed and that click was silently lost (type a remark, click a
+// slider or Remove -> nothing happened). Now it only redraws if there's
+// actually something new, and waits for the click to go through first.
+let renderDeferred = false;
 function markEditing(delta) {
   editingCount = Math.max(0, editingCount + delta);
-  if (editingCount === 0) render();
+  if (editingCount === 0 && renderDeferred) {
+    renderDeferred = false;
+    setTimeout(() => { if (editingCount === 0) render(); }, 300);
+  }
 }
 
 const MAX_TOASTS = 3;
@@ -7962,7 +8164,10 @@ async function fetchRecords() {
   });
   const changed = JSON.stringify(fresh) !== JSON.stringify(records);
   records = fresh;
-  if (editingCount === 0 && changed) render();
+  if (changed) {
+    if (editingCount === 0) render();
+    else renderDeferred = true;
+  }
 }
 
 /* ---------- Manifest upload (drag & drop) ----------
@@ -8176,6 +8381,7 @@ function auditActionLabel(action) {
   return {
     added: t('action_added'), deleted: t('action_deleted'), restored: t('action_restored'),
     toggle: t('action_toggle'), remarks: t('action_remarks'),
+    attachment: t('action_attachment'), attachment_removed: t('action_attachment_removed'),
   }[action] || action;
 }
 
@@ -8199,17 +8405,17 @@ async function showHistory(bl) {
   }
   body.innerHTML = entries.map(e => {
     let line;
-    const byUser = e.by_user || t('unknown_user');
+    const byUser = esc(e.by_user || t('unknown_user'));
     if (e.action === 'toggle') {
-      line = `<b>${byUser}</b> ${t('history_set_field', {field: historyFieldLabel(e.field), value: e.new_value ? t('yes') : t('no')})}`;
+      line = `<b>${byUser}</b> ${t('history_set_field', {field: esc(historyFieldLabel(e.field)), value: e.new_value ? t('yes') : t('no')})}`;
     } else if (e.action === 'remarks') {
-      line = `<b>${byUser}</b> ${e.new_value ? t('history_edited_remarks', {value: e.new_value}) : t('history_cleared_remarks')}`;
+      line = `<b>${byUser}</b> ${e.new_value ? t('history_edited_remarks', {value: esc(e.new_value)}) : t('history_cleared_remarks')}`;
     } else if (e.action === 'added') {
-      line = `<b>${byUser}</b> ${e.new_value ? t('history_added_this_bl', {value: e.new_value}) : t('history_added_bl_plain')}`;
+      line = `<b>${byUser}</b> ${e.new_value ? t('history_added_this_bl', {value: esc(e.new_value)}) : t('history_added_bl_plain')}`;
     } else {
-      line = `<b>${byUser}</b> ${auditActionLabel(e.action)}`;
+      line = `<b>${byUser}</b> ${esc(auditActionLabel(e.action))}`;
     }
-    return `<div class="history-row"><div>${line}</div><div class="when">${formatLocalTime(e.at)}</div></div>`;
+    return `<div class="history-row"><div>${line}</div><div class="when">${esc(formatLocalTime(e.at))}</div></div>`;
   }).join('');
 }
 
@@ -8233,8 +8439,8 @@ function docChip(bl, kind, hasFile) {
   const label = kind === 'invoice' ? t('doc_chip_inv') : t('doc_chip_do');
   const full = kind === 'invoice' ? t('doc_invoice') : t('doc_delivery_order');
   const title = hasFile ? t('attached_tooltip', {full}) : t('not_attached_tooltip', {full});
-  return `<span class="doc-chip ${hasFile ? 'has-file' : 'no-file'}" title="${title}"
-            onclick="event.stopPropagation(); showDocs('${bl}')">${label}</span>`;
+  return `<span class="doc-chip ${hasFile ? 'has-file' : 'no-file'}" title="${esc(title)}"
+            onclick="event.stopPropagation(); showDocs(${jsq(bl)})">${esc(label)}</span>`;
 }
 
 function renderDocsSections(data, canManage) {
@@ -8244,19 +8450,19 @@ function renderDocsSections(data, canManage) {
     const att = atts[kind];
     let status, actions;
     if (att) {
-      status = `${t('attached_label', {filename: ''})}<b>${att.filename || (kind + '.pdf')}</b><br>${t('by_at', {user: att.uploaded_by || t('unknown_user'), time: formatLocalTime(att.uploaded_at)})}`;
+      status = `${t('attached_label', {filename: ''})}<b>${esc(att.filename || (kind + '.pdf'))}</b><br>${t('by_at', {user: esc(att.uploaded_by || t('unknown_user')), time: esc(formatLocalTime(att.uploaded_at))})}`;
       actions = `
         <a href="/api/records/${encodeURIComponent(data.bl_number)}/attachment/${kind}" target="_blank" rel="noopener">
           <button type="button">${t('download')}</button>
         </a>
         ${canManage ? `
-          <label class="btn-upload">${t('replace')}<input type="file" accept=".pdf,application/pdf" onchange="uploadAttachment('${data.bl_number}', '${kind}', this)"></label>
-          <button type="button" class="btn-danger" onclick="removeAttachment('${data.bl_number}', '${kind}')">${t('remove')}</button>
+          <label class="btn-upload">${t('replace')}<input type="file" accept=".pdf,application/pdf" onchange="uploadAttachment(${jsq(data.bl_number)}, '${kind}', this)"></label>
+          <button type="button" class="btn-danger" onclick="removeAttachment(${jsq(data.bl_number)}, '${kind}')">${t('remove')}</button>
         ` : ''}`;
     } else {
       status = canManage ? t('not_attached_yet') : t('not_attached_waiting');
       actions = canManage ? `
-        <label class="btn-upload">${t('upload_pdf')}<input type="file" accept=".pdf,application/pdf" onchange="uploadAttachment('${data.bl_number}', '${kind}', this)"></label>
+        <label class="btn-upload">${t('upload_pdf')}<input type="file" accept=".pdf,application/pdf" onchange="uploadAttachment(${jsq(data.bl_number)}, '${kind}', this)"></label>
       ` : '';
     }
     return `
@@ -8278,7 +8484,7 @@ async function showDocs(bl) {
 
   const res = await fetch(`/api/records/${encodeURIComponent(bl)}/lookup`);
   const data = await res.json();
-  if (!res.ok) { body.innerHTML = `<div style="color:var(--muted); padding:10px 0;">${data.error || t('could_not_load_bl')}</div>`; return; }
+  if (!res.ok) { body.innerHTML = `<div style="color:var(--muted); padding:10px 0;">${esc(data.error || t('could_not_load_bl'))}</div>`; return; }
   const canManage = IS_ADMIN || data.created_by === CURRENT_USER;
   body.innerHTML = renderDocsSections(data, canManage);
 }
@@ -8357,7 +8563,7 @@ async function handleAutoMatchFiles(fileList) {
     const row = document.createElement('div');
     row.className = 'match-row';
     row.id = rowId;
-    row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">${t('reading_ellipsis')}</div>`;
+    row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">${t('reading_ellipsis')}</div>`;
     listEl.appendChild(row);
 
     if (file.size > 10 * 1024 * 1024) {
@@ -8375,7 +8581,7 @@ async function handleAutoMatchFiles(fileList) {
       if (!res.ok) throw new Error(detect.error || t('could_not_read_file'));
     } catch (err) {
       row.className = 'match-row review';
-      row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">${err.message}</div>`;
+      row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">${esc(err.message)}</div>`;
       needsReview++; updateSummary();
       continue;
     }
@@ -8385,7 +8591,7 @@ async function handleAutoMatchFiles(fileList) {
       if (ok) {
         row.className = 'match-row ok';
         const issuedNote = data.auto_issued_field ? t('marked_issued_suffix') : '';
-        row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">&check; ${detect.matched_bl} - ${autoMatchKindLabel(detect.kind)}${issuedNote}</div>`;
+        row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">&check; ${esc(detect.matched_bl)} - ${esc(autoMatchKindLabel(detect.kind))}${esc(issuedNote)}</div>`;
         attached++; updateSummary();
         continue;
       }
@@ -8416,12 +8622,12 @@ function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
     : t('no_bl_matched');
 
   row.innerHTML = `
-    <div class="match-file" title="${file.name}">${file.name}</div>
-    <div class="match-status">${statusText}</div>
+    <div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div>
+    <div class="match-status">${esc(statusText)}</div>
     <div class="match-review-controls">
       <select class="review-bl">
         <option value="">${t('select_bl_ellipsis')}</option>
-        ${candidates.map(bl => `<option value="${bl}" ${bl === detect.matched_bl ? 'selected' : ''}>${bl}</option>`).join('')}
+        ${candidates.map(bl => `<option value="${esc(bl)}" ${bl === detect.matched_bl ? 'selected' : ''}>${esc(bl)}</option>`).join('')}
       </select>
       <select class="review-kind">
         <option value="">${t('kind_ellipsis')}</option>
@@ -8442,7 +8648,7 @@ function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
     if (!ok) { showToast(data.error || t('attach_failed')); btn.disabled = false; btn.textContent = t('attach_btn'); return; }
     row.className = 'match-row ok';
     const issuedNote = data.auto_issued_field ? t('marked_issued_suffix') : '';
-    row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">&check; ${bl} - ${autoMatchKindLabel(kind)}${issuedNote}</div>`;
+    row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">&check; ${esc(bl)} - ${esc(autoMatchKindLabel(kind))}${esc(issuedNote)}</div>`;
     await fetchRecords();
   };
 }
@@ -8551,11 +8757,11 @@ function checkbox(bl, field, checked, by, at) {
   return `
     <div class="checkwrap">
       <label class="switch">
-        <input type="checkbox" id="${id}" ${checked ? 'checked' : ''}
-          onchange="toggle('${bl}', '${field}', this.checked)">
+        <input type="checkbox" id="${esc(id)}" ${checked ? 'checked' : ''}
+          onchange="toggle(${jsq(bl)}, '${field}', this.checked)">
         <span class="slider"></span>
       </label>
-      ${checked ? `<span class="meta" title="${by || ''} - ${formatLocalTime(at)}">${by || ''} - ${formatLocalTime(at)}</span>` : ''}
+      ${checked ? `<span class="meta" title="${esc((by || '') + ' - ' + formatLocalTime(at))}">${esc((by || '') + ' - ' + formatLocalTime(at))}</span>` : ''}
     </div>`;
 }
 
@@ -8587,10 +8793,10 @@ function rowsHtml(list) {
     return `
     <tr id="row_${cssEscape(r.bl_number)}" class="${complete ? 'row-complete' : ''}">
       <td class="select-col"><input type="checkbox" class="row-select" ${selectedBLs.has(r.bl_number) ? 'checked' : ''}
-            onchange="toggleRowSelect('${r.bl_number}', this.checked)"></td>
+            onchange="toggleRowSelect(${jsq(r.bl_number)}, this.checked)"></td>
       <td>
         <div class="bl-cell">
-          <b>${r.bl_number}</b>
+          <b>${esc(r.bl_number)}</b>
           <div class="bl-cell-chips">
             ${docChip(r.bl_number, 'invoice', r.has_invoice_file)}
             ${docChip(r.bl_number, 'do', r.has_do_file)}
@@ -8601,11 +8807,11 @@ function rowsHtml(list) {
       <td data-label="${t('th_invoice_issued')}">${checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at)}</td>
       <td data-label="${t('th_approval_received')}">${checkbox(r.bl_number, 'approval_received', !!r.approval_received, r.approval_by, r.approval_at)}</td>
       <td data-label="${t('th_do_issued')}">${checkbox(r.bl_number, 'do_issued', !!r.do_issued, r.do_by, r.do_at)}</td>
-      <td data-label="${t('th_remarks')}"><input class="remarks-input" type="text" value="${(r.remarks || '').replace(/"/g,'&quot;')}"
-            oninput="onRemarksInput('${r.bl_number}', this.value)"
+      <td data-label="${t('th_remarks')}"><input class="remarks-input" type="text" value="${esc(r.remarks || '')}"
+            oninput="onRemarksInput(${jsq(r.bl_number)}, this.value)"
             onfocus="markEditing(1)" onblur="markEditing(-1)" placeholder="${t('notes_placeholder')}"></td>
-      <td>{% if role == 'admin' %}<button type="button" class="hist-btn" title="${t('history')}" onclick="showHistory('${r.bl_number}')">${t('history')}</button>{% endif %}</td>
-      <td><button class="del" onclick="deleteRecord('${r.bl_number}')">${t('remove')}</button></td>
+      <td>{% if role == 'admin' %}<button type="button" class="hist-btn" title="${t('history')}" onclick="showHistory(${jsq(r.bl_number)})">${t('history')}</button>{% endif %}</td>
+      <td><button class="del" onclick="deleteRecord(${jsq(r.bl_number)})">${t('remove')}</button></td>
     </tr>`;
   }).join('');
 }
@@ -8679,36 +8885,36 @@ function bulkRemoveSelected(vesselKey) {
 }
 
 function bulkBarHtml(vesselKey, list) {
-  const key = vesselKey.replace(/"/g, '&quot;');
+  const key = esc(vesselKey);
   const blsAttr = list.map(r => r.bl_number).join('|');
   return `
-    <div class="bulk-bar" data-bar-key="${key}" data-bls="${blsAttr}">
+    <div class="bulk-bar" data-bar-key="${key}" data-bls="${esc(blsAttr)}">
       <span class="bulk-count"></span>
       <span class="bulk-group">
-        <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'invoice_issued', true)">${t('mark_invoice_issued')}</button>
-        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'invoice_issued', false)">${t('unmark')}</button>
+        <button type="button" onclick="bulkSetField(${jsq(vesselKey)}, 'invoice_issued', true)">${t('mark_invoice_issued')}</button>
+        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField(${jsq(vesselKey)}, 'invoice_issued', false)">${t('unmark')}</button>
       </span>
       <span class="bulk-group">
-        <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'approval_received', true)">${t('mark_approval_received')}</button>
-        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'approval_received', false)">${t('unmark')}</button>
+        <button type="button" onclick="bulkSetField(${jsq(vesselKey)}, 'approval_received', true)">${t('mark_approval_received')}</button>
+        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField(${jsq(vesselKey)}, 'approval_received', false)">${t('unmark')}</button>
       </span>
       <span class="bulk-group">
-        <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'do_issued', true)">${t('mark_do_issued')}</button>
-        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'do_issued', false)">${t('unmark')}</button>
+        <button type="button" onclick="bulkSetField(${jsq(vesselKey)}, 'do_issued', true)">${t('mark_do_issued')}</button>
+        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField(${jsq(vesselKey)}, 'do_issued', false)">${t('unmark')}</button>
       </span>
-      <button type="button" class="bulk-remove-btn" onclick="bulkRemoveSelected('${vesselKey.replace(/'/g,"\\'")}')">${t('remove')}</button>
+      <button type="button" class="bulk-remove-btn" onclick="bulkRemoveSelected(${jsq(vesselKey)})">${t('remove')}</button>
     </div>`;
 }
 
 function tableHtml(list, vesselKey) {
-  const key = vesselKey.replace(/"/g, '&quot;');
+  const key = esc(vesselKey);
   return `
     ${bulkBarHtml(vesselKey, list)}
     <div class="overflow">
       <table>
         <thead>
           <tr>
-            <th class="select-col"><input type="checkbox" class="select-all-vessel" data-bar-key="${key}" title="${t('select_deselect_vessel_title')}" onchange="list_selectAllVessel('${vesselKey.replace(/'/g,"\\'")}', this.checked)"></th>
+            <th class="select-col"><input type="checkbox" class="select-all-vessel" data-bar-key="${key}" title="${t('select_deselect_vessel_title')}" onchange="list_selectAllVessel(${jsq(vesselKey)}, this.checked)"></th>
             <th>${t('th_bl_number')}</th>
             <th>${t('th_invoice_issued')}</th>
             <th>${t('th_approval_received')}</th>
@@ -8777,27 +8983,26 @@ function vesselGroupHtml(portName, vesselName, list, archivedView) {
   const rawPort = (sortedList[0] && sortedList[0].port) || '';
   const rawVessel = (sortedList[0] && sortedList[0].vessel) || '';
   const blList = sortedList.map(r => r.bl_number);
-  const pEsc = portName.replace(/'/g, "\\'");
-  const vEsc = vesselName.replace(/'/g, "\\'");
-  const blsJson = JSON.stringify(blList).replace(/'/g, "&#39;");
+  // HTML-escaped JSON array, safe inside a double-quoted attribute.
+  const blsJson = esc(JSON.stringify(blList));
   return `
     <div class="vessel-group" id="group_${cssEscape(vesselKey)}">
-      <div class="vessel-header ${vesselCollapsed ? 'collapsed' : ''}" onclick="if(event.target.tagName!=='INPUT' && event.target.tagName!=='BUTTON' && event.target.tagName!=='A') toggleGroup('${collapseKey.replace(/'/g,"\\'")}')">
+      <div class="vessel-header ${vesselCollapsed ? 'collapsed' : ''}" onclick="if(event.target.tagName!=='INPUT' && event.target.tagName!=='BUTTON' && event.target.tagName!=='A') toggleGroup(${jsq(collapseKey)})">
         ${CHEVRON}
-        <input class="group-name" value="${vesselName === 'Unassigned' ? '' : vesselName}" placeholder="${t('unassigned_vessel_ph')}"
+        <input class="group-name" value="${vesselName === 'Unassigned' ? '' : esc(vesselName)}" placeholder="${t('unassigned_vessel_ph')}"
           onclick="event.stopPropagation()"
-          onchange="renameGroup('vessel', '${pEsc}', '${vEsc}', this.value, 'Unassigned')">
+          onchange="renameGroup('vessel', ${jsq(portName)}, ${jsq(vesselName)}, this.value, 'Unassigned')">
         ${archivedView ? '' : `<span class="eta-wrap" onclick="event.stopPropagation()">
           <span class="eta-label">${t('eta_label')}</span>
-          <input type="date" class="eta-input${eta ? '' : ' eta-unset'}" value="${eta}" title="${t('expected_arrival_title')}"
-            onchange="this.classList.toggle('eta-unset', !this.value); setVesselEta(JSON.parse(this.dataset.bls), this.value)" data-bls='${blsJson}'>
+          <input type="date" class="eta-input${eta ? '' : ' eta-unset'}" value="${esc(eta)}" title="${t('expected_arrival_title')}"
+            onchange="this.classList.toggle('eta-unset', !this.value); setVesselEta(JSON.parse(this.dataset.bls), this.value)" data-bls="${blsJson}">
           ${eta ? '' : `<span class="eta-unset-hint">${t('not_set')}</span>`}
         </span>`}
         <span class="group-count">${t('bl_count', {n: sortedList.length, p: sortedList.length === 1 ? '' : 's'})}${left ? t('left_suffix', {n: left}) : t('done_suffix')}</span>
         <span class="vessel-progress ${pct >= 100 ? 'done' : ''}" title="${t('pct_complete', {pct})}"><span class="vessel-progress-fill" style="width:${pct}%"></span></span>
         <a onclick="event.stopPropagation()" href="/api/export?port=${encodeURIComponent(rawPort)}&vessel=${encodeURIComponent(rawVessel)}" class="group-export" title="${t('export_vessel_title')}">${t('export')}</a>
-        <button type="button" class="group-neutral" onclick='event.stopPropagation(); setVesselArchived(${blsJson}, ${archivedView ? 'false' : 'true'})'>${archivedView ? t('unarchive') : t('archive')}</button>
-        <button type="button" class="group-remove" onclick="event.stopPropagation(); removeVesselGroup('${pEsc}', '${vEsc}')">${t('remove_all')}</button>
+        <button type="button" class="group-neutral" onclick="event.stopPropagation(); setVesselArchived(${blsJson}, ${archivedView ? 'false' : 'true'})">${archivedView ? t('unarchive') : t('archive')}</button>
+        <button type="button" class="group-remove" onclick="event.stopPropagation(); removeVesselGroup(${jsq(portName)}, ${jsq(vesselName)})">${t('remove_all')}</button>
       </div>
       <div class="vessel-body ${vesselCollapsed ? 'collapsed' : ''}">
         ${tableHtml(sortedList, vesselKey)}
@@ -8828,14 +9033,13 @@ function portGroupHtml(portName, vesselNames, vessels, archivedView, suppressHea
   // to just the groups that still need work. Archived ports always start
   // collapsed - that section is for reference, not day-to-day work.
   const portCollapsed = portKey in collapsedGroups ? !!collapsedGroups[portKey] : (archivedView ? true : (portTotal > 0 && portLeft === 0));
-  const pEsc = portName.replace(/'/g, "\\'");
   return `
     <div class="port-group">
-      <div class="port-header ${portCollapsed ? 'collapsed' : ''}" onclick="if(event.target.tagName!=='INPUT' && event.target.tagName!=='A') toggleGroup('${portKey.replace(/'/g,"\\'")}')">
+      <div class="port-header ${portCollapsed ? 'collapsed' : ''}" onclick="if(event.target.tagName!=='INPUT' && event.target.tagName!=='A') toggleGroup(${jsq(portKey)})">
         ${CHEVRON}
-        <input class="group-name" value="${portName === 'Unassigned' ? '' : portName}" placeholder="${t('unassigned_port_ph')}"
+        <input class="group-name" value="${portName === 'Unassigned' ? '' : esc(portName)}" placeholder="${t('unassigned_port_ph')}"
           onclick="event.stopPropagation()"
-          onchange="renameGroup('port', '${pEsc}', '', this.value, 'Unassigned')">
+          onchange="renameGroup('port', ${jsq(portName)}, '', this.value, 'Unassigned')">
       </div>
       <div class="port-body ${portCollapsed ? 'collapsed' : ''}">${vesselsHtml}</div>
     </div>`;
@@ -8847,7 +9051,7 @@ function render() {
   if (operatorFilterEl) {
     const operators = [...new Set(records.map(r => r.created_by).filter(Boolean))].sort();
     const current = operatorFilterEl.value;
-    operatorFilterEl.innerHTML = `<option value="">${t('all_operators')}</option>` + operators.map(a => `<option value="${a.replace(/"/g,'&quot;')}">${a}</option>`).join('');
+    operatorFilterEl.innerHTML = `<option value="">${t('all_operators')}</option>` + operators.map(a => `<option value="${esc(a)}">${esc(a)}</option>`).join('');
     if (operators.includes(current)) operatorFilterEl.value = current;
     syncGlassSelectLabel('operatorFilter');
   }
@@ -8882,9 +9086,8 @@ function render() {
         const completeCount = portRecords.filter(r => r.invoice_issued && r.approval_received && r.do_issued).length;
         const pct = blCount ? Math.round(completeCount / blCount * 100) : 0;
         const done = pct >= 100;
-        const label = portName.replace(/</g, '&lt;').replace(/>/g, '&gt;');
-        const pEsc = portName.replace(/'/g, "\\'");
-        return `<button type="button" class="port-card" onclick="selectPortTab('${pEsc}')">
+        const label = esc(portName);
+        return `<button type="button" class="port-card" onclick="selectPortTab(${jsq(portName)})">
           <div class="port-card-icon">${anchorIcon}</div>
           <div class="port-card-name">${label}</div>
           <div class="port-card-meta">${t('port_card_meta', {vesselCount, vp: vesselCount === 1 ? '' : 's', blCount, bp: blCount === 1 ? '' : 's'})}</div>
@@ -8897,7 +9100,7 @@ function render() {
       // Drilled-in state: a port is selected, so the card grid is hidden
       // and replaced by a small breadcrumb/back control + heading above
       // that one port's (unchanged) groups.
-      const label = selectedPortTab.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const label = esc(selectedPortTab);
       const backArrow = currentLang === 'ar' ? '&rarr;' : '&larr;';
       portTabsEl.innerHTML = `<div class="port-breadcrumb">
         <button type="button" class="port-back-btn" onclick="selectPortTab('')">${backArrow} ${t('all_ports_back')}</button>
@@ -8928,7 +9131,7 @@ function render() {
         const vessels = ports[portName];
         sortedVesselNames(vessels).forEach(vesselName => {
           const key = 'vessel:' + portName + ':' + vesselName;
-          options += `<option value="${key.replace(/"/g, '&quot;')}">${vesselName.replace(/"/g, '&quot;')}</option>`;
+          options += `<option value="${esc(key)}">${esc(vesselName)}</option>`;
         });
       });
       jumpEl.innerHTML = options;
