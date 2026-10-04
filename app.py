@@ -2837,8 +2837,32 @@ def upload_attachment(bl_number, kind):
         (bl_number, kind, file.filename, psycopg2.Binary(data), len(data), user, now),
     )
     _log_audit(bl_number, "attachment", kind, "", file.filename)
+
+    # Attaching the file *is* the real-world signal that the invoice/DO was
+    # actually issued - no reason to also make someone flip the slider by
+    # hand afterward. Only flips the status 0 -> 1 though: if it's already
+    # marked issued and this upload is just a Replace (a corrected file),
+    # that's not a fresh issuance, so the original by/at stays as-is rather
+    # than being silently rewritten to whoever happened to replace the file.
+    status_field = {"invoice": "invoice_issued", "do": "do_issued"}.get(kind)
+    status_by_at = {"invoice_issued": ("invoice_by", "invoice_at"), "do_issued": ("do_by", "do_at")}
+    auto_issued = False
+    if status_field:
+        by_field, at_field = status_by_at[status_field]
+        current = db.execute(f"SELECT {status_field} FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
+        if current and not current[status_field]:
+            db.execute(
+                f"UPDATE records SET {status_field} = 1, {by_field} = ?, {at_field} = ? WHERE bl_number = ?",
+                (user, now, bl_number),
+            )
+            _log_audit(bl_number, "toggle", status_field, "", "1")
+            auto_issued = True
+
     db.commit()
-    return jsonify({"ok": True, "filename": file.filename, "uploaded_by": user, "uploaded_at": now})
+    return jsonify({
+        "ok": True, "filename": file.filename, "uploaded_by": user, "uploaded_at": now,
+        "auto_issued_field": status_field if auto_issued else None,
+    })
 
 
 @app.route("/api/records/<path:bl_number>/attachment/<kind>", methods=["GET"])
@@ -7808,7 +7832,11 @@ async function uploadAttachment(bl, kind, input) {
 
   const {ok, data} = await submitAttachmentFile(bl, kind, file);
   if (!ok) { showToast(data.error || 'Upload failed.'); return; }
-  showToast(`${kind === 'invoice' ? 'Invoice' : 'Delivery Order'} uploaded.`);
+  const label = kind === 'invoice' ? 'Invoice' : 'Delivery Order';
+  // Attaching the file auto-flips the matching Issued slider server-side
+  // (see upload_attachment) - say so, so it's obvious the status change
+  // wasn't a separate click someone forgot to make.
+  showToast(data.auto_issued_field ? `${label} uploaded - marked as issued.` : `${label} uploaded.`);
   await fetchRecords();
   if (document.getElementById('docsOverlay').style.display !== 'none') await showDocs(bl);
   if (document.getElementById('findBlOverlay').style.display !== 'none') await doFindBl();
@@ -7894,7 +7922,8 @@ async function handleAutoMatchFiles(fileList) {
       const {ok, data} = await submitAttachmentFile(detect.matched_bl, detect.kind, file);
       if (ok) {
         row.className = 'match-row ok';
-        row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">&check; ${detect.matched_bl} - ${autoMatchKindLabel(detect.kind)}</div>`;
+        const issuedNote = data.auto_issued_field ? ' &middot; marked issued' : '';
+        row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">&check; ${detect.matched_bl} - ${autoMatchKindLabel(detect.kind)}${issuedNote}</div>`;
         attached++; updateSummary();
         continue;
       }
@@ -7951,7 +7980,8 @@ function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
     const {ok, data} = await submitAttachmentFile(bl, kind, file);
     if (!ok) { showToast(data.error || 'Attach failed.'); btn.disabled = false; btn.textContent = 'Attach'; return; }
     row.className = 'match-row ok';
-    row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">&check; ${bl} - ${autoMatchKindLabel(kind)}</div>`;
+    const issuedNote = data.auto_issued_field ? ' &middot; marked issued' : '';
+    row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">&check; ${bl} - ${autoMatchKindLabel(kind)}${issuedNote}</div>`;
     await fetchRecords();
     if (document.getElementById('findBlOverlay').style.display !== 'none') await doFindBl();
   };
