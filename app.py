@@ -2972,11 +2972,10 @@ def delete_attachment(bl_number, kind):
 @app.route("/api/records/<path:bl_number>/lookup", methods=["GET"])
 @login_required
 def lookup_record(bl_number):
-    """Looks up one BL by its exact number regardless of who created it -
-    the normal board stays scoped to each staff member's own BLs, but once
-    the invoice/DO are issued, the person forwarding them to the customs
-    broker is often someone else entirely, and they need a way to find
-    that BL's files without the whole board being thrown open to everyone."""
+    """Looks up one BL by its exact number regardless of who created it.
+    Used by the Documents modal (the doc chips next to a BL's own row) -
+    not scoped to the viewer's own BLs since a record's docs are still
+    shown to an admin or anyone else who can already see that row."""
     bl_number = bl_number.strip().upper()
     if not bl_number:
         return jsonify({"error": "Enter a BL number."}), 400
@@ -6983,8 +6982,8 @@ PAGE_HTML = """
   .port-header .group-remove { color: rgba(255,255,255,0.75); }
   .port-header .group-remove:hover { background: color-mix(in srgb, var(--danger) 55%, transparent); color: #fff; }
   /* Destructive ("Remove all") gets the same red outline as every other
-     destructive control in the app (.del, bulk Remove, Clear board) -
-     see the button-hierarchy notes near .btn-danger below. */
+     destructive control in the app (.del, bulk Remove) - see the
+     button-hierarchy notes near .btn-danger below. */
   .vessel-header .group-remove {
     color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
   }
@@ -7099,8 +7098,15 @@ PAGE_HTML = """
   tbody tr.row-complete td { color: var(--muted); }
   tbody tr.row-complete td:nth-child(2) { box-shadow: inset 3px 0 0 var(--success); }
 
-  .bl-cell { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; overflow: hidden; }
-  .bl-cell b { font-weight: 700; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; }
+  /* Column, not row: the BL number sits on its own line and the doc chips
+     always sit on the line below it. A single flex-wrap row here wrapped
+     inconsistently depending on how long the BL number text happened to
+     be - short numbers left room for the chips to tuck in beside them,
+     long ones pushed the chips down, so the same row shape looked
+     different BL to BL. Forcing two rows keeps it identical everywhere. */
+  .bl-cell { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; overflow: hidden; }
+  .bl-cell b { font-weight: 700; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .bl-cell-chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .badge-complete {
     display: inline-flex; align-items: center; gap: 3px;
     background: var(--success-bg); color: var(--success); font-size: 10.5px; font-weight: 700;
@@ -7288,6 +7294,20 @@ PAGE_HTML = """
   @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
   @keyframes toast-out { to { opacity: 0; transform: translateY(8px); } }
 
+  /* Floating "back to top" bubble - jumps back up to the Discharge Port /
+     Vessel fields from anywhere on a long board. Sits above #toastHost's
+     own resting position (bottom:20px) so a toast popping in doesn't land
+     right on top of it. */
+  .scroll-top-btn {
+    position: fixed; bottom: 86px; right: 24px; z-index: 900;
+    width: 46px; height: 46px; border-radius: 50%; padding: 0;
+    background: var(--navy-deep); color: #fff; border: none;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: var(--shadow-md); cursor: pointer;
+  }
+  .scroll-top-btn:hover { background: var(--navy-light); }
+  .scroll-top-btn svg { width: 20px; height: 20px; }
+
   @media (max-width: 600px) {
     .stat { min-width: 45%; }
   }
@@ -7321,7 +7341,7 @@ PAGE_HTML = """
     </div>
   </div>
 
-  <div class="card">
+  <div class="card" id="manifestCard">
     <div class="card-label">Add a manifest</div>
     <div class="tag-fields">
       <div>
@@ -7340,7 +7360,8 @@ PAGE_HTML = """
       </div>
       <div>
         <label for="vesselField">Vessel</label>
-        <input type="text" id="vesselField" placeholder="e.g. TAI KNIGHT" style="text-transform:uppercase;" oninput="this.value = this.value.toUpperCase();">
+        <input type="text" id="vesselField" placeholder="e.g. TAI KNIGHT" style="text-transform:uppercase;" oninput="this.value = this.value.toUpperCase();"
+          onkeydown="if(event.key==='Enter'){ event.preventDefault(); uploadExcel(); }">
       </div>
     </div>
     <label class="dropzone" id="dropzone" for="manifestFile">
@@ -7361,6 +7382,28 @@ PAGE_HTML = """
     </div>
   </div>
 
+  <div class="card">
+    <div class="card-label">Attach documents</div>
+    <div style="font-size:12.5px; color:var(--muted); margin-bottom:12px;">
+      Drop Invoice / Delivery Order PDFs here - each one is read and matched to its BL automatically, same as the manifest upload above.
+      The <span class="doc-chip has-file" style="cursor:default;">INV</span> / <span class="doc-chip has-file" style="cursor:default;">DO</span> chips next to a BL number below show what's already attached.
+    </div>
+    <label class="dropzone" id="autoMatchDropzone" for="autoMatchFile">
+      <div class="dropzone-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8">
+          <path d="M12 16V4M12 4l-4 4M12 4l4 4"/><path d="M4 16v3a1 1 0 001 1h14a1 1 0 001-1v-3"/>
+        </svg>
+      </div>
+      <div>
+        <div class="dropzone-text"><b>Click to upload</b> or drag &amp; drop Invoice/DO PDFs</div>
+        <div class="dropzone-sub">Drop as many at once as you like - each is matched to its BL automatically</div>
+      </div>
+      <input type="file" id="autoMatchFile" accept=".pdf" multiple style="display:none" onchange="handleAutoMatchFiles(this.files)">
+    </label>
+    <div id="autoMatchSummary" style="font-size:12.5px; color:var(--muted); margin-top:10px;"></div>
+    <div id="autoMatchList" style="margin-top:6px;"></div>
+  </div>
+
   <div class="summary" id="summary"></div>
 
   <div class="card">
@@ -7374,11 +7417,7 @@ PAGE_HTML = """
         <select id="operatorFilter" class="nice-select" onchange="render()"><option value="">All operators</option></select>
       </div>
       {% endif %}
-      <button type="button" class="btn-neutral" onclick="setAllGroupsCollapsed(false)">Expand all</button>
       <button type="button" class="btn-neutral" onclick="setAllGroupsCollapsed(true)">Collapse all</button>
-      <button type="button" class="btn-neutral" onclick="openFindBl()">Find a BL</button>
-      <button type="button" class="btn-neutral" onclick="openAutoMatch()">Attach documents</button>
-      <button type="button" id="clearAllBtn" class="btn-danger" style="margin-left:auto;" onclick="clearAllRecords()">Clear board</button>
     </div>
     <div id="portTabs"></div>
     <div id="groups"></div>
@@ -7393,6 +7432,9 @@ PAGE_HTML = """
   </div>
 
   <div id="toastHost"></div>
+  <button type="button" id="scrollTopBtn" class="scroll-top-btn" title="Back to Discharge Port / Vessel" onclick="scrollToManifestForm()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+  </button>
   <div id="historyOverlay" class="history-overlay" style="display:none;" onclick="if(event.target===this) closeHistory()">
     <div class="history-modal">
       <div class="history-modal-head">
@@ -7410,48 +7452,6 @@ PAGE_HTML = """
         <button type="button" onclick="closeDocs()" style="background:none; color:var(--text); padding:4px 10px;">&times;</button>
       </div>
       <div id="docsBody" class="history-modal-body"></div>
-    </div>
-  </div>
-
-  <div id="findBlOverlay" class="history-overlay" style="display:none;" onclick="if(event.target===this) closeFindBl()">
-    <div class="history-modal">
-      <div class="history-modal-head">
-        <b>Find a BL</b>
-        <button type="button" onclick="closeFindBl()" style="background:none; color:var(--text); padding:4px 10px;">&times;</button>
-      </div>
-      <div class="history-modal-body">
-        <div class="docs-find-row">
-          <input type="text" id="findBlInput" placeholder="Enter exact BL number..." style="text-transform:uppercase;"
-            oninput="this.value = this.value.toUpperCase();" onkeydown="if(event.key==='Enter') doFindBl();">
-          <button type="button" onclick="doFindBl()">Find</button>
-        </div>
-        <div id="findBlBody"></div>
-      </div>
-    </div>
-  </div>
-
-  <div id="autoMatchOverlay" class="history-overlay" style="display:none;" onclick="if(event.target===this) closeAutoMatch()">
-    <div class="history-modal" style="max-width:600px;">
-      <div class="history-modal-head">
-        <b>Attach documents</b>
-        <button type="button" onclick="closeAutoMatch()" style="background:none; color:var(--text); padding:4px 10px;">&times;</button>
-      </div>
-      <div class="history-modal-body">
-        <label class="dropzone" id="autoMatchDropzone" for="autoMatchFile">
-          <div class="dropzone-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8">
-              <path d="M12 16V4M12 4l-4 4M12 4l4 4"/><path d="M4 16v3a1 1 0 001 1h14a1 1 0 001-1v-3"/>
-            </svg>
-          </div>
-          <div>
-            <div class="dropzone-text"><b>Click to upload</b> or drag &amp; drop Invoice/DO PDFs</div>
-            <div class="dropzone-sub">Drop as many at once as you like - each is matched to its BL automatically</div>
-          </div>
-          <input type="file" id="autoMatchFile" accept=".pdf" multiple style="display:none" onchange="handleAutoMatchFiles(this.files)">
-        </label>
-        <div id="autoMatchSummary" style="font-size:12.5px; color:var(--muted); margin-top:10px;"></div>
-        <div id="autoMatchList" style="margin-top:6px;"></div>
-      </div>
     </div>
   </div>
 
@@ -7686,13 +7686,14 @@ function updateCompleteBadge(bl) {
   const row = document.getElementById('row_' + cssEscape(bl));
   if (!row) return;
   const cell = row.querySelector('.bl-cell');
+  const chips = cell.querySelector('.bl-cell-chips') || cell;
   let badge = cell.querySelector('.badge-complete');
   const complete = !!(rec.invoice_issued && rec.approval_received && rec.do_issued);
   if (complete && !badge) {
     badge = document.createElement('span');
     badge.className = 'badge-complete';
     badge.innerHTML = '&check; Complete';
-    cell.appendChild(badge);
+    chips.appendChild(badge);
   } else if (!complete && badge) {
     badge.remove();
   }
@@ -7812,11 +7813,11 @@ function closeHistory() {
    Invoice/DO file has been attached (native title= gives a real hover
    tooltip on desktop, and the click handler covers mobile where hover
    doesn't exist). Clicking either chip - or any cell in the row that opens
-   it - shows the Documents modal, which is also reused by "Find a BL" below
-   for the cross-staff handoff: the person who issues the invoice/DO isn't
-   always the person who forwards it to the customs broker, so download
-   (and this lookup) deliberately isn't limited to the BL's creator, even
-   though upload/replace/remove still are. */
+   it - shows the Documents modal. Download (and the /lookup it's built on)
+   deliberately isn't limited to the BL's creator, even though upload/
+   replace/remove still are - but note this only helps someone who can
+   already see the row: the board itself (and search) stays scoped to each
+   staff member's own BLs. */
 const DOC_KINDS = [['invoice', 'Invoice'], ['do', 'Delivery Order']];
 
 function docChip(bl, kind, hasFile) {
@@ -7902,7 +7903,6 @@ async function uploadAttachment(bl, kind, input) {
   showToast(data.auto_issued_field ? `${label} uploaded - marked as issued.` : `${label} uploaded.`);
   await fetchRecords();
   if (document.getElementById('docsOverlay').style.display !== 'none') await showDocs(bl);
-  if (document.getElementById('findBlOverlay').style.display !== 'none') await doFindBl();
 }
 
 /* ---------- Attach documents (batch auto-match) ----------
@@ -7923,17 +7923,6 @@ const autoMatchDropzone = document.getElementById('autoMatchDropzone');
 autoMatchDropzone.addEventListener('drop', e => {
   if (e.dataTransfer.files && e.dataTransfer.files.length) handleAutoMatchFiles(e.dataTransfer.files);
 });
-
-function openAutoMatch() {
-  document.getElementById('autoMatchOverlay').style.display = 'flex';
-  document.getElementById('autoMatchSummary').textContent = '';
-  document.getElementById('autoMatchList').innerHTML = '';
-  document.getElementById('autoMatchFile').value = '';
-}
-
-function closeAutoMatch() {
-  document.getElementById('autoMatchOverlay').style.display = 'none';
-}
 
 function autoMatchKindLabel(kind) {
   return kind === 'invoice' ? 'Invoice' : kind === 'do' ? 'Delivery Order' : 'Unrecognized document';
@@ -8006,7 +7995,6 @@ async function handleAutoMatchFiles(fileList) {
   }
 
   await fetchRecords();
-  if (document.getElementById('findBlOverlay').style.display !== 'none') await doFindBl();
 }
 
 function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
@@ -8046,7 +8034,6 @@ function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
     const issuedNote = data.auto_issued_field ? ' &middot; marked issued' : '';
     row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">&check; ${bl} - ${autoMatchKindLabel(kind)}${issuedNote}</div>`;
     await fetchRecords();
-    if (document.getElementById('findBlOverlay').style.display !== 'none') await doFindBl();
   };
 }
 
@@ -8056,35 +8043,6 @@ async function removeAttachment(bl, kind) {
   showToast(`${kind === 'invoice' ? 'Invoice' : 'Delivery Order'} removed.`);
   await fetchRecords();
   if (document.getElementById('docsOverlay').style.display !== 'none') await showDocs(bl);
-  if (document.getElementById('findBlOverlay').style.display !== 'none') await doFindBl();
-}
-
-function openFindBl() {
-  document.getElementById('findBlOverlay').style.display = 'flex';
-  document.getElementById('findBlBody').innerHTML = '';
-  const input = document.getElementById('findBlInput');
-  input.value = '';
-  setTimeout(() => input.focus(), 50);
-}
-
-function closeFindBl() {
-  document.getElementById('findBlOverlay').style.display = 'none';
-}
-
-async function doFindBl() {
-  const bl = document.getElementById('findBlInput').value.trim().toUpperCase();
-  const body = document.getElementById('findBlBody');
-  if (!bl) { body.innerHTML = ''; return; }
-  body.innerHTML = '<div style="color:var(--muted); padding:10px 0;">Searching...</div>';
-
-  const res = await fetch(`/api/records/${encodeURIComponent(bl)}/lookup`);
-  const data = await res.json();
-  if (!res.ok) { body.innerHTML = `<div style="color:var(--muted); padding:10px 0;">${data.error || 'Not found.'}</div>`; return; }
-  const canManage = IS_ADMIN || data.created_by === CURRENT_USER;
-  body.innerHTML = `
-    <div style="margin-bottom:8px; font-size:12.5px; color:var(--muted);">
-      ${[data.port, data.vessel].filter(Boolean).join(' &middot; ') || 'No port/vessel set'}
-    </div>` + renderDocsSections(data, canManage);
 }
 
 function deleteRecord(bl) {
@@ -8163,10 +8121,6 @@ function removePortGroup(portName) {
   confirmBulkRemove(portName === 'Unassigned' ? null : portName, list);
 }
 
-function clearAllRecords() {
-  confirmBulkRemove('the whole board', records.slice());
-}
-
 async function renameGroup(type, oldPort, oldVessel, newValue, fallbackLabel) {
   const val = newValue.trim() || fallbackLabel;
   await fetch('/api/groups/rename', {
@@ -8226,9 +8180,11 @@ function rowsHtml(list) {
       <td>
         <div class="bl-cell">
           <b>${r.bl_number}</b>
-          ${docChip(r.bl_number, 'invoice', r.has_invoice_file)}
-          ${docChip(r.bl_number, 'do', r.has_do_file)}
-          ${complete ? '<span class="badge-complete">&check; Complete</span>' : ''}
+          <div class="bl-cell-chips">
+            ${docChip(r.bl_number, 'invoice', r.has_invoice_file)}
+            ${docChip(r.bl_number, 'do', r.has_do_file)}
+            ${complete ? '<span class="badge-complete">&check; Complete</span>' : ''}
+          </div>
         </div>
       </td>
       <td data-label="Invoice Issued">${checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at)}</td>
@@ -8438,8 +8394,20 @@ function vesselGroupHtml(portName, vesselName, list, archivedView) {
     </div>`;
 }
 
-function portGroupHtml(portName, vesselNames, vessels, archivedView) {
+function portGroupHtml(portName, vesselNames, vessels, archivedView, suppressHeader) {
   const portKey = archivedView ? 'port:' + portName + ':archived' : 'port:' + portName;
+  const vesselsHtml = vesselNames.map(vesselName => vesselGroupHtml(portName, vesselName, vessels[vesselName], archivedView)).join('');
+  // When a single port is already drilled into (the breadcrumb above the
+  // board names it), this group's own dark "<PORT> ▾" header would just be
+  // repeating that same name a few pixels below it with nothing new to
+  // collapse into - so skip the header/collapse chrome entirely and show
+  // the vessel groups directly. Still used (header shown) for the "all
+  // ports" search view and the archived-vessels section, where more than
+  // one port can appear at once and the header is the only thing naming
+  // which port a group belongs to.
+  if (suppressHeader) {
+    return `<div class="port-group port-group-flat">${vesselsHtml}</div>`;
+  }
   const portTotal = vesselNames.reduce((sum, v) => sum + vessels[v].length, 0);
   const portLeft = vesselNames.reduce((sum, v) => sum + vessels[v].filter(r => !(r.invoice_issued && r.approval_received && r.do_issued)).length, 0);
   // Default state (only applies the first time a group is seen - once a
@@ -8449,7 +8417,6 @@ function portGroupHtml(portName, vesselNames, vessels, archivedView) {
   // to just the groups that still need work. Archived ports always start
   // collapsed - that section is for reference, not day-to-day work.
   const portCollapsed = portKey in collapsedGroups ? !!collapsedGroups[portKey] : (archivedView ? true : (portTotal > 0 && portLeft === 0));
-  const vesselsHtml = vesselNames.map(vesselName => vesselGroupHtml(portName, vesselName, vessels[vesselName], archivedView)).join('');
   const pEsc = portName.replace(/'/g, "\\'");
   return `
     <div class="port-group">
@@ -8559,7 +8526,7 @@ function render() {
 
     groupsEl.innerHTML = displayPortNames.map(portName => {
       const vessels = ports[portName];
-      return portGroupHtml(portName, sortedVesselNames(vessels), vessels, false);
+      return portGroupHtml(portName, sortedVesselNames(vessels), vessels, false, !!selectedPortTab);
     }).join('');
   }
 
@@ -8650,6 +8617,11 @@ function jumpToVessel(key) {
     const el = document.getElementById('group_' + cssEscape(key));
     if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
   });
+}
+
+function scrollToManifestForm() {
+  const el = document.getElementById('manifestCard');
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 function setAllGroupsCollapsed(collapsed) {
