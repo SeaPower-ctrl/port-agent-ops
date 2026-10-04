@@ -109,6 +109,7 @@ const I18N = {
     or_drag_drop_manifest: "or drag & drop your manifest",
     manifest_dropzone_sub: ".xlsx, .xls, .csv, .docx or .pdf - the BL Number column is read automatically",
     add_to_board: "Add to board",
+    vessel_placeholder: "e.g. TAI KNIGHT",
     adding_ellipsis: "Adding...",
     // Attach documents card
     attach_documents: "Attach documents",
@@ -118,6 +119,9 @@ const I18N = {
     auto_match_dropzone_sub: "Drop as many at once as you like - each is matched to its BL automatically",
     // Toolbar / search
     search_bl_placeholder: "Search BL number...",
+    search_shortcut_title: "Shortcut: press / from anywhere to search. Enter jumps to the BL, Esc clears.",
+    no_bl_match: 'No BL matches "{q}".',
+    many_bls_match: "{n} BLs match - keep typing to narrow it down.",
     select_vessel_to_view: "Select a vessel to view",
     all_operators: "All operators",
     collapse_all: "Collapse all",
@@ -269,8 +273,9 @@ const I18N = {
     vessel_label: "السفينة",
     click_to_upload: "اضغط للرفع",
     or_drag_drop_manifest: "أو اسحب وأفلت بيان الشحن",
-    manifest_dropzone_sub: "xlsx. أو xls. أو csv. أو docx. أو pdf. - يتم قراءة عمود رقم البوليصة تلقائيًا",
+    manifest_dropzone_sub: "\\u2066.xlsx, .xls, .csv, .docx, .pdf\\u2069 - يتم قراءة عمود رقم البوليصة تلقائيًا",
     add_to_board: "إضافة إلى اللوحة",
+    vessel_placeholder: "مثال: TAI KNIGHT",
     adding_ellipsis: "جارٍ الإضافة...",
     attach_documents: "إرفاق المستندات",
     attach_docs_help: "أسقط ملفات الفاتورة / أمر التسليم (PDF) هنا - تتم قراءة كل ملف ومطابقته تلقائيًا مع رقم البوليصة، بنفس طريقة رفع بيان الشحن أعلاه.",
@@ -278,6 +283,9 @@ const I18N = {
     or_drag_drop_docs: "أو اسحب وأفلت ملفات الفاتورة / أمر التسليم",
     auto_match_dropzone_sub: "أسقط أي عدد من الملفات دفعة واحدة - تتم مطابقة كل ملف تلقائيًا مع رقم البوليصة الخاص به",
     search_bl_placeholder: "ابحث برقم البوليصة...",
+    search_shortcut_title: "اختصار: اضغط / من أي مكان للبحث. Enter للانتقال إلى البوليصة، وEsc للمسح.",
+    no_bl_match: 'لا توجد بوليصة تطابق "{q}".',
+    many_bls_match: "{n} بوليصة تطابق البحث - تابع الكتابة لتضييق النتائج.",
     select_vessel_to_view: "اختر سفينة للعرض",
     all_operators: "جميع الموظفين",
     collapse_all: "طي الكل",
@@ -7197,7 +7205,14 @@ PAGE_HTML = """
   .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
   .brand-text .app-name { font-size: 15px; font-weight: 700; color: var(--text); letter-spacing: -0.01em; }
   .brand-text .app-tag { font-size: 11px; color: var(--muted); font-weight: 500; }
-  .topbar-right { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+  /* Wraps as a whole group (never word-by-word inside a link) - on a phone,
+     "Signed in as admin" / "Log out" used to break into stacks of 1-2
+     words, and in Arabic (longer labels) Log out was pushed off-screen. */
+  .topbar-right {
+    display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted);
+    flex-wrap: wrap; justify-content: flex-end; row-gap: 6px; min-width: 0;
+  }
+  .topbar-right a, .who { white-space: nowrap; }
   .topbar-right a {
     color: var(--navy); text-decoration: none; font-weight: 600; font-size: 13px;
     padding: 6px 12px; border-radius: 20px; transition: background .15s ease;
@@ -7208,7 +7223,10 @@ PAGE_HTML = """
   .who b { color: var(--text); }
 
   /* Sun/moon theme switch */
-  .theme-switch { position: relative; display: inline-flex; width: 54px; height: 29px; cursor: pointer; flex-shrink: 0; }
+  /* direction:ltr - a self-contained control with no reading direction.
+     Left to mirror in Arabic, its sun/moon icons swapped sides while the
+     knob didn't, so it showed the wrong icon in both themes. */
+  .theme-switch { position: relative; display: inline-flex; width: 54px; height: 29px; cursor: pointer; flex-shrink: 0; direction: ltr; }
   .theme-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
   .theme-track {
     position: absolute; inset: 0; border-radius: 999px; display: flex; align-items: center;
@@ -7400,6 +7418,9 @@ PAGE_HTML = """
   button {
     background: var(--navy); color: #fff; border: none; border-radius: 999px;
     padding: 10px 18px; font-size: 13px; font-weight: 600; cursor: pointer;
+    font-family: inherit; /* browsers default buttons to Arial - every button
+                             was in a different font from the page (and in
+                             Arabic, not Cairo) */
     transition: background .15s ease, transform .08s ease;
   }
   button:hover { background: var(--navy-light); }
@@ -7469,7 +7490,7 @@ PAGE_HTML = """
   }
   .port-card {
     display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
-    text-align: left; font-family: inherit; cursor: pointer;
+    text-align: start; font-family: inherit; cursor: pointer;
     background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 14px;
     padding: 16px; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
   }
@@ -7535,9 +7556,18 @@ PAGE_HTML = """
   }
   .group-neutral:hover { background: color-mix(in srgb, var(--border) 70%, transparent); }
   .group-export {
-    margin-left: auto; font-size: 11px; font-weight: 700; padding: 5px 11px;
+    font-size: 11px; font-weight: 700; padding: 5px 11px;
     border-radius: 999px; flex-shrink: 0; text-decoration: none;
   }
+  /* Export / Archive / Remove all always travel together as one block at
+     the far end of the header (inline-start auto margin = right in
+     English, left in Arabic). Previously each button wrapped on its own,
+     so on a phone they landed in different spots depending on how long
+     the (translated) text before them was. */
+  .group-actions { display: flex; align-items: center; gap: 8px; margin-inline-start: auto; flex-shrink: 0; }
+  /* Port/vessel name boxes size to their content - the browser default
+     (~20 characters) clipped longer names like "YANBU COMMERCIAL PORT". */
+  .group-name { field-sizing: content; min-width: 8ch; max-width: 100%; }
   .port-header .group-export { color: rgba(255,255,255,0.75); }
   .port-header .group-export:hover { background: rgba(255,255,255,0.14); color: #fff; }
   .vessel-header .group-export { color: var(--navy-light); }
@@ -7609,7 +7639,7 @@ PAGE_HTML = """
   th:nth-child(6), td:nth-child(6) { width: 23%; }
   th:nth-child(7), td:nth-child(7) { width: 6%; }
   th:nth-child(8), td:nth-child(8) { width: 10%; }
-  th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid var(--border); overflow: hidden; }
+  th, td { text-align: start; padding: 12px 10px; border-bottom: 1px solid var(--border); overflow: hidden; }
   .select-col { text-align: center; }
   th {
     color: var(--muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase;
@@ -7665,7 +7695,7 @@ PAGE_HTML = """
   .bulk-bar.active { display: flex; }
   .bulk-bar .bulk-count {
     font-weight: 700; color: var(--navy); background: color-mix(in srgb, var(--gold) 22%, transparent);
-    padding: 3px 10px; border-radius: 999px; margin-right: 2px;
+    padding: 3px 10px; border-radius: 999px; margin-inline-end: 2px;
   }
   :root[data-theme="dark"] .bulk-bar .bulk-count { color: var(--gold-light); }
   .bulk-bar button {
@@ -7688,13 +7718,16 @@ PAGE_HTML = """
   :root[data-theme="dark"] .bulk-bar button.bulk-unmark-btn { color: var(--navy-light); }
   .bulk-bar button.bulk-unmark-btn:hover { background: color-mix(in srgb, var(--navy-light) 16%, transparent); }
   .bulk-bar button.bulk-remove-btn {
-    background: none; color: var(--danger); margin-left: auto;
+    background: none; color: var(--danger); margin-inline-start: auto;
     border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
   }
   .bulk-bar button.bulk-remove-btn:hover { background: var(--danger-bg); }
 
+  /* Above the floating back-to-top button (900) so the dimmed backdrop
+     really covers everything behind the popup; toasts (1200) stay above it
+     so "Invoice uploaded" etc. are still visible while the popup is open. */
   .history-overlay {
-    position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 60;
+    position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 1100;
     display: flex; align-items: center; justify-content: center; padding: 20px;
   }
   .history-modal {
@@ -7706,6 +7739,9 @@ PAGE_HTML = """
     display: flex; align-items: center; gap: 10px; padding: 14px 18px;
     border-bottom: 1px solid var(--border);
   }
+  /* Title takes the free space so the × always sits in the far corner
+     (right in English, left in Arabic) instead of hugging the title. */
+  .history-modal-head b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .history-modal-body { padding: 10px 18px; overflow-y: auto; }
   .history-row { padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 12.5px; }
   .history-row:last-child { border-bottom: none; }
@@ -7759,9 +7795,18 @@ PAGE_HTML = """
   .match-row .match-status { font-size: 11.5px; color: var(--muted); }
   .match-row.ok .match-status { color: var(--success, #1f9d55); }
   .match-row.review { flex-wrap: wrap; }
-  .match-row.review .match-review-controls { display: flex; gap: 6px; align-items: center; width: 100%; margin-top: 4px; }
+  /* Controls always get their own line under the file name + status (the
+     longer Arabic status text used to push them to a different spot than
+     in English), aligned to the start of the line. */
+  .match-row.review .match-review-controls { display: flex; gap: 8px; align-items: center; flex: 0 0 100%; min-width: 0; margin-top: 6px; }
+  /* Were plain unstyled browser dropdowns - now match the app's inputs. */
   .match-row.review .match-review-controls select,
-  .match-row.review .match-review-controls input { flex: 1; min-width: 0; }
+  .match-row.review .match-review-controls input {
+    flex: 0 1 260px; min-width: 0; font-family: inherit; font-size: 13px; color: var(--text);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 7px 10px;
+  }
+  .match-row.review .match-review-controls select:focus { outline: none; border-color: var(--navy-light); }
+  .match-row.review .match-review-controls button { padding: 7px 16px; flex-shrink: 0; }
 
   /* Mobile - below this width, each row becomes a stacked card instead of
      a table row (a wide table just forces sideways scrolling on a phone,
@@ -7783,8 +7828,10 @@ PAGE_HTML = """
        row - fine on a desktop width, but forced onto one line on a phone
        it pushes the page wider than the screen. Let them wrap instead. */
     .port-header, .vessel-header { flex-wrap: wrap; row-gap: 6px; }
-    .group-export { margin-left: 0; }
-    .group-remove:last-of-type { margin-left: auto; }
+    /* Actions get their own full row: Export + Archive at the start,
+       Remove all alone at the far end - identical in both languages. */
+    .group-actions { flex-basis: 100%; margin-inline-start: 0; }
+    .group-actions .group-remove { margin-inline-start: auto; }
     .row { flex-wrap: wrap; }
   }
 
@@ -7818,7 +7865,7 @@ PAGE_HTML = """
   input:checked + .slider:before { transform: translateX(19px); }
 
   /* Toast notifications (replace confirm()/alert() popups) */
-  #toastHost { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; pointer-events: none; max-width: min(320px, calc(100vw - 40px)); }
+  #toastHost { position: fixed; bottom: 20px; inset-inline-end: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1200; pointer-events: none; max-width: min(320px, calc(100vw - 40px)); }
   #toastHost .toast { pointer-events: auto; }
   .toast {
     background: var(--navy-deep); color: #fff; padding: 11px 16px; border-radius: 12px; font-size: 13px;
@@ -7835,17 +7882,57 @@ PAGE_HTML = """
      own resting position (bottom:20px) so a toast popping in doesn't land
      right on top of it. */
   .scroll-top-btn {
-    position: fixed; bottom: 86px; right: 24px; z-index: 900;
+    position: fixed; bottom: 86px; inset-inline-end: 24px; z-index: 900;
     width: 46px; height: 46px; border-radius: 50%; padding: 0;
     background: var(--navy-deep); color: #fff; border: none;
     display: flex; align-items: center; justify-content: center;
     box-shadow: var(--shadow-md); cursor: pointer;
+    /* Hidden until the manifest form has scrolled out of view - it was
+       showing at the very top of the page too, sitting on top of
+       "Collapse all" / the archived count with nothing to scroll back to. */
+    opacity: 0; visibility: hidden; transform: translateY(8px);
+    transition: opacity .2s ease, transform .2s ease, visibility .2s;
   }
+  .scroll-top-btn.show { opacity: 1; visibility: visible; transform: none; }
   .scroll-top-btn:hover { background: var(--navy-light); }
   .scroll-top-btn svg { width: 20px; height: 20px; }
+  /* Room under the last card so the floating button never covers it. */
+  body::after { content: ""; display: block; height: 70px; }
 
+  /* Search box + "/" shortcut hint. The hint only shows while the box is
+     empty and not focused, and never on touch devices (no keyboard). */
+  .search-wrap { position: relative; flex: 1; min-width: 180px; }
+  .search-wrap #searchBox { width: 100%; padding-inline-end: 34px; }
+  .kbd-hint {
+    position: absolute; inset-inline-end: 9px; top: 50%; transform: translateY(-50%);
+    font: 600 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--muted);
+    border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 5px;
+    padding: 3px 6px; background: var(--card); pointer-events: none;
+  }
+  #searchBox:focus + .kbd-hint, #searchBox:not(:placeholder-shown) + .kbd-hint { display: none; }
+  @media (hover: none) { .kbd-hint { display: none; } }
+  /* Brief highlight on the row the search jumped to. */
+  @keyframes row-flash { 0%, 40% { background: color-mix(in srgb, var(--gold) 30%, transparent); } 100% { background: transparent; } }
+  tr.row-flash > td { animation: row-flash 1.8s ease-out; }
+
+  /* Phone layout */
   @media (max-width: 600px) {
-    .stat { min-width: 45%; }
+    /* Stats: three compact tiles in one row instead of three half-width
+       cards stacked ragged down the page. */
+    .summary { gap: 8px; flex-wrap: nowrap; }
+    .stat { flex: 1 1 0; min-width: 0; max-width: none; padding: 10px 12px; display: block; }
+    .stat-icon { display: none; }
+    .stat b { font-size: 19px; }
+    /* Toolbar: search + Collapse all share row 1, then each dropdown gets a
+       full-width row (they were three different widths across three rows;
+       side by side they're too narrow and cut off "Select a vessel to view"). */
+    .toolbar-row .search-wrap { flex: 1 1 calc(100% - 130px); min-width: 0; }
+    .toolbar-row .btn-neutral { flex: 0 0 auto; }
+    .toolbar-row .glass-select-wrap { flex: 1 1 100%; min-width: 0 !important; order: 2; }
+    /* Top bar: drop the "Signed in as" words (the username stays). */
+    .who-label { display: none; }
+    .topbar-right { gap: 6px; }
+    .topbar-right a { padding: 6px 8px; }
   }
 
   /* English/Arabic switch - plain two-option pill, same spot as the
@@ -7863,25 +7950,27 @@ PAGE_HTML = """
   .lang-opt:hover:not(.active) { background: var(--border); color: var(--text); }
 
   /* ---------- RTL (Arabic) overrides ----------
-     Setting dir="rtl" on <html> already flips text direction and the
-     visual order of flex-row children on its own; what's left here are
-     the handful of PHYSICAL left/right values (fixed-position corners,
-     "margin-left:auto" used to push something to the far edge, chevron
-     rotation) that don't auto-mirror with dir/direction. */
+     Setting dir="rtl" on <html> flips text direction and the order of
+     flex-row children. Spacing/positions in this page use logical
+     properties (margin-inline-start, inset-inline-end, text-align:start)
+     that flip with the language on their own, so English and Arabic can't
+     drift apart - don't add plain margin-left/right etc. for layout. Only
+     things with no logical equivalent are overridden here. */
   [dir="rtl"] body { font-family: 'Cairo', 'Segoe UI', Tahoma, Arial, sans-serif; }
-  [dir="rtl"] th, [dir="rtl"] td { text-align: right; }
-  [dir="rtl"] .cs-option { text-align: right; }
-  [dir="rtl"] .group-export { margin-left: 0; margin-right: auto; }
-  [dir="rtl"] .bulk-bar .bulk-count { margin-right: 0; margin-left: 2px; }
-  [dir="rtl"] .bulk-bar button.bulk-remove-btn { margin-left: 0; margin-right: auto; }
-  [dir="rtl"] #toastHost { right: auto; left: 20px; }
-  [dir="rtl"] .scroll-top-btn { right: auto; left: 24px; }
+  [dir="rtl"] .cs-option { text-align: start; }
   [dir="rtl"] .port-header.collapsed .chev,
   [dir="rtl"] .vessel-header.collapsed .chev { transform: rotate(90deg); }
-  @media (max-width: 700px) {
-    [dir="rtl"] .group-export { margin-right: 0; }
-    [dir="rtl"] .group-remove:last-of-type { margin-left: 0; margin-right: auto; }
-  }
+  /* Arabic is a joined-up script: letter-spacing pulls the letters apart
+     and UPPERCASE means nothing - and the tiny 10-11px label sizes chosen
+     for English capitals are too small to read in Arabic. */
+  [dir="rtl"] .card-label, [dir="rtl"] .tag-fields label, [dir="rtl"] th,
+  [dir="rtl"] .eta-label, [dir="rtl"] .doc-chip, [dir="rtl"] .badge-complete,
+  [dir="rtl"] tbody tr td[data-label]::before { letter-spacing: 0; text-transform: none; }
+  [dir="rtl"] .card-label { font-size: 14px; }
+  [dir="rtl"] .tag-fields label { font-size: 12.5px; }
+  [dir="rtl"] th { font-size: 12px; }
+  [dir="rtl"] .eta-label, [dir="rtl"] .eta-unset-hint, [dir="rtl"] .meta { font-size: 11.5px; }
+  [dir="rtl"] tbody tr td[data-label]::before { font-size: 12px; }
 </style>
 </head>
 <body>
@@ -7911,7 +8000,7 @@ PAGE_HTML = """
         </span>
       </label>
       {% if role == 'admin' %}<a href="/users" data-i18n="manage_users">Manage Users</a>{% endif %}
-      <span class="who"><span data-i18n="signed_in_as">Signed in as</span> <b>{{ username }}</b></span>
+      <span class="who"><span class="who-label" data-i18n="signed_in_as">Signed in as</span> <b>{{ username }}</b></span>
       <a href="/logout" data-i18n="log_out">Log out</a>
     </div>
   </div>
@@ -7935,7 +8024,7 @@ PAGE_HTML = """
       </div>
       <div>
         <label for="vesselField" data-i18n="vessel_label">Vessel</label>
-        <input type="text" id="vesselField" placeholder="e.g. TAI KNIGHT" style="text-transform:uppercase;" oninput="this.value = this.value.toUpperCase();"
+        <input type="text" id="vesselField" placeholder="e.g. TAI KNIGHT" data-i18n-ph="vessel_placeholder" style="text-transform:uppercase;" oninput="this.value = this.value.toUpperCase();"
           onkeydown="if(event.key==='Enter'){ event.preventDefault(); uploadExcel(); }">
       </div>
     </div>
@@ -7983,8 +8072,11 @@ PAGE_HTML = """
   <div class="summary" id="summary"></div>
 
   <div class="card">
-    <div class="row" style="margin-bottom:14px; flex-wrap:wrap;">
-      <input type="text" id="searchBox" placeholder="Search BL number..." data-i18n-ph="search_bl_placeholder" oninput="render()" style="flex:1; min-width:180px;">
+    <div class="row toolbar-row" style="margin-bottom:14px; flex-wrap:wrap;">
+      <div class="search-wrap" title="Shortcut: press / from anywhere to search. Enter jumps to the BL, Esc clears." data-i18n-title="search_shortcut_title">
+        <input type="text" id="searchBox" placeholder="Search BL number..." data-i18n-ph="search_bl_placeholder" oninput="render()" onkeydown="onSearchKeydown(event)" autocomplete="off">
+        <kbd class="kbd-hint" aria-hidden="true">/</kbd>
+      </div>
       <div class="glass-select-wrap" style="width:auto; min-width:200px;">
         <select id="jumpSelect" class="nice-select" onchange="jumpToVessel(this.value)"><option value="" data-i18n="select_vessel_to_view">Select a vessel to view</option></select>
       </div>
@@ -8050,6 +8142,13 @@ function esc(s) {
 // double-quoted attributes and for any characters in the value.
 function jsq(s) {
   return esc(JSON.stringify(String(s === undefined || s === null ? '' : s)));
+}
+// Text direction for a free-text box: follow its own content once it has
+// some (an English remark on the Arabic board reads left-to-right instead
+// of being cut off at the start), but stay with the page's direction while
+// empty so the placeholder sits on the correct side.
+function autoDir(v) {
+  return v ? 'auto' : (currentLang === 'ar' ? 'rtl' : 'ltr');
 }
 
 /* ---------- Theme (light/dark, sun/moon toggle) ---------- */
@@ -8267,7 +8366,11 @@ function formatLocalTime(raw) {
   const iso = raw.includes('T') ? raw : raw.replace(' ', 'T') + ':00Z';
   const d = new Date(iso);
   if (isNaN(d.getTime())) return raw;
-  return d.toLocaleString(undefined, {
+  // In Arabic mode, Arabic month names - but Western digits (nu-latn) and
+  // the Gregorian calendar (ca-gregory), matching how dates are written in
+  // the office; a bare 'ar-SA' would switch to Hijri dates and ٠-٩ digits.
+  const locale = currentLang === 'ar' ? 'ar-u-nu-latn-ca-gregory' : undefined;
+  return d.toLocaleString(locale, {
     year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
   });
 }
@@ -8807,8 +8910,8 @@ function rowsHtml(list) {
       <td data-label="${t('th_invoice_issued')}">${checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at)}</td>
       <td data-label="${t('th_approval_received')}">${checkbox(r.bl_number, 'approval_received', !!r.approval_received, r.approval_by, r.approval_at)}</td>
       <td data-label="${t('th_do_issued')}">${checkbox(r.bl_number, 'do_issued', !!r.do_issued, r.do_by, r.do_at)}</td>
-      <td data-label="${t('th_remarks')}"><input class="remarks-input" type="text" value="${esc(r.remarks || '')}"
-            oninput="onRemarksInput(${jsq(r.bl_number)}, this.value)"
+      <td data-label="${t('th_remarks')}"><input class="remarks-input" type="text" dir="${autoDir(r.remarks)}" value="${esc(r.remarks || '')}"
+            oninput="this.dir = autoDir(this.value); onRemarksInput(${jsq(r.bl_number)}, this.value)"
             onfocus="markEditing(1)" onblur="markEditing(-1)" placeholder="${t('notes_placeholder')}"></td>
       <td>{% if role == 'admin' %}<button type="button" class="hist-btn" title="${t('history')}" onclick="showHistory(${jsq(r.bl_number)})">${t('history')}</button>{% endif %}</td>
       <td><button class="del" onclick="deleteRecord(${jsq(r.bl_number)})">${t('remove')}</button></td>
@@ -8989,7 +9092,7 @@ function vesselGroupHtml(portName, vesselName, list, archivedView) {
     <div class="vessel-group" id="group_${cssEscape(vesselKey)}">
       <div class="vessel-header ${vesselCollapsed ? 'collapsed' : ''}" onclick="if(event.target.tagName!=='INPUT' && event.target.tagName!=='BUTTON' && event.target.tagName!=='A') toggleGroup(${jsq(collapseKey)})">
         ${CHEVRON}
-        <input class="group-name" value="${vesselName === 'Unassigned' ? '' : esc(vesselName)}" placeholder="${t('unassigned_vessel_ph')}"
+        <input class="group-name" dir="${autoDir(vesselName === 'Unassigned' ? '' : vesselName)}" oninput="this.dir = autoDir(this.value)" value="${vesselName === 'Unassigned' ? '' : esc(vesselName)}" placeholder="${t('unassigned_vessel_ph')}"
           onclick="event.stopPropagation()"
           onchange="renameGroup('vessel', ${jsq(portName)}, ${jsq(vesselName)}, this.value, 'Unassigned')">
         ${archivedView ? '' : `<span class="eta-wrap" onclick="event.stopPropagation()">
@@ -9000,9 +9103,11 @@ function vesselGroupHtml(portName, vesselName, list, archivedView) {
         </span>`}
         <span class="group-count">${t('bl_count', {n: sortedList.length, p: sortedList.length === 1 ? '' : 's'})}${left ? t('left_suffix', {n: left}) : t('done_suffix')}</span>
         <span class="vessel-progress ${pct >= 100 ? 'done' : ''}" title="${t('pct_complete', {pct})}"><span class="vessel-progress-fill" style="width:${pct}%"></span></span>
-        <a onclick="event.stopPropagation()" href="/api/export?port=${encodeURIComponent(rawPort)}&vessel=${encodeURIComponent(rawVessel)}" class="group-export" title="${t('export_vessel_title')}">${t('export')}</a>
-        <button type="button" class="group-neutral" onclick="event.stopPropagation(); setVesselArchived(${blsJson}, ${archivedView ? 'false' : 'true'})">${archivedView ? t('unarchive') : t('archive')}</button>
-        <button type="button" class="group-remove" onclick="event.stopPropagation(); removeVesselGroup(${jsq(portName)}, ${jsq(vesselName)})">${t('remove_all')}</button>
+        <span class="group-actions">
+          <a onclick="event.stopPropagation()" href="/api/export?port=${encodeURIComponent(rawPort)}&vessel=${encodeURIComponent(rawVessel)}" class="group-export" title="${t('export_vessel_title')}">${t('export')}</a>
+          <button type="button" class="group-neutral" onclick="event.stopPropagation(); setVesselArchived(${blsJson}, ${archivedView ? 'false' : 'true'})">${archivedView ? t('unarchive') : t('archive')}</button>
+          <button type="button" class="group-remove" onclick="event.stopPropagation(); removeVesselGroup(${jsq(portName)}, ${jsq(vesselName)})">${t('remove_all')}</button>
+        </span>
       </div>
       <div class="vessel-body ${vesselCollapsed ? 'collapsed' : ''}">
         ${tableHtml(sortedList, vesselKey)}
@@ -9037,7 +9142,7 @@ function portGroupHtml(portName, vesselNames, vessels, archivedView, suppressHea
     <div class="port-group">
       <div class="port-header ${portCollapsed ? 'collapsed' : ''}" onclick="if(event.target.tagName!=='INPUT' && event.target.tagName!=='A') toggleGroup(${jsq(portKey)})">
         ${CHEVRON}
-        <input class="group-name" value="${portName === 'Unassigned' ? '' : esc(portName)}" placeholder="${t('unassigned_port_ph')}"
+        <input class="group-name" dir="${autoDir(portName === 'Unassigned' ? '' : portName)}" oninput="this.dir = autoDir(this.value)" value="${portName === 'Unassigned' ? '' : esc(portName)}" placeholder="${t('unassigned_port_ph')}"
           onclick="event.stopPropagation()"
           onchange="renameGroup('port', ${jsq(portName)}, '', this.value, 'Unassigned')">
       </div>
@@ -9239,6 +9344,19 @@ function scrollToManifestForm() {
   if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
+// Only show the back-to-top button once the manifest form is out of view -
+// there's nothing to scroll back to before that, and it was covering
+// controls ("Collapse all", the archived count) near the top of the page.
+(function initScrollTopVisibility() {
+  const btn = document.getElementById('scrollTopBtn');
+  const card = document.getElementById('manifestCard');
+  if (!btn || !card) return;
+  const update = () => btn.classList.toggle('show', card.getBoundingClientRect().bottom < 0);
+  window.addEventListener('scroll', update, { passive: true });
+  window.addEventListener('resize', update);
+  update();
+})();
+
 function setAllGroupsCollapsed(collapsed) {
   const q = document.getElementById('searchBox').value.trim().toLowerCase();
   records.filter(r => r.bl_number.toLowerCase().includes(q)).forEach(r => {
@@ -9438,19 +9556,32 @@ function onGlassTriggerKeydown(id, e) {
   if (e.key === 'Tab' && state.open) closeGlassSelect(id);
 }
 
-// Keyboard shortcuts: "/" focuses search, Escape collapses all groups -
-// both no-ops while the person is actually typing, and Escape defers to
-// whatever more specific thing (a glass-dropdown panel, the history modal)
-// is already open, so it never fights with that control's own handling.
+/* ---------- Keyboard shortcuts ----------
+     /      jump to the BL search box from anywhere (selects what's there,
+            so you can just type the next BL)
+     Enter  (in search) jump straight to the matching BL - see onSearchKeydown
+     Esc    (in search) clear it; otherwise close whatever popup is open,
+            or collapse all groups if nothing is
+   All are no-ops while typing in another field. "/" is matched by the
+   physical key (e.code 'Slash') as well as the character: on an Arabic
+   keyboard that same key types "ظ", so e.key alone never fired for
+   Arabic-keyboard users. */
+function isTypingTarget(el) {
+  const tag = el ? el.tagName : '';
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (el && el.isContentEditable);
+}
+function focusSearch() {
+  const box = document.getElementById('searchBox');
+  if (!box) return;
+  box.focus();
+  box.select();
+}
 document.addEventListener('keydown', (e) => {
-  const active = document.activeElement;
-  const tag = active ? active.tagName : '';
-  const isTyping = tag === 'INPUT' || tag === 'TEXTAREA' || (active && active.isContentEditable);
+  const isTyping = isTypingTarget(document.activeElement);
 
-  if (e.key === '/' && !isTyping) {
+  if ((e.key === '/' || e.code === 'Slash') && !isTyping && !e.ctrlKey && !e.metaKey && !e.altKey) {
     e.preventDefault();
-    const box = document.getElementById('searchBox');
-    if (box) box.focus();
+    focusSearch();
     return;
   }
 
@@ -9460,12 +9591,67 @@ document.addEventListener('keydown', (e) => {
     // handler (onGlassTriggerKeydown) already closed it and stopped this
     // keystroke from bubbling here - this is just a safety net.
     if (Object.values(customSelects).some(s => s.open)) return;
+    const docsOverlay = document.getElementById('docsOverlay');
+    if (docsOverlay && docsOverlay.style.display !== 'none') { closeDocs(); return; }
     const historyOverlay = document.getElementById('historyOverlay');
     if (historyOverlay && historyOverlay.style.display !== 'none') { closeHistory(); return; }
     if (document.querySelector('.bulk-bar.active')) return;
     setAllGroupsCollapsed(true);
   }
 });
+
+// Enter in the search box: if the query identifies exactly one BL (an
+// exact number, or the only partial match), open its port and vessel,
+// scroll it into view and flash it. The text stays selected so the next
+// BL can be typed straight over it: type - Enter - type - Enter.
+function onSearchKeydown(e) {
+  const box = e.target;
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    e.stopPropagation();
+    if (box.value) { box.value = ''; render(); } else { box.blur(); }
+    return;
+  }
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  const q = box.value.trim().toLowerCase();
+  if (!q) return;
+  const opEl = document.getElementById('operatorFilter');
+  const op = opEl ? opEl.value : '';
+  const matches = records.filter(r => r.bl_number.toLowerCase().includes(q) && (!op || r.created_by === op));
+  const target = matches.find(r => r.bl_number.toLowerCase() === q) || (matches.length === 1 ? matches[0] : null);
+  if (!target) {
+    showToast(matches.length ? t('many_bls_match', {n: matches.length}) : t('no_bl_match', {q: box.value.trim()}));
+    return;
+  }
+  jumpToBl(target.bl_number);
+  box.select();
+}
+
+function jumpToBl(bl) {
+  const rec = records.find(r => r.bl_number === bl);
+  if (!rec) return;
+  const port = rec.port || 'Unassigned';
+  const vessel = rec.vessel || 'Unassigned';
+  if (rec.archived) {
+    archivedSectionOpen = true;
+    collapsedGroups['port:' + port + ':archived'] = false;
+    collapsedGroups['vessel:' + port + ':' + vessel + ':archived'] = false;
+  } else {
+    selectedPortTab = port;
+    collapsedGroups['port:' + port] = false;
+    collapsedGroups['vessel:' + port + ':' + vessel] = false;
+  }
+  render();
+  requestAnimationFrame(() => {
+    const row = document.getElementById('row_' + cssEscape(bl));
+    if (!row) return;
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    row.classList.remove('row-flash');
+    void row.offsetWidth;  // restart the animation if it's the same row again
+    row.classList.add('row-flash');
+  });
+}
 
 applyI18n();
 initGlassSelects();
