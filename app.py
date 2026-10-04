@@ -235,7 +235,7 @@ const I18N = {
     heads_up_duplicate: "Heads up - {n} BL(s) already exist under a different vessel: {lines}{more}.",
     already_under: "{bl} (already under {vessel} / {port})",
     and_n_more: " and {n} more",
-    could_not_save_retry: "Could not save that change - retrying...",
+    could_not_save_retry: "Could not save that change - please try again.",
     only_pdf_accepted: "Only PDF files are accepted.",
     file_too_large: "That file is larger than 10MB.",
     uploaded_marked_issued: "{label} uploaded - marked as issued.",
@@ -389,7 +389,7 @@ const I18N = {
     heads_up_duplicate: "تنبيه - توجد {n} بوليصة مسجلة مسبقًا تحت سفينة مختلفة: {lines}{more}.",
     already_under: "{bl} (مسجلة تحت {vessel} / {port})",
     and_n_more: "، و{n} أخرى",
-    could_not_save_retry: "تعذر حفظ هذا التغيير - جارٍ إعادة المحاولة...",
+    could_not_save_retry: "تعذر حفظ هذا التغيير - يرجى المحاولة مرة أخرى.",
     only_pdf_accepted: "يُقبل فقط ملفات PDF.",
     file_too_large: "حجم هذا الملف أكبر من 10 ميجابايت.",
     uploaded_marked_issued: "تم رفع {label} - وتم تمييزها كصادرة.",
@@ -3217,17 +3217,24 @@ def bulk_toggle_records():
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M") if value else ""
     by_val = user if value else ""
 
+    # One UPDATE for the whole selection (it used to be ~3 database round
+    # trips per BL, which on Render made a big vessel's Mark/Unmark slow
+    # enough for the board's background refresh to flip sliders back).
+    # Only rows whose status actually changes are touched: marking a BL
+    # that's already marked must NOT overwrite who marked it and when.
     db = get_db()
-    updated = []
-    for bl_number in bl_numbers:
-        if not _owns_record(bl_number):
-            continue
-        db.execute(
-            f"UPDATE records SET {field} = ?, {by_field} = ?, {at_field} = ? WHERE bl_number = ?",
-            (value, by_val, now, bl_number),
-        )
+    sql = (
+        f"UPDATE records SET {field} = ?, {by_field} = ?, {at_field} = ? "
+        f"WHERE bl_number = ANY(?) AND COALESCE({field}, 0) <> ?"
+    )
+    params = [value, by_val, now, bl_numbers, value]
+    if session.get("role") != "admin":
+        sql += " AND created_by = ?"  # staff can only touch their own BLs, same as _owns_record
+        params.append(session.get("username"))
+    sql += " RETURNING bl_number"
+    updated = [r["bl_number"] for r in db.execute(sql, tuple(params)).fetchall()]
+    for bl_number in updated:
         _log_audit(bl_number, "toggle", field, "" if value else "1", "1" if value else "")
-        updated.append(bl_number)
     db.commit()
     return jsonify({"updated": updated})
 
@@ -8172,6 +8179,26 @@ const IS_ADMIN = {{ (role == 'admin')|tojson }};
 let records = [];
 let suppressPollUntil = 0;
 let editingCount = 0;
+
+/* ---------- Saves vs. the 4-second background refresh ----------
+   The board re-reads /api/records every 4s. A refresh that runs while a
+   save is still on its way to the server (or that STARTED before the save
+   landed and comes back after) carries the OLD values - and used to
+   overwrite what was just clicked: bulk "Unmark" turned the sliders off,
+   a refresh flipped them back on, then the save finished and they flipped
+   off again. The 2-second pause after a click only hid this when the
+   server answered quickly. Now every save is tracked, and a refresh result
+   is thrown away if any save was in flight at any point while it ran. */
+let pendingWrites = 0;  // saves currently in flight
+let writeVersion = 0;   // bumped whenever a save starts or finishes
+let fetchSeq = 0;       // only the newest refresh may apply its result
+function beginWrite() { pendingWrites++; writeVersion++; }
+function endWrite() { pendingWrites = Math.max(0, pendingWrites - 1); writeVersion++; }
+// fetch() for anything that changes data on the server.
+async function apiWrite(url, opts) {
+  beginWrite();
+  try { return await fetch(url, opts); } finally { endWrite(); }
+}
 let collapsedGroups = {};
 let archivedSectionOpen = false;
 let selectedPortTab = '';
@@ -8250,11 +8277,19 @@ function naturalCompare(a, b) {
   return 0;
 }
 
-async function fetchRecords() {
-  if (Date.now() < suppressPollUntil) return;
+// force: the refresh a save does right after it lands - skips the short
+// post-click pause (which only exists for the background timer).
+async function fetchRecords(force) {
+  if (!force && Date.now() < suppressPollUntil) return;
+  if (pendingWrites > 0) return;  // a save is in flight - its own follow-up refresh will sync
+  const mySeq = ++fetchSeq;
+  const versionAtStart = writeVersion;
   const res = await fetch('/api/records');
   if (res.status === 401 || res.redirected) { location.reload(); return; }
   const fresh = await res.json();
+  // Stale: a save started/finished while this was in flight, or a newer
+  // refresh has already been issued. Drop it rather than roll the board back.
+  if (mySeq !== fetchSeq || writeVersion !== versionAtStart || pendingWrites > 0) return;
   fresh.forEach(nr => {
     if (remarksTimers[nr.bl_number]) {
       const old = records.find(r => r.bl_number === nr.bl_number);
@@ -8318,7 +8353,7 @@ async function uploadExcel() {
   formData.append('port', port);
   formData.append('vessel', vessel);
 
-  const res = await fetch('/api/manifest/upload', { method: 'POST', body: formData });
+  const res = await apiWrite('/api/manifest/upload', { method: 'POST', body: formData });
   const data = await res.json();
   if (data.error) {
     showToast(data.error);
@@ -8333,7 +8368,7 @@ async function uploadExcel() {
   document.getElementById('dropzoneFilename').textContent = '';
   btn.textContent = originalLabel;
 
-  await fetchRecords();
+  await fetchRecords(true);
   showToast(t('bl_records_added', {added: data.added}) + (data.skipped ? t('already_on_board_skipped', {skipped: data.skipped}) : '') + '.');
 
   // A BL that's already on the board under a DIFFERENT vessel than the one
@@ -8455,13 +8490,24 @@ function toggle(bl, field, value) {
   suppressPollUntil = Date.now() + 2000;
 
   const key = bl + '::' + field;
+  // The save counts as "in flight" from the click itself, not just once
+  // the debounced request goes out - otherwise a refresh landing inside
+  // the 350ms debounce window could still flip the slider back.
+  if (!toggleSendTimers[key]) beginWrite();
   clearTimeout(toggleSendTimers[key]);
-  toggleSendTimers[key] = setTimeout(() => {
+  toggleSendTimers[key] = setTimeout(async () => {
     delete toggleSendTimers[key];
-    fetch(`/api/records/${encodeURIComponent(bl)}/toggle`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({field, value})
-    }).then(() => fetchRecords()).catch(() => { showToast(t('could_not_save_retry')); fetchRecords(); });
+    let ok = false;
+    try {
+      const res = await fetch(`/api/records/${encodeURIComponent(bl)}/toggle`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({field, value})
+      });
+      ok = res.ok;
+    } catch (e) { ok = false; }
+    endWrite();
+    if (!ok) showToast(t('could_not_save_retry'));
+    fetchRecords(true);  // sync with the server either way (shows the real state if it failed)
   }, 350);
 }
 
@@ -8472,7 +8518,7 @@ function onRemarksInput(bl, value) {
   clearTimeout(remarksTimers[bl]);
   remarksTimers[bl] = setTimeout(async () => {
     delete remarksTimers[bl];
-    await fetch(`/api/records/${encodeURIComponent(bl)}/remarks`, {
+    await apiWrite(`/api/records/${encodeURIComponent(bl)}/remarks`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({remarks: value})
     });
@@ -8602,7 +8648,7 @@ async function submitAttachmentFile(bl, kind, file) {
   // each caller decides how to react to the result.
   const form = new FormData();
   form.append('file', file);
-  const res = await fetch(`/api/records/${encodeURIComponent(bl)}/attachment/${kind}`, {method: 'POST', body: form});
+  const res = await apiWrite(`/api/records/${encodeURIComponent(bl)}/attachment/${kind}`, {method: 'POST', body: form});
   const data = await res.json();
   return {ok: res.ok, data};
 }
@@ -8620,7 +8666,7 @@ async function uploadAttachment(bl, kind, input) {
   // (see upload_attachment) - say so, so it's obvious the status change
   // wasn't a separate click someone forgot to make.
   showToast(data.auto_issued_field ? t('uploaded_marked_issued', {label}) : t('uploaded', {label}));
-  await fetchRecords();
+  await fetchRecords(true);
   if (document.getElementById('docsOverlay').style.display !== 'none') await showDocs(bl);
 }
 
@@ -8713,7 +8759,7 @@ async function handleAutoMatchFiles(fileList) {
     needsReview++; updateSummary();
   }
 
-  await fetchRecords();
+  await fetchRecords(true);
 }
 
 function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
@@ -8752,15 +8798,15 @@ function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
     row.className = 'match-row ok';
     const issuedNote = data.auto_issued_field ? t('marked_issued_suffix') : '';
     row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">&check; ${esc(bl)} - ${esc(autoMatchKindLabel(kind))}${esc(issuedNote)}</div>`;
-    await fetchRecords();
+    await fetchRecords(true);
   };
 }
 
 async function removeAttachment(bl, kind) {
-  const res = await fetch(`/api/records/${encodeURIComponent(bl)}/attachment/${kind}`, {method: 'DELETE'});
+  const res = await apiWrite(`/api/records/${encodeURIComponent(bl)}/attachment/${kind}`, {method: 'DELETE'});
   if (!res.ok) { showToast(t('could_not_remove_file')); return; }
   showToast(t('doc_removed', {kind: kind === 'invoice' ? t('doc_invoice') : t('doc_delivery_order')}));
-  await fetchRecords();
+  await fetchRecords(true);
   if (document.getElementById('docsOverlay').style.display !== 'none') await showDocs(bl);
 }
 
@@ -8771,17 +8817,17 @@ function deleteRecord(bl) {
   records.splice(idx, 1);
   render();
   suppressPollUntil = Date.now() + 4000;
-  fetch(`/api/records/${encodeURIComponent(bl)}`, {method: 'DELETE'});
+  apiWrite(`/api/records/${encodeURIComponent(bl)}`, {method: 'DELETE'}).catch(() => fetchRecords(true));
 
   showToast(t('removed_bl', {bl}), {
     actionLabel: t('undo'),
     duration: 3000,
     onAction: async () => {
-      await fetch('/api/records/restore', {
+      await apiWrite('/api/records/restore', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(removed)
       });
-      await fetchRecords();
+      await fetchRecords(true);
       showToast(t('restored_bl', {bl}));
     }
   });
@@ -8809,7 +8855,7 @@ async function doBulkRemove(list) {
   render();
   suppressPollUntil = Date.now() + 5000;
 
-  const res = await fetch('/api/records/bulk-delete', {
+  const res = await apiWrite('/api/records/bulk-delete', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({bl_numbers: blNumbers})
   });
@@ -8820,15 +8866,15 @@ async function doBulkRemove(list) {
     actionLabel: t('undo'),
     duration: 5000,
     onAction: async () => {
-      await fetch('/api/records/bulk-restore', {
+      await apiWrite('/api/records/bulk-restore', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({records: deleted})
       });
-      await fetchRecords();
+      await fetchRecords(true);
       showToast(t('restored'));
     }
   });
-  await fetchRecords();
+  await fetchRecords(true);
 }
 
 function removeVesselGroup(portName, vesselName) {
@@ -8843,11 +8889,11 @@ function removePortGroup(portName) {
 
 async function renameGroup(type, oldPort, oldVessel, newValue, fallbackLabel) {
   const val = newValue.trim() || fallbackLabel;
-  await fetch('/api/groups/rename', {
+  await apiWrite('/api/groups/rename', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({type, old_port: oldPort, old_vessel: oldVessel, new_value: val === fallbackLabel ? '' : val})
   });
-  await fetchRecords();
+  await fetchRecords(true);
 }
 
 function toggleGroup(key) {
@@ -8953,9 +8999,13 @@ async function bulkSetField(vesselKey, field, value) {
   const blNumbers = scope.filter(bl => selectedBLs.has(bl));
   if (!blNumbers.length) { showToast(t('select_at_least_one')); return; }
 
+  // Only BLs whose state actually changes are touched - bulk "Mark" on a
+  // selection where some were already marked used to overwrite who/when
+  // on those too (making it look like you'd issued Ahmed's invoice today,
+  // and skewing KPI turnaround times). Same rule on the server.
   blNumbers.forEach(bl => {
     const rec = records.find(r => r.bl_number === bl);
-    if (rec) {
+    if (rec && !!rec[field] !== !!value) {
       rec[field] = value ? 1 : 0;
       const byField = field.replace('_issued', '_by').replace('_received', '_by');
       const atField = field.replace('_issued', '_at').replace('_received', '_at');
@@ -8966,12 +9016,17 @@ async function bulkSetField(vesselKey, field, value) {
   suppressPollUntil = Date.now() + 2000;
   render();
 
-  await fetch('/api/records/bulk-toggle', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({bl_numbers: blNumbers, field, value})
-  });
-  showToast(t('bls_updated', {n: blNumbers.length}));
-  await fetchRecords();
+  let data = null;
+  try {
+    const res = await apiWrite('/api/records/bulk-toggle', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({bl_numbers: blNumbers, field, value})
+    });
+    if (res.ok) data = await res.json();
+  } catch (e) { data = null; }
+  if (data && Array.isArray(data.updated)) showToast(t('bls_updated', {n: data.updated.length}));
+  else showToast(t('could_not_save_retry'));
+  await fetchRecords(true);
 }
 
 function bulkRemoveSelected(vesselKey) {
@@ -9280,11 +9335,11 @@ async function setVesselEta(blNumbers, eta) {
   });
   suppressPollUntil = Date.now() + 1500;
   render();
-  await fetch('/api/vessel/eta', {
+  await apiWrite('/api/vessel/eta', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({bl_numbers: blNumbers, eta})
   });
-  await fetchRecords();
+  await fetchRecords(true);
 }
 
 async function setVesselArchived(blNumbers, archived) {
@@ -9294,12 +9349,12 @@ async function setVesselArchived(blNumbers, archived) {
   });
   suppressPollUntil = Date.now() + 1500;
   render();
-  await fetch('/api/vessel/archive', {
+  await apiWrite('/api/vessel/archive', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({bl_numbers: blNumbers, archived})
   });
   showToast(archived ? t('vessel_archived') : t('vessel_restored'));
-  await fetchRecords();
+  await fetchRecords(true);
 }
 
 function selectPortTab(port) {
