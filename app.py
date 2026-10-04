@@ -66,6 +66,368 @@ else:
 LOGO_B64 = "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"
 
 
+# Shared English/Arabic translation dictionary + helper JS, injected into
+# every page's <script> block (via `""" + I18N_JS + """`) so every page
+# draws from the same terms - a BL stays "Bill of Lading" the same way on
+# every screen instead of getting re-translated slightly differently each
+# time. Keys are generic (not DO-Tracker-specific) on purpose so the same
+# dictionary grows to cover the other pages without restructuring.
+#
+# How a page uses this:
+#   - Static HTML text: add data-i18n="key" (textContent), data-i18n-ph="key"
+#     (placeholder) or data-i18n-title="key" (title) to the element; applyI18n()
+#     fills it in from I18N[currentLang].
+#   - JS-generated HTML (template literals in render()-type functions):
+#     call t('key') or t('key', {var: value}) directly instead of hardcoding
+#     English text, so it already comes out right on every re-render.
+#   - The language itself is NOT saved to the account - it's a per-browser
+#     localStorage choice (same mechanism as the existing light/dark toggle),
+#     so it doesn't follow a person to a different device or session.
+I18N_JS = """
+const I18N = {
+  en: {
+    // Topbar
+    app_tagline: "DO Tracker",
+    manage_users: "Manage Users",
+    signed_in_as: "Signed in as",
+    log_out: "Log out",
+    toggle_dark_mode: "Toggle dark mode",
+    switch_language: "Switch language",
+    // Manifest card
+    add_a_manifest: "Add a manifest",
+    discharge_port: "Discharge Port",
+    select_a_port: "Select a port...",
+    port_dammam: "Dammam Port",
+    port_jubail: "Jubail Commercial Port",
+    port_jeddah: "Jeddah Port",
+    port_yanbu_commercial: "Yanbu Commercial Port",
+    port_yanbu_industrial: "Yanbu Industrial Port",
+    port_kap: "KAP",
+    vessel_label: "Vessel",
+    click_to_upload: "Click to upload",
+    or_drag_drop_manifest: "or drag & drop your manifest",
+    manifest_dropzone_sub: ".xlsx, .xls, .csv, .docx or .pdf - the BL Number column is read automatically",
+    add_to_board: "Add to board",
+    adding_ellipsis: "Adding...",
+    // Attach documents card
+    attach_documents: "Attach documents",
+    attach_docs_help: "Drop Invoice / Delivery Order PDFs here - each one is read and matched to its BL automatically, same as the manifest upload above.",
+    attach_docs_help2: "chips next to a BL number below show what's already attached.",
+    or_drag_drop_docs: "or drag & drop Invoice/DO PDFs",
+    auto_match_dropzone_sub: "Drop as many at once as you like - each is matched to its BL automatically",
+    // Toolbar / search
+    search_bl_placeholder: "Search BL number...",
+    select_vessel_to_view: "Select a vessel to view",
+    all_operators: "All operators",
+    collapse_all: "Collapse all",
+    archived_vessels: "Archived vessels",
+    scroll_top_title: "Back to Discharge Port / Vessel",
+    // Stats
+    total_bls: "Total BLs",
+    remaining: "Remaining",
+    fully_complete: "Fully Complete",
+    // Port landing / breadcrumb
+    all_ports_back: "All Ports",
+    all_done: "All done",
+    pct_complete: "{pct}% complete",
+    port_card_meta: "{vesselCount} vessel{vp} · {blCount} BL{bp}",
+    no_bls_yet: "No BLs on the board yet. Upload an Excel manifest above to get started.",
+    // Table headers
+    th_bl_number: "BL Number",
+    th_invoice_issued: "Invoice Issued",
+    th_approval_received: "Approval Received",
+    th_do_issued: "DO Issued",
+    th_remarks: "Remarks",
+    // Row actions
+    remove: "Remove",
+    history: "History",
+    notes_placeholder: "notes...",
+    unassigned_vessel_ph: "Unassigned vessel",
+    unassigned_port_ph: "Unassigned port",
+    complete_badge: "Complete",
+    // Vessel group header
+    eta_label: "ETA",
+    not_set: "Not set",
+    expected_arrival_title: "Expected arrival",
+    export: "Export",
+    export_vessel_title: "Export this vessel to Excel",
+    archive: "Archive",
+    unarchive: "Unarchive",
+    remove_all: "Remove all",
+    select_deselect_vessel_title: "Select/deselect all in this vessel",
+    bl_count: "{n} BL{p}",
+    left_suffix: " · {n} left",
+    done_suffix: " · done",
+    // Bulk bar
+    mark_invoice_issued: "Mark Invoice Issued",
+    mark_approval_received: "Mark Approval Received",
+    mark_do_issued: "Mark DO Issued",
+    unmark: "Unmark",
+    selected_count: "{n} selected",
+    // Documents modal / doc chips
+    documents_title: "Documents",
+    documents_for: "Documents - {bl}",
+    loading: "Loading...",
+    could_not_load_bl: "Could not load this BL.",
+    doc_invoice: "Invoice",
+    doc_delivery_order: "Delivery Order",
+    doc_chip_inv: "INV",
+    doc_chip_do: "DO",
+    attached_label: "Attached: {filename}",
+    by_at: "by {user} - {time}",
+    not_attached_yet: "Not attached yet.",
+    not_attached_waiting: "Not attached yet - waiting on the issuing staff member.",
+    download: "Download",
+    replace: "Replace",
+    upload_pdf: "Upload PDF",
+    attached_tooltip: "{full} attached - click to view",
+    not_attached_tooltip: "{full} not attached yet - click to upload",
+    // Auto-match batch
+    select_bl_ellipsis: "Select BL...",
+    kind_ellipsis: "Kind...",
+    attach_btn: "Attach",
+    attaching_ellipsis: "Attaching...",
+    reading_ellipsis: "Reading...",
+    too_large_skipped: "Too large (over 10MB) - skipped.",
+    could_not_read_file: "Could not read this file.",
+    matches_multiple: "Matches more than one BL - pick the right one",
+    could_not_tell_kind: "Couldn't tell Invoice from Delivery Order",
+    no_bl_matched: "No BL on your board matched this document",
+    unrecognized_document: "Unrecognized document",
+    marked_issued_suffix: " · marked issued",
+    attached_automatically: "{n} attached automatically",
+    need_your_input: ", {n} need your input",
+    processing_more: " (processing {n} more...)",
+    drop_pdf_only: "Drop PDF files only.",
+    pick_bl_and_kind: "Pick both a BL number and a document kind.",
+    could_not_remove_file: "Could not remove the file.",
+    doc_removed: "{kind} removed.",
+    upload_failed: "Upload failed.",
+    attach_failed: "Attach failed.",
+    // History modal
+    history_for: "History - {bl}",
+    could_not_load_history: "Could not load history.",
+    no_history_yet: "No history recorded yet.",
+    unknown_user: "Unknown",
+    action_added: "Added to board",
+    action_deleted: "Removed",
+    action_restored: "Restored",
+    action_toggle: "status changed",
+    action_remarks: "Remarks edited",
+    yes: "Yes",
+    no: "No",
+    history_set_field: "set {field} to {value}",
+    history_edited_remarks: 'edited remarks: "{value}"',
+    history_cleared_remarks: "edited remarks (cleared)",
+    history_added_this_bl: "added this BL ({value})",
+    history_added_bl_plain: "added this BL",
+    // Toasts
+    choose_manifest_first: "Choose a manifest file first.",
+    bl_records_added: "{added} new BL record(s) added",
+    already_on_board_skipped: ", {skipped} already on the board (skipped)",
+    heads_up_duplicate: "Heads up - {n} BL(s) already exist under a different vessel: {lines}{more}.",
+    already_under: "{bl} (already under {vessel} / {port})",
+    and_n_more: " and {n} more",
+    could_not_save_retry: "Could not save that change - retrying...",
+    only_pdf_accepted: "Only PDF files are accepted.",
+    file_too_large: "That file is larger than 10MB.",
+    uploaded_marked_issued: "{label} uploaded - marked as issued.",
+    uploaded: "{label} uploaded.",
+    removed_bl: "Removed BL {bl}.",
+    restored_bl: "Restored BL {bl}.",
+    nothing_to_remove: "Nothing to remove.",
+    confirm_remove_all: "Remove all {n} BL{p}{inLabel}?",
+    in_label: " in {label}",
+    bls_removed: "{n} BL{p} removed.",
+    restored: "Restored.",
+    select_at_least_one: "Select at least one BL first.",
+    bls_updated: "{n} BL(s) updated.",
+    vessel_archived: 'Vessel archived - find it under "Archived vessels" below.',
+    vessel_restored: "Vessel restored to the board.",
+    undo: "Undo",
+    confirm: "Confirm",
+  },
+  ar: {
+    app_tagline: "متتبع أوامر التسليم",
+    manage_users: "إدارة المستخدمين",
+    signed_in_as: "مسجّل الدخول باسم",
+    log_out: "تسجيل الخروج",
+    toggle_dark_mode: "تبديل الوضع الداكن",
+    switch_language: "تبديل اللغة",
+    add_a_manifest: "إضافة بيان شحن",
+    discharge_port: "ميناء التفريغ",
+    select_a_port: "اختر ميناء...",
+    port_dammam: "ميناء الدمام",
+    port_jubail: "ميناء الجبيل التجاري",
+    port_jeddah: "ميناء جدة",
+    port_yanbu_commercial: "ميناء ينبع التجاري",
+    port_yanbu_industrial: "ميناء ينبع الصناعي",
+    port_kap: "KAP",
+    vessel_label: "السفينة",
+    click_to_upload: "اضغط للرفع",
+    or_drag_drop_manifest: "أو اسحب وأفلت بيان الشحن",
+    manifest_dropzone_sub: "xlsx. أو xls. أو csv. أو docx. أو pdf. - يتم قراءة عمود رقم البوليصة تلقائيًا",
+    add_to_board: "إضافة إلى اللوحة",
+    adding_ellipsis: "جارٍ الإضافة...",
+    attach_documents: "إرفاق المستندات",
+    attach_docs_help: "أسقط ملفات الفاتورة / أمر التسليم (PDF) هنا - تتم قراءة كل ملف ومطابقته تلقائيًا مع رقم البوليصة، بنفس طريقة رفع بيان الشحن أعلاه.",
+    attach_docs_help2: "الشارات الظاهرة بجانب رقم البوليصة أدناه توضح المستندات المرفقة بالفعل.",
+    or_drag_drop_docs: "أو اسحب وأفلت ملفات الفاتورة / أمر التسليم",
+    auto_match_dropzone_sub: "أسقط أي عدد من الملفات دفعة واحدة - تتم مطابقة كل ملف تلقائيًا مع رقم البوليصة الخاص به",
+    search_bl_placeholder: "ابحث برقم البوليصة...",
+    select_vessel_to_view: "اختر سفينة للعرض",
+    all_operators: "جميع الموظفين",
+    collapse_all: "طي الكل",
+    archived_vessels: "السفن المؤرشفة",
+    scroll_top_title: "الرجوع إلى ميناء التفريغ / السفينة",
+    total_bls: "إجمالي البوالص",
+    remaining: "المتبقي",
+    fully_complete: "مكتمل بالكامل",
+    all_ports_back: "جميع الموانئ",
+    all_done: "اكتمل الكل",
+    pct_complete: "{pct}% مكتمل",
+    port_card_meta: "{vesselCount} سفينة · {blCount} بوليصة",
+    no_bls_yet: "لا توجد بوالص على اللوحة بعد. قم برفع بيان شحن (إكسل) أعلاه للبدء.",
+    th_bl_number: "رقم البوليصة",
+    th_invoice_issued: "صدور الفاتورة",
+    th_approval_received: "استلام الموافقة",
+    th_do_issued: "صدور أمر التسليم",
+    th_remarks: "ملاحظات",
+    remove: "إزالة",
+    history: "السجل",
+    notes_placeholder: "ملاحظات...",
+    unassigned_vessel_ph: "سفينة غير محددة",
+    unassigned_port_ph: "ميناء غير محدد",
+    complete_badge: "مكتمل",
+    eta_label: "الوصول المتوقع",
+    not_set: "غير محدد",
+    expected_arrival_title: "تاريخ الوصول المتوقع",
+    export: "تصدير",
+    export_vessel_title: "تصدير بيانات هذه السفينة إلى إكسل",
+    archive: "أرشفة",
+    unarchive: "إلغاء الأرشفة",
+    remove_all: "إزالة الكل",
+    select_deselect_vessel_title: "تحديد/إلغاء تحديد الكل في هذه السفينة",
+    bl_count: "{n} بوليصة",
+    left_suffix: " · متبقي {n}",
+    done_suffix: " · مكتمل",
+    mark_invoice_issued: "تمييز: صدور الفاتورة",
+    mark_approval_received: "تمييز: استلام الموافقة",
+    mark_do_issued: "تمييز: صدور أمر التسليم",
+    unmark: "إلغاء التمييز",
+    selected_count: "تم تحديد {n}",
+    documents_title: "المستندات",
+    documents_for: "المستندات - {bl}",
+    loading: "جارٍ التحميل...",
+    could_not_load_bl: "تعذر تحميل بيانات هذه البوليصة.",
+    doc_invoice: "الفاتورة",
+    doc_delivery_order: "أمر التسليم",
+    doc_chip_inv: "فاتورة",
+    doc_chip_do: "تسليم",
+    attached_label: "مرفق: {filename}",
+    by_at: "بواسطة {user} - {time}",
+    not_attached_yet: "لم يتم الإرفاق بعد.",
+    not_attached_waiting: "لم يتم الإرفاق بعد - بانتظار الموظف المصدر.",
+    download: "تحميل",
+    replace: "استبدال",
+    upload_pdf: "رفع ملف PDF",
+    attached_tooltip: "{full} مرفقة - اضغط للعرض",
+    not_attached_tooltip: "{full} غير مرفقة بعد - اضغط للرفع",
+    select_bl_ellipsis: "اختر رقم البوليصة...",
+    kind_ellipsis: "النوع...",
+    attach_btn: "إرفاق",
+    attaching_ellipsis: "جارٍ الإرفاق...",
+    reading_ellipsis: "جارٍ القراءة...",
+    too_large_skipped: "الحجم كبير جدًا (أكثر من 10 ميجابايت) - تم التخطي.",
+    could_not_read_file: "تعذرت قراءة هذا الملف.",
+    matches_multiple: "يطابق أكثر من بوليصة - يرجى اختيار الصحيحة",
+    could_not_tell_kind: "تعذر تحديد ما إذا كان فاتورة أو أمر تسليم",
+    no_bl_matched: "لا توجد بوليصة على لوحتك تطابق هذا المستند",
+    unrecognized_document: "مستند غير معروف",
+    marked_issued_suffix: " · تم التمييز كصادرة",
+    attached_automatically: "{n} تم إرفاقها تلقائيًا",
+    need_your_input: "، {n} بحاجة إلى إدخال يدوي",
+    processing_more: " (جارٍ معالجة {n} أخرى...)",
+    drop_pdf_only: "يرجى إسقاط ملفات PDF فقط.",
+    pick_bl_and_kind: "يرجى اختيار رقم البوليصة ونوع المستند معًا.",
+    could_not_remove_file: "تعذرت إزالة الملف.",
+    doc_removed: "تمت إزالة {kind}.",
+    upload_failed: "فشل الرفع.",
+    attach_failed: "فشل الإرفاق.",
+    history_for: "السجل - {bl}",
+    could_not_load_history: "تعذر تحميل السجل.",
+    no_history_yet: "لا يوجد سجل مسجل بعد.",
+    unknown_user: "غير معروف",
+    action_added: "تمت الإضافة إلى اللوحة",
+    action_deleted: "تمت الإزالة",
+    action_restored: "تمت الاستعادة",
+    action_toggle: "تم تغيير الحالة",
+    action_remarks: "تم تعديل الملاحظات",
+    yes: "نعم",
+    no: "لا",
+    history_set_field: "قام بتعيين {field} إلى {value}",
+    history_edited_remarks: 'قام بتعديل الملاحظات: "{value}"',
+    history_cleared_remarks: "قام بمسح الملاحظات",
+    history_added_this_bl: "أضاف هذه البوليصة ({value})",
+    history_added_bl_plain: "أضاف هذه البوليصة",
+    choose_manifest_first: "يرجى اختيار ملف بيان الشحن أولًا.",
+    bl_records_added: "تمت إضافة {added} بوليصة جديدة",
+    already_on_board_skipped: "، و{skipped} موجودة مسبقًا على اللوحة (تم تخطيها)",
+    heads_up_duplicate: "تنبيه - توجد {n} بوليصة مسجلة مسبقًا تحت سفينة مختلفة: {lines}{more}.",
+    already_under: "{bl} (مسجلة تحت {vessel} / {port})",
+    and_n_more: "، و{n} أخرى",
+    could_not_save_retry: "تعذر حفظ هذا التغيير - جارٍ إعادة المحاولة...",
+    only_pdf_accepted: "يُقبل فقط ملفات PDF.",
+    file_too_large: "حجم هذا الملف أكبر من 10 ميجابايت.",
+    uploaded_marked_issued: "تم رفع {label} - وتم تمييزها كصادرة.",
+    uploaded: "تم رفع {label}.",
+    removed_bl: "تمت إزالة البوليصة {bl}.",
+    restored_bl: "تمت استعادة البوليصة {bl}.",
+    nothing_to_remove: "لا يوجد ما يمكن إزالته.",
+    confirm_remove_all: "هل تريد إزالة جميع البوالص البالغ عددها {n}{inLabel}؟",
+    in_label: " في {label}",
+    bls_removed: "تمت إزالة {n} بوليصة.",
+    restored: "تمت الاستعادة.",
+    select_at_least_one: "يرجى تحديد بوليصة واحدة على الأقل أولًا.",
+    bls_updated: "تم تحديث {n} بوليصة.",
+    vessel_archived: 'تمت أرشفة السفينة - يمكنك إيجادها ضمن "السفن المؤرشفة" أدناه.',
+    vessel_restored: "تمت استعادة السفينة إلى اللوحة.",
+    undo: "تراجع",
+    confirm: "تأكيد",
+  },
+};
+
+let currentLang = 'en';
+try { currentLang = localStorage.getItem('lang') || 'en'; } catch (e) {}
+
+function t(key, vars) {
+  const dict = I18N[currentLang] || I18N.en;
+  let str = (key in dict) ? dict[key] : (I18N.en[key] !== undefined ? I18N.en[key] : key);
+  if (vars) {
+    str = str.replace(/\\{(\\w+)\\}/g, (_, k) => (vars[k] !== undefined ? vars[k] : ''));
+  }
+  return str;
+}
+
+function applyI18n() {
+  document.documentElement.lang = currentLang === 'ar' ? 'ar' : 'en';
+  document.documentElement.dir = currentLang === 'ar' ? 'rtl' : 'ltr';
+  document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.getAttribute('data-i18n')); });
+  document.querySelectorAll('[data-i18n-ph]').forEach(el => { el.placeholder = t(el.getAttribute('data-i18n-ph')); });
+  document.querySelectorAll('[data-i18n-title]').forEach(el => { el.title = t(el.getAttribute('data-i18n-title')); });
+  document.querySelectorAll('.lang-opt').forEach(b => b.classList.toggle('active', b.dataset.langBtn === currentLang));
+}
+
+function setLang(lang) {
+  if (lang === currentLang) return;
+  currentLang = lang;
+  try { localStorage.setItem('lang', lang); } catch (e) {}
+  applyI18n();
+  if (typeof render === 'function') render();
+}
+"""
+
+
 class DBWrapper:
     """Thin wrapper so the rest of the app can keep using SQLite-style
     '?' placeholders and db.execute(...).fetchone()/fetchall(), while
@@ -6592,6 +6954,9 @@ PAGE_HTML = """
 <meta charset="utf-8">
 <title>Compass - DO Tracker</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + """">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
   :root {
     --bg: #f2f4f7;
@@ -7311,6 +7676,41 @@ PAGE_HTML = """
   @media (max-width: 600px) {
     .stat { min-width: 45%; }
   }
+
+  /* English/Arabic switch - plain two-option pill, same spot as the
+     theme toggle. The active language is bold/highlighted; clicking the
+     other one switches (see setLang() in the shared I18N script). */
+  .lang-switch {
+    display: flex; align-items: center; gap: 2px; padding: 2px;
+    border: 1px solid var(--border); border-radius: 999px; background: var(--card);
+  }
+  .lang-opt {
+    background: none; color: var(--muted); font-size: 11.5px; font-weight: 700;
+    padding: 5px 10px; border-radius: 999px; line-height: 1;
+  }
+  .lang-opt.active { background: var(--navy); color: #fff; }
+  .lang-opt:hover:not(.active) { background: var(--border); color: var(--text); }
+
+  /* ---------- RTL (Arabic) overrides ----------
+     Setting dir="rtl" on <html> already flips text direction and the
+     visual order of flex-row children on its own; what's left here are
+     the handful of PHYSICAL left/right values (fixed-position corners,
+     "margin-left:auto" used to push something to the far edge, chevron
+     rotation) that don't auto-mirror with dir/direction. */
+  [dir="rtl"] body { font-family: 'Cairo', 'Segoe UI', Tahoma, Arial, sans-serif; }
+  [dir="rtl"] th, [dir="rtl"] td { text-align: right; }
+  [dir="rtl"] .cs-option { text-align: right; }
+  [dir="rtl"] .group-export { margin-left: 0; margin-right: auto; }
+  [dir="rtl"] .bulk-bar .bulk-count { margin-right: 0; margin-left: 2px; }
+  [dir="rtl"] .bulk-bar button.bulk-remove-btn { margin-left: 0; margin-right: auto; }
+  [dir="rtl"] #toastHost { right: auto; left: 20px; }
+  [dir="rtl"] .scroll-top-btn { right: auto; left: 24px; }
+  [dir="rtl"] .port-header.collapsed .chev,
+  [dir="rtl"] .vessel-header.collapsed .chev { transform: rotate(90deg); }
+  @media (max-width: 700px) {
+    [dir="rtl"] .group-export { margin-right: 0; }
+    [dir="rtl"] .group-remove:last-of-type { margin-left: 0; margin-right: auto; }
+  }
 </style>
 </head>
 <body>
@@ -7319,11 +7719,15 @@ PAGE_HTML = """
       <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
       <div class="brand-text">
         <span class="app-name">Compass</span>
-        <span class="app-tag">DO Tracker</span>
+        <span class="app-tag" data-i18n="app_tagline">DO Tracker</span>
       </div>
     </a>
     <div class="topbar-right">
-      <label class="theme-switch" title="Toggle dark mode">
+      <div class="lang-switch" title="EN / &#1593;&#1585;&#1576;&#1610;">
+        <button type="button" class="lang-opt active" data-lang-btn="en" onclick="setLang('en')">EN</button>
+        <button type="button" class="lang-opt" data-lang-btn="ar" onclick="setLang('ar')">&#1593;&#1585;&#1576;&#1610;</button>
+      </div>
+      <label class="theme-switch" title="Toggle dark mode" data-i18n-title="toggle_dark_mode">
         <input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')">
         <span class="theme-track">
           <span class="theme-icon sun">
@@ -7335,31 +7739,31 @@ PAGE_HTML = """
           <span class="theme-knob"></span>
         </span>
       </label>
-      {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
-      <span class="who">Signed in as <b>{{ username }}</b></span>
-      <a href="/logout">Log out</a>
+      {% if role == 'admin' %}<a href="/users" data-i18n="manage_users">Manage Users</a>{% endif %}
+      <span class="who"><span data-i18n="signed_in_as">Signed in as</span> <b>{{ username }}</b></span>
+      <a href="/logout" data-i18n="log_out">Log out</a>
     </div>
   </div>
 
   <div class="card" id="manifestCard">
-    <div class="card-label">Add a manifest</div>
+    <div class="card-label" data-i18n="add_a_manifest">Add a manifest</div>
     <div class="tag-fields">
       <div>
-        <label for="portField">Discharge Port</label>
+        <label for="portField" data-i18n="discharge_port">Discharge Port</label>
         <div class="glass-select-wrap">
           <select id="portField" class="nice-select">
-            <option value="">Select a port...</option>
-            <option value="DAMMAM PORT">Dammam Port</option>
-            <option value="JUBAIL COMMERCIAL PORT">Jubail Commercial Port</option>
-            <option value="JEDDAH PORT">Jeddah Port</option>
-            <option value="YANBU COMMERCIAL PORT">Yanbu Commercial Port</option>
-            <option value="YANBU INDUSTRIAL PORT">Yanbu Industrial Port</option>
-            <option value="KAP">KAP</option>
+            <option value="" data-i18n="select_a_port">Select a port...</option>
+            <option value="DAMMAM PORT" data-i18n="port_dammam">Dammam Port</option>
+            <option value="JUBAIL COMMERCIAL PORT" data-i18n="port_jubail">Jubail Commercial Port</option>
+            <option value="JEDDAH PORT" data-i18n="port_jeddah">Jeddah Port</option>
+            <option value="YANBU COMMERCIAL PORT" data-i18n="port_yanbu_commercial">Yanbu Commercial Port</option>
+            <option value="YANBU INDUSTRIAL PORT" data-i18n="port_yanbu_industrial">Yanbu Industrial Port</option>
+            <option value="KAP" data-i18n="port_kap">KAP</option>
           </select>
         </div>
       </div>
       <div>
-        <label for="vesselField">Vessel</label>
+        <label for="vesselField" data-i18n="vessel_label">Vessel</label>
         <input type="text" id="vesselField" placeholder="e.g. TAI KNIGHT" style="text-transform:uppercase;" oninput="this.value = this.value.toUpperCase();"
           onkeydown="if(event.key==='Enter'){ event.preventDefault(); uploadExcel(); }">
       </div>
@@ -7371,22 +7775,23 @@ PAGE_HTML = """
         </svg>
       </div>
       <div>
-        <div class="dropzone-text"><b>Click to upload</b> or drag &amp; drop your manifest</div>
-        <div class="dropzone-sub">.xlsx, .xls, .csv, .docx or .pdf - the BL Number column is read automatically</div>
+        <div class="dropzone-text"><b data-i18n="click_to_upload">Click to upload</b> <span data-i18n="or_drag_drop_manifest">or drag &amp; drop your manifest</span></div>
+        <div class="dropzone-sub" data-i18n="manifest_dropzone_sub">.xlsx, .xls, .csv, .docx or .pdf - the BL Number column is read automatically</div>
         <div class="dropzone-filename" id="dropzoneFilename"></div>
       </div>
       <input type="file" id="manifestFile" accept=".xlsx,.xlsm,.xls,.csv,.docx,.pdf" style="display:none" onchange="stageManifestFile()">
     </label>
     <div class="row" style="margin-top:14px;">
-      <button type="button" id="addManifestBtn" onclick="uploadExcel()" disabled>Add to board</button>
+      <button type="button" id="addManifestBtn" onclick="uploadExcel()" disabled data-i18n="add_to_board">Add to board</button>
     </div>
   </div>
 
   <div class="card">
-    <div class="card-label">Attach documents</div>
+    <div class="card-label" data-i18n="attach_documents">Attach documents</div>
     <div style="font-size:12.5px; color:var(--muted); margin-bottom:12px;">
-      Drop Invoice / Delivery Order PDFs here - each one is read and matched to its BL automatically, same as the manifest upload above.
-      The <span class="doc-chip has-file" style="cursor:default;">INV</span> / <span class="doc-chip has-file" style="cursor:default;">DO</span> chips next to a BL number below show what's already attached.
+      <span data-i18n="attach_docs_help">Drop Invoice / Delivery Order PDFs here - each one is read and matched to its BL automatically, same as the manifest upload above.</span>
+      <span class="doc-chip has-file" style="cursor:default;" data-i18n="doc_chip_inv">INV</span> / <span class="doc-chip has-file" style="cursor:default;" data-i18n="doc_chip_do">DO</span>
+      <span data-i18n="attach_docs_help2">chips next to a BL number below show what's already attached.</span>
     </div>
     <label class="dropzone" id="autoMatchDropzone" for="autoMatchFile">
       <div class="dropzone-icon">
@@ -7395,8 +7800,8 @@ PAGE_HTML = """
         </svg>
       </div>
       <div>
-        <div class="dropzone-text"><b>Click to upload</b> or drag &amp; drop Invoice/DO PDFs</div>
-        <div class="dropzone-sub">Drop as many at once as you like - each is matched to its BL automatically</div>
+        <div class="dropzone-text"><b data-i18n="click_to_upload">Click to upload</b> <span data-i18n="or_drag_drop_docs">or drag &amp; drop Invoice/DO PDFs</span></div>
+        <div class="dropzone-sub" data-i18n="auto_match_dropzone_sub">Drop as many at once as you like - each is matched to its BL automatically</div>
       </div>
       <input type="file" id="autoMatchFile" accept=".pdf" multiple style="display:none" onchange="handleAutoMatchFiles(this.files)">
     </label>
@@ -7408,16 +7813,16 @@ PAGE_HTML = """
 
   <div class="card">
     <div class="row" style="margin-bottom:14px; flex-wrap:wrap;">
-      <input type="text" id="searchBox" placeholder="Search BL number..." oninput="render()" style="flex:1; min-width:180px;">
+      <input type="text" id="searchBox" placeholder="Search BL number..." data-i18n-ph="search_bl_placeholder" oninput="render()" style="flex:1; min-width:180px;">
       <div class="glass-select-wrap" style="width:auto; min-width:200px;">
-        <select id="jumpSelect" class="nice-select" onchange="jumpToVessel(this.value)"><option value="">Select a vessel to view</option></select>
+        <select id="jumpSelect" class="nice-select" onchange="jumpToVessel(this.value)"><option value="" data-i18n="select_vessel_to_view">Select a vessel to view</option></select>
       </div>
       {% if role == 'admin' %}
       <div class="glass-select-wrap" style="width:auto; min-width:140px;">
-        <select id="operatorFilter" class="nice-select" onchange="render()"><option value="">All operators</option></select>
+        <select id="operatorFilter" class="nice-select" onchange="render()"><option value="" data-i18n="all_operators">All operators</option></select>
       </div>
       {% endif %}
-      <button type="button" class="btn-neutral" onclick="setAllGroupsCollapsed(true)">Collapse all</button>
+      <button type="button" class="btn-neutral" data-i18n="collapse_all" onclick="setAllGroupsCollapsed(true)">Collapse all</button>
     </div>
     <div id="portTabs"></div>
     <div id="groups"></div>
@@ -7425,14 +7830,14 @@ PAGE_HTML = """
 
   <div class="card" id="archivedCard" style="display:none;">
     <div class="row" style="margin-bottom:14px; cursor:pointer;" onclick="archivedSectionOpen = !archivedSectionOpen; render();">
-      <b style="flex:1;">Archived vessels</b>
+      <b style="flex:1;" data-i18n="archived_vessels">Archived vessels</b>
       <span class="group-count" id="archivedCount"></span>
     </div>
     <div id="archivedGroups"></div>
   </div>
 
   <div id="toastHost"></div>
-  <button type="button" id="scrollTopBtn" class="scroll-top-btn" title="Back to Discharge Port / Vessel" onclick="scrollToManifestForm()">
+  <button type="button" id="scrollTopBtn" class="scroll-top-btn" title="Back to Discharge Port / Vessel" data-i18n-title="scroll_top_title" onclick="scrollToManifestForm()">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
   </button>
   <div id="historyOverlay" class="history-overlay" style="display:none;" onclick="if(event.target===this) closeHistory()">
@@ -7448,7 +7853,7 @@ PAGE_HTML = """
   <div id="docsOverlay" class="history-overlay" style="display:none;" onclick="if(event.target===this) closeDocs()">
     <div class="history-modal">
       <div class="history-modal-head">
-        <b id="docsTitle">Documents</b>
+        <b id="docsTitle" data-i18n="documents_title">Documents</b>
         <button type="button" onclick="closeDocs()" style="background:none; color:var(--text); padding:4px 10px;">&times;</button>
       </div>
       <div id="docsBody" class="history-modal-body"></div>
@@ -7456,6 +7861,7 @@ PAGE_HTML = """
   </div>
 
 <script>
+""" + I18N_JS + """
 /* ---------- Theme (light/dark, sun/moon toggle) ---------- */
 (function initTheme() {
   let saved = null;
@@ -7593,12 +7999,12 @@ function stageManifestFile() {
 async function uploadExcel() {
   const fileInput = document.getElementById('manifestFile');
   const file = fileInput.files[0];
-  if (!file) { showToast('Choose a manifest file first.'); return; }
+  if (!file) { showToast(t('choose_manifest_first')); return; }
 
   const btn = document.getElementById('addManifestBtn');
   btn.disabled = true;
   const originalLabel = btn.textContent;
-  btn.textContent = 'Adding...';
+  btn.textContent = t('adding_ellipsis');
 
   const port = document.getElementById('portField').value.trim().toUpperCase();
   const vessel = document.getElementById('vesselField').value.trim().toUpperCase();
@@ -7624,7 +8030,7 @@ async function uploadExcel() {
   btn.textContent = originalLabel;
 
   await fetchRecords();
-  showToast(data.added + ' new BL record(s) added' + (data.skipped ? `, ${data.skipped} already on the board (skipped)` : '') + '.');
+  showToast(t('bl_records_added', {added: data.added}) + (data.skipped ? t('already_on_board_skipped', {skipped: data.skipped}) : '') + '.');
 
   // A BL that's already on the board under a DIFFERENT vessel than the one
   // just uploaded is worth a second look - either this file re-lists a BL
@@ -7633,10 +8039,10 @@ async function uploadExcel() {
   // repeat-upload duplicate would hide it.
   if (data.duplicate_elsewhere && data.duplicate_elsewhere.length) {
     const lines = data.duplicate_elsewhere.slice(0, 5).map(d =>
-      `${d.bl_number} (already under ${d.existing_vessel || 'Unassigned'} / ${d.existing_port || 'Unassigned'})`
+      t('already_under', {bl: d.bl_number, vessel: d.existing_vessel || t('unassigned_vessel_ph'), port: d.existing_port || t('unassigned_port_ph')})
     ).join('; ');
-    const more = data.duplicate_elsewhere.length > 5 ? ` and ${data.duplicate_elsewhere.length - 5} more` : '';
-    showToast(`Heads up - ${data.duplicate_elsewhere.length} BL(s) already exist under a different vessel: ${lines}${more}.`, {duration: 9000});
+    const more = data.duplicate_elsewhere.length > 5 ? t('and_n_more', {n: data.duplicate_elsewhere.length - 5}) : '';
+    showToast(t('heads_up_duplicate', {n: data.duplicate_elsewhere.length, lines, more}), {duration: 9000});
   }
 }
 
@@ -7692,7 +8098,7 @@ function updateCompleteBadge(bl) {
   if (complete && !badge) {
     badge = document.createElement('span');
     badge.className = 'badge-complete';
-    badge.innerHTML = '&check; Complete';
+    badge.innerHTML = '&check; ' + t('complete_badge');
     chips.appendChild(badge);
   } else if (!complete && badge) {
     badge.remove();
@@ -7747,7 +8153,7 @@ function toggle(bl, field, value) {
     fetch(`/api/records/${encodeURIComponent(bl)}/toggle`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({field, value})
-    }).then(() => fetchRecords()).catch(() => { showToast('Could not save that change - retrying...'); fetchRecords(); });
+    }).then(() => fetchRecords()).catch(() => { showToast(t('could_not_save_retry')); fetchRecords(); });
   }, 350);
 }
 
@@ -7766,39 +8172,42 @@ function onRemarksInput(bl, value) {
 }
 
 /* ---------- Per-BL history ---------- */
-const AUDIT_ACTION_LABELS = {
-  added: 'Added to board', deleted: 'Removed', restored: 'Restored',
-  toggle: 'status changed', remarks: 'Remarks edited',
-};
+function auditActionLabel(action) {
+  return {
+    added: t('action_added'), deleted: t('action_deleted'), restored: t('action_restored'),
+    toggle: t('action_toggle'), remarks: t('action_remarks'),
+  }[action] || action;
+}
 
 function historyFieldLabel(field) {
-  return {invoice_issued: 'Invoice Issued', approval_received: 'Approval Received', do_issued: 'DO Issued', remarks: 'Remarks'}[field] || field;
+  return {invoice_issued: t('th_invoice_issued'), approval_received: t('th_approval_received'), do_issued: t('th_do_issued'), remarks: t('th_remarks')}[field] || field;
 }
 
 async function showHistory(bl) {
   const overlay = document.getElementById('historyOverlay');
   const body = document.getElementById('historyBody');
-  document.getElementById('historyTitle').textContent = 'History - ' + bl;
-  body.innerHTML = '<div style="color:var(--muted); padding:10px 0;">Loading...</div>';
+  document.getElementById('historyTitle').textContent = t('history_for', {bl});
+  body.innerHTML = `<div style="color:var(--muted); padding:10px 0;">${t('loading')}</div>`;
   overlay.style.display = 'flex';
 
   const res = await fetch(`/api/records/${encodeURIComponent(bl)}/history`);
-  if (!res.ok) { body.innerHTML = '<div style="color:var(--muted); padding:10px 0;">Could not load history.</div>'; return; }
+  if (!res.ok) { body.innerHTML = `<div style="color:var(--muted); padding:10px 0;">${t('could_not_load_history')}</div>`; return; }
   const entries = await res.json();
   if (!entries.length) {
-    body.innerHTML = '<div style="color:var(--muted); padding:10px 0;">No history recorded yet.</div>';
+    body.innerHTML = `<div style="color:var(--muted); padding:10px 0;">${t('no_history_yet')}</div>`;
     return;
   }
   body.innerHTML = entries.map(e => {
     let line;
+    const byUser = e.by_user || t('unknown_user');
     if (e.action === 'toggle') {
-      line = `<b>${e.by_user || 'Unknown'}</b> set ${historyFieldLabel(e.field)} to ${e.new_value ? 'Yes' : 'No'}`;
+      line = `<b>${byUser}</b> ${t('history_set_field', {field: historyFieldLabel(e.field), value: e.new_value ? t('yes') : t('no')})}`;
     } else if (e.action === 'remarks') {
-      line = `<b>${e.by_user || 'Unknown'}</b> edited remarks${e.new_value ? ': "' + e.new_value + '"' : ' (cleared)'}`;
+      line = `<b>${byUser}</b> ${e.new_value ? t('history_edited_remarks', {value: e.new_value}) : t('history_cleared_remarks')}`;
     } else if (e.action === 'added') {
-      line = `<b>${e.by_user || 'Unknown'}</b> added this BL${e.new_value ? ' (' + e.new_value + ')' : ''}`;
+      line = `<b>${byUser}</b> ${e.new_value ? t('history_added_this_bl', {value: e.new_value}) : t('history_added_bl_plain')}`;
     } else {
-      line = `<b>${e.by_user || 'Unknown'}</b> ${AUDIT_ACTION_LABELS[e.action] || e.action}`;
+      line = `<b>${byUser}</b> ${auditActionLabel(e.action)}`;
     }
     return `<div class="history-row"><div>${line}</div><div class="when">${formatLocalTime(e.at)}</div></div>`;
   }).join('');
@@ -7818,35 +8227,36 @@ function closeHistory() {
    replace/remove still are - but note this only helps someone who can
    already see the row: the board itself (and search) stays scoped to each
    staff member's own BLs. */
-const DOC_KINDS = [['invoice', 'Invoice'], ['do', 'Delivery Order']];
+const DOC_KINDS = ['invoice', 'do'];
 
 function docChip(bl, kind, hasFile) {
-  const label = kind === 'invoice' ? 'INV' : 'DO';
-  const full = kind === 'invoice' ? 'Invoice' : 'Delivery Order';
-  const title = hasFile ? `${full} attached - click to view` : `${full} not attached yet - click to upload`;
+  const label = kind === 'invoice' ? t('doc_chip_inv') : t('doc_chip_do');
+  const full = kind === 'invoice' ? t('doc_invoice') : t('doc_delivery_order');
+  const title = hasFile ? t('attached_tooltip', {full}) : t('not_attached_tooltip', {full});
   return `<span class="doc-chip ${hasFile ? 'has-file' : 'no-file'}" title="${title}"
             onclick="event.stopPropagation(); showDocs('${bl}')">${label}</span>`;
 }
 
 function renderDocsSections(data, canManage) {
   const atts = data.attachments || {};
-  return DOC_KINDS.map(([kind, label]) => {
+  return DOC_KINDS.map(kind => {
+    const label = kind === 'invoice' ? t('doc_invoice') : t('doc_delivery_order');
     const att = atts[kind];
     let status, actions;
     if (att) {
-      status = `Attached: <b>${att.filename || (kind + '.pdf')}</b><br>by ${att.uploaded_by || 'Unknown'} - ${formatLocalTime(att.uploaded_at)}`;
+      status = `${t('attached_label', {filename: ''})}<b>${att.filename || (kind + '.pdf')}</b><br>${t('by_at', {user: att.uploaded_by || t('unknown_user'), time: formatLocalTime(att.uploaded_at)})}`;
       actions = `
         <a href="/api/records/${encodeURIComponent(data.bl_number)}/attachment/${kind}" target="_blank" rel="noopener">
-          <button type="button">Download</button>
+          <button type="button">${t('download')}</button>
         </a>
         ${canManage ? `
-          <label class="btn-upload">Replace<input type="file" accept=".pdf,application/pdf" onchange="uploadAttachment('${data.bl_number}', '${kind}', this)"></label>
-          <button type="button" class="btn-danger" onclick="removeAttachment('${data.bl_number}', '${kind}')">Remove</button>
+          <label class="btn-upload">${t('replace')}<input type="file" accept=".pdf,application/pdf" onchange="uploadAttachment('${data.bl_number}', '${kind}', this)"></label>
+          <button type="button" class="btn-danger" onclick="removeAttachment('${data.bl_number}', '${kind}')">${t('remove')}</button>
         ` : ''}`;
     } else {
-      status = canManage ? 'Not attached yet.' : 'Not attached yet - waiting on the issuing staff member.';
+      status = canManage ? t('not_attached_yet') : t('not_attached_waiting');
       actions = canManage ? `
-        <label class="btn-upload">Upload PDF<input type="file" accept=".pdf,application/pdf" onchange="uploadAttachment('${data.bl_number}', '${kind}', this)"></label>
+        <label class="btn-upload">${t('upload_pdf')}<input type="file" accept=".pdf,application/pdf" onchange="uploadAttachment('${data.bl_number}', '${kind}', this)"></label>
       ` : '';
     }
     return `
@@ -7861,14 +8271,14 @@ function renderDocsSections(data, canManage) {
 async function showDocs(bl) {
   const overlay = document.getElementById('docsOverlay');
   const body = document.getElementById('docsBody');
-  document.getElementById('docsTitle').textContent = 'Documents - ' + bl;
-  body.innerHTML = '<div style="color:var(--muted); padding:10px 0;">Loading...</div>';
+  document.getElementById('docsTitle').textContent = t('documents_for', {bl});
+  body.innerHTML = `<div style="color:var(--muted); padding:10px 0;">${t('loading')}</div>`;
   overlay.style.display = 'flex';
   overlay.dataset.bl = bl;
 
   const res = await fetch(`/api/records/${encodeURIComponent(bl)}/lookup`);
   const data = await res.json();
-  if (!res.ok) { body.innerHTML = `<div style="color:var(--muted); padding:10px 0;">${data.error || 'Could not load this BL.'}</div>`; return; }
+  if (!res.ok) { body.innerHTML = `<div style="color:var(--muted); padding:10px 0;">${data.error || t('could_not_load_bl')}</div>`; return; }
   const canManage = IS_ADMIN || data.created_by === CURRENT_USER;
   body.innerHTML = renderDocsSections(data, canManage);
 }
@@ -7891,16 +8301,16 @@ async function submitAttachmentFile(bl, kind, file) {
 async function uploadAttachment(bl, kind, input) {
   const file = input.files && input.files[0];
   if (!file) return;
-  if (!file.name.toLowerCase().endsWith('.pdf')) { showToast('Only PDF files are accepted.'); input.value = ''; return; }
-  if (file.size > 10 * 1024 * 1024) { showToast('That file is larger than 10MB.'); input.value = ''; return; }
+  if (!file.name.toLowerCase().endsWith('.pdf')) { showToast(t('only_pdf_accepted')); input.value = ''; return; }
+  if (file.size > 10 * 1024 * 1024) { showToast(t('file_too_large')); input.value = ''; return; }
 
   const {ok, data} = await submitAttachmentFile(bl, kind, file);
-  if (!ok) { showToast(data.error || 'Upload failed.'); return; }
-  const label = kind === 'invoice' ? 'Invoice' : 'Delivery Order';
+  if (!ok) { showToast(data.error || t('upload_failed')); return; }
+  const label = kind === 'invoice' ? t('doc_invoice') : t('doc_delivery_order');
   // Attaching the file auto-flips the matching Issued slider server-side
   // (see upload_attachment) - say so, so it's obvious the status change
   // wasn't a separate click someone forgot to make.
-  showToast(data.auto_issued_field ? `${label} uploaded - marked as issued.` : `${label} uploaded.`);
+  showToast(data.auto_issued_field ? t('uploaded_marked_issued', {label}) : t('uploaded', {label}));
   await fetchRecords();
   if (document.getElementById('docsOverlay').style.display !== 'none') await showDocs(bl);
 }
@@ -7925,19 +8335,19 @@ autoMatchDropzone.addEventListener('drop', e => {
 });
 
 function autoMatchKindLabel(kind) {
-  return kind === 'invoice' ? 'Invoice' : kind === 'do' ? 'Delivery Order' : 'Unrecognized document';
+  return kind === 'invoice' ? t('doc_invoice') : kind === 'do' ? t('doc_delivery_order') : t('unrecognized_document');
 }
 
 async function handleAutoMatchFiles(fileList) {
   const files = Array.from(fileList || []).filter(f => f.name.toLowerCase().endsWith('.pdf'));
-  if (!files.length) { showToast('Drop PDF files only.'); return; }
+  if (!files.length) { showToast(t('drop_pdf_only')); return; }
 
   const listEl = document.getElementById('autoMatchList');
   const summaryEl = document.getElementById('autoMatchSummary');
   let attached = 0, needsReview = 0;
   const updateSummary = () => {
-    summaryEl.textContent = `${attached} attached automatically` + (needsReview ? `, ${needsReview} need your input` : '') +
-      ((attached + needsReview) < files.length ? ` (processing ${files.length - attached - needsReview} more...)` : '.');
+    summaryEl.textContent = t('attached_automatically', {n: attached}) + (needsReview ? t('need_your_input', {n: needsReview}) : '') +
+      ((attached + needsReview) < files.length ? t('processing_more', {n: files.length - attached - needsReview}) : '.');
   };
   updateSummary();
 
@@ -7947,11 +8357,11 @@ async function handleAutoMatchFiles(fileList) {
     const row = document.createElement('div');
     row.className = 'match-row';
     row.id = rowId;
-    row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">Reading...</div>`;
+    row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">${t('reading_ellipsis')}</div>`;
     listEl.appendChild(row);
 
     if (file.size > 10 * 1024 * 1024) {
-      row.querySelector('.match-status').textContent = 'Too large (over 10MB) - skipped.';
+      row.querySelector('.match-status').textContent = t('too_large_skipped');
       needsReview++; updateSummary();
       continue;
     }
@@ -7962,7 +8372,7 @@ async function handleAutoMatchFiles(fileList) {
       form.append('file', file);
       const res = await fetch('/api/attachments/detect', {method: 'POST', body: form});
       detect = await res.json();
-      if (!res.ok) throw new Error(detect.error || 'Could not read this file.');
+      if (!res.ok) throw new Error(detect.error || t('could_not_read_file'));
     } catch (err) {
       row.className = 'match-row review';
       row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">${err.message}</div>`;
@@ -7974,7 +8384,7 @@ async function handleAutoMatchFiles(fileList) {
       const {ok, data} = await submitAttachmentFile(detect.matched_bl, detect.kind, file);
       if (ok) {
         row.className = 'match-row ok';
-        const issuedNote = data.auto_issued_field ? ' &middot; marked issued' : '';
+        const issuedNote = data.auto_issued_field ? t('marked_issued_suffix') : '';
         row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">&check; ${detect.matched_bl} - ${autoMatchKindLabel(detect.kind)}${issuedNote}</div>`;
         attached++; updateSummary();
         continue;
@@ -8001,37 +8411,37 @@ function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
   const blOptions = records.map(r => r.bl_number).sort();
   const candidates = (detect.candidates && detect.candidates.length) ? detect.candidates : blOptions;
   const statusText = errorMsg ? errorMsg
-    : detect.candidates && detect.candidates.length ? `Matches more than one BL - pick the right one`
-    : !detect.kind ? `Couldn't tell Invoice from Delivery Order`
-    : `No BL on your board matched this document`;
+    : detect.candidates && detect.candidates.length ? t('matches_multiple')
+    : !detect.kind ? t('could_not_tell_kind')
+    : t('no_bl_matched');
 
   row.innerHTML = `
     <div class="match-file" title="${file.name}">${file.name}</div>
     <div class="match-status">${statusText}</div>
     <div class="match-review-controls">
       <select class="review-bl">
-        <option value="">Select BL...</option>
+        <option value="">${t('select_bl_ellipsis')}</option>
         ${candidates.map(bl => `<option value="${bl}" ${bl === detect.matched_bl ? 'selected' : ''}>${bl}</option>`).join('')}
       </select>
       <select class="review-kind">
-        <option value="">Kind...</option>
-        <option value="invoice" ${detect.kind === 'invoice' ? 'selected' : ''}>Invoice</option>
-        <option value="do" ${detect.kind === 'do' ? 'selected' : ''}>Delivery Order</option>
+        <option value="">${t('kind_ellipsis')}</option>
+        <option value="invoice" ${detect.kind === 'invoice' ? 'selected' : ''}>${t('doc_invoice')}</option>
+        <option value="do" ${detect.kind === 'do' ? 'selected' : ''}>${t('doc_delivery_order')}</option>
       </select>
-      <button type="button" class="review-attach-btn">Attach</button>
+      <button type="button" class="review-attach-btn">${t('attach_btn')}</button>
     </div>`;
 
   row.querySelector('.review-attach-btn').onclick = async () => {
     const bl = row.querySelector('.review-bl').value;
     const kind = row.querySelector('.review-kind').value;
-    if (!bl || !kind) { showToast('Pick both a BL number and a document kind.'); return; }
+    if (!bl || !kind) { showToast(t('pick_bl_and_kind')); return; }
     const btn = row.querySelector('.review-attach-btn');
     btn.disabled = true;
-    btn.textContent = 'Attaching...';
+    btn.textContent = t('attaching_ellipsis');
     const {ok, data} = await submitAttachmentFile(bl, kind, file);
-    if (!ok) { showToast(data.error || 'Attach failed.'); btn.disabled = false; btn.textContent = 'Attach'; return; }
+    if (!ok) { showToast(data.error || t('attach_failed')); btn.disabled = false; btn.textContent = t('attach_btn'); return; }
     row.className = 'match-row ok';
-    const issuedNote = data.auto_issued_field ? ' &middot; marked issued' : '';
+    const issuedNote = data.auto_issued_field ? t('marked_issued_suffix') : '';
     row.innerHTML = `<div class="match-file" title="${file.name}">${file.name}</div><div class="match-status">&check; ${bl} - ${autoMatchKindLabel(kind)}${issuedNote}</div>`;
     await fetchRecords();
   };
@@ -8039,8 +8449,8 @@ function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
 
 async function removeAttachment(bl, kind) {
   const res = await fetch(`/api/records/${encodeURIComponent(bl)}/attachment/${kind}`, {method: 'DELETE'});
-  if (!res.ok) { showToast('Could not remove the file.'); return; }
-  showToast(`${kind === 'invoice' ? 'Invoice' : 'Delivery Order'} removed.`);
+  if (!res.ok) { showToast(t('could_not_remove_file')); return; }
+  showToast(t('doc_removed', {kind: kind === 'invoice' ? t('doc_invoice') : t('doc_delivery_order')}));
   await fetchRecords();
   if (document.getElementById('docsOverlay').style.display !== 'none') await showDocs(bl);
 }
@@ -8054,8 +8464,8 @@ function deleteRecord(bl) {
   suppressPollUntil = Date.now() + 4000;
   fetch(`/api/records/${encodeURIComponent(bl)}`, {method: 'DELETE'});
 
-  showToast('Removed BL ' + bl + '.', {
-    actionLabel: 'Undo',
+  showToast(t('removed_bl', {bl}), {
+    actionLabel: t('undo'),
     duration: 3000,
     onAction: async () => {
       await fetch('/api/records/restore', {
@@ -8063,7 +8473,7 @@ function deleteRecord(bl) {
         body: JSON.stringify(removed)
       });
       await fetchRecords();
-      showToast('Restored BL ' + bl + '.');
+      showToast(t('restored_bl', {bl}));
     }
   });
 }
@@ -8073,9 +8483,10 @@ function deleteRecord(bl) {
    operating on a whole list of records at once via the bulk API so a
    500-BL manifest doesn't fire 500 individual requests. */
 function confirmBulkRemove(label, list) {
-  if (!list.length) { showToast('Nothing to remove.'); return; }
-  showToast(`Remove all ${list.length} BL${list.length === 1 ? '' : 's'}${label ? ' in ' + label : ''}?`, {
-    actionLabel: 'Confirm',
+  if (!list.length) { showToast(t('nothing_to_remove')); return; }
+  const n = list.length;
+  showToast(t('confirm_remove_all', {n, p: n === 1 ? '' : 's', inLabel: label ? t('in_label', {label}) : ''}), {
+    actionLabel: t('confirm'),
     duration: 6000,
     onAction: () => doBulkRemove(list)
   });
@@ -8096,8 +8507,8 @@ async function doBulkRemove(list) {
   const data = await res.json();
   const deleted = (data.deleted && data.deleted.length) ? data.deleted : snapshot;
 
-  showToast(`${deleted.length} BL${deleted.length === 1 ? '' : 's'} removed.`, {
-    actionLabel: 'Undo',
+  showToast(t('bls_removed', {n: deleted.length, p: deleted.length === 1 ? '' : 's'}), {
+    actionLabel: t('undo'),
     duration: 5000,
     onAction: async () => {
       await fetch('/api/records/bulk-restore', {
@@ -8105,7 +8516,7 @@ async function doBulkRemove(list) {
         body: JSON.stringify({records: deleted})
       });
       await fetchRecords();
-      showToast('Restored.');
+      showToast(t('restored'));
     }
   });
   await fetchRecords();
@@ -8160,9 +8571,9 @@ function summaryHtml() {
   const remaining = total - complete;
 
   return `
-    <div class="stat"><div class="stat-icon">${icons.total}</div><div><b>${total}</b>Total BLs</div></div>
-    <div class="stat ${remaining ? 'gold' : 'done'}"><div class="stat-icon">${icons.check}</div><div><b>${remaining}</b>Remaining</div></div>
-    <div class="stat done"><div class="stat-icon">${icons.check}</div><div><b>${complete}</b>Fully Complete</div></div>
+    <div class="stat"><div class="stat-icon">${icons.total}</div><div><b>${total}</b>${t('total_bls')}</div></div>
+    <div class="stat ${remaining ? 'gold' : 'done'}"><div class="stat-icon">${icons.check}</div><div><b>${remaining}</b>${t('remaining')}</div></div>
+    <div class="stat done"><div class="stat-icon">${icons.check}</div><div><b>${complete}</b>${t('fully_complete')}</div></div>
   `;
 }
 
@@ -8183,18 +8594,18 @@ function rowsHtml(list) {
           <div class="bl-cell-chips">
             ${docChip(r.bl_number, 'invoice', r.has_invoice_file)}
             ${docChip(r.bl_number, 'do', r.has_do_file)}
-            ${complete ? '<span class="badge-complete">&check; Complete</span>' : ''}
+            ${complete ? `<span class="badge-complete">&check; ${t('complete_badge')}</span>` : ''}
           </div>
         </div>
       </td>
-      <td data-label="Invoice Issued">${checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at)}</td>
-      <td data-label="Approval Received">${checkbox(r.bl_number, 'approval_received', !!r.approval_received, r.approval_by, r.approval_at)}</td>
-      <td data-label="DO Issued">${checkbox(r.bl_number, 'do_issued', !!r.do_issued, r.do_by, r.do_at)}</td>
-      <td data-label="Remarks"><input class="remarks-input" type="text" value="${(r.remarks || '').replace(/"/g,'&quot;')}"
+      <td data-label="${t('th_invoice_issued')}">${checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at)}</td>
+      <td data-label="${t('th_approval_received')}">${checkbox(r.bl_number, 'approval_received', !!r.approval_received, r.approval_by, r.approval_at)}</td>
+      <td data-label="${t('th_do_issued')}">${checkbox(r.bl_number, 'do_issued', !!r.do_issued, r.do_by, r.do_at)}</td>
+      <td data-label="${t('th_remarks')}"><input class="remarks-input" type="text" value="${(r.remarks || '').replace(/"/g,'&quot;')}"
             oninput="onRemarksInput('${r.bl_number}', this.value)"
-            onfocus="markEditing(1)" onblur="markEditing(-1)" placeholder="notes..."></td>
-      <td>{% if role == 'admin' %}<button type="button" class="hist-btn" title="History" onclick="showHistory('${r.bl_number}')">History</button>{% endif %}</td>
-      <td><button class="del" onclick="deleteRecord('${r.bl_number}')">Remove</button></td>
+            onfocus="markEditing(1)" onblur="markEditing(-1)" placeholder="${t('notes_placeholder')}"></td>
+      <td>{% if role == 'admin' %}<button type="button" class="hist-btn" title="${t('history')}" onclick="showHistory('${r.bl_number}')">${t('history')}</button>{% endif %}</td>
+      <td><button class="del" onclick="deleteRecord('${r.bl_number}')">${t('remove')}</button></td>
     </tr>`;
   }).join('');
 }
@@ -8209,7 +8620,7 @@ function updateBulkBars() {
     const scope = (bar.dataset.bls || '').split('|').filter(Boolean);
     const count = scope.filter(bl => selectedBLs.has(bl)).length;
     const label = bar.querySelector('.bulk-count');
-    if (label) label.textContent = count ? `${count} selected` : '';
+    if (label) label.textContent = count ? t('selected_count', {n: count}) : '';
     bar.classList.toggle('active', count > 0);
   });
   // Keep each vessel group's "select all" header checkbox in sync with the
@@ -8231,7 +8642,7 @@ async function bulkSetField(vesselKey, field, value) {
   const listEl = document.querySelector(`[data-bar-key="${CSS.escape(vesselKey)}"]`);
   const scope = listEl ? (listEl.dataset.bls || '').split('|').filter(Boolean) : [];
   const blNumbers = scope.filter(bl => selectedBLs.has(bl));
-  if (!blNumbers.length) { showToast('Select at least one BL first.'); return; }
+  if (!blNumbers.length) { showToast(t('select_at_least_one')); return; }
 
   blNumbers.forEach(bl => {
     const rec = records.find(r => r.bl_number === bl);
@@ -8250,7 +8661,7 @@ async function bulkSetField(vesselKey, field, value) {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({bl_numbers: blNumbers, field, value})
   });
-  showToast(`${blNumbers.length} BL(s) updated.`);
+  showToast(t('bls_updated', {n: blNumbers.length}));
   await fetchRecords();
 }
 
@@ -8262,7 +8673,7 @@ function bulkRemoveSelected(vesselKey) {
   const listEl = document.querySelector(`[data-bar-key="${CSS.escape(vesselKey)}"]`);
   const scope = listEl ? (listEl.dataset.bls || '').split('|').filter(Boolean) : [];
   const blNumbers = scope.filter(bl => selectedBLs.has(bl));
-  if (!blNumbers.length) { showToast('Select at least one BL first.'); return; }
+  if (!blNumbers.length) { showToast(t('select_at_least_one')); return; }
   const list = blNumbers.map(bl => records.find(r => r.bl_number === bl)).filter(Boolean);
   confirmBulkRemove(null, list);
 }
@@ -8274,18 +8685,18 @@ function bulkBarHtml(vesselKey, list) {
     <div class="bulk-bar" data-bar-key="${key}" data-bls="${blsAttr}">
       <span class="bulk-count"></span>
       <span class="bulk-group">
-        <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'invoice_issued', true)">Mark Invoice Issued</button>
-        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'invoice_issued', false)">Unmark</button>
+        <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'invoice_issued', true)">${t('mark_invoice_issued')}</button>
+        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'invoice_issued', false)">${t('unmark')}</button>
       </span>
       <span class="bulk-group">
-        <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'approval_received', true)">Mark Approval Received</button>
-        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'approval_received', false)">Unmark</button>
+        <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'approval_received', true)">${t('mark_approval_received')}</button>
+        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'approval_received', false)">${t('unmark')}</button>
       </span>
       <span class="bulk-group">
-        <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'do_issued', true)">Mark DO Issued</button>
-        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'do_issued', false)">Unmark</button>
+        <button type="button" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'do_issued', true)">${t('mark_do_issued')}</button>
+        <button type="button" class="bulk-unmark-btn" onclick="bulkSetField('${vesselKey.replace(/'/g,"\\'")}', 'do_issued', false)">${t('unmark')}</button>
       </span>
-      <button type="button" class="bulk-remove-btn" onclick="bulkRemoveSelected('${vesselKey.replace(/'/g,"\\'")}')">Remove</button>
+      <button type="button" class="bulk-remove-btn" onclick="bulkRemoveSelected('${vesselKey.replace(/'/g,"\\'")}')">${t('remove')}</button>
     </div>`;
 }
 
@@ -8297,12 +8708,12 @@ function tableHtml(list, vesselKey) {
       <table>
         <thead>
           <tr>
-            <th class="select-col"><input type="checkbox" class="select-all-vessel" data-bar-key="${key}" title="Select/deselect all in this vessel" onchange="list_selectAllVessel('${vesselKey.replace(/'/g,"\\'")}', this.checked)"></th>
-            <th>BL Number</th>
-            <th>Invoice Issued</th>
-            <th>Approval Received</th>
-            <th>DO Issued</th>
-            <th>Remarks</th>
+            <th class="select-col"><input type="checkbox" class="select-all-vessel" data-bar-key="${key}" title="${t('select_deselect_vessel_title')}" onchange="list_selectAllVessel('${vesselKey.replace(/'/g,"\\'")}', this.checked)"></th>
+            <th>${t('th_bl_number')}</th>
+            <th>${t('th_invoice_issued')}</th>
+            <th>${t('th_approval_received')}</th>
+            <th>${t('th_do_issued')}</th>
+            <th>${t('th_remarks')}</th>
             <th></th>
             <th></th>
           </tr>
@@ -8373,20 +8784,20 @@ function vesselGroupHtml(portName, vesselName, list, archivedView) {
     <div class="vessel-group" id="group_${cssEscape(vesselKey)}">
       <div class="vessel-header ${vesselCollapsed ? 'collapsed' : ''}" onclick="if(event.target.tagName!=='INPUT' && event.target.tagName!=='BUTTON' && event.target.tagName!=='A') toggleGroup('${collapseKey.replace(/'/g,"\\'")}')">
         ${CHEVRON}
-        <input class="group-name" value="${vesselName === 'Unassigned' ? '' : vesselName}" placeholder="Unassigned vessel"
+        <input class="group-name" value="${vesselName === 'Unassigned' ? '' : vesselName}" placeholder="${t('unassigned_vessel_ph')}"
           onclick="event.stopPropagation()"
           onchange="renameGroup('vessel', '${pEsc}', '${vEsc}', this.value, 'Unassigned')">
         ${archivedView ? '' : `<span class="eta-wrap" onclick="event.stopPropagation()">
-          <span class="eta-label">ETA</span>
-          <input type="date" class="eta-input${eta ? '' : ' eta-unset'}" value="${eta}" title="Expected arrival"
+          <span class="eta-label">${t('eta_label')}</span>
+          <input type="date" class="eta-input${eta ? '' : ' eta-unset'}" value="${eta}" title="${t('expected_arrival_title')}"
             onchange="this.classList.toggle('eta-unset', !this.value); setVesselEta(JSON.parse(this.dataset.bls), this.value)" data-bls='${blsJson}'>
-          ${eta ? '' : '<span class="eta-unset-hint">Not set</span>'}
+          ${eta ? '' : `<span class="eta-unset-hint">${t('not_set')}</span>`}
         </span>`}
-        <span class="group-count">${sortedList.length} BL${sortedList.length === 1 ? '' : 's'}${left ? ` &middot; ${left} left` : ' &middot; done'}</span>
-        <span class="vessel-progress ${pct >= 100 ? 'done' : ''}" title="${pct}% complete"><span class="vessel-progress-fill" style="width:${pct}%"></span></span>
-        <a onclick="event.stopPropagation()" href="/api/export?port=${encodeURIComponent(rawPort)}&vessel=${encodeURIComponent(rawVessel)}" class="group-export" title="Export this vessel to Excel">Export</a>
-        <button type="button" class="group-neutral" onclick='event.stopPropagation(); setVesselArchived(${blsJson}, ${archivedView ? 'false' : 'true'})'>${archivedView ? 'Unarchive' : 'Archive'}</button>
-        <button type="button" class="group-remove" onclick="event.stopPropagation(); removeVesselGroup('${pEsc}', '${vEsc}')">Remove all</button>
+        <span class="group-count">${t('bl_count', {n: sortedList.length, p: sortedList.length === 1 ? '' : 's'})}${left ? t('left_suffix', {n: left}) : t('done_suffix')}</span>
+        <span class="vessel-progress ${pct >= 100 ? 'done' : ''}" title="${t('pct_complete', {pct})}"><span class="vessel-progress-fill" style="width:${pct}%"></span></span>
+        <a onclick="event.stopPropagation()" href="/api/export?port=${encodeURIComponent(rawPort)}&vessel=${encodeURIComponent(rawVessel)}" class="group-export" title="${t('export_vessel_title')}">${t('export')}</a>
+        <button type="button" class="group-neutral" onclick='event.stopPropagation(); setVesselArchived(${blsJson}, ${archivedView ? 'false' : 'true'})'>${archivedView ? t('unarchive') : t('archive')}</button>
+        <button type="button" class="group-remove" onclick="event.stopPropagation(); removeVesselGroup('${pEsc}', '${vEsc}')">${t('remove_all')}</button>
       </div>
       <div class="vessel-body ${vesselCollapsed ? 'collapsed' : ''}">
         ${tableHtml(sortedList, vesselKey)}
@@ -8422,7 +8833,7 @@ function portGroupHtml(portName, vesselNames, vessels, archivedView, suppressHea
     <div class="port-group">
       <div class="port-header ${portCollapsed ? 'collapsed' : ''}" onclick="if(event.target.tagName!=='INPUT' && event.target.tagName!=='A') toggleGroup('${portKey.replace(/'/g,"\\'")}')">
         ${CHEVRON}
-        <input class="group-name" value="${portName === 'Unassigned' ? '' : portName}" placeholder="Unassigned port"
+        <input class="group-name" value="${portName === 'Unassigned' ? '' : portName}" placeholder="${t('unassigned_port_ph')}"
           onclick="event.stopPropagation()"
           onchange="renameGroup('port', '${pEsc}', '', this.value, 'Unassigned')">
       </div>
@@ -8436,7 +8847,7 @@ function render() {
   if (operatorFilterEl) {
     const operators = [...new Set(records.map(r => r.created_by).filter(Boolean))].sort();
     const current = operatorFilterEl.value;
-    operatorFilterEl.innerHTML = '<option value="">All operators</option>' + operators.map(a => `<option value="${a.replace(/"/g,'&quot;')}">${a}</option>`).join('');
+    operatorFilterEl.innerHTML = `<option value="">${t('all_operators')}</option>` + operators.map(a => `<option value="${a.replace(/"/g,'&quot;')}">${a}</option>`).join('');
     if (operators.includes(current)) operatorFilterEl.value = current;
     syncGlassSelectLabel('operatorFilter');
   }
@@ -8476,9 +8887,9 @@ function render() {
         return `<button type="button" class="port-card" onclick="selectPortTab('${pEsc}')">
           <div class="port-card-icon">${anchorIcon}</div>
           <div class="port-card-name">${label}</div>
-          <div class="port-card-meta">${vesselCount} vessel${vesselCount === 1 ? '' : 's'} &middot; ${blCount} BL${blCount === 1 ? '' : 's'}</div>
+          <div class="port-card-meta">${t('port_card_meta', {vesselCount, vp: vesselCount === 1 ? '' : 's', blCount, bp: blCount === 1 ? '' : 's'})}</div>
           <span class="vessel-progress port-card-progress ${done ? 'done' : ''}"><span class="vessel-progress-fill" style="width:${pct}%"></span></span>
-          <div class="port-card-pct ${done ? 'done' : ''}">${done ? 'All done' : pct + '% complete'}</div>
+          <div class="port-card-pct ${done ? 'done' : ''}">${done ? t('all_done') : t('pct_complete', {pct})}</div>
         </button>`;
       }).join('');
       portTabsEl.innerHTML = `<div class="port-card-grid">${cards}</div>`;
@@ -8487,8 +8898,9 @@ function render() {
       // and replaced by a small breadcrumb/back control + heading above
       // that one port's (unchanged) groups.
       const label = selectedPortTab.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const backArrow = currentLang === 'ar' ? '&rarr;' : '&larr;';
       portTabsEl.innerHTML = `<div class="port-breadcrumb">
-        <button type="button" class="port-back-btn" onclick="selectPortTab('')">&larr; All Ports</button>
+        <button type="button" class="port-back-btn" onclick="selectPortTab('')">${backArrow} ${t('all_ports_back')}</button>
         <h2 class="port-breadcrumb-heading">${label}</h2>
       </div>`;
     }
@@ -8503,7 +8915,7 @@ function render() {
 
   const groupsEl = document.getElementById('groups');
   if (portNames.length === 0) {
-    groupsEl.innerHTML = '<div style="color:var(--muted); padding:24px 4px;">No BLs on the board yet. Upload an Excel manifest above to get started.</div>';
+    groupsEl.innerHTML = `<div style="color:var(--muted); padding:24px 4px;">${t('no_bls_yet')}</div>`;
   } else {
     // Vessel/port jump menu - with 20-25 manifests a month, scrolling down
     // the whole board to find one vessel doesn't scale. Built fresh every
@@ -8511,7 +8923,7 @@ function render() {
     const jumpEl = document.getElementById('jumpSelect');
     if (jumpEl) {
       const current = jumpEl.value;
-      let options = '<option value="">Select a vessel to view</option>';
+      let options = `<option value="">${t('select_vessel_to_view')}</option>`;
       portNames.forEach(portName => {
         const vessels = ports[portName];
         sortedVesselNames(vessels).forEach(vesselName => {
@@ -8536,7 +8948,7 @@ function render() {
       archivedCard.style.display = 'none';
     } else {
       archivedCard.style.display = '';
-      document.getElementById('archivedCount').textContent = archivedList.length + ' BL' + (archivedList.length === 1 ? '' : 's');
+      document.getElementById('archivedCount').textContent = t('bl_count', {n: archivedList.length, p: archivedList.length === 1 ? '' : 's'});
       const archivedGroupsEl = document.getElementById('archivedGroups');
       archivedGroupsEl.style.display = archivedSectionOpen ? '' : 'none';
       if (archivedSectionOpen) {
@@ -8578,7 +8990,7 @@ async function setVesselArchived(blNumbers, archived) {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({bl_numbers: blNumbers, archived})
   });
-  showToast(archived ? 'Vessel archived - find it under "Archived vessels" below.' : 'Vessel restored to the board.');
+  showToast(archived ? t('vessel_archived') : t('vessel_restored'));
   await fetchRecords();
 }
 
@@ -8852,6 +9264,7 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+applyI18n();
 initGlassSelects();
 
 fetchRecords();
