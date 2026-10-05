@@ -24,8 +24,9 @@ import time
 import secrets
 import base64
 import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import ssl
+from email.message import EmailMessage
+from email.utils import formataddr
 from datetime import datetime, date, timedelta
 from functools import wraps
 from urllib.parse import quote as url_quote
@@ -253,6 +254,51 @@ const I18N = {
     vessel_restored: "Vessel restored to the board.",
     undo: "Undo",
     confirm: "Confirm",
+    // Customer sharing (Documents popup)
+    customer_contacts: "Customer contacts",
+    consignee_name: "Consignee",
+    consignee_email: "Consignee email",
+    consignee_phone: "Consignee phone",
+    broker_email: "Customs broker email",
+    broker_phone: "Customs broker phone",
+    save_contacts: "Save contacts",
+    contacts_saved: "Contacts saved.",
+    no_contacts: "No contact details yet.",
+    share_with_customer: "Tracking link",
+    share_help: "A private page where the customer can check this BL's status - no login, status only.",
+    create_link: "Create tracking link",
+    copy_link: "Copy link",
+    link_copied: "Tracking link copied.",
+    show_qr: "QR code",
+    download_qr: "Download QR (PNG)",
+    new_link: "New link",
+    new_link_title: "Replace this link - the old one stops working",
+    confirm_new_link: "Replace the tracking link? The old link will stop working.",
+    link_replaced: "New link created - the old link no longer works.",
+    notify_customer: "Notify customer",
+    email_do_to: "Email the DO to:",
+    recipient_consignee: "Consignee",
+    recipient_broker: "Broker",
+    send_do_email: "Email the DO",
+    sending_ellipsis: "Sending...",
+    do_emailed: "DO emailed to {to}.",
+    attach_do_first: "Attach the Delivery Order PDF to email it.",
+    email_not_setup: "Email isn't set up yet - an admin needs to add the company mailbox.",
+    whatsapp_consignee: "WhatsApp consignee",
+    whatsapp_broker: "WhatsApp broker",
+    whatsapp_help: "Opens WhatsApp with the message and tracking link ready - you press Send.",
+    err_bad_email: "That doesn't look like an email address.",
+    err_bad_phone: "That doesn't look like a phone number.",
+    err_no_recipient: "Tick at least one recipient that has an email address.",
+    err_no_do: "Attach the Delivery Order PDF to email it.",
+    err_email_not_configured: "Email isn't set up yet - an admin needs to add the company mailbox.",
+    err_send_failed: "The email could not be sent. Check the mailbox settings and try again.",
+    err_no_phone: "No phone number saved for that contact.",
+    contacts_found: " · contact details found for {n}",
+    action_contacts: "updated the contact details",
+    action_link_reset: "replaced the tracking link",
+    history_notified_email: "emailed the DO to {value}",
+    history_notified_whatsapp: "opened WhatsApp to {value}",
   },
   ar: {
     app_tagline: "متتبع أوامر التسليم",
@@ -407,6 +453,50 @@ const I18N = {
     vessel_restored: "تمت استعادة السفينة إلى اللوحة.",
     undo: "تراجع",
     confirm: "تأكيد",
+    customer_contacts: "جهات اتصال العميل",
+    consignee_name: "المرسل إليه",
+    consignee_email: "بريد المرسل إليه",
+    consignee_phone: "هاتف المرسل إليه",
+    broker_email: "بريد المخلص الجمركي",
+    broker_phone: "هاتف المخلص الجمركي",
+    save_contacts: "حفظ جهات الاتصال",
+    contacts_saved: "تم حفظ جهات الاتصال.",
+    no_contacts: "لا توجد بيانات اتصال بعد.",
+    share_with_customer: "رابط التتبع",
+    share_help: "صفحة خاصة يتابع منها العميل حالة هذه البوليصة دون تسجيل دخول - تعرض الحالة فقط.",
+    create_link: "إنشاء رابط التتبع",
+    copy_link: "نسخ الرابط",
+    link_copied: "تم نسخ رابط التتبع.",
+    show_qr: "رمز QR",
+    download_qr: "تنزيل رمز QR (PNG)",
+    new_link: "رابط جديد",
+    new_link_title: "استبدال الرابط - سيتوقف الرابط القديم عن العمل",
+    confirm_new_link: "استبدال رابط التتبع؟ سيتوقف الرابط القديم عن العمل.",
+    link_replaced: "تم إنشاء رابط جديد - الرابط القديم لم يعد يعمل.",
+    notify_customer: "إشعار العميل",
+    email_do_to: "إرسال أمر التسليم بالبريد إلى:",
+    recipient_consignee: "المرسل إليه",
+    recipient_broker: "المخلص الجمركي",
+    send_do_email: "إرسال أمر التسليم",
+    sending_ellipsis: "جارٍ الإرسال...",
+    do_emailed: "تم إرسال أمر التسليم إلى {to}.",
+    attach_do_first: "أرفق ملف أمر التسليم (PDF) لإرساله بالبريد.",
+    email_not_setup: "لم يتم إعداد البريد بعد - يلزم أن يضيف المسؤول بريد الشركة.",
+    whatsapp_consignee: "واتساب المرسل إليه",
+    whatsapp_broker: "واتساب المخلص",
+    whatsapp_help: "يفتح واتساب مع الرسالة ورابط التتبع جاهزين - اضغط إرسال.",
+    err_bad_email: "صيغة البريد الإلكتروني غير صحيحة.",
+    err_bad_phone: "صيغة رقم الهاتف غير صحيحة.",
+    err_no_recipient: "اختر مستلمًا واحدًا على الأقل لديه بريد إلكتروني.",
+    err_no_do: "أرفق ملف أمر التسليم (PDF) لإرساله بالبريد.",
+    err_email_not_configured: "لم يتم إعداد البريد بعد - يلزم أن يضيف المسؤول بريد الشركة.",
+    err_send_failed: "تعذر إرسال البريد. تحقق من إعدادات البريد وحاول مرة أخرى.",
+    err_no_phone: "لا يوجد رقم هاتف محفوظ لجهة الاتصال هذه.",
+    contacts_found: " · تم العثور على بيانات اتصال لـ {n}",
+    action_contacts: "حدّث بيانات الاتصال",
+    action_link_reset: "استبدل رابط التتبع",
+    history_notified_email: "أرسل أمر التسليم بالبريد إلى {value}",
+    history_notified_whatsapp: "فتح واتساب إلى {value}",
   },
 };
 
@@ -580,6 +670,16 @@ def init_db():
     # main board (manually, from the UI) without deleting its data - it's
     # still searchable/exportable, just out of the day-to-day view.
     cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS archived INTEGER DEFAULT 0")
+    # Customer sharing: who to notify about this BL (consignee and/or their
+    # customs broker - which one varies per BL), and the secret code behind
+    # its public tracking link (/t/<token>). The token is random, never the
+    # BL number, so nobody can look up someone else's cargo by guessing.
+    for col in ("consignee_email", "consignee_phone", "broker_email", "broker_phone", "track_token"):
+        cur.execute(f"ALTER TABLE records ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_records_track_token ON records (track_token) "
+        "WHERE track_token IS NOT NULL AND track_token <> ''"
+    )
     cur.execute(
         """CREATE TABLE IF NOT EXISTS audit_log (
             id SERIAL PRIMARY KEY,
@@ -1060,31 +1160,53 @@ def build_sof_pdf(doc):
     return bytes(out)
 
 
-def send_email(to_addrs, subject, body):
+def email_configured():
+    return bool(os.environ.get("SMTP_HOST") and os.environ.get("SMTP_USER") and os.environ.get("SMTP_PASSWORD"))
+
+
+def send_email(to_addrs, subject, body, attachments=None):
     """Sends through SMTP creds in the environment (SMTP_HOST/PORT/USER/
-    PASSWORD/FROM) - nothing is hardcoded here, same pattern as
-    DATABASE_URL/APP_SECRET_KEY. Returns (ok, error_message) instead of
-    raising, so a missing/misconfigured mail account degrades to "alert
-    not sent" rather than a 500 on whatever triggered it."""
+    PASSWORD/FROM, optional SMTP_FROM_NAME) - nothing is hardcoded here,
+    same pattern as DATABASE_URL/APP_SECRET_KEY. Returns (ok, error_message)
+    instead of raising, so a missing/misconfigured mail account degrades to
+    "not sent" rather than a 500 on whatever triggered it.
+
+    attachments: optional list of (filename, bytes, mime_type).
+    Port 465 uses implicit TLS; anything else (587, Office 365 / Google
+    Workspace) upgrades with STARTTLS. Either way the server's certificate
+    is now VERIFIED (ssl.create_default_context) - the old bare
+    starttls() encrypted the connection but accepted any certificate, so
+    someone on the network could have posed as the mail server and
+    collected the mailbox password."""
     host = os.environ.get("SMTP_HOST", "")
-    port = os.environ.get("SMTP_PORT", "587")
+    port = int(os.environ.get("SMTP_PORT", "587") or 587)
     user = os.environ.get("SMTP_USER", "")
     password = os.environ.get("SMTP_PASSWORD", "")
     sender = os.environ.get("SMTP_FROM", user)
-    if not host or not user or not password:
+    sender_name = os.environ.get("SMTP_FROM_NAME", "Sea Power Marine Services")
+    if not email_configured():
         return False, "Email isn't configured yet (SMTP_HOST/SMTP_USER/SMTP_PASSWORD missing)."
     if not to_addrs:
         return False, "No recipient configured."
     try:
-        msg = MIMEMultipart()
-        msg["From"] = sender
+        msg = EmailMessage()  # handles UTF-8 (Arabic) subjects, bodies and filenames
+        msg["From"] = formataddr((sender_name, sender)) if sender_name else sender
         msg["To"] = ", ".join(to_addrs)
         msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain"))
-        with smtplib.SMTP(host, int(port), timeout=20) as server:
-            server.starttls()
-            server.login(user, password)
-            server.sendmail(sender, to_addrs, msg.as_string())
+        msg.set_content(body)
+        for fname, data, mime in (attachments or []):
+            maintype, _, subtype = (mime or "application/octet-stream").partition("/")
+            msg.add_attachment(data, maintype=maintype, subtype=subtype or "octet-stream", filename=fname)
+        ctx = ssl.create_default_context()
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=20, context=ctx) as server:
+                server.login(user, password)
+                server.send_message(msg, from_addr=sender, to_addrs=to_addrs)
+        else:
+            with smtplib.SMTP(host, port, timeout=20) as server:
+                server.starttls(context=ctx)
+                server.login(user, password)
+                server.send_message(msg, from_addr=sender, to_addrs=to_addrs)
         return True, None
     except Exception as e:
         return False, str(e)
@@ -1679,6 +1801,124 @@ def _extract_bl_numbers_from_lines(text):
     return _extract_bl_numbers_from_rows(rows)
 
 
+# ---------- Consignee contact details (for customer notifications) ----------
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_EMAIL_FULL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+_PHONE_CANDIDATE_RE = re.compile(r"(?:\+|00)?\d[\d\s().-]{7,18}\d")
+
+
+def _normalize_phone(raw):
+    """Phone -> international '+<digits>' form (what WhatsApp needs), or ''.
+    Saudi local formats get +966: '0501234567', '501234567',
+    '00966 50 123 4567', '966-50-1234567' all -> '+966501234567';
+    '011 230 8888' -> '+966112308888'. A number typed with '+' or '00'
+    keeps its own country code."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    d = re.sub(r"\D", "", s)
+    if s.startswith("+"):
+        pass
+    elif d.startswith("00"):
+        d = d[2:]
+    elif d.startswith("0") and len(d) == 10:      # 05x xxx xxxx / 01x xxx xxxx
+        d = "966" + d[1:]
+    elif d.startswith("5") and len(d) == 9:       # 5x xxx xxxx
+        d = "966" + d
+    if not (8 <= len(d) <= 15):
+        return ""
+    return "+" + d
+
+
+def _saudi_phones_in(text):
+    """Saudi mobile/landline numbers found in free text (a manifest's
+    consignee cell). Deliberately strict: those cells also carry CR and VAT
+    numbers (10-15 digits) that must not be mistaken for phones."""
+    out = []
+    for m in _PHONE_CANDIDATE_RE.findall(str(text or "")):
+        p = _normalize_phone(m)
+        if re.fullmatch(r"\+966[15]\d{8}", p) and p not in out:
+            out.append(p)
+    return out
+
+
+def _clean_email(raw):
+    e = str(raw or "").strip()
+    return e if e and len(e) <= 254 and _EMAIL_FULL_RE.match(e) else ""
+
+
+_CONSIGNEE_HEADERS = ("consignee", "收货人")
+_NOTIFY_HEADERS = ("notify", "通知人")
+_REMARK_HEADERS = ("remark", "term", "contact", "备注")
+
+
+def _extract_contacts_from_rows(rows):
+    """{bl_number: {"name", "email", "phone"}} from a manifest table that has
+    CONSIGNEE / NOTIFY (and often a remarks/TERM) column next to the B/L NO.
+    column - e.g. the Tianjin manifests, where those cells hold the company
+    name and address with an email/phone mixed in. Only the consignee side
+    is read (never the SHIPPER column - that's the Chinese shipper's own
+    contact). BL keys are normalized exactly like the BL extraction, so they
+    line up with the records being inserted. Returns {} for tables without
+    those columns (most packing lists) - this is a best-effort extra and
+    never blocks the BL upload itself."""
+    if not rows:
+        return {}
+    bl_col = hdr_idx = None
+    for i, row in enumerate(rows[:8]):
+        for j, cell in enumerate(row):
+            norm = _normalize_header(cell)
+            if norm and any(norm == w.replace(" ", "") for w in BL_HEADER_WORDS):
+                bl_col, hdr_idx = j, i
+        if bl_col is not None:
+            break
+    if bl_col is None:
+        return {}
+    cols = {"consignee": None, "notify": None, "remark": None}
+    for row in rows[:hdr_idx + 1]:  # bilingual manifests put Chinese + English headers on two rows
+        for j, cell in enumerate(row):
+            text = re.sub(r"\s+", "", str(cell or "").lower())
+            if not text or j == bl_col:
+                continue
+            for key, words in (("consignee", _CONSIGNEE_HEADERS), ("notify", _NOTIFY_HEADERS), ("remark", _REMARK_HEADERS)):
+                if cols[key] is None and any(w in text for w in words):
+                    cols[key] = j
+    if cols["consignee"] is None and cols["notify"] is None:
+        return {}
+
+    def cell(row, key):
+        j = cols[key]
+        return str(row[j]) if j is not None and j < len(row) and row[j] is not None else ""
+
+    out = {}
+    for row in rows[hdr_idx + 1:]:
+        if bl_col >= len(row) or row[bl_col] is None:
+            continue
+        cons, notify, remark = cell(row, "consignee"), cell(row, "notify"), cell(row, "remark")
+        first_line = next((ln.strip() for ln in cons.splitlines() if ln.strip()), "")
+        name = "" if first_line.upper().startswith(("TO ORDER", "TO THE ORDER")) else first_line[:120]
+        email = ""
+        for src in (cons, notify, remark):
+            found = _EMAIL_RE.findall(src)
+            if found:
+                email = _clean_email(found[0])
+                break
+        phone = ""
+        for src in (cons, notify, remark):
+            found = _saudi_phones_in(src)
+            if found:
+                phone = found[0]
+                break
+        if not (name or email or phone):
+            continue
+        for line in str(row[bl_col]).splitlines():
+            bl = line.strip().upper()
+            if bl and "total" not in _normalize_header(bl):
+                out[bl] = {"name": name, "email": email, "phone": phone}
+    return out
+
+
 _ZIP_MAGIC = b"PK\x03\x04"
 _OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
@@ -1710,6 +1950,15 @@ def _load_excel_sheets_by_content(raw_bytes, filename):
     raise ValueError(f"{filename} isn't a recognizable Excel file")
 
 
+def _safe_extract_contacts(rows):
+    """Contact extraction is a bonus - a quirk in some manifest must never
+    stop its BL numbers from being added."""
+    try:
+        return _extract_contacts_from_rows(rows)
+    except Exception:
+        return {}
+
+
 @app.route("/api/manifest/upload", methods=["POST"])
 @login_required
 def upload_manifest_excel():
@@ -1728,6 +1977,7 @@ def upload_manifest_excel():
     vessel = request.form.get("vessel", "").strip().upper()
 
     bl_numbers = []
+    contacts = {}  # bl -> consignee name/email/phone, when the manifest has them (see _extract_contacts_from_rows)
 
     try:
         if filename.endswith((".xlsx", ".xlsm", ".xls")):
@@ -1752,11 +2002,13 @@ def upload_manifest_excel():
                 if i > 0 and _dtrkr_is_non_manifest_sheet_name(sheet_name):
                     continue
                 bl_numbers.extend(_extract_bl_numbers_from_rows(rows, allow_no_header_fallback=(i == 0)))
+                contacts.update(_safe_extract_contacts(rows))
 
         elif filename.endswith(".csv"):
             text = file.read().decode("utf-8-sig", errors="ignore")
             rows = list(csv.reader(io.StringIO(text)))
             bl_numbers.extend(_extract_bl_numbers_from_rows(rows))
+            contacts.update(_safe_extract_contacts(rows))
 
         elif filename.endswith(".docx"):
             import docx
@@ -1765,6 +2017,7 @@ def upload_manifest_excel():
                 for i, table in enumerate(document.tables):
                     rows = [[cell.text for cell in row.cells] for row in table.rows]
                     bl_numbers.extend(_extract_bl_numbers_from_rows(rows, allow_no_header_fallback=(i == 0)))
+                    contacts.update(_safe_extract_contacts(rows))
             else:
                 full_text = "\n".join(p.text for p in document.paragraphs)
                 bl_numbers.extend(_extract_bl_numbers_from_lines(full_text))
@@ -1780,6 +2033,7 @@ def upload_manifest_excel():
                 if all_tables:
                     for i, table in enumerate(all_tables):
                         bl_numbers.extend(_extract_bl_numbers_from_rows(table, allow_no_header_fallback=(i == 0)))
+                        contacts.update(_safe_extract_contacts(table))
                 else:
                     for page in pdf.pages:
                         bl_numbers.extend(_extract_bl_numbers_from_lines(page.extract_text() or ""))
@@ -1801,10 +2055,16 @@ def upload_manifest_excel():
     # not a routine duplicate. Collected separately and surfaced in the
     # response instead of disappearing into the plain "skipped" count.
     duplicate_elsewhere = []
+    contacts_filled = 0
+    is_admin = session.get("role") == "admin"
     for bl_number in bl_numbers:
         if not bl_number:
             continue
-        existing = db.execute("SELECT vessel, port FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
+        found = contacts.get(bl_number) or {}
+        existing = db.execute(
+            "SELECT vessel, port, created_by, consignee, consignee_email, consignee_phone FROM records WHERE bl_number = ?",
+            (bl_number,),
+        ).fetchone()
         if existing:
             skipped += 1
             if (existing["vessel"] or "") != vessel or (existing["port"] or "") != port:
@@ -1812,16 +2072,34 @@ def upload_manifest_excel():
                     "bl_number": bl_number,
                     "existing_port": existing["port"], "existing_vessel": existing["vessel"],
                 })
+            # Re-uploading a manifest fills in consignee contacts that are
+            # still blank - never overwrites anything already there (it may
+            # have been corrected by hand), and only on the uploader's own
+            # BLs (or any, for an admin).
+            if found and (is_admin or existing["created_by"] == session.get("username")):
+                fills = {k: found[src] for k, src in (("consignee", "name"), ("consignee_email", "email"), ("consignee_phone", "phone"))
+                         if found.get(src) and not (existing[k] or "").strip()}
+                if fills:
+                    db.execute(
+                        "UPDATE records SET " + ", ".join(f"{k} = ?" for k in fills) + " WHERE bl_number = ?",
+                        (*fills.values(), bl_number),
+                    )
+                    contacts_filled += 1
             continue
         db.execute(
-            "INSERT INTO records (bl_number, port, vessel, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
-            (bl_number, port, vessel, datetime.utcnow().strftime("%Y-%m-%d %H:%M"), session.get("username")),
+            "INSERT INTO records (bl_number, port, vessel, created_at, created_by, consignee, consignee_email, consignee_phone) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (bl_number, port, vessel, datetime.utcnow().strftime("%Y-%m-%d %H:%M"), session.get("username"),
+             found.get("name", ""), found.get("email", ""), found.get("phone", "")),
         )
+        if found.get("email") or found.get("phone"):
+            contacts_filled += 1
         _log_audit(bl_number, "added", "", "", f"{port} / {vessel}")
         added += 1
 
     db.commit()
-    return jsonify({"added": added, "skipped": skipped, "duplicate_elsewhere": duplicate_elsewhere})
+    return jsonify({"added": added, "skipped": skipped, "duplicate_elsewhere": duplicate_elsewhere,
+                    "contacts_found": contacts_filled})
 
 
 # ---------- Direct Delivery Classifier ----------
@@ -3058,12 +3336,21 @@ def _restore_one_record(db, data):
     else:
         owner = session.get("username")
 
+    # Keep the BL's tracking link working after an Undo (the customer may
+    # already have it) - unless that code is somehow in use elsewhere, in
+    # which case the BL just gets a fresh one when next shared.
+    token = str(data.get("track_token") or "").strip()
+    if token and (not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", token)
+                  or db.execute("SELECT 1 FROM records WHERE track_token = ?", (token,)).fetchone()):
+        token = ""
+
     db.execute(
         """INSERT INTO records
            (bl_number, consignee, port, vessel, invoice_issued, invoice_by, invoice_at,
             approval_received, approval_by, approval_at, do_issued, do_by, do_at,
-            remarks, created_at, created_by, eta, archived)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            remarks, created_at, created_by, eta, archived,
+            consignee_email, consignee_phone, broker_email, broker_phone, track_token)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             bl_number,
             data.get("consignee", ""),
@@ -3083,6 +3370,11 @@ def _restore_one_record(db, data):
             owner,
             str(data.get("eta") or ""),
             1 if data.get("archived") else 0,
+            _clean_email(data.get("consignee_email")),
+            _normalize_phone(data.get("consignee_phone")),
+            _clean_email(data.get("broker_email")),
+            _normalize_phone(data.get("broker_phone")),
+            token,
         ),
     )
     _unstash_attachments(db, bl_number)
@@ -3513,13 +3805,17 @@ def lookup_record(bl_number):
     db = get_db()
     row = db.execute(
         f"""SELECT bl_number, port, vessel, created_by, invoice_issued, invoice_by, invoice_at,
-                   do_issued, do_by, do_at{ATTACHMENT_FLAGS_SQL}
+                   do_issued, do_by, do_at, consignee, consignee_email, consignee_phone,
+                   broker_email, broker_phone, track_token{ATTACHMENT_FLAGS_SQL}
             FROM records r WHERE bl_number = ?""",
         (bl_number,),
     ).fetchone()
     if not row:
         return jsonify({"error": f'No BL found matching "{bl_number}".'}), 404
     result = dict(row)
+    token = result.pop("track_token", "") or ""
+    result["track_url"] = f"{_public_base_url()}/t/{token}" if token else ""
+    result["email_configured"] = email_configured()
     # Attach filename/uploaded_by/uploaded_at per kind too - the has_invoice_file/
     # has_do_file flags above are enough for a status dot, but the Documents
     # modal and the Find-a-BL lookup both want to show who uploaded what and
@@ -3530,6 +3826,310 @@ def lookup_record(bl_number):
     ).fetchall()
     result["attachments"] = {a["kind"]: dict(a) for a in atts}
     return jsonify(result)
+
+
+# ---------- Customer sharing: contacts, tracking link, QR, notifications ----------
+
+# Arabic port names for customer-facing text (the board stores the English,
+# upper-case name; matches the DO Tracker's own Arabic labels).
+PORT_NAMES_AR = {
+    "DAMMAM PORT": "ميناء الدمام",
+    "JUBAIL COMMERCIAL PORT": "ميناء الجبيل التجاري",
+    "JEDDAH PORT": "ميناء جدة",
+    "YANBU COMMERCIAL PORT": "ميناء ينبع التجاري",
+    "YANBU INDUSTRIAL PORT": "ميناء ينبع الصناعي",
+}
+COMPANY_NAME_EN = "Sea Power Marine Services Co. Ltd"
+COMPANY_NAME_AR = "شركة سي باور للخدمات البحرية المحدودة"
+
+
+def _public_base_url():
+    """Base URL for links sent to customers. PUBLIC_BASE_URL (env) wins if
+    set - e.g. once Compass has its own domain; otherwise the address this
+    request came in on. Render terminates HTTPS at its proxy, so the real
+    scheme comes from X-Forwarded-Proto, not request.scheme ("http")."""
+    env = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if env:
+        return env
+    proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "https").split(",")[0].strip()
+    return f"{proto}://{request.host}"
+
+
+def _ensure_track_token(db, bl_number, force_new=False):
+    """The BL's tracking code, creating one on first use. 16 random bytes
+    (~128 bits) - impossible to guess, so the link itself is the key."""
+    row = db.execute("SELECT track_token FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
+    if not row:
+        return None
+    if row["track_token"] and not force_new:
+        return row["track_token"]
+    token = secrets.token_urlsafe(16)
+    db.execute("UPDATE records SET track_token = ? WHERE bl_number = ?", (token, bl_number))
+    db.commit()
+    return token
+
+
+@app.route("/api/records/<path:bl_number>/contacts", methods=["POST"])
+@login_required
+def update_contacts(bl_number):
+    bl_number = bl_number.upper()
+    if not _owns_record(bl_number):
+        return jsonify({"error": "Not your record.", "error_code": "not_owner"}), 403
+    data = request.get_json(force=True) or {}
+    vals = {}
+    for key in ("consignee_email", "broker_email"):
+        raw = str(data.get(key) or "").strip()
+        if raw and not _clean_email(raw):
+            return jsonify({"error": f"That doesn't look like an email address: {raw}", "error_code": "bad_email", "field": key}), 400
+        vals[key] = _clean_email(raw)
+    for key in ("consignee_phone", "broker_phone"):
+        raw = str(data.get(key) or "").strip()
+        if raw and not _normalize_phone(raw):
+            return jsonify({"error": f"That doesn't look like a phone number: {raw}", "error_code": "bad_phone", "field": key}), 400
+        vals[key] = _normalize_phone(raw)
+    if "consignee" in data:
+        vals["consignee"] = str(data.get("consignee") or "").strip()[:120]
+    db = get_db()
+    db.execute(
+        "UPDATE records SET " + ", ".join(f"{k} = ?" for k in vals) + " WHERE bl_number = ?",
+        (*vals.values(), bl_number),
+    )
+    _log_audit(bl_number, "contacts")
+    db.commit()
+    return jsonify({"ok": True, **vals})
+
+
+@app.route("/api/records/<path:bl_number>/share-link", methods=["POST"])
+@login_required
+def share_link(bl_number):
+    """Returns the BL's public tracking link, creating it on first use.
+    ?reset=1 replaces it with a new one - the old link stops working
+    (use when a link has gone to the wrong person)."""
+    bl_number = bl_number.upper()
+    if not _owns_record(bl_number):
+        return jsonify({"error": "Not your record.", "error_code": "not_owner"}), 403
+    db = get_db()
+    reset = request.args.get("reset") == "1"
+    token = _ensure_track_token(db, bl_number, force_new=reset)
+    if not token:
+        return jsonify({"error": "BL not found."}), 404
+    if reset:
+        _log_audit(bl_number, "link_reset")
+        db.commit()
+    return jsonify({"ok": True, "url": f"{_public_base_url()}/t/{token}"})
+
+
+@app.route("/api/records/<path:bl_number>/qr", methods=["GET"])
+@login_required
+def share_qr(bl_number):
+    """QR code of the tracking link - SVG to show on screen, ?format=png
+    (and &download=1) for pasting into a message or printing."""
+    import segno
+    bl_number = bl_number.upper()
+    if not _owns_record(bl_number):
+        return "Not your record.", 403
+    db = get_db()
+    token = _ensure_track_token(db, bl_number)
+    if not token:
+        return "BL not found.", 404
+    qr = segno.make(f"{_public_base_url()}/t/{token}", error="m")
+    buf = io.BytesIO()
+    as_png = request.args.get("format") == "png"
+    if as_png:
+        qr.save(buf, kind="png", scale=10, border=3)
+    else:
+        qr.save(buf, kind="svg", scale=6, border=2, dark="#0b2740", xmldecl=False)
+    headers = {"Cache-Control": "no-store"}
+    if request.args.get("download") == "1":
+        headers["Content-Disposition"] = _content_disposition(f"QR_{bl_number}.{'png' if as_png else 'svg'}", "qr.png")
+    return Response(buf.getvalue(), mimetype="image/png" if as_png else "image/svg+xml", headers=headers)
+
+
+def _notify_texts(rec, url):
+    """Bilingual (English, then Arabic) customer messages. Formal, plain
+    wording - reviewed Arabic should replace this draft if needed."""
+    bl, vessel = rec["bl_number"], (rec["vessel"] or "-")
+    port_en = (rec["port"] or "-").title()
+    port_ar = PORT_NAMES_AR.get((rec["port"] or "").upper(), rec["port"] or "-")
+    name = (rec["consignee"] or "").strip()
+    subject = f"Delivery Order Issued - B/L {bl} - {vessel} | تم إصدار أمر التسليم - بوليصة {bl}"
+    body = (
+        f"Dear {name or 'Valued Customer'},\n\n"
+        f"The Delivery Order for the shipment below has been issued and is attached to this email.\n\n"
+        f"B/L No.: {bl}\nVessel: {vessel}\nPort of Discharge: {port_en}\n\n"
+        f"Track the status of this shipment at any time:\n{url}\n\n"
+        f"Regards,\n{COMPANY_NAME_EN}\n\n"
+        f"------------------------------------------------------------\n\n"
+        f"{('السادة ' + name) if name else 'عميلنا العزيز'}،\n\n"
+        f"نفيدكم بأنه تم إصدار أمر التسليم للشحنة الموضحة أدناه، وتجدونه مرفقًا بهذه الرسالة.\n\n"
+        f"رقم البوليصة: {bl}\nالسفينة: {vessel}\nميناء التفريغ: {port_ar}\n\n"
+        f"يمكنكم متابعة حالة الشحنة في أي وقت عبر الرابط التالي:\n{url}\n\n"
+        f"مع أطيب التحيات،\n{COMPANY_NAME_AR}\n"
+    )
+    if rec["do_issued"]:
+        wa = (f"{COMPANY_NAME_EN}: The Delivery Order for B/L {bl} ({vessel}) has been issued. Track the shipment: {url}\n\n"
+              f"{COMPANY_NAME_AR}: تم إصدار أمر التسليم للبوليصة {bl} ({vessel}). لمتابعة الشحنة: {url}")
+    else:
+        wa = (f"{COMPANY_NAME_EN}: Track the status of B/L {bl} ({vessel}) here: {url}\n\n"
+              f"{COMPANY_NAME_AR}: لمتابعة حالة البوليصة {bl} ({vessel}): {url}")
+    return subject, body, wa
+
+
+@app.route("/api/records/<path:bl_number>/notify/email", methods=["POST"])
+@login_required
+def notify_email(bl_number):
+    """Emails the attached Delivery Order (plus the tracking link) to the
+    BL's consignee and/or broker. Only ever runs on a staff click - nothing
+    is sent automatically."""
+    bl_number = bl_number.upper()
+    if not _owns_record(bl_number):
+        return jsonify({"error": "Not your record.", "error_code": "not_owner"}), 403
+    data = request.get_json(force=True) or {}
+    who = [w for w in (data.get("to") or []) if w in ("consignee", "broker")]
+    db = get_db()
+    rec = db.execute("SELECT * FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
+    if not rec:
+        return jsonify({"error": "BL not found."}), 404
+    addrs = []
+    for w in who:
+        e = _clean_email(rec[f"{w}_email"])
+        if e and e.lower() not in (a.lower() for a in addrs):
+            addrs.append(e)
+    if not addrs:
+        return jsonify({"error": "Choose at least one recipient with an email address.", "error_code": "no_recipient"}), 400
+    att = db.execute(
+        "SELECT filename, data FROM record_attachments WHERE bl_number = ? AND kind = 'do'", (bl_number,)
+    ).fetchone()
+    if not att:
+        return jsonify({"error": "Attach the Delivery Order PDF first.", "error_code": "no_do"}), 400
+    if not email_configured():
+        return jsonify({"error": "Email isn't set up yet.", "error_code": "email_not_configured"}), 400
+    token = _ensure_track_token(db, bl_number)
+    url = f"{_public_base_url()}/t/{token}"
+    subject, body, _ = _notify_texts(rec, url)
+    fname = att["filename"] or f"DO_{bl_number}.pdf"
+    ok, err = send_email(addrs, subject, body, attachments=[(fname, bytes(att["data"]), "application/pdf")])
+    if not ok:
+        return jsonify({"error": f"The email could not be sent: {err}", "error_code": "send_failed"}), 502
+    _log_audit(bl_number, "notified", "email", "", ", ".join(addrs))
+    db.commit()
+    return jsonify({"ok": True, "sent_to": addrs})
+
+
+@app.route("/api/records/<path:bl_number>/notify/whatsapp", methods=["POST"])
+@login_required
+def notify_whatsapp(bl_number):
+    """Builds the wa.me link (WhatsApp opens with the message ready - the
+    staff member presses Send from their own WhatsApp) and records it in
+    the BL's history. No WhatsApp Business account needed for this."""
+    bl_number = bl_number.upper()
+    if not _owns_record(bl_number):
+        return jsonify({"error": "Not your record.", "error_code": "not_owner"}), 403
+    who = (request.get_json(force=True) or {}).get("to")
+    if who not in ("consignee", "broker"):
+        return jsonify({"error": "Invalid recipient."}), 400
+    db = get_db()
+    rec = db.execute("SELECT * FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
+    if not rec:
+        return jsonify({"error": "BL not found."}), 404
+    phone = _normalize_phone(rec[f"{who}_phone"])
+    if not phone:
+        return jsonify({"error": "No phone number saved for that contact.", "error_code": "no_phone"}), 400
+    token = _ensure_track_token(db, bl_number)
+    _, _, text = _notify_texts(rec, f"{_public_base_url()}/t/{token}")
+    _log_audit(bl_number, "notified", "whatsapp", "", phone)
+    db.commit()
+    return jsonify({"ok": True, "url": f"https://wa.me/{phone.lstrip('+')}?text={url_quote(text, safe='')}"})
+
+
+# ---------- Public tracking page (no login) ----------
+
+TRACK_TEXT = {
+    "en": {
+        "title": "Shipment Status", "bl": "B/L No.", "vessel": "Vessel", "port": "Port of Discharge", "eta": "ETA",
+        "steps": ["Invoice issued", "Approval received", "Delivery Order issued"],
+        "status": ["Your shipment is registered and being processed.",
+                   "Invoice issued - awaiting approval.",
+                   "Approval received - Delivery Order in preparation.",
+                   "Delivery Order issued."],
+        "pending": "Pending", "updated": "Last updated", "not_found_title": "Link not active",
+        "not_found": "This tracking link is no longer active. Please contact Sea Power for an updated link.",
+        "contact": "Questions about this shipment?", "lang_switch": "العربية",
+        "company": COMPANY_NAME_EN,
+        "months": ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+    },
+    "ar": {
+        "title": "حالة الشحنة", "bl": "رقم البوليصة", "vessel": "السفينة", "port": "ميناء التفريغ", "eta": "الوصول المتوقع",
+        "steps": ["صدور الفاتورة", "استلام الموافقة", "صدور أمر التسليم"],
+        "status": ["تم تسجيل شحنتكم وجارٍ العمل عليها.",
+                   "تم إصدار الفاتورة - بانتظار الموافقة.",
+                   "تم استلام الموافقة - جارٍ إعداد أمر التسليم.",
+                   "تم إصدار أمر التسليم."],
+        "pending": "قيد الانتظار", "updated": "آخر تحديث", "not_found_title": "الرابط غير فعال",
+        "not_found": "رابط التتبع هذا لم يعد فعالًا. يرجى التواصل مع سي باور للحصول على رابط محدّث.",
+        "contact": "هل لديكم استفسار حول هذه الشحنة؟", "lang_switch": "English",
+        "company": COMPANY_NAME_AR,
+        "months": ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"],
+    },
+}
+
+
+def _track_date(raw, lang):
+    """Stored 'YYYY-MM-DD HH:MM' (UTC) or 'YYYY-MM-DD' -> '5 Oct 2026' in
+    Saudi time (UTC+3), with Arabic month names on the Arabic page."""
+    if not raw:
+        return ""
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            d = datetime.strptime(raw, fmt)
+            if fmt == "%Y-%m-%d %H:%M":
+                d = d + timedelta(hours=3)
+            return f"{d.day} {TRACK_TEXT[lang]['months'][d.month - 1]} {d.year}"
+        except ValueError:
+            continue
+    return ""
+
+
+@app.route("/t/<token>")
+def public_tracking(token):
+    """The page a consignee/broker opens from a shared link or QR code.
+    No login. Shows status only - BL, vessel, port, ETA and the three steps
+    with their dates - never remarks, staff names, contacts or documents."""
+    accept = request.headers.get("Accept-Language", "")
+    lang = request.args.get("lang") or ("ar" if accept.lower().startswith("ar") else "en")
+    lang = "ar" if lang == "ar" else "en"
+    tx = TRACK_TEXT[lang]
+    rec = None
+    if re.fullmatch(r"[A-Za-z0-9_-]{16,64}", token or ""):
+        rec = get_db().execute(
+            """SELECT bl_number, vessel, port, eta, invoice_issued, invoice_at, approval_received, approval_at,
+                      do_issued, do_at, created_at FROM records WHERE track_token = ?""",
+            (token,),
+        ).fetchone()
+    ctx = {"lang": lang, "tx": tx, "logo": LOGO_B64, "found": bool(rec),
+           "contact_phone": os.environ.get("COMPANY_PHONE", ""), "contact_email": os.environ.get("COMPANY_EMAIL", "")}
+    if rec:
+        done = [bool(rec["invoice_issued"]), bool(rec["approval_received"]), bool(rec["do_issued"])]
+        dates = [_track_date(rec["invoice_at"], lang), _track_date(rec["approval_at"], lang), _track_date(rec["do_at"], lang)]
+        stage = 3 if done[2] else 2 if done[1] else 1 if done[0] else 0
+        stamps = [s for s in (rec["invoice_at"], rec["approval_at"], rec["do_at"], rec["created_at"]) if s]
+        port = rec["port"] or ""
+        ctx.update({
+            "bl": rec["bl_number"], "vessel": rec["vessel"] or "-",
+            "port": (PORT_NAMES_AR.get(port.upper(), port) if lang == "ar" else port.title()) or "-",
+            "eta": _track_date(rec["eta"], lang),
+            "steps": [{"label": tx["steps"][i], "done": done[i], "date": dates[i]} for i in range(3)],
+            "stage": stage, "status": tx["status"][stage],
+            "updated": _track_date(max(stamps), lang) if stamps else "",
+        })
+    html = render_template_string(TRACK_HTML, **ctx)
+    resp = Response(html, status=200 if rec else 404, mimetype="text/html")
+    # Not for search engines, never cached by shared proxies, and the
+    # secret link isn't leaked to other sites via the Referer header.
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    return resp
 
 
 @app.route("/api/export", methods=["GET"])
@@ -7133,6 +7733,130 @@ loadDocuments();
 </body></html>
 """
 
+# Public tracking page (/t/<token>) - what a consignee or broker sees.
+# Self-contained, mobile-first (most will open it from WhatsApp), Arabic
+# right-to-left when lang=ar. Jinja autoescapes every value.
+TRACK_HTML = """<!DOCTYPE html>
+<html lang="{{ lang }}" dir="{{ 'rtl' if lang == 'ar' else 'ltr' }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>{{ tx.title }}{% if found %} - {{ bl }}{% endif %} | Sea Power</title>
+{% if lang == 'ar' %}
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet">
+{% endif %}
+<style>
+  :root {
+    --bg: #f3f5f8; --card: #ffffff; --text: #14212e; --muted: #64748b; --border: #e2e8f0;
+    --navy: #123a56; --navy-deep: #0b2740; --gold: #c9a227; --ok: #1f9d55; --ok-bg: #e7f6ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0d1520; --card: #152131; --text: #e6edf5; --muted: #93a3b8; --border: #26364a;
+            --navy: #5aa2d1; --navy-deep: #274a67; --ok: #4cc283; --ok-bg: #12342a; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  [dir="rtl"] body { font-family: 'Cairo', 'Segoe UI', Tahoma, Arial, sans-serif; }
+  .wrap { max-width: 520px; margin: 0 auto; padding: 18px 16px 40px; }
+  .brand { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+  .brand-id { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .brand img { height: 38px; width: auto; }
+  .brand b { font-size: 14px; line-height: 1.25; }
+  .lang { font-size: 13px; font-weight: 700; color: var(--navy); text-decoration: none; padding: 7px 12px;
+          border: 1px solid var(--border); border-radius: 999px; background: var(--card); white-space: nowrap; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 18px; padding: 20px;
+          box-shadow: 0 1px 2px rgba(15, 30, 50, .05), 0 8px 24px rgba(15, 30, 50, .06); }
+  .eyebrow { font-size: 12px; font-weight: 700; color: var(--muted); letter-spacing: .04em; text-transform: uppercase; }
+  [dir="rtl"] .eyebrow { letter-spacing: 0; text-transform: none; font-size: 13px; }
+  .bl { font-size: 24px; font-weight: 800; margin: 4px 0 14px; word-break: break-all; }
+  .status { display: flex; gap: 10px; align-items: center; padding: 12px 14px; border-radius: 12px;
+            background: color-mix(in srgb, var(--gold) 14%, transparent); font-weight: 700; font-size: 15px; }
+  .status.done { background: var(--ok-bg); color: var(--ok); }
+  .status .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--gold); flex-shrink: 0; }
+  .status.done .dot { background: var(--ok); }
+  .details { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 16px; margin: 18px 0 4px; }
+  .details div span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+  .details div b { font-size: 15px; }
+  .details .full { grid-column: 1 / -1; }
+  .steps { list-style: none; margin: 22px 0 0; padding: 0; }
+  .step { position: relative; display: flex; gap: 14px; padding-bottom: 22px; }
+  .step:last-child { padding-bottom: 0; }
+  .step::before { content: ""; position: absolute; inset-inline-start: 13px; top: 28px; bottom: 0; width: 2px; background: var(--border); }
+  .step:last-child::before { display: none; }
+  .step.done::before { background: var(--ok); }
+  .mark { width: 28px; height: 28px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+          border: 2px solid var(--border); background: var(--card); color: transparent; font-size: 15px; font-weight: 800; position: relative; z-index: 1; }
+  .step.done .mark { background: var(--ok); border-color: var(--ok); color: #fff; }
+  .step.current .mark { border-color: var(--gold); box-shadow: 0 0 0 4px color-mix(in srgb, var(--gold) 22%, transparent); }
+  .step-text b { display: block; font-size: 15px; padding-top: 3px; }
+  .step-text span { font-size: 13px; color: var(--muted); }
+  .updated { margin-top: 18px; font-size: 12px; color: var(--muted); }
+  .foot { margin-top: 18px; text-align: center; font-size: 13px; color: var(--muted); line-height: 1.7; }
+  .foot a { color: var(--navy); font-weight: 700; text-decoration: none; }
+  .nf h1 { font-size: 20px; margin: 0 0 8px; }
+  .nf p { margin: 0; color: var(--muted); line-height: 1.6; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <div class="brand-id">
+      <img src="data:image/png;base64,{{ logo }}" alt="Sea Power">
+      <b>{{ tx.company }}</b>
+    </div>
+    <a class="lang" href="?lang={{ 'en' if lang == 'ar' else 'ar' }}">{{ tx.lang_switch }}</a>
+  </div>
+
+  {% if found %}
+  <div class="card">
+    <div class="eyebrow">{{ tx.title }}</div>
+    <div class="bl"><span dir="ltr">{{ bl }}</span></div>
+    <div class="status{% if stage == 3 %} done{% endif %}"><span class="dot"></span>{{ status }}</div>
+
+    <div class="details">
+      <div><span>{{ tx.vessel }}</span><b dir="auto">{{ vessel }}</b></div>
+      <div><span>{{ tx.eta }}</span><b>{{ eta or '-' }}</b></div>
+      <div class="full"><span>{{ tx.port }}</span><b>{{ port }}</b></div>
+    </div>
+
+    <ol class="steps">
+      {% for s in steps %}
+      <li class="step{% if s.done %} done{% elif loop.index0 == stage %} current{% endif %}">
+        <span class="mark">&#10003;</span>
+        <div class="step-text"><b>{{ s.label }}</b><span>{{ s.date if s.done else tx.pending }}</span></div>
+      </li>
+      {% endfor %}
+    </ol>
+    {% if updated %}<div class="updated">{{ tx.updated }}: {{ updated }}</div>{% endif %}
+  </div>
+  {% else %}
+  <div class="card nf">
+    <h1>{{ tx.not_found_title }}</h1>
+    <p>{{ tx.not_found }}</p>
+  </div>
+  {% endif %}
+
+  <div class="foot">
+    {{ tx.contact }}<br>
+    {% if contact_phone %}<a href="tel:{{ contact_phone }}" dir="ltr">{{ contact_phone }}</a>{% endif %}
+    {% if contact_phone and contact_email %} &middot; {% endif %}
+    {% if contact_email %}<a href="mailto:{{ contact_email }}">{{ contact_email }}</a>{% endif %}
+    {% if not contact_phone and not contact_email %}{{ tx.company }}{% endif %}
+  </div>
+</div>
+</body>
+</html>
+"""
+
+
 PAGE_HTML = """
 <!DOCTYPE html>
 <html>
@@ -7789,6 +8513,37 @@ PAGE_HTML = """
   .docs-find-row { display: flex; gap: 8px; margin-bottom: 10px; }
   .docs-find-row input { flex: 1; }
 
+  /* Customer sharing sections in the Documents popup */
+  #docsOverlay .history-modal { max-width: 560px; max-height: 86vh; }
+  .docs-section .docs-actions button { padding: 7px 14px; font-size: 12.5px; }
+  .docs-section .docs-actions button:disabled { opacity: .45; cursor: not-allowed; }
+  .share-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px; margin-bottom: 10px; }
+  .share-full { grid-column: 1 / -1; }
+  .share-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .share-field span { font-size: 11.5px; font-weight: 600; color: var(--muted); }
+  .share-field b { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+  /* All contact boxes styled alike - type=email/tel otherwise fall back to
+     the browser's default look while type=text gets the app's. */
+  .share-field input {
+    width: 100%; padding: 8px 10px; font-size: 13px; font-family: inherit; color: var(--text);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+  }
+  .share-field input:focus { outline: none; border-color: var(--navy-light); }
+  .share-link-row { margin-bottom: 8px; }
+  .share-url { font-size: 12.5px; padding: 8px 10px; color: var(--muted); }
+  .qr-panel { margin-top: 10px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .qr-panel img { width: 148px; height: 148px; background: #fff; border-radius: 10px; border: 1px solid var(--border); padding: 4px; }
+  .qr-panel a { font-size: 12.5px; font-weight: 600; color: var(--navy-light); }
+  .share-checks { display: flex; gap: 8px 16px; flex-wrap: wrap; margin-bottom: 10px; }
+  .share-check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+  .share-check small { color: var(--muted); font-size: 11.5px; }
+  .share-check.disabled { opacity: .45; cursor: not-allowed; }
+  .share-hint { margin-top: 6px; }
+  .wa-row { margin-top: 12px; }
+  .docs-section .docs-actions button.btn-whatsapp { background: #1f9d55; }
+  .docs-section .docs-actions button.btn-whatsapp:hover { background: #17834a; }
+  @media (max-width: 600px) { .share-grid { grid-template-columns: 1fr; } }
+
   /* "Attach documents" auto-match batch rows - one per dropped file, while
      it's being read/matched, once it's auto-attached, or (when the BL
      couldn't be pinned down automatically) while it waits for the user to
@@ -8369,7 +9124,7 @@ async function uploadExcel() {
   btn.textContent = originalLabel;
 
   await fetchRecords(true);
-  showToast(t('bl_records_added', {added: data.added}) + (data.skipped ? t('already_on_board_skipped', {skipped: data.skipped}) : '') + '.');
+  showToast(t('bl_records_added', {added: data.added}) + (data.skipped ? t('already_on_board_skipped', {skipped: data.skipped}) : '') + (data.contacts_found ? t('contacts_found', {n: data.contacts_found}) : '') + '.');
 
   // A BL that's already on the board under a DIFFERENT vessel than the one
   // just uploaded is worth a second look - either this file re-lists a BL
@@ -8531,6 +9286,7 @@ function auditActionLabel(action) {
     added: t('action_added'), deleted: t('action_deleted'), restored: t('action_restored'),
     toggle: t('action_toggle'), remarks: t('action_remarks'),
     attachment: t('action_attachment'), attachment_removed: t('action_attachment_removed'),
+    contacts: t('action_contacts'), link_reset: t('action_link_reset'),
   }[action] || action;
 }
 
@@ -8559,6 +9315,8 @@ async function showHistory(bl) {
       line = `<b>${byUser}</b> ${t('history_set_field', {field: esc(historyFieldLabel(e.field)), value: e.new_value ? t('yes') : t('no')})}`;
     } else if (e.action === 'remarks') {
       line = `<b>${byUser}</b> ${e.new_value ? t('history_edited_remarks', {value: esc(e.new_value)}) : t('history_cleared_remarks')}`;
+    } else if (e.action === 'notified') {
+      line = `<b>${byUser}</b> ${t(e.field === 'whatsapp' ? 'history_notified_whatsapp' : 'history_notified_email', {value: esc(e.new_value)})}`;
     } else if (e.action === 'added') {
       line = `<b>${byUser}</b> ${e.new_value ? t('history_added_this_bl', {value: esc(e.new_value)}) : t('history_added_bl_plain')}`;
     } else {
@@ -8635,7 +9393,170 @@ async function showDocs(bl) {
   const data = await res.json();
   if (!res.ok) { body.innerHTML = `<div style="color:var(--muted); padding:10px 0;">${esc(data.error || t('could_not_load_bl'))}</div>`; return; }
   const canManage = IS_ADMIN || data.created_by === CURRENT_USER;
-  body.innerHTML = renderDocsSections(data, canManage);
+  body.innerHTML = renderDocsSections(data, canManage) + renderShareSections(data, canManage);
+}
+
+/* ---------- Customer sharing: contacts, tracking link, notify ----------
+   Lives in the same Documents popup. Nothing is ever sent automatically:
+   "Email the DO" and "WhatsApp" only act on a click. */
+function apiErrorText(data) {
+  const code = data && data.error_code;
+  const translated = code ? t('err_' + code) : '';
+  if (translated && translated !== 'err_' + code) {
+    return code === 'send_failed' && data.error ? `${translated} (${data.error.replace(/^The email could not be sent: /, '')})` : translated;
+  }
+  return (data && data.error) || t('could_not_save_retry');
+}
+
+function renderShareSections(data, canManage) {
+  const bl = data.bl_number;
+  const field = (key, label, type) => canManage
+    ? `<label class="share-field"><span>${t(label)}</span>
+         <input type="${type}" id="ct_${key}" value="${esc(data[key] || '')}" dir="${autoDir(data[key])}"
+                oninput="this.dir = autoDir(this.value)" autocomplete="off"></label>`
+    : `<div class="share-field"><span>${t(label)}</span><b dir="auto">${esc(data[key] || '-')}</b></div>`;
+  const contacts = `
+    <div class="docs-section">
+      <div class="docs-section-title">${t('customer_contacts')}</div>
+      <div class="share-grid">
+        <div class="share-full">${field('consignee', 'consignee_name', 'text')}</div>
+        ${field('consignee_email', 'consignee_email', 'email')}
+        ${field('consignee_phone', 'consignee_phone', 'tel')}
+        ${field('broker_email', 'broker_email', 'email')}
+        ${field('broker_phone', 'broker_phone', 'tel')}
+      </div>
+      ${canManage ? `<div class="docs-actions"><button type="button" onclick="saveContacts(${jsq(bl)})">${t('save_contacts')}</button></div>` : ''}
+    </div>`;
+
+  const link = data.track_url
+    ? `<div class="share-link-row">
+         <input type="text" class="share-url" id="shareUrl" value="${esc(data.track_url)}" readonly dir="ltr" onclick="this.select()">
+       </div>
+       <div class="docs-actions">
+         <button type="button" onclick="copyShareLink()">${t('copy_link')}</button>
+         ${canManage ? `<button type="button" class="btn-neutral" onclick="toggleQr(${jsq(bl)})">${t('show_qr')}</button>
+         <button type="button" class="btn-neutral" title="${esc(t('new_link_title'))}" onclick="confirmNewLink(${jsq(bl)})">${t('new_link')}</button>` : ''}
+       </div>
+       <div id="qrPanel" class="qr-panel" style="display:none;"></div>`
+    : (canManage ? `<div class="docs-actions"><button type="button" onclick="createShareLink(${jsq(bl)}, false)">${t('create_link')}</button></div>` : `<div class="docs-status">-</div>`);
+  const share = `
+    <div class="docs-section">
+      <div class="docs-section-title">${t('share_with_customer')}</div>
+      <div class="docs-status">${t('share_help')}</div>
+      ${link}
+    </div>`;
+
+  if (!canManage) return contacts + share;
+  const hasDo = !!(data.attachments && data.attachments.do);
+  const recip = (who, label) => {
+    const email = data[who + '_email'];
+    return `<label class="share-check${email ? '' : ' disabled'}">
+      <input type="checkbox" class="notify-to" value="${who}" ${email ? 'checked' : 'disabled'}>
+      <span>${t(label)}</span>${email ? `<small dir="ltr">${esc(email)}</small>` : ''}</label>`;
+  };
+  const emailBlocked = !hasDo ? t('attach_do_first') : (!data.email_configured ? t('email_not_setup') : '');
+  const waBtn = (who, label) => data[who + '_phone']
+    ? `<button type="button" class="btn-whatsapp" onclick="openWhatsApp(${jsq(bl)}, '${who}')">${t(label)}</button>` : '';
+  const anyPhone = data.consignee_phone || data.broker_phone;
+  const notify = `
+    <div class="docs-section">
+      <div class="docs-section-title">${t('notify_customer')}</div>
+      <div class="docs-status">${t('email_do_to')}</div>
+      <div class="share-checks">${recip('consignee', 'recipient_consignee')}${recip('broker', 'recipient_broker')}</div>
+      <div class="docs-actions">
+        <button type="button" id="emailDoBtn" onclick="emailDo(${jsq(bl)})" ${emailBlocked ? 'disabled' : ''}>${t('send_do_email')}</button>
+      </div>
+      ${emailBlocked ? `<div class="docs-status share-hint">${emailBlocked}</div>` : ''}
+      ${anyPhone ? `<div class="docs-actions wa-row">${waBtn('consignee', 'whatsapp_consignee')}${waBtn('broker', 'whatsapp_broker')}</div>
+                    <div class="docs-status share-hint">${t('whatsapp_help')}</div>` : ''}
+    </div>`;
+  return contacts + share + notify;
+}
+
+async function saveContacts(bl) {
+  const val = id => (document.getElementById(id) || {}).value || '';
+  const payload = {
+    consignee: val('ct_consignee'), consignee_email: val('ct_consignee_email'), consignee_phone: val('ct_consignee_phone'),
+    broker_email: val('ct_broker_email'), broker_phone: val('ct_broker_phone'),
+  };
+  const res = await apiWrite(`/api/records/${encodeURIComponent(bl)}/contacts`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    showToast(apiErrorText(data));
+    const bad = data.field && document.getElementById('ct_' + data.field);
+    if (bad) bad.focus();
+    return;
+  }
+  showToast(t('contacts_saved'));
+  await showDocs(bl);
+  fetchRecords(true);
+}
+
+async function createShareLink(bl, reset) {
+  const res = await apiWrite(`/api/records/${encodeURIComponent(bl)}/share-link${reset ? '?reset=1' : ''}`, {method: 'POST'});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { showToast(apiErrorText(data)); return; }
+  await showDocs(bl);
+  if (reset) showToast(t('link_replaced'));
+  else copyShareLink();
+}
+
+function confirmNewLink(bl) {
+  showToast(t('confirm_new_link'), {actionLabel: t('confirm'), duration: 6000, onAction: () => createShareLink(bl, true)});
+}
+
+async function copyShareLink() {
+  const box = document.getElementById('shareUrl');
+  if (!box) return;
+  try {
+    await navigator.clipboard.writeText(box.value);
+  } catch (e) {
+    box.select(); document.execCommand('copy');  // older browsers / non-HTTPS
+  }
+  showToast(t('link_copied'));
+}
+
+function toggleQr(bl) {
+  const panel = document.getElementById('qrPanel');
+  if (!panel) return;
+  if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+  const base = `/api/records/${encodeURIComponent(bl)}/qr`;
+  panel.innerHTML = `<img src="${base}?v=${Date.now()}" alt="QR">
+    <a href="${base}?format=png&download=1">${t('download_qr')}</a>`;
+  panel.style.display = '';
+}
+
+async function emailDo(bl) {
+  const to = [...document.querySelectorAll('.notify-to:checked')].map(c => c.value);
+  if (!to.length) { showToast(t('err_no_recipient')); return; }
+  const btn = document.getElementById('emailDoBtn');
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = t('sending_ellipsis');
+  try {
+    const res = await apiWrite(`/api/records/${encodeURIComponent(bl)}/notify/email`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({to})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast(apiErrorText(data), {duration: 8000}); return; }
+    showToast(t('do_emailed', {to: data.sent_to.join(', ')}));
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+}
+
+async function openWhatsApp(bl, who) {
+  // Open the tab right away (inside the click), then point it at WhatsApp
+  // once the server returns the link - browsers block a window opened
+  // later, after a network round trip, as an unwanted popup.
+  const win = window.open('about:blank', '_blank');
+  const res = await apiWrite(`/api/records/${encodeURIComponent(bl)}/notify/whatsapp`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({to: who})
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { if (win) win.close(); showToast(apiErrorText(data)); return; }
+  if (win) { win.opener = null; win.location.href = data.url; } else { location.href = data.url; }
 }
 
 function closeDocs() {
