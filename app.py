@@ -107,13 +107,18 @@ const I18N = {
     port_kap: "KAP",
     vessel_label: "Vessel",
     click_to_upload: "Click to upload",
-    or_drag_drop_manifest: "or drag & drop your manifest",
+    or_drag_drop_manifest: "or drag & drop your manifest (one or several files)",
+    n_files_selected: "{n} files: {names}",
+    adding_progress: "Adding {i} of {n}...",
+    file_failed: "{name}: {error}",
     manifest_dropzone_sub: ".xlsx, .xls, .csv, .docx or .pdf - the BL Number column is read automatically",
     add_to_board: "Add to board",
     vessel_placeholder: "e.g. TAI KNIGHT",
     adding_ellipsis: "Adding...",
     // Attach documents card
     attach_documents: "Attach documents",
+    attach_results_title: "Attaching documents",
+    attach_batch_done: "Documents: {summary}",
     attach_docs_help: "Drop Invoice / Delivery Order PDFs here - each one is read and matched to its BL automatically, same as the manifest upload above.",
     attach_docs_help2: "chips next to a BL number below show what's already attached.",
     or_drag_drop_docs: "or drag & drop Invoice/DO PDFs",
@@ -222,6 +227,7 @@ const I18N = {
     action_remarks: "Remarks edited",
     action_attachment: "attached a document",
     action_attachment_removed: "removed a document",
+    history_customer_download: "Customer downloaded the invoice through the tracking link",
     yes: "Yes",
     no: "No",
     history_set_field: "set {field} to {value}",
@@ -265,7 +271,7 @@ const I18N = {
     contacts_saved: "Contacts saved.",
     no_contacts: "No contact details yet.",
     share_with_customer: "Tracking link",
-    share_help: "A private page where the customer can check this BL's status - no login, status only.",
+    share_help: "A private page where the customer can check this BL's status and download the invoice - no login.",
     create_link: "Create tracking link",
     copy_link: "Copy link",
     link_copied: "Tracking link copied.",
@@ -318,12 +324,17 @@ const I18N = {
     port_kap: "KAP",
     vessel_label: "السفينة",
     click_to_upload: "اضغط للرفع",
-    or_drag_drop_manifest: "أو اسحب وأفلت بيان الشحن",
+    or_drag_drop_manifest: "أو اسحب وأفلت بيان الشحن (ملف واحد أو عدة ملفات)",
+    n_files_selected: "{n} ملفات: {names}",
+    adding_progress: "جارٍ إضافة {i} من {n}...",
+    file_failed: "{name}: {error}",
     manifest_dropzone_sub: "\\u2066.xlsx, .xls, .csv, .docx, .pdf\\u2069 - يتم قراءة عمود رقم البوليصة تلقائيًا",
     add_to_board: "إضافة إلى اللوحة",
     vessel_placeholder: "مثال: TAI KNIGHT",
     adding_ellipsis: "جارٍ الإضافة...",
     attach_documents: "إرفاق المستندات",
+    attach_results_title: "نتائج إرفاق المستندات",
+    attach_batch_done: "المستندات: {summary}",
     attach_docs_help: "أسقط ملفات الفاتورة / أمر التسليم (PDF) هنا - تتم قراءة كل ملف ومطابقته تلقائيًا مع رقم البوليصة، بنفس طريقة رفع بيان الشحن أعلاه.",
     attach_docs_help2: "الشارات الظاهرة بجانب رقم البوليصة أدناه توضح المستندات المرفقة بالفعل.",
     or_drag_drop_docs: "أو اسحب وأفلت ملفات الفاتورة / أمر التسليم",
@@ -422,6 +433,7 @@ const I18N = {
     action_remarks: "تم تعديل الملاحظات",
     action_attachment: "أرفق مستندًا",
     action_attachment_removed: "أزال مستندًا",
+    history_customer_download: "قام العميل بتحميل الفاتورة عبر رابط التتبع",
     yes: "نعم",
     no: "لا",
     history_set_field: "قام بتعيين {field} إلى {value}",
@@ -463,7 +475,7 @@ const I18N = {
     contacts_saved: "تم حفظ جهات الاتصال.",
     no_contacts: "لا توجد بيانات اتصال بعد.",
     share_with_customer: "رابط التتبع",
-    share_help: "صفحة خاصة يتابع منها العميل حالة هذه البوليصة دون تسجيل دخول - تعرض الحالة فقط.",
+    share_help: "صفحة خاصة يتابع منها العميل حالة هذه البوليصة ويحمّل الفاتورة دون تسجيل دخول.",
     create_link: "إنشاء رابط التتبع",
     copy_link: "نسخ الرابط",
     link_copied: "تم نسخ رابط التتبع.",
@@ -4053,6 +4065,7 @@ TRACK_TEXT = {
                    "Approval received - Delivery Order in preparation.",
                    "Delivery Order issued."],
         "pending": "Pending", "updated": "Last updated", "not_found_title": "Link not active",
+        "download_invoice": "Download invoice (PDF)",
         "not_found": "This tracking link is no longer active. Please contact Sea Power for an updated link.",
         "contact": "Questions about this shipment?", "lang_switch": "العربية",
         "company": COMPANY_NAME_EN,
@@ -4066,6 +4079,7 @@ TRACK_TEXT = {
                    "تم استلام الموافقة - جارٍ إعداد أمر التسليم.",
                    "تم إصدار أمر التسليم."],
         "pending": "قيد الانتظار", "updated": "آخر تحديث", "not_found_title": "الرابط غير فعال",
+        "download_invoice": "تحميل الفاتورة (PDF)",
         "not_found": "رابط التتبع هذا لم يعد فعالًا. يرجى التواصل مع سي باور للحصول على رابط محدّث.",
         "contact": "هل لديكم استفسار حول هذه الشحنة؟", "lang_switch": "English",
         "company": COMPANY_NAME_AR,
@@ -4093,8 +4107,9 @@ def _track_date(raw, lang):
 @app.route("/t/<token>")
 def public_tracking(token):
     """The page a consignee/broker opens from a shared link or QR code.
-    No login. Shows status only - BL, vessel, port, ETA and the three steps
-    with their dates - never remarks, staff names, contacts or documents."""
+    No login. Shows status - BL, vessel, port, ETA and the three steps with
+    their dates - plus a download for the invoice PDF once one is attached.
+    Never remarks, staff names, contacts or the Delivery Order."""
     accept = request.headers.get("Accept-Language", "")
     lang = request.args.get("lang") or ("ar" if accept.lower().startswith("ar") else "en")
     lang = "ar" if lang == "ar" else "en"
@@ -4121,11 +4136,48 @@ def public_tracking(token):
             "steps": [{"label": tx["steps"][i], "done": done[i], "date": dates[i]} for i in range(3)],
             "stage": stage, "status": tx["status"][stage],
             "updated": _track_date(max(stamps), lang) if stamps else "",
+            "invoice_url": f"/t/{token}/invoice" if _track_invoice(token) else "",
         })
     html = render_template_string(TRACK_HTML, **ctx)
     resp = Response(html, status=200 if rec else 404, mimetype="text/html")
     # Not for search engines, never cached by shared proxies, and the
     # secret link isn't leaked to other sites via the Referer header.
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    return resp
+
+
+def _track_invoice(token):
+    """The invoice attachment (filename + bytes) for a tracking code, or None
+    if the code isn't valid or no invoice has been attached yet."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", token or ""):
+        return None
+    return get_db().execute(
+        """SELECT a.bl_number, a.filename, a.data FROM record_attachments a
+           JOIN records r ON r.bl_number = a.bl_number
+           WHERE r.track_token = ? AND a.kind = 'invoice'""",
+        (token,),
+    ).fetchone()
+
+
+@app.route("/t/<token>/invoice")
+def public_tracking_invoice(token):
+    """Invoice PDF download for whoever holds the tracking link / QR code -
+    the same unguessable code is the key, so "New link" in the Documents
+    popup cuts off downloads too. Only the invoice: the Delivery Order
+    stays internal. Each download is noted in the BL's History."""
+    row = _track_invoice(token)
+    if not row:
+        return Response("This link is no longer active.", status=404, mimetype="text/plain")
+    db = get_db()
+    db.execute(
+        "INSERT INTO audit_log (bl_number, action, field, old_value, new_value, by_user, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (row["bl_number"], "customer_download", "invoice", "", "", "tracking link", datetime.utcnow().strftime("%Y-%m-%d %H:%M")),
+    )
+    db.commit()
+    resp = Response(bytes(row["data"]), mimetype="application/pdf")
+    resp.headers["Content-Disposition"] = _content_disposition(row["filename"] or f"invoice_{row['bl_number']}.pdf", f"invoice_{row['bl_number']}.pdf")
     resp.headers["X-Robots-Tag"] = "noindex, nofollow"
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["Referrer-Policy"] = "no-referrer"
@@ -7799,6 +7851,11 @@ TRACK_HTML = """<!DOCTYPE html>
   .step-text b { display: block; font-size: 15px; padding-top: 3px; }
   .step-text span { font-size: 13px; color: var(--muted); }
   .updated { margin-top: 18px; font-size: 12px; color: var(--muted); }
+  .dl { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 22px;
+        padding: 13px 16px; border-radius: 12px; background: var(--navy); color: #fff;
+        font-weight: 700; font-size: 15px; text-decoration: none; }
+  .dl svg { width: 18px; height: 18px; flex-shrink: 0; }
+  .dl:active { opacity: .85; }
   .foot { margin-top: 18px; text-align: center; font-size: 13px; color: var(--muted); line-height: 1.7; }
   .foot a { color: var(--navy); font-weight: 700; text-decoration: none; }
   .nf h1 { font-size: 20px; margin: 0 0 8px; }
@@ -7835,6 +7892,12 @@ TRACK_HTML = """<!DOCTYPE html>
       </li>
       {% endfor %}
     </ol>
+    {% if invoice_url %}
+    <a class="dl" href="{{ invoice_url }}" rel="nofollow">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12M12 16l-5-5M12 16l5-5"/><path d="M4 20h16"/></svg>
+      {{ tx.download_invoice }}
+    </a>
+    {% endif %}
     {% if updated %}<div class="updated">{{ tx.updated }}: {{ updated }}</div>{% endif %}
   </div>
   {% else %}
@@ -8453,6 +8516,22 @@ PAGE_HTML = """
     border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
   }
   .bulk-bar button.bulk-remove-btn:hover { background: var(--danger-bg); }
+  /* Phones: the selection bar is pinned to the bottom of the screen (like
+     Gmail/WhatsApp selection mode) instead of sitting above the BL list.
+     Above the list it appeared off-screen when you ticked a BL far down a
+     long vessel - you couldn't see it, and had to scroll all the way up to
+     use it and then find your place again. Only one bar is pinned at a
+     time: the vessel you're working in. */
+  @media (max-width: 600px) {
+    .bulk-bar.active.docked {
+      position: fixed; inset-inline: 10px; bottom: 10px; z-index: 950; margin: 0;
+      background: color-mix(in srgb, var(--gold) 12%, var(--card));
+      box-shadow: var(--shadow-md); max-height: 45vh; overflow-y: auto;
+    }
+    body:has(.bulk-bar.active.docked) .scroll-top-btn { display: none; }
+    body:has(.bulk-bar.active.docked) #toastHost { bottom: calc(var(--dock-h, 0px) + 20px); }
+    body:has(.bulk-bar.active.docked)::after { height: calc(var(--dock-h, 0px) + 70px); }
+  }
 
   /* Above the floating back-to-top button (900) so the dimmed backdrop
      really covers everything behind the popup; toasts (1200) stay above it
@@ -8548,6 +8627,8 @@ PAGE_HTML = """
      it's being read/matched, once it's auto-attached, or (when the BL
      couldn't be pinned down automatically) while it waits for the user to
      pick the right one by hand. */
+  .automatch-modal { max-width: 640px; }
+  .automatch-summary { font-size: 12.5px; color: var(--muted); padding: 4px 0 6px; }
   .match-row {
     display: flex; align-items: center; gap: 10px; padding: 9px 0;
     border-bottom: 1px solid var(--border); font-size: 12.5px;
@@ -8691,8 +8772,11 @@ PAGE_HTML = """
     .toolbar-row .search-wrap { flex: 1 1 calc(100% - 130px); min-width: 0; }
     .toolbar-row .btn-neutral { flex: 0 0 auto; }
     .toolbar-row .glass-select-wrap { flex: 1 1 100%; min-width: 0 !important; order: 2; }
-    /* Top bar: drop the "Signed in as" words (the username stays). */
+    /* Top bar: drop the "Signed in as" words (the username stays), and let
+       it scroll away - pinned, its 2-3 rows took ~15% of a phone screen
+       permanently, away from the BL list. */
     .who-label { display: none; }
+    .topbar { position: static; }
     .topbar-right { gap: 6px; }
     .topbar-right a { padding: 6px 8px; }
   }
@@ -8801,7 +8885,7 @@ PAGE_HTML = """
         <div class="dropzone-sub" data-i18n="manifest_dropzone_sub">.xlsx, .xls, .csv, .docx or .pdf - the BL Number column is read automatically</div>
         <div class="dropzone-filename" id="dropzoneFilename"></div>
       </div>
-      <input type="file" id="manifestFile" accept=".xlsx,.xlsm,.xls,.csv,.docx,.pdf" style="display:none" onchange="stageManifestFile()">
+      <input type="file" id="manifestFile" accept=".xlsx,.xlsm,.xls,.csv,.docx,.pdf" multiple style="display:none" onchange="stageManifestFile()">
     </label>
     <div class="row" style="margin-top:14px;">
       <button type="button" id="addManifestBtn" onclick="uploadExcel()" disabled data-i18n="add_to_board">Add to board</button>
@@ -8827,8 +8911,6 @@ PAGE_HTML = """
       </div>
       <input type="file" id="autoMatchFile" accept=".pdf" multiple style="display:none" onchange="handleAutoMatchFiles(this.files)">
     </label>
-    <div id="autoMatchSummary" style="font-size:12.5px; color:var(--muted); margin-top:10px;"></div>
-    <div id="autoMatchList" style="margin-top:6px;"></div>
   </div>
 
   <div class="summary" id="summary"></div>
@@ -8872,6 +8954,21 @@ PAGE_HTML = """
         <button type="button" onclick="closeHistory()" style="background:none; color:var(--text); padding:4px 10px;">&times;</button>
       </div>
       <div id="historyBody" class="history-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Results of dropping Invoice/DO PDFs. Shown in a popup (closed with x,
+       a click outside, or Esc) instead of stacking up on the front page. -->
+  <div id="autoMatchOverlay" class="history-overlay" style="display:none;" onclick="if(event.target===this) closeAutoMatch()">
+    <div class="history-modal automatch-modal">
+      <div class="history-modal-head">
+        <b data-i18n="attach_results_title">Attaching documents</b>
+        <button type="button" onclick="closeAutoMatch()" style="background:none; color:var(--text); padding:4px 10px;" aria-label="Close">&times;</button>
+      </div>
+      <div class="history-modal-body">
+        <div id="autoMatchSummary" class="automatch-summary"></div>
+        <div id="autoMatchList"></div>
+      </div>
     </div>
   </div>
 
@@ -9071,72 +9168,82 @@ const dropzone = document.getElementById('dropzone');
   dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.remove('dragover'); });
 });
 dropzone.addEventListener('drop', e => {
-  const file = e.dataTransfer.files[0];
-  if (!file) return;
+  if (!e.dataTransfer.files.length) return;
   document.getElementById('manifestFile').files = e.dataTransfer.files;
   stageManifestFile();
 });
 
+// Several manifest files can be added at once (e.g. one vessel's cargo split
+// across a few files) - all go to the same Port + Vessel typed above.
 function stageManifestFile() {
-  const fileInput = document.getElementById('manifestFile');
-  const file = fileInput.files[0];
+  const files = Array.from(document.getElementById('manifestFile').files || []);
   const btn = document.getElementById('addManifestBtn');
-  if (!file) {
-    document.getElementById('dropzoneFilename').textContent = '';
-    btn.disabled = true;
-    return;
-  }
-  document.getElementById('dropzoneFilename').textContent = file.name;
+  const label = document.getElementById('dropzoneFilename');
+  if (!files.length) { label.textContent = ''; btn.disabled = true; return; }
+  label.textContent = files.length === 1 ? files[0].name
+    : t('n_files_selected', {n: files.length, names: files.map(f => f.name).join(', ')});
   btn.disabled = false;
 }
 
 async function uploadExcel() {
   const fileInput = document.getElementById('manifestFile');
-  const file = fileInput.files[0];
-  if (!file) { showToast(t('choose_manifest_first')); return; }
+  const files = Array.from(fileInput.files || []);
+  if (!files.length) { showToast(t('choose_manifest_first')); return; }
 
   const btn = document.getElementById('addManifestBtn');
   btn.disabled = true;
   const originalLabel = btn.textContent;
-  btn.textContent = t('adding_ellipsis');
 
   const port = document.getElementById('portField').value.trim().toUpperCase();
   const vessel = document.getElementById('vesselField').value.trim().toUpperCase();
 
-  const formData = new FormData();
-  formData.append('file', file);
-  formData.append('port', port);
-  formData.append('vessel', vessel);
-
-  const res = await apiWrite('/api/manifest/upload', { method: 'POST', body: formData });
-  const data = await res.json();
-  if (data.error) {
-    showToast(data.error);
-    btn.disabled = false;
-    btn.textContent = originalLabel;
-    return;
+  // One file at a time, so a BL listed in two of the files is simply
+  // "already on the board" by the second one instead of racing itself.
+  let added = 0, skipped = 0, contacts = 0;
+  const dupElsewhere = [], failed = [];
+  for (let i = 0; i < files.length; i++) {
+    btn.textContent = files.length > 1 ? t('adding_progress', {i: i + 1, n: files.length}) : t('adding_ellipsis');
+    const formData = new FormData();
+    formData.append('file', files[i]);
+    formData.append('port', port);
+    formData.append('vessel', vessel);
+    let data;
+    try {
+      const res = await apiWrite('/api/manifest/upload', { method: 'POST', body: formData });
+      data = await res.json();
+    } catch (e) {
+      data = {error: t('could_not_save_retry')};
+    }
+    if (data.error) { failed.push(t('file_failed', {name: files[i].name, error: data.error})); continue; }
+    added += data.added || 0;
+    skipped += data.skipped || 0;
+    contacts += data.contacts_found || 0;
+    (data.duplicate_elsewhere || []).forEach(d => dupElsewhere.push(d));
   }
 
-  // Reset the dropzone so the same "Add to board" flow can be repeated
-  // for the next manifest without leftover state from this one.
+  // Reset the dropzone so the same "Add to board" flow can be repeated.
   fileInput.value = '';
   document.getElementById('dropzoneFilename').textContent = '';
   btn.textContent = originalLabel;
+  btn.disabled = true;
 
   await fetchRecords(true);
-  showToast(t('bl_records_added', {added: data.added}) + (data.skipped ? t('already_on_board_skipped', {skipped: data.skipped}) : '') + (data.contacts_found ? t('contacts_found', {n: data.contacts_found}) : '') + '.');
+  if (failed.length < files.length) {
+    showToast(t('bl_records_added', {added}) + (skipped ? t('already_on_board_skipped', {skipped}) : '') + (contacts ? t('contacts_found', {n: contacts}) : '') + '.');
+  }
+  failed.forEach(msg => showToast(msg, {duration: 9000}));
 
   // A BL that's already on the board under a DIFFERENT vessel than the one
   // just uploaded is worth a second look - either this file re-lists a BL
   // that's really a different shipment (a shipper reusing a number), or a
   // genuine mistake. Either way, silently skipping it like an ordinary
   // repeat-upload duplicate would hide it.
-  if (data.duplicate_elsewhere && data.duplicate_elsewhere.length) {
-    const lines = data.duplicate_elsewhere.slice(0, 5).map(d =>
+  if (dupElsewhere.length) {
+    const lines = dupElsewhere.slice(0, 5).map(d =>
       t('already_under', {bl: d.bl_number, vessel: d.existing_vessel || t('unassigned_vessel_ph'), port: d.existing_port || t('unassigned_port_ph')})
     ).join('; ');
-    const more = data.duplicate_elsewhere.length > 5 ? t('and_n_more', {n: data.duplicate_elsewhere.length - 5}) : '';
-    showToast(t('heads_up_duplicate', {n: data.duplicate_elsewhere.length, lines, more}), {duration: 9000});
+    const more = dupElsewhere.length > 5 ? t('and_n_more', {n: dupElsewhere.length - 5}) : '';
+    showToast(t('heads_up_duplicate', {n: dupElsewhere.length, lines, more}), {duration: 9000});
   }
 }
 
@@ -9311,7 +9418,9 @@ async function showHistory(bl) {
   body.innerHTML = entries.map(e => {
     let line;
     const byUser = esc(e.by_user || t('unknown_user'));
-    if (e.action === 'toggle') {
+    if (e.action === 'customer_download') {
+      line = esc(t('history_customer_download'));
+    } else if (e.action === 'toggle') {
       line = `<b>${byUser}</b> ${t('history_set_field', {field: esc(historyFieldLabel(e.field)), value: e.new_value ? t('yes') : t('no')})}`;
     } else if (e.action === 'remarks') {
       line = `<b>${byUser}</b> ${e.new_value ? t('history_edited_remarks', {value: esc(e.new_value)}) : t('history_cleared_remarks')}`;
@@ -9614,31 +9723,65 @@ function autoMatchKindLabel(kind) {
   return kind === 'invoice' ? t('doc_invoice') : kind === 'do' ? t('doc_delivery_order') : t('unrecognized_document');
 }
 
+/* The results popup. Opening it when it's closed starts a fresh list;
+   dropping more files while it's already open adds to the same list. */
+let autoMatchRunning = 0;  // batches still being processed
+function autoMatchSummaryText() {
+  const list = document.getElementById('autoMatchList');
+  const attached = list.querySelectorAll('.match-row.ok').length;
+  const review = list.querySelectorAll('.match-row.review').length;
+  const pending = list.querySelectorAll('.match-row').length - attached - review;
+  return t('attached_automatically', {n: attached}) + (review ? t('need_your_input', {n: review}) : '') +
+    (pending ? t('processing_more', {n: pending}) : '.');
+}
+function updateAutoMatchSummary() {
+  document.getElementById('autoMatchSummary').textContent = autoMatchSummaryText();
+}
+function openAutoMatch() {
+  const overlay = document.getElementById('autoMatchOverlay');
+  if (overlay.style.display === 'none') {
+    document.getElementById('autoMatchList').innerHTML = '';
+    document.getElementById('autoMatchSummary').textContent = '';
+  }
+  overlay.style.display = 'flex';
+}
+function closeAutoMatch() {
+  document.getElementById('autoMatchOverlay').style.display = 'none';
+}
+function autoMatchIsOpen() {
+  return document.getElementById('autoMatchOverlay').style.display !== 'none';
+}
+
 async function handleAutoMatchFiles(fileList) {
   const files = Array.from(fileList || []).filter(f => f.name.toLowerCase().endsWith('.pdf'));
+  const input = document.getElementById('autoMatchFile');
+  if (input) input.value = '';  // so the same file can be picked again later
   if (!files.length) { showToast(t('drop_pdf_only')); return; }
 
+  openAutoMatch();
+  autoMatchRunning++;
   const listEl = document.getElementById('autoMatchList');
-  const summaryEl = document.getElementById('autoMatchSummary');
-  let attached = 0, needsReview = 0;
-  const updateSummary = () => {
-    summaryEl.textContent = t('attached_automatically', {n: attached}) + (needsReview ? t('need_your_input', {n: needsReview}) : '') +
-      ((attached + needsReview) < files.length ? t('processing_more', {n: files.length - attached - needsReview}) : '.');
-  };
+  const updateSummary = updateAutoMatchSummary;
+
+  // One row per file straight away, so the popup shows the whole batch
+  // (and "processing N more") from the start.
+  const rows = files.map((file, i) => {
+    const row = document.createElement('div');
+    row.className = 'match-row';
+    row.id = `matchrow_${Date.now()}_${i}`;
+    row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">${t('reading_ellipsis')}</div>`;
+    listEl.appendChild(row);
+    return row;
+  });
   updateSummary();
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
-    const rowId = `matchrow_${Date.now()}_${i}`;
-    const row = document.createElement('div');
-    row.className = 'match-row';
-    row.id = rowId;
-    row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">${t('reading_ellipsis')}</div>`;
-    listEl.appendChild(row);
+    const row = rows[i];
 
     if (file.size > 10 * 1024 * 1024) {
       row.querySelector('.match-status').textContent = t('too_large_skipped');
-      needsReview++; updateSummary();
+      updateSummary();
       continue;
     }
 
@@ -9652,7 +9795,7 @@ async function handleAutoMatchFiles(fileList) {
     } catch (err) {
       row.className = 'match-row review';
       row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">${esc(err.message)}</div>`;
-      needsReview++; updateSummary();
+      updateSummary();
       continue;
     }
 
@@ -9662,7 +9805,7 @@ async function handleAutoMatchFiles(fileList) {
         row.className = 'match-row ok';
         const issuedNote = data.auto_issued_field ? t('marked_issued_suffix') : '';
         row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">&check; ${esc(detect.matched_bl)} - ${esc(autoMatchKindLabel(detect.kind))}${esc(issuedNote)}</div>`;
-        attached++; updateSummary();
+        updateSummary();
         continue;
       }
       // Fall through to manual review if the upload itself was rejected
@@ -9671,16 +9814,19 @@ async function handleAutoMatchFiles(fileList) {
       // drop the file silently if it happens.
       row.className = 'match-row review';
       renderAutoMatchReviewRow(row, file, detect, data.error);
-      needsReview++; updateSummary();
+      updateSummary();
       continue;
     }
 
     row.className = 'match-row review';
     renderAutoMatchReviewRow(row, file, detect, null);
-    needsReview++; updateSummary();
+    updateSummary();
   }
 
+  autoMatchRunning--;
   await fetchRecords(true);
+  // Closed the popup before it finished? Say how it went, briefly.
+  if (!autoMatchIsOpen() && !autoMatchRunning) showToast(t('attach_batch_done', {summary: autoMatchSummaryText()}), {duration: 7000});
 }
 
 function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
@@ -9719,6 +9865,7 @@ function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
     row.className = 'match-row ok';
     const issuedNote = data.auto_issued_field ? t('marked_issued_suffix') : '';
     row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">&check; ${esc(bl)} - ${esc(autoMatchKindLabel(kind))}${esc(issuedNote)}</div>`;
+    updateAutoMatchSummary();
     await fetchRecords(true);
   };
 }
@@ -9891,7 +10038,16 @@ function toggleRowSelect(bl, checked) {
   updateBulkBars();
 }
 
+let dockedBarKey = null;  // vessel whose selection bar is pinned (phones)
 function updateBulkBars() {
+  // The selection bar appears above the BL list when the first row is
+  // ticked (and disappears with the last), which pushed the whole list -
+  // including the row just clicked - down/up by the bar's height (57px on
+  // a desktop, ~200px on a phone). Keep the row that was clicked fixed on
+  // screen by scrolling the page by exactly that amount.
+  const active = document.activeElement;
+  const anchor = active && active.closest ? active.closest('tr') : null;
+  const anchorTop = anchor ? anchor.getBoundingClientRect().top : null;
   document.querySelectorAll('.bulk-bar').forEach(bar => {
     const scope = (bar.dataset.bls || '').split('|').filter(Boolean);
     const count = scope.filter(bl => selectedBLs.has(bl)).length;
@@ -9912,6 +10068,26 @@ function updateBulkBars() {
     cb.checked = scope.length > 0 && count === scope.length;
     cb.indeterminate = count > 0 && count < scope.length;
   });
+  // Which selection bar gets pinned to the bottom on a phone: the one for
+  // the vessel just clicked in, else the one already pinned, else any.
+  let dock = null;
+  if (anchor && anchor.isConnected) {
+    const g = anchor.closest('.vessel-group');
+    dock = g ? g.querySelector('.bulk-bar.active') : null;
+  }
+  if (!dock && dockedBarKey) {
+    dock = [...document.querySelectorAll('.bulk-bar.active')].find(b => b.dataset.barKey === dockedBarKey) || null;
+  }
+  if (!dock) dock = document.querySelector('.bulk-bar.active');
+  dockedBarKey = dock ? dock.dataset.barKey : null;
+  document.querySelectorAll('.bulk-bar').forEach(b => b.classList.toggle('docked', b === dock));
+  const pinned = dock && getComputedStyle(dock).position === 'fixed';
+  document.documentElement.style.setProperty('--dock-h', pinned ? dock.offsetHeight + 'px' : '0px');
+
+  if (anchor && anchor.isConnected && anchorTop !== null) {
+    const shift = anchor.getBoundingClientRect().top - anchorTop;
+    if (Math.abs(shift) > 1) window.scrollBy(0, shift);
+  }
 }
 
 async function bulkSetField(vesselKey, field, value) {
@@ -10012,7 +10188,17 @@ function list_selectAllVessel(vesselKey, checked) {
   const bar = document.querySelector(`[data-bar-key="${CSS.escape(vesselKey)}"]`);
   const bls = bar ? (bar.dataset.bls || '').split('|').filter(Boolean) : [];
   bls.forEach(bl => { if (checked) selectedBLs.add(bl); else selectedBLs.delete(bl); });
+  // Same as updateBulkBars(): keep the list still while the selection bar
+  // appears/disappears above it.
+  const box = bar ? bar.parentElement.querySelector('.overflow') : null;
+  const groupId = box ? box.closest('.vessel-group').id : null;
+  const before = box ? box.getBoundingClientRect().top : null;
   render();
+  const after = groupId ? document.querySelector('#' + CSS.escape(groupId) + ' .overflow') : null;
+  if (after && before !== null) {
+    const shift = after.getBoundingClientRect().top - before;
+    if (Math.abs(shift) > 1) window.scrollBy(0, shift);
+  }
 }
 
 function groupRecordsByPortVessel(list) {
@@ -10126,7 +10312,29 @@ function portGroupHtml(portName, vesselNames, vessels, archivedView, suppressHea
     </div>`;
 }
 
+// Each vessel's BL list scrolls inside its own box. render() rebuilds the
+// board from scratch, and a rebuilt box always starts at the top - so ticking
+// a slider halfway down a 70-BL vessel threw you back to the first BL once
+// the save finished and the board redrew. Remember every box's scroll
+// position before the rebuild and put it back afterwards.
+function saveListScroll() {
+  const saved = {};
+  document.querySelectorAll('.vessel-group').forEach(g => {
+    const box = g.querySelector('.overflow');
+    if (box && (box.scrollTop || box.scrollLeft)) saved[g.id] = [box.scrollTop, box.scrollLeft];
+  });
+  return saved;
+}
+function restoreListScroll(saved) {
+  Object.keys(saved).forEach(id => {
+    const g = document.getElementById(id);
+    const box = g && g.querySelector('.overflow');
+    if (box) { box.scrollTop = saved[id][0]; box.scrollLeft = saved[id][1]; }
+  });
+}
+
 function render() {
+  const savedListScroll = saveListScroll();
   const q = document.getElementById('searchBox').value.trim().toLowerCase();
   const operatorFilterEl = document.getElementById('operatorFilter');
   if (operatorFilterEl) {
@@ -10245,6 +10453,7 @@ function render() {
     }
   }
 
+  restoreListScroll(savedListScroll);
   updateSummaryOnly();
   updateBulkBars();
 }
@@ -10569,6 +10778,7 @@ document.addEventListener('keydown', (e) => {
     if (Object.values(customSelects).some(s => s.open)) return;
     const docsOverlay = document.getElementById('docsOverlay');
     if (docsOverlay && docsOverlay.style.display !== 'none') { closeDocs(); return; }
+    if (autoMatchIsOpen()) { closeAutoMatch(); return; }
     const historyOverlay = document.getElementById('historyOverlay');
     if (historyOverlay && historyOverlay.style.display !== 'none') { closeHistory(); return; }
     if (document.querySelector('.bulk-bar.active')) return;
