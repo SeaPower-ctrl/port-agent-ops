@@ -19,6 +19,8 @@ Then open http://localhost:5000
 import os
 import re
 import csv
+import unicodedata
+import html.parser
 import io
 import time
 import secrets
@@ -111,7 +113,7 @@ const I18N = {
     n_files_selected: "{n} files: {names}",
     adding_progress: "Adding {i} of {n}...",
     file_failed: "{name}: {error}",
-    manifest_dropzone_sub: ".xlsx, .xls, .csv, .docx or .pdf - the BL Number column is read automatically",
+    manifest_dropzone_sub: ".xlsx, .xls, .csv, .docx or .pdf - the BL numbers are read automatically",
     add_to_board: "Add to board",
     vessel_placeholder: "e.g. TAI KNIGHT",
     adding_ellipsis: "Adding...",
@@ -243,6 +245,42 @@ const I18N = {
     already_under: "{bl} (already under {vessel} / {port})",
     and_n_more: " and {n} more",
     could_not_save_retry: "Could not save that change - please try again.",
+    // Manifest preview (check before adding)
+    mp_title: "Check before adding",
+    mp_reading: "Reading the manifest...",
+    mp_read_failed: "Could not read the file(s) - please try again.",
+    mp_destination: "Adding to {port} · {vessel}",
+    mp_no_vessel: "No vessel typed in - these will go under Unassigned.",
+    mp_no_port: "No discharge port selected - these will go under Unassigned.",
+    mp_found: "{n} BL(s) found",
+    mp_summary: "{sel} of {total} selected",
+    mp_add_n: "Add {n} BL(s)",
+    mp_nothing_new: "Nothing new to add",
+    mp_adding: "Adding...",
+    mp_cancel: "Cancel",
+    mp_toggle_file: "Select / clear all in this file",
+    mp_status_new: "New",
+    mp_status_on_board: "Already on this vessel",
+    mp_status_elsewhere: "Already under {vessel} / {port}",
+    mp_status_repeat: "Listed twice - added once",
+    mp_note_hidden_row: "Hidden row in Excel - tick to add",
+    mp_note_hidden_sheet: "On a hidden sheet - tick to add",
+    mp_note_struck: "Crossed out in the file - tick to add",
+    mp_err_unsupported: "Not a supported file type (.xlsx, .xls, .csv, .docx, .pdf).",
+    mp_err_unreadable: "Could not open this file - it may be damaged or password-protected.",
+    mp_err_no_bls: "No BL numbers found - the file needs a B/L NO. column.",
+    mp_err_too_large: "This file is larger than 25MB.",
+    mp_err_empty: "This file is empty.",
+    mp_contact_title: "E-mail: {email} · Phone: {phone}",
+    already_has_file_confirm: "Matches {bl}, which already has a {kind} attached - pick it below to replace it",
+    member_match_confirm: "Names one of the BLs in the combined entry {bl} - check it and attach",
+    mp_status_taken: "Already on the board (another user's)",
+    mp_status_fills: "Already on the board - adds missing contact details",
+    mp_save_contacts_n: "Save contact details for {n} BL(s)",
+    mp_summary_fills: " · contact details for {n} existing",
+    mp_warn_truncated: "Very large file - only the first 20,000 rows were read.",
+    contacts_updated: "Contact details added to {n} BL(s) already on the board.",
+    left_out_hidden: "{n} BL(s) in hidden or crossed-out rows were left out.",
     only_pdf_accepted: "Only PDF files are accepted.",
     file_too_large: "That file is larger than 10MB.",
     uploaded_marked_issued: "{label} uploaded - marked as issued.",
@@ -328,7 +366,7 @@ const I18N = {
     n_files_selected: "{n} ملفات: {names}",
     adding_progress: "جارٍ إضافة {i} من {n}...",
     file_failed: "{name}: {error}",
-    manifest_dropzone_sub: "\\u2066.xlsx, .xls, .csv, .docx, .pdf\\u2069 - يتم قراءة عمود رقم البوليصة تلقائيًا",
+    manifest_dropzone_sub: "\\u2066.xlsx, .xls, .csv, .docx, .pdf\\u2069 - تُقرأ أرقام البوالص تلقائيًا",
     add_to_board: "إضافة إلى اللوحة",
     vessel_placeholder: "مثال: TAI KNIGHT",
     adding_ellipsis: "جارٍ الإضافة...",
@@ -448,6 +486,41 @@ const I18N = {
     already_under: "{bl} (مسجلة تحت {vessel} / {port})",
     and_n_more: "، و{n} أخرى",
     could_not_save_retry: "تعذر حفظ هذا التغيير - يرجى المحاولة مرة أخرى.",
+    mp_title: "راجِع قبل الإضافة",
+    mp_reading: "جارٍ قراءة بيان الشحن...",
+    mp_read_failed: "تعذرت قراءة الملفات - يرجى المحاولة مرة أخرى.",
+    mp_destination: "ستُضاف إلى {port} · {vessel}",
+    mp_no_vessel: "لم يُكتب اسم السفينة - ستُضاف تحت «غير محدد».",
+    mp_no_port: "لم يُختر ميناء التفريغ - ستُضاف تحت «غير محدد».",
+    mp_found: "تم العثور على {n} بوليصة",
+    mp_summary: "تم تحديد {sel} من {total}",
+    mp_add_n: "إضافة {n} بوليصة",
+    mp_nothing_new: "لا يوجد جديد للإضافة",
+    mp_adding: "جارٍ الإضافة...",
+    mp_cancel: "إلغاء",
+    mp_toggle_file: "تحديد / إلغاء تحديد الكل في هذا الملف",
+    mp_status_new: "جديدة",
+    mp_status_on_board: "موجودة على هذه السفينة",
+    mp_status_elsewhere: "مسجلة تحت {vessel} / {port}",
+    mp_status_repeat: "مكررة - تُضاف مرة واحدة",
+    mp_note_hidden_row: "صف مخفي في الإكسل - حدّدها لإضافتها",
+    mp_note_hidden_sheet: "في ورقة مخفية - حدّدها لإضافتها",
+    mp_note_struck: "مشطوبة في الملف - حدّدها لإضافتها",
+    mp_err_unsupported: "نوع الملف غير مدعوم (\\u2066.xlsx, .xls, .csv, .docx, .pdf\\u2069).",
+    mp_err_unreadable: "تعذر فتح هذا الملف - قد يكون تالفًا أو محميًا بكلمة مرور.",
+    mp_err_no_bls: "لم يتم العثور على أرقام بوالص - يجب أن يحتوي الملف على عمود رقم البوليصة.",
+    mp_err_too_large: "حجم هذا الملف أكبر من 25 ميجابايت.",
+    mp_err_empty: "هذا الملف فارغ.",
+    mp_contact_title: "البريد: {email} · الهاتف: {phone}",
+    already_has_file_confirm: "يطابق {bl}، ومرفق بها {kind} مسبقًا - اخترها أدناه لاستبداله",
+    member_match_confirm: "يذكر إحدى البوالص ضمن الإدخال المجمّع {bl} - تحقّق ثم أرفِق",
+    mp_status_taken: "موجودة على اللوحة لدى مستخدم آخر",
+    mp_status_fills: "موجودة - تُضاف بيانات الاتصال الناقصة",
+    mp_save_contacts_n: "حفظ بيانات الاتصال لـ {n} بوليصة",
+    mp_summary_fills: " · بيانات اتصال لـ {n} موجودة",
+    mp_warn_truncated: "ملف كبير جدًا - تمت قراءة أول 20,000 صف فقط.",
+    contacts_updated: "تمت إضافة بيانات الاتصال إلى {n} بوليصة موجودة على اللوحة.",
+    left_out_hidden: "تم استبعاد {n} بوليصة في صفوف مخفية أو مشطوبة.",
     only_pdf_accepted: "يُقبل فقط ملفات PDF.",
     file_too_large: "حجم هذا الملف أكبر من 10 ميجابايت.",
     uploaded_marked_issued: "تم رفع {label} - وتم تمييزها كصادرة.",
@@ -539,6 +612,7 @@ function setLang(lang) {
   try { localStorage.setItem('lang', lang); } catch (e) {}
   applyI18n();
   if (typeof render === 'function') render();
+  try { document.dispatchEvent(new Event('langchange')); } catch (e) {}
 }
 """
 
@@ -1507,7 +1581,16 @@ def list_records():
             f"SELECT r.*{ATTACHMENT_FLAGS_SQL} FROM records r WHERE created_by = ? ORDER BY created_at DESC",
             (session.get("username"),),
         ).fetchall()
-    return jsonify([dict(r) for r in rows])
+    out = []
+    for r in rows:
+        rec = dict(r)
+        # The individual B/Ls a combined entry stands for, so searching the
+        # board for "...002" finds "...001-003".
+        members = bl_members(rec["bl_number"])[1:]
+        if members:
+            rec["bl_members"] = members
+        out.append(rec)
+    return jsonify(out)
 
 
 def _parse_ts(s):
@@ -1658,166 +1741,24 @@ def _log_audit(bl_number, action, field="", old_value="", new_value=""):
 @app.route("/api/manifest", methods=["POST"])
 @login_required
 def submit_manifest():
-    data = request.get_json(force=True)
-    lines = data.get("lines", "")
-    db = get_db()
-    added = 0
-    for raw in lines.splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        # Only the BL number matters now - if the user still pastes
-        # "BL, something" (old habit), just take the BL part.
-        bl_number = raw.split(",", 1)[0].strip().upper()
-        consignee = ""
-        if not bl_number:
-            continue
-        existing = db.execute("SELECT 1 FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
-        if existing:
-            continue
-        db.execute(
-            "INSERT INTO records (bl_number, consignee, created_at, created_by) VALUES (?, ?, ?, ?)",
-            (bl_number, consignee, datetime.utcnow().strftime("%Y-%m-%d %H:%M"), session.get("username")),
-        )
-        added += 1
-    db.commit()
-    return jsonify({"added": added})
-
-
-# Header names we'll recognize for the BL Number column in an uploaded
-# manifest. Matching is case-insensitive and ignores spaces/punctuation.
-# (Consignee is intentionally no longer tracked - only the BL number matters.)
-BL_HEADER_WORDS = ["blnumber", "bl", "billoflading", "billofladingno", "bl no", "blno"]
-
-
-def _normalize_header(text):
-    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
-
-
-def _extract_bl_numbers_from_rows(rows, allow_no_header_fallback=True):
-    """rows: a list of rows, each row a sequence of cell values (any type,
-    already-stringifiable). Looks for a header naming the BL Number column
-    in the first 5 rows (same recognized header words used for Excel).
-
-    If no such header is found:
-      - allow_no_header_fallback=False skips this table entirely (used for
-        sheets/tables beyond the first one in a multi-sheet/multi-table
-        file - real manifests are commonly one main BL-list sheet plus
-        per-BL "attachment" sheets, e.g. a vehicle's chassis/engine-number
-        list, which have an ITEM/serial column but no BL Number column at
-        all; blindly reading their column A as BL numbers turns "1, 2, 3,
-        4..." into fake BL records).
-      - allow_no_header_fallback=True (the default - used for a lone
-        sheet/table, or plain pasted text) falls back to column A as the
-        BL number. As a safety net even then, if the values that column A
-        produces are themselves just "1", "2", "3", "4", ... (a serial/
-        item counter, not real BL data), this is skipped too.
-
-    Returns a flat list of upper-cased BL number strings (not deduped)."""
-    if not rows:
-        return []
-
-    bl_col = None
-    header_row_index = None
-    for i, row in enumerate(rows[:5]):
-        for col_index, cell in enumerate(row):
-            norm = _normalize_header(cell)
-            # Exact match only - a loose "startswith" here used to also
-            # match unrelated things like a "B/L ATTACHMENT" sheet title
-            # (normalizes to "blattachment", which starts with "bl"),
-            # falsely treating it as a real header and reading junk data
-            # out of the column below it.
-            if norm and any(norm == w.replace(" ", "") for w in BL_HEADER_WORDS):
-                bl_col = col_index
-                header_row_index = i
-        if bl_col is not None:
-            break
-
-    if bl_col is None:
-        if not allow_no_header_fallback:
-            return []
-        bl_col = 0
-        data_rows = rows
-    else:
-        data_rows = rows[header_row_index + 1:]
-
-    out = []
-    for row in data_rows:
-        if bl_col >= len(row):
-            continue
-        raw_bl = row[bl_col]
-        if raw_bl is None or str(raw_bl).strip() == "":
-            continue
-        raw_text = str(raw_bl).strip()
-        # A cell occasionally lists more than one BL number stacked on
-        # separate lines inside it (e.g. a shared-contact/remarks row that
-        # covers two BLs handled by the same person) - split those apart
-        # rather than keeping the newline embedded in one garbled
-        # "BL1\nBL2" record, which would land on the board as its own
-        # fake, unmatched entry alongside the two real ones.
-        for line in raw_text.splitlines():
-            candidate = line.strip().upper()
-            if not candidate:
-                continue
-            # Skip a summary row ("TOTAL:", "GRAND TOTAL", "SUB TOTAL",
-            # "VOYAGE TOTAL", "PAGE TOTAL"...) sitting in the same column as
-            # the real BL numbers - manifests commonly have one or more of
-            # these (a running subtotal per page, plus a grand/voyage total
-            # at the end), and none of them are real BLs. A substring check
-            # catches every "___ TOTAL" variant rather than only the exact
-            # phrases seen so far.
-            norm_candidate = _normalize_header(candidate)
-            candidate_check = re.sub(r"\s+", "", candidate)
-            if "total" in norm_candidate or any(w in candidate_check for w in ("合计", "总计", "汇总", "小计")):
-                continue
-            out.append(candidate)
-
-    if header_row_index is None:
-        sample = out[:5]
-        if sample == [str(n) for n in range(1, len(sample) + 1)]:
-            return []
-
-    return out
-
-
-_DTRKR_NON_MANIFEST_SHEET_RE = re.compile(
-    r"CONTACT|REMARK|NOTES?\b|ADDRESS", re.IGNORECASE
-)
-
-
-def _dtrkr_is_non_manifest_sheet_name(name):
-    """A sheet whose own name marks it as per-BL reference info (a contact
-    list, remarks, notes...) rather than the shipment's actual BL data.
-    These sheets commonly reuse a "BL NO." column just to key their rows to
-    a BL, which would otherwise look exactly like a real manifest table and
-    get re-extracted as if it were one - at best adding nothing but repeat
-    work (the same BL numbers already found on the main sheet), at worst
-    adding garbage (one shared-contact row can cover two BLs via a
-    multi-line cell, or append extra text like "BL085(085 123-125)")."""
-    return bool(_DTRKR_NON_MANIFEST_SHEET_RE.search(str(name or "")))
-
-
-def _extract_bl_numbers_from_lines(text):
-    """Fallback for formats with no real table (a .docx with no tables, or
-    a .pdf page with no detectable table/borders - common for manifests
-    exported or printed without visible grid lines). One BL per non-empty
-    line, taking whatever is before the first comma if present, then run
-    through the same header-recognition as tabular rows so a stray header
-    line like "BL Number" at the top doesn't get inserted as a record."""
-    rows = []
-    for raw in text.splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        rows.append([raw.split(",", 1)[0].strip()])
-    return _extract_bl_numbers_from_rows(rows)
+    """Older "paste a list of BLs" endpoint (not used by the board itself
+    any more). One BL per line; "BL, something" keeps just the BL. Lines
+    that aren't a B/L number are ignored, and BLs go through the same add
+    path as a manifest upload."""
+    data = request.get_json(force=True, silent=True) or {}
+    items = []
+    for raw in str(data.get("lines", "")).splitlines():
+        for bl in _mf_bls_from_line(raw.split(",", 1)[0], allow_numeric=True)[:1]:
+            items.append({"bl": bl})
+    if not items:
+        return jsonify({"added": 0})
+    return jsonify({"added": _manifest_add("", "", items)["added"]})
 
 
 # ---------- Consignee contact details (for customer notifications) ----------
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _EMAIL_FULL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
-_PHONE_CANDIDATE_RE = re.compile(r"(?:\+|00)?\d[\d\s().-]{7,18}\d")
 
 
 def _normalize_phone(raw):
@@ -1825,12 +1766,13 @@ def _normalize_phone(raw):
     Saudi local formats get +966: '0501234567', '501234567',
     '00966 50 123 4567', '966-50-1234567' all -> '+966501234567';
     '011 230 8888' -> '+966112308888'. A number typed with '+' or '00'
-    keeps its own country code."""
+    keeps its own country code. The local trunk 0 that people often keep
+    after the country code ('+966 0501234567', '+0549928955') is dropped."""
     s = str(raw or "").strip()
     if not s:
         return ""
     d = re.sub(r"\D", "", s)
-    if s.startswith("+"):
+    if s.startswith("+") and not s.startswith("+0"):
         pass
     elif d.startswith("00"):
         d = d[2:]
@@ -1838,97 +1780,16 @@ def _normalize_phone(raw):
         d = "966" + d[1:]
     elif d.startswith("5") and len(d) == 9:       # 5x xxx xxxx
         d = "966" + d
+    if d.startswith("9660") and len(d) == 13:     # +966 0 5x xxx xxxx
+        d = "966" + d[4:]
     if not (8 <= len(d) <= 15):
         return ""
     return "+" + d
 
 
-def _saudi_phones_in(text):
-    """Saudi mobile/landline numbers found in free text (a manifest's
-    consignee cell). Deliberately strict: those cells also carry CR and VAT
-    numbers (10-15 digits) that must not be mistaken for phones."""
-    out = []
-    for m in _PHONE_CANDIDATE_RE.findall(str(text or "")):
-        p = _normalize_phone(m)
-        if re.fullmatch(r"\+966[15]\d{8}", p) and p not in out:
-            out.append(p)
-    return out
-
-
 def _clean_email(raw):
     e = str(raw or "").strip()
     return e if e and len(e) <= 254 and _EMAIL_FULL_RE.match(e) else ""
-
-
-_CONSIGNEE_HEADERS = ("consignee", "收货人")
-_NOTIFY_HEADERS = ("notify", "通知人")
-_REMARK_HEADERS = ("remark", "term", "contact", "备注")
-
-
-def _extract_contacts_from_rows(rows):
-    """{bl_number: {"name", "email", "phone"}} from a manifest table that has
-    CONSIGNEE / NOTIFY (and often a remarks/TERM) column next to the B/L NO.
-    column - e.g. the Tianjin manifests, where those cells hold the company
-    name and address with an email/phone mixed in. Only the consignee side
-    is read (never the SHIPPER column - that's the Chinese shipper's own
-    contact). BL keys are normalized exactly like the BL extraction, so they
-    line up with the records being inserted. Returns {} for tables without
-    those columns (most packing lists) - this is a best-effort extra and
-    never blocks the BL upload itself."""
-    if not rows:
-        return {}
-    bl_col = hdr_idx = None
-    for i, row in enumerate(rows[:8]):
-        for j, cell in enumerate(row):
-            norm = _normalize_header(cell)
-            if norm and any(norm == w.replace(" ", "") for w in BL_HEADER_WORDS):
-                bl_col, hdr_idx = j, i
-        if bl_col is not None:
-            break
-    if bl_col is None:
-        return {}
-    cols = {"consignee": None, "notify": None, "remark": None}
-    for row in rows[:hdr_idx + 1]:  # bilingual manifests put Chinese + English headers on two rows
-        for j, cell in enumerate(row):
-            text = re.sub(r"\s+", "", str(cell or "").lower())
-            if not text or j == bl_col:
-                continue
-            for key, words in (("consignee", _CONSIGNEE_HEADERS), ("notify", _NOTIFY_HEADERS), ("remark", _REMARK_HEADERS)):
-                if cols[key] is None and any(w in text for w in words):
-                    cols[key] = j
-    if cols["consignee"] is None and cols["notify"] is None:
-        return {}
-
-    def cell(row, key):
-        j = cols[key]
-        return str(row[j]) if j is not None and j < len(row) and row[j] is not None else ""
-
-    out = {}
-    for row in rows[hdr_idx + 1:]:
-        if bl_col >= len(row) or row[bl_col] is None:
-            continue
-        cons, notify, remark = cell(row, "consignee"), cell(row, "notify"), cell(row, "remark")
-        first_line = next((ln.strip() for ln in cons.splitlines() if ln.strip()), "")
-        name = "" if first_line.upper().startswith(("TO ORDER", "TO THE ORDER")) else first_line[:120]
-        email = ""
-        for src in (cons, notify, remark):
-            found = _EMAIL_RE.findall(src)
-            if found:
-                email = _clean_email(found[0])
-                break
-        phone = ""
-        for src in (cons, notify, remark):
-            found = _saudi_phones_in(src)
-            if found:
-                phone = found[0]
-                break
-        if not (name or email or phone):
-            continue
-        for line in str(row[bl_col]).splitlines():
-            bl = line.strip().upper()
-            if bl and "total" not in _normalize_header(bl):
-                out[bl] = {"name": name, "email": email, "phone": phone}
-    return out
 
 
 _ZIP_MAGIC = b"PK\x03\x04"
@@ -1962,156 +1823,1181 @@ def _load_excel_sheets_by_content(raw_bytes, filename):
     raise ValueError(f"{filename} isn't a recognizable Excel file")
 
 
-def _safe_extract_contacts(rows):
-    """Contact extraction is a bonus - a quirk in some manifest must never
-    stop its BL numbers from being added."""
+# ---------- Manifest reading (DO Tracker "Add a manifest") ----------
+#
+# Every load port / forwarder sends its manifest in its own layout, so this
+# never trusts one fixed template. What it relies on instead:
+#
+#  * The B/L column is found by its HEADER ("B/L NO.", "BL Number",
+#    "Bill of Lading No.", "B/L Nr.", "提单号码" ...) anywhere in the first 40
+#    rows - not just the first 5, and never by assuming column A. Only that
+#    column is read, below the header.
+#  * Every value read from it must actually LOOK like a B/L number (letters
+#    and digits, no spaces/sentences/phone numbers/dates). Notes typed under
+#    a BL in the same cell ("no have bl draft", "according to MR",
+#    "(050-055+165)", "will switch bl"), TOTAL rows, repeated header rows and
+#    blank lines are dropped.
+#  * A sheet/table with NO B/L header is only used when it is clearly the
+#    manifest itself or its continuation (page 2 of a Word/PDF table): one
+#    column holding nothing but distinct B/L-shaped values of one series
+#    (e.g. JYM2603BYQJD2..). Attachment sheets (VIN / chassis / engine lists,
+#    "B/L ATTACHMENT") never qualify, so their numbers can't become BLs.
+#  * A tab with a B/L column but no cargo columns (a "CONTACT INFORMATION"
+#    or remarks tab) is used only for contact details, never to add BLs.
+#  * Rows hidden in Excel (e.g. other discharge ports filtered out), hidden
+#    sheets, and B/L cells that are crossed out (strikethrough = cancelled /
+#    shut out) are reported separately and left unticked in the preview
+#    instead of being added silently.
+#
+# The result is shown in a preview before anything is added, so even a
+# layout never seen before can't put junk on the board without someone
+# seeing it first.
+
+_MF_MAX_ROWS = 20000
+_MF_MAX_COLS = 60
+_MF_INVISIBLE_RE = re.compile(r"[​-‏‪-‮⁦-⁩﻿]")
+_MF_SEP_TRANSLATE = str.maketrans({
+    "、": "/", ",": "/", "&": "/", "+": "/", "\\": "/",
+    "—": "-", "–": "-", "‐": "-", "‑": "-", "~": "-", "−": "-",
+})
+
+
+def _mf_norm(text):
+    """Upper-cased, NFKC-normalized (full-width Ａ１／：（ -> A1/:( ),
+    invisible direction marks removed. Used for B/L values and headers."""
+    s = unicodedata.normalize("NFKC", str(text or ""))
+    s = _MF_INVISIBLE_RE.sub("", s)
+    return s.upper()
+
+
+def _mf_cell_text(v):
+    """One spreadsheet/table cell as text. Excel stores numbers as floats, so
+    a whole number comes back as 2015.0 from .xls files - shown as 2015."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, float):
+        return str(int(v)) if v.is_integer() else str(v)
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    return str(v)
+
+
+# A header cell naming the B/L column. "MBL"/"HBL"/"HOUSE B/L" are accepted
+# too, but a plain B/L column is preferred when a sheet has both.
+_MF_BL_HEADER_RE = re.compile(
+    r"^(?P<pre>(?:HOUSE|MASTER|OCEAN|H|M)\s*[./-]?\s*)?"
+    r"(?:B\s*[/\\.-]?\s*L|BILL\s+OF\s+LADING|BOL)\.?"
+    r"(?:\s*(?:NO|NOS|NR|NUM|NUMBER|NUMBERS|N°|#))?\.?\s*[:#]?\s*$"
+)
+_MF_BL_HEADER_CN_RE = re.compile(r"^(?:海运)?(?:提单|提單|运单|運單)(?:号码|號碼|号|號|编号|編號)?$")
+
+# Other column headers that only a real cargo manifest has. A table whose
+# header has the B/L column plus at least one of these is a manifest table;
+# one with only a B/L column and e.g. "CONTACT INFORMATION" is reference info.
+_MF_CARGO_HEADER_WORDS = (
+    "MARK", "DESCRIPTION", "PACKAGE", "PKG", "QTY", "QUANTITY", "WEIGHT", "MEASUREMENT", "CBM",
+    "VOLUME", "SHIPPER", "CONSIGNEE", "NOTIFY", "CARGO", "GOODS", "COMMODITY", "CONTAINER",
+    "唛头", "唛", "货名", "品名", "件数", "包装", "毛重", "重量", "尺码", "体积", "货主", "发货人", "收货人", "通知人",
+)
+
+
+def _mf_header_rank(cell):
+    """0 = this cell is a plain B/L-number column header, 1 = a house/master
+    B/L header, None = not a B/L header. A label that already carries a value
+    ("B/L NO.CH26207YJED301", "B/L NO.: MX26188LJED025" - the title line of an
+    attachment sheet) is not a column header."""
+    lines = [ln.strip() for ln in str(cell or "").splitlines() if ln.strip()]
+    if not lines or len(lines) > 3:
+        return None
+    best = None
+    for ln in lines:
+        n = _mf_norm(ln).strip()
+        m = _MF_BL_HEADER_RE.match(n)
+        if m:
+            r = 1 if m.group("pre") else 0
+        elif _MF_BL_HEADER_CN_RE.match(re.sub(r"\s+", "", n)):
+            r = 0
+        else:
+            if any(ch.isdigit() for ch in n):
+                return None
+            continue
+        best = r if best is None else min(best, r)
+    return best
+
+
+def _mf_row_has_cargo_words(row, skip=None):
+    for j, c in enumerate(row):
+        if j == skip:
+            continue
+        n = re.sub(r"\s+", "", _mf_norm(c))
+        if n and any(w in n for w in _MF_CARGO_HEADER_WORDS):
+            return True
+    return False
+
+
+def _mf_header_col(row):
+    """Column of the B/L header if this row is a table header row, else None.
+    A lone "B/L" word in a title/letterhead row doesn't count: the row must
+    also name a cargo column, or be a short (1-2 cell) header like
+    "BL Number" / "BL NO. | CONTACT INFORMATION"."""
+    found = [(rk, j) for j, c in enumerate(row) if (rk := _mf_header_rank(c)) is not None]
+    if not found:
+        return None
+    rk, j = min(found)  # plain B/L before house/master; leftmost first
+    nonempty = sum(1 for c in row if str(c or "").strip())
+    if nonempty > 2 and not _mf_row_has_cargo_words(row, skip=j):
+        return None
+    return j
+
+
+def _mf_find_header(rows, limit=40):
+    """(row_index, col_index) of the B/L column header, or (None, None)."""
+    for i in range(min(len(rows), limit)):
+        j = _mf_header_col(rows[i])
+        if j is not None:
+            return i, j
+    return None, None
+
+
+_MF_BL_CHARS_RE = re.compile(r"^[A-Z0-9](?:[A-Z0-9/.\-_#]*[A-Z0-9])?$")
+_MF_TOTAL_RE = re.compile(r"TOTAL|合计|总计|汇总|小计")
+
+_VIN_VALUES = dict(zip("0123456789ABCDEFGHJKLMNPRSTUVWXYZ",
+                       [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 7, 9, 2, 3, 4, 5, 6, 7, 8, 9]))
+_VIN_WEIGHTS = (8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2)
+
+
+def _mf_is_vin(tok):
+    """A 17-character vehicle VIN with a valid check digit (the chassis
+    numbers listed on a B/L's attachment sheet)."""
+    if len(tok) != 17 or not re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", tok):
+        return False
+    if re.fullmatch(r"[A-Z]{4,}\d{6,}", tok):
+        return False        # carrier-style B/L (SCAC + port + serial, e.g. HLCUSHA2401234567), never a VIN
+    check = sum(_VIN_VALUES[c] * w for c, w in zip(tok, _VIN_WEIGHTS)) % 11
+    return tok[8] == ("X" if check == 10 else str(check))
+
+
+def _mf_shape_ok(tok, allow_numeric=False, strict=False):
+    """Does this single token look like a B/L number? Letters + digits, no
+    spaces, 5-40 characters, nothing but / - . _ # as separators. A purely
+    numeric B/L is only accepted directly under a B/L header (allow_numeric).
+    strict (used where there is no header to go by): must start with a
+    letter, have 2+ letters and 2+ digits, and must not be a vehicle VIN."""
+    if not (5 <= len(tok) <= 40) or not _MF_BL_CHARS_RE.match(tok):
+        return False
+    letters = sum(c.isalpha() for c in tok)
+    digits = sum(c.isdigit() for c in tok)
+    if digits == 0 or _MF_TOTAL_RE.search(tok):
+        return False
+    if letters == 0:
+        # Some carriers' B/Ls are all digits - accepted only under a B/L
+        # header, and never when it is plainly a Saudi phone number.
+        return (allow_numeric and tok.isdigit() and 6 <= len(tok) <= 20
+                and not re.fullmatch(r"(?:00)?966[15]\d{8}|0[15]\d{8}", tok))
+    if strict and (letters < 2 or digits < 2 or not tok[0].isalpha() or _mf_is_vin(tok)):
+        return False
+    return True
+
+
+def _mf_family(tok):
+    """The series a B/L belongs to: 'JYM2603BYQJD' for JYM2603BYQJD201,
+    'QCLYGJD' for QCLYGJD31A/B. Used to recognise continuation tables and
+    to keep stray tokens out of free-text reads."""
+    first = re.split(r"[/-]", tok, maxsplit=1)[0]
+    m = re.match(r"^(.*[A-Z])(\d+)[A-Z]{0,2}$", first)
+    if not m:
+        return None
+    fam = m.group(1)
+    return fam if len(fam) >= 2 and fam[0].isalpha() else None
+
+
+# What may follow a separator inside one B/L entry: more numbers of the same
+# series ("-003", "/27", "/002A"), a suffix letter ("31A/B"), a short code
+# ("-HK", "-TS1") or the full next B/L of the same series. A word after a
+# dash/slash ("QCLYGJD29 - CANCELLED", "COSU6123456780 + VIN LIST") is a note,
+# not part of the number, and is cut off there.
+_MF_TAIL_SEGMENT_RE = re.compile(r"^(?:\d{1,6}[A-Z]{0,2}|[A-Z]{1,2}|[A-Z]{1,3}\d{1,4}[A-Z]?)$")
+
+
+def _mf_trim_tail(tok):
+    parts = re.split(r"([/-])", tok)
+    fam = _mf_family(parts[0])
+    if len(parts) == 1 or not fam:
+        return tok          # nothing joined on, or no series to judge by (e.g. "SEAPWR-2026-JED-0021")
+    out = parts[0]
+    for i in range(1, len(parts) - 1, 2):
+        sep, seg = parts[i], parts[i + 1]
+        if not (_MF_TAIL_SEGMENT_RE.match(seg) or _mf_family(seg) == fam):
+            break
+        out += sep + seg
+    return out
+
+
+def _mf_cell_lines(cell):
+    """A cell's lines, with a B/L entry that wrapped onto the next line put
+    back together ("QCLYGJD26/27/" + "28", "BO26215XJED001" + "-003")."""
+    out = []
+    for ln in str(cell or "").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        n = _mf_norm(ln)
+        if out and (re.search(r"[/\-、,&+~]$", _mf_norm(out[-1])) or re.match(r"^[/\-、,&+~]\s*\d", n)):
+            out[-1] = out[-1] + ln
+        else:
+            out.append(ln)
+    return out
+
+
+_MF_LABEL_RE = re.compile(r"^(?:B\s*/\s*L|B\s*L|BILL\s+OF\s+LADING)\s*(?:(?:NO|NUMBER|NR)\b\.?\s*[:#]?|[:#])\s*")
+
+
+def _mf_bls_from_line(line, allow_numeric=False, strict=False):
+    """B/L number(s) on one line of a B/L cell, normalized ('CH26207YJED502、503'
+    -> 'CH26207YJED502/503', 'BO26215XJED001 - 003' -> 'BO26215XJED001-003').
+    A note after the number ('YZ26228XJED086-88 will switch bl',
+    'QCLYGJD29 (see attachment)') is cut off; a line that is only a note
+    returns []. Two numbers of the same series on one line ('QCNJJD01
+    QCNJJD02') come back as two."""
+    s = _mf_norm(line).strip()
+    if not s:
+        return []
+    s = _MF_LABEL_RE.sub("", s)
+    if s.startswith("+"):
+        return []                       # a phone number typed in the B/L column
+    s = re.split(r"[(\[{<]", s, maxsplit=1)[0]
+    s = s.translate(_MF_SEP_TRANSLATE)
+    s = re.sub(r"\s*([/-])\s*", r"\1", s)
+    s = re.sub(r"-{2,}", "-", s)
+    s = re.sub(r"/{2,}", "/", s)
+    toks = [_mf_trim_tail(t.strip(".,;:/-#")) for t in s.split()]
+    toks = [t for t in toks if t]
+    if not toks:
+        return []
+    first = toks[0]
+    if not _mf_shape_ok(first, allow_numeric, strict):
+        return []
+    out = [first]
+    fam = _mf_family(first)
+    for t in toks[1:]:
+        if fam and _mf_shape_ok(t, False, strict) and _mf_family(t) == fam and t not in out:
+            out.append(t)
+    return out
+
+
+def _mf_bls_from_cell(cell, allow_numeric=False, strict=False):
+    """All B/L numbers in one B/L cell. Several stacked on separate lines
+    are separate BLs; lines that are notes are dropped."""
+    out = []
+    for ln in _mf_cell_lines(cell):
+        for b in _mf_bls_from_line(ln, allow_numeric, strict):
+            if b not in out:
+                out.append(b)
+    return out
+
+
+def bl_match_key(bl):
+    """How two B/L strings are compared for "already on the board": case,
+    spaces and separator style don't matter, so a BL saved earlier as
+    'CH26207YJED502、503' is the same as 'CH26207YJED502/503'."""
+    s = _mf_norm(bl).translate(_MF_SEP_TRANSLATE)
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"-{2,}", "-", s)
+    return re.sub(r"/{2,}", "/", s)
+
+
+def bl_members(bl):
+    """The individual B/L numbers one manifest entry stands for. Manifests
+    combine B/Ls on one line in many ways; each of these is understood:
+      BO26215XJED001-003   -> ...001, ...002, ...003
+      QCLYGJD26/27/28      -> QCLYGJD26, QCLYGJD27, QCLYGJD28
+      BO26215XJED052-3/118 -> ...052, ...053, ...118
+      MX26188BJED011/17-18 -> ...011, ...017, ...018
+      QCLYGJD31A/B         -> QCLYGJD31A, QCLYGJD31B
+    The entry itself always comes first. Anything that can't be read with
+    certainty adds only the first number (never a guessed range)."""
+    whole = bl_match_key(bl)
+    out = [whole]
+    parts = re.split(r"([/-])", whole)
+    m = re.match(r"^(.*[A-Z])(\d+)([A-Z]{0,2})$", parts[0])
+    if not m:
+        return out
+    prefix, num, _suf = m.groups()
+    width = len(num)
+    members = [parts[0]]
+    last_s = num
+    ok = True
+    i = 1
+    while ok and i < len(parts) - 1:
+        sep, tok = parts[i], parts[i + 1]
+        i += 2
+        mm = re.match(r"^" + re.escape(prefix) + r"(\d+)([A-Z]{0,2})$", tok) or re.match(r"^(\d*)([A-Z]{0,2})$", tok)
+        if not mm or not (mm.group(1) or mm.group(2)):
+            ok = False
+            break
+        d, sfx = mm.groups()
+        if not d:                                   # "31A/B": same number, next letter
+            if sep != "/":
+                ok = False
+                break
+            members.append(prefix + last_s + sfx)
+            continue
+        if len(d) < len(last_s):                    # "010-12" -> 012, "052-3" -> 053
+            d = last_s[:len(last_s) - len(d)] + d
+        if sep == "-":
+            a, b = int(last_s), int(d)
+            if sfx or b <= a or b - a > 300:
+                ok = False
+                break
+            members.extend(prefix + str(n).zfill(width) for n in range(a + 1, b + 1))
+        else:
+            members.append(prefix + d + sfx)
+        last_s = d
+    for b in (members if ok else members[:1]):
+        if b not in out:
+            out.append(b)
+    return out
+
+
+# ----- reading the file into tables -----
+
+def _mf_tables_from_excel(raw, filename):
+    """[{name, rows, hidden_rows, hidden_sheet, struck}] for every sheet.
+    Formatting is read too: which rows are hidden (filtered out / hidden by
+    hand) and which cells are crossed out."""
+    tables = []
+    if raw[:4] == _ZIP_MAGIC:
+        wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+        for ws in wb.worksheets:
+            rows, struck = [], set()
+            truncated = (ws.max_row or 0) > _MF_MAX_ROWS
+            max_row = min(ws.max_row or 0, _MF_MAX_ROWS)
+            max_col = min(ws.max_column or 0, _MF_MAX_COLS)
+            if max_row and max_col:
+                for r_i, row in enumerate(ws.iter_rows(min_row=1, max_row=max_row, max_col=max_col)):
+                    vals = []
+                    for c_i, c in enumerate(row):
+                        vals.append(_mf_cell_text(c.value))
+                        if c.value is not None and c_i < 20 and getattr(getattr(c, "font", None), "strike", False):
+                            struck.add((r_i, c_i))
+                    rows.append(vals)
+            hidden_rows = {i - 1 for i, d in ws.row_dimensions.items() if d.hidden}
+            tables.append({"name": ws.title, "rows": rows, "hidden_rows": hidden_rows,
+                           "hidden_sheet": ws.sheet_state != "visible", "struck": struck, "truncated": truncated})
+        return tables
     try:
-        return _extract_contacts_from_rows(rows)
+        book = xlrd.open_workbook(file_contents=raw, formatting_info=True)
+        fmt = True
     except Exception:
+        book = xlrd.open_workbook(file_contents=raw)
+        fmt = False
+    for sh in book.sheets():
+        nrows, ncols = min(sh.nrows, _MF_MAX_ROWS), min(sh.ncols, _MF_MAX_COLS)
+        rows = [[_mf_cell_text(v) for v in sh.row_values(r, 0, ncols)] for r in range(nrows)]
+        hidden_rows, struck = set(), set()
+        if fmt:
+            hidden_rows = {r for r, info in sh.rowinfo_map.items() if info.hidden}
+            for r in range(nrows):
+                for c in range(min(len(rows[r]), 20)):
+                    if rows[r][c].strip():
+                        try:
+                            if book.font_list[book.xf_list[sh.cell_xf_index(r, c)].font_index].struck_out:
+                                struck.add((r, c))
+                        except Exception:
+                            pass
+        tables.append({"name": sh.name, "rows": rows, "hidden_rows": hidden_rows,
+                       "hidden_sheet": getattr(sh, "visibility", 0) != 0, "struck": struck,
+                       "truncated": sh.nrows > _MF_MAX_ROWS})
+    return tables
+
+
+def _mf_plain_table(name, rows):
+    return {"name": name, "rows": [[_mf_cell_text(v) for v in r][:_MF_MAX_COLS] for r in rows[:_MF_MAX_ROWS]],
+            "hidden_rows": set(), "hidden_sheet": False, "struck": set(), "truncated": len(rows) > _MF_MAX_ROWS}
+
+
+class _MfHtmlTables(html.parser.HTMLParser):
+    """Collects every <table> in an HTML document as rows of cell text -
+    some systems export an ".xls" that is really an HTML page."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tables, self._stack = [], []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self._stack.append({"rows": [], "row": None, "cell": None})
+        elif not self._stack:
+            return
+        t = self._stack[-1]
+        if tag == "tr":
+            t["row"] = []
+            t["rows"].append(t["row"])
+        elif tag in ("td", "th"):
+            if t["row"] is None:
+                t["row"] = []
+                t["rows"].append(t["row"])
+            t["cell"] = []
+            colspan = str(dict(attrs).get("colspan") or "1").strip()
+            t["span"] = min(50, int(colspan)) if colspan.isdigit() and int(colspan) > 0 else 1
+        elif tag == "br" and t.get("cell") is not None:
+            t["cell"].append("\n")
+
+    def handle_endtag(self, tag):
+        if not self._stack:
+            return
+        t = self._stack[-1]
+        if tag in ("td", "th") and t.get("cell") is not None:
+            t["row"].append("".join(t["cell"]).strip())
+            t["row"].extend([""] * (t.get("span", 1) - 1))
+            t["cell"] = None
+        elif tag == "table":
+            self.tables.append(self._stack.pop()["rows"])
+
+    def handle_data(self, data):
+        if self._stack and self._stack[-1].get("cell") is not None:
+            self._stack[-1]["cell"].append(data)
+
+
+def _mf_tables_from_markup_or_text(raw):
+    """An ".xls" that isn't a real Excel file: an HTML table page, an
+    Excel 2003 XML spreadsheet, or plain tab/comma-separated text."""
+    text = _mf_decode_csv(raw)
+    head = text.lstrip("\ufeff \r\n\t")[:4000].lower()
+    if "urn:schemas-microsoft-com:office:spreadsheet" in head:
+        import xml.etree.ElementTree as ET
+        ss = "{urn:schemas-microsoft-com:office:spreadsheet}"
+        root = ET.fromstring(raw)
+        tables = []
+        for ws in root.iter(ss + "Worksheet"):
+            rows = []
+            for row in ws.iter(ss + "Row"):
+                if row.get(ss + "Index", "").isdigit():
+                    rows.extend([] for _ in range(int(row.get(ss + "Index")) - 1 - len(rows)))
+                vals = []
+                for c in row.findall(ss + "Cell"):
+                    if c.get(ss + "Index", "").isdigit():
+                        vals.extend([""] * (int(c.get(ss + "Index")) - 1 - len(vals)))
+                    d = c.find(ss + "Data")
+                    vals.append("".join(d.itertext()) if d is not None else "")
+                rows.append(vals)
+            tables.append(_mf_plain_table(ws.get(ss + "Name") or "Sheet", rows))
+        return tables
+    if head.startswith("<") or "<table" in head:
+        parser = _MfHtmlTables()
+        parser.feed(text)
+        return [_mf_plain_table(f"Table {n + 1}", rows) for n, rows in enumerate(parser.tables)]
+    # Tab/comma-separated text saved with an .xls name. Anything else (a
+    # damaged file, binary junk) is reported as unreadable, not guessed at.
+    sample = text[:4000]
+    printable = sum(ch.isprintable() or ch in "\r\n\t" for ch in sample)
+    lines = [ln for ln in sample.splitlines() if ln.strip()]
+    delim = _mf_sniff_delimiter(text)
+    if not lines or printable < 0.95 * len(sample) or sum(1 for ln in lines if delim in ln) < min(2, len(lines)):
+        raise ValueError("not a spreadsheet")
+    return [_mf_plain_table("Sheet", list(csv.reader(io.StringIO(text), delimiter=delim)))]
+
+
+def _mf_sniff_delimiter(text):
+    """The separator a CSV/text export actually uses - comma, semicolon
+    (European Excel), tab or pipe - judged from the first lines."""
+    sample = [ln for ln in text[:6000].splitlines() if ln.strip()][:20]
+    best, best_score = ",", 0
+    for d in (",", ";", "\t", "|"):
+        counts = [ln.count(d) for ln in sample]
+        score = sum(1 for c in counts if c) * 10 + sum(counts)
+        if score > best_score:
+            best, best_score = d, score
+    return best
+
+
+def _mf_decode_csv(raw):
+    for enc in ("utf-8-sig", "gb18030", "cp1256"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1", errors="ignore")
+
+
+# ----- finding the B/Ls -----
+
+def _mf_free_column(rows):
+    """For a table with no B/L header: the column (if any) holding nothing
+    but distinct, strictly B/L-shaped values of one series. Returns
+    (col, family) or (None, None)."""
+    ncols = max((len(r) for r in rows), default=0)
+    best = (0, None, None)
+    for j in range(ncols):
+        vals, nonempty = [], 0
+        for r in rows:
+            lines = _mf_cell_lines(r[j] if j < len(r) else "")
+            if not lines:
+                continue
+            nonempty += 1
+            if len(lines) > 2:
+                continue
+            got = _mf_bls_from_line(lines[0], strict=True)
+            if got:
+                vals.append(got[0])
+        if not vals or len(vals) < 0.8 * nonempty or len(set(vals)) < 0.8 * len(vals):
+            continue
+        fams = {}
+        for v in vals:
+            fams[_mf_family(v)] = fams.get(_mf_family(v), 0) + 1
+        fam, fam_n = max(fams.items(), key=lambda kv: kv[1])
+        if fam is None or fam_n < 0.8 * len(vals):
+            continue
+        if len(vals) > best[0]:
+            best = (len(vals), j, fam)
+    return best[1], best[2]
+
+
+def _mf_text_bls(text):
+    """B/Ls from a document with no table at all (a PDF printed without grid
+    lines, a Word file typed as plain lines). Only the first token of a line
+    (or the value after a "B/L NO.:" label) is considered, it must be
+    strictly B/L-shaped, and - unless it was labelled - its series has to
+    occur at least twice, so stray words like a model or HS code can't slip in."""
+    cands = []
+    for line in str(text or "").splitlines():
+        n = _mf_norm(line).strip()
+        if not n:
+            continue
+        lab = re.search(r"(?:B\s*/\s*L|\bBL|BILL\s+OF\s+LADING)\s*(?:NO\b|NUMBER|NR\b)?\.?\s*[:#]\s*(\S+)", n)
+        if lab:
+            for b in _mf_bls_from_line(lab.group(1), strict=True):
+                cands.append((b, True))
+            continue
+        toks = n.split()
+        if len(toks) > 1 and toks[0].isdigit() and len(toks[0]) <= 4:
+            toks = toks[1:]                 # "1  QCLYGJD02  N/M ..." (serial no. first)
+        for b in _mf_bls_from_line(toks[0], strict=True)[:1]:
+            cands.append((b, False))
+    counts = {}
+    for b, _ in cands:
+        f = _mf_family(b)
+        counts[f] = counts.get(f, 0) + 1
+    out = []
+    for b, labelled in cands:
+        f = _mf_family(b)
+        if f and (labelled or (counts[f] >= 2 and len(f) >= 3)) and b not in out:
+            out.append(b)
+    return out
+
+
+# A second table further down the manifest sheet listing vehicles/serials
+# ("NO. | CHASSIS NO. | ENGINE NO."): reading stops there until another
+# B/L header row appears.
+_MF_SUBTABLE_HEADER_RE = re.compile(r"\b(?:VIN|CHASSIS|ENGINE|SERIAL|FRAME)\b|车架|发动机|底盘")
+_MF_REFERENCE_SHEET_RE = re.compile(r"CONTACT|REMARK|NOTES?\b|ADDRESS|联系|备注", re.IGNORECASE)
+_MF_ATTACHMENT_SHEET_RE = re.compile(r"ATTACH|附件|VIN|CHASSIS|ENGINE", re.IGNORECASE)
+
+
+def _mf_note(t, i, col):
+    if t["hidden_sheet"]:
+        return "hidden_sheet"
+    if i in t["hidden_rows"]:
+        return "hidden_row"
+    if (i, col) in t["struck"]:
+        return "struck"
+    return None
+
+
+def _mf_analyse(tables):
+    """Decide where the B/Ls are. Returns an ordered list of
+    {"bl", "note"} (note None = add it; 'hidden_row' / 'hidden_sheet' /
+    'struck' = left unticked in the preview). Marks each table with its role
+    ('source' = B/Ls read from it, 'reference' = contact details only) and
+    the rows/column read, for the contact reader."""
+    headed = []
+    for t in tables:
+        t["role"], t["data_rows"] = None, []
+        hi, hc = _mf_find_header(t["rows"])
+        t["hdr"], t["bl_col"] = hi, hc
+        if hi is None:
+            continue
+        block = t["rows"][max(0, hi - 1):hi + 2]
+        t["cargo"] = any(_mf_row_has_cargo_words(r, skip=hc) for r in block)
+        t["ref_name"] = bool(_MF_REFERENCE_SHEET_RE.search(t["name"] or ""))
+        headed.append(t)
+
+    sources = [t for t in headed if t["cargo"] and not t["ref_name"]]
+    if not sources:
+        sources = [t for t in headed if not t["ref_name"]] or headed[:1]
+    for t in headed:
+        t["role"] = "source" if t in sources else "reference"
+
+    entries, seen, families = [], {}, set()
+
+    def add(bl, note):
+        k = bl_match_key(bl)
+        if k in seen:
+            # A later visible copy upgrades an earlier hidden/crossed-out one.
+            if note is None and entries[seen[k]]["note"] is not None:
+                entries[seen[k]]["note"] = None
+            return
+        seen[k] = len(entries)
+        entries.append({"bl": bl, "note": note})
+        if note is None and _mf_family(bl):
+            families.add(_mf_family(bl))
+
+    for t in sources:
+        rows, col = t["rows"], t["bl_col"]
+        data = range(t["hdr"] + 1, len(rows))
+
+        def count(j):
+            return sum(1 for i in data if j < len(rows[i]) and _mf_bls_from_cell(rows[i][j], allow_numeric=True))
+        # Merged header cells occasionally put the label one column off from
+        # the values - if the header's column holds no B/Ls at all but a
+        # neighbour does, the neighbour is the real B/L column.
+        if count(col) == 0:
+            alt = max((j for j in (col - 1, col + 1) if j >= 0), key=count, default=col)
+            if count(alt) > 0:
+                col = alt
+        t["bl_col"] = col
+        reading = True
+        for i in data:
+            row = rows[i]
+            bls = _mf_bls_from_cell(row[col], allow_numeric=True) if (reading and col < len(row)) else []
+            if not bls:
+                # A second section further down with its own header row
+                # (another page / discharge port): follow its B/L column.
+                hc = _mf_header_col(row)
+                if hc is not None:
+                    col, reading = hc, True
+                elif any(_MF_SUBTABLE_HEADER_RE.search(_mf_norm(c)) for c in row):
+                    reading = False
+                continue
+            t["data_rows"].append((i, col, bls))
+        # A vehicle VIN that still ended up in the B/L column (a chassis list
+        # pasted under the manifest without its own header) is dropped -
+        # unless it belongs to the same series as the sheet's real B/Ls.
+        fam_count = {}
+        for _, _, bls in t["data_rows"]:
+            for b in bls:
+                fam_count[_mf_family(b)] = fam_count.get(_mf_family(b), 0) + 1
+        main_fam = max(fam_count, key=fam_count.get) if fam_count else None
+        kept = []
+        for i, c, bls in t["data_rows"]:
+            bls = [b for b in bls if not (_mf_is_vin(b) and _mf_family(b) != main_fam)]
+            if bls:
+                kept.append((i, c, bls))
+                for b in bls:
+                    add(b, _mf_note(t, i, c))
+        t["data_rows"] = kept
+
+    # Tables with no B/L header at all. With a headed manifest in the file,
+    # only an obvious continuation (same B/L series) counts. With none, the
+    # first non-empty table may hold the manifest (a Word table without a
+    # header row), plus its continuations.
+    seed_allowed = not any(t["role"] == "source" for t in tables)
+    for t in tables:
+        if t["hdr"] is not None:
+            continue
+        rows = t["rows"]
+        if not any(str(c).strip() for r in rows for c in r):
+            continue
+        may_seed = seed_allowed and not families and not _MF_ATTACHMENT_SHEET_RE.search(t["name"] or "")
+        seed_allowed = False
+        col, fam = _mf_free_column(rows)
+        if col is None or not (fam in families or may_seed):
+            continue
+        t["role"], t["hdr"], t["bl_col"] = "source", -1, col
+        for i, r in enumerate(rows):
+            lines = _mf_cell_lines(r[col] if col < len(r) else "")
+            if not lines or len(lines) > 2:
+                continue
+            bls = _mf_bls_from_line(lines[0], strict=True)
+            if not bls or _mf_family(bls[0]) != fam:
+                continue
+            t["data_rows"].append((i, col, bls[:1]))
+            add(bls[0], _mf_note(t, i, col))
+    return entries
+
+
+# ----- consignee contact details -----
+
+_MF_PARTY_MARK_RE = re.compile(
+    r"(?im)^[ \t]*(?:<[ \t]*(SHIPPER|SHPR|SH|CONSIGNEE|CNEE|CO|CN|ATTN|NOTIFY[ \t]*PARTY|NOTIFY|NF|NT)[ \t]*\d?[ \t]*:?[ \t]*>"
+    r"|(SHIPPER|SHPR|SH|CONSIGNEE|CNEE|CO|CN|ATTN|NOTIFY[ \t]*PARTY|NOTIFY|NF|NT)[ \t]*\d?[ \t]*:)[ \t]*"
+)
+_MF_PARTY_KIND = {"SHIPPER": "sh", "SHPR": "sh", "SH": "sh", "CONSIGNEE": "co", "CNEE": "co", "CO": "co", "CN": "co",
+                  "ATTN": "co", "NOTIFY PARTY": "nf", "NOTIFY": "nf", "NF": "nf", "NT": "nf"}
+
+
+def _mf_split_parties(text):
+    """A combined 'SHIPPER & CONSIGNEE & NOTIFY' cell ("<SH:>... <CO:>...
+    <NF:>...", or "SH:... ATTN:... NF:...") -> {"sh": ..., "co": ..., "nf": ...}.
+    Returns {} when the cell has no such markers."""
+    text = unicodedata.normalize("NFKC", str(text or ""))
+    marks = []
+    for m in _MF_PARTY_MARK_RE.finditer(text):
+        word = re.sub(r"\s+", " ", (m.group(1) or m.group(2)).upper())
+        marks.append((m.start(), m.end(), _MF_PARTY_KIND[word]))
+    kinds = {k for _, _, k in marks}
+    if "sh" not in kinds or not ({"co", "nf"} & kinds):
         return {}
+    out = {}
+    for n, (_s, e, kind) in enumerate(marks):
+        end = marks[n + 1][0] if n + 1 < len(marks) else len(text)
+        out.setdefault(kind, text[e:end].strip())
+    return out
+
+
+_MF_TO_ORDER_RE = re.compile(r"^\W*(?:TO\s+(?:THE\s+)?ORDER|TO\s+SHIPPER'?S?\s+ORDER|ORDER\s+OF)\b", re.IGNORECASE)
+_MF_SAME_AS_RE = re.compile(r"^\W*SAME\s+AS\s+(?:THE\s+)?CONSIGNEE", re.IGNORECASE)
+_MF_NAME_CONT_RE = re.compile(r"^(?:AND\b|&|CO\b|CO\.|COMPANY\b|LTD|LIMITED\b|LLC\b|L\.L\.C|W\.L\.L|EST\b|EST\.|ESTABLISHMENT\b|FOR\b)", re.IGNORECASE)
+_MF_ADDRESS_START_RE = re.compile(r"[\s,]+(?:P\.?\s?O\.?\s*BOX\b|POB\b|BUILDING\s*(?:NO\b|NUMBER\b|#|\d)|BLDG\b|ADD(?:RESS)?\s*[:.]|\d)", re.IGNORECASE)
+_MF_NAME_LABEL_RE = re.compile(r"^(?:CONSIGNEE|CNEE|CO|CN|ATTN|NAME|COMPANY\s+NAME)\s*[:：]\s*", re.IGNORECASE)
+
+
+def _mf_party_name(block):
+    """Company name = first line of the party block; a name that runs onto
+    a second line ("SALEM BIN AHMED ... / AND SONS CO. LTD.") is joined."""
+    lines = [re.sub(r"\s+", " ", ln.replace("\xa0", " ")).strip(" ,;:-") for ln in str(block or "").splitlines()]
+    lines = [ln for ln in lines if ln]
+    if not lines:
+        return ""
+    name = _MF_NAME_LABEL_RE.sub("", lines[0]).strip(" ,;:-")
+    if len(name) > 40:
+        # Name and address typed on one line ("TALAI AL-FOLATH FOR
+        # MANUFACTURING CO 2ND INDUSTRIAL AREA P.O BOX 22766, JEDDAH"):
+        # keep the part before the address starts.
+        cut = _MF_ADDRESS_START_RE.search(name)
+        if cut and cut.start() >= 8:
+            name = name[:cut.start()].strip(" ,;:-")
+    if len(lines) > 1 and _MF_NAME_CONT_RE.match(lines[1]) and not re.search(r"\d", lines[1]):
+        name = f"{name} {lines[1]}"
+    return name[:120]
+
+
+_MF_PHONE_GROUP_RE = re.compile(r"\+?\d+")
+
+
+def _mf_phones(text):
+    """Saudi phone numbers in a block of text -> (mobiles, landlines), each
+    normalized to +966... . Digit groups are joined only across spaces,
+    dots, dashes and brackets on the same line, and a number is only read
+    from where a phone number can start (the first group of a run, a group
+    starting with 0 / +, or right after another number) - so two numbers
+    typed side by side ('0126081236 0505584273') aren't merged, and the tail
+    of a foreign number ('+971 50 739 7579') is never mistaken for a Saudi
+    mobile. Numbers labelled FAX are skipped."""
+    mob, land = [], []
+    for line in str(text or "").replace("\xa0", " ").splitlines():
+        groups = [(m.start(), m.end(), m.group(0)) for m in _MF_PHONE_GROUP_RE.finditer(line)]
+
+        def joined(a, b):
+            return re.fullmatch(r"[ \t().-]{0,3}", line[groups[a][1]:groups[b][0]]) and not groups[b][2].startswith("+")
+        k, after_number = 0, False
+        while k < len(groups):
+            can_start = k == 0 or not joined(k - 1, k) or after_number or groups[k][2].startswith(("0", "+"))
+            used = None
+            if can_start:
+                digits = ""
+                for e in range(k, min(k + 6, len(groups))):
+                    if e > k and not joined(e - 1, e):
+                        break
+                    digits += groups[e][2]
+                    p = _normalize_phone(digits)
+                    if re.fullmatch(r"\+966[15]\d{8}", p):
+                        used = (e, p)
+                        break
+            if used:
+                e, p = used
+                label = re.findall(r"[A-Z]+", line[:groups[k][0]].upper()[-14:])
+                if not (label and label[-1] == "FAX"):
+                    bucket = mob if p.startswith("+9665") else land
+                    if p not in bucket:
+                        bucket.append(p)
+                k, after_number = e + 1, True
+            else:
+                k, after_number = k + 1, False
+    return mob, land
+
+
+def _mf_emails(text):
+    out = []
+    for e in _EMAIL_RE.findall(unicodedata.normalize("NFKC", str(text or ""))):
+        e = _clean_email(e.strip(".;,-"))
+        if e and e not in out:
+            out.append(e)
+    return out
+
+
+_MF_GENERIC_MAIL_LABELS = {"GMAIL", "HOTMAIL", "YAHOO", "OUTLOOK", "ICLOUD", "LIVE", "MAIL", "EMAIL", "FOXMAIL",
+                           "SINA", "SOHU", "ALIYUN", "YMAIL", "YANDEX", "PROTONMAIL", "MSN", "AOL"}
+
+
+def _mf_compact(text):
+    return re.sub(r"[^A-Z0-9]", "", _mf_norm(text))
+
+
+def _mf_contact_from_parts(consignee, notify, extras, shipper=""):
+    """name/email/phone for one BL. The consignee is the customer, unless
+    the B/L is consigned 'TO ORDER' (of a bank / the shipper) - then the
+    consignee block is the bank's own address, so it is skipped and the
+    notify party (the actual buyer) is who gets contacted; the consignee name
+    is then left blank rather than filled with someone who isn't the
+    consignee. The shipper is never used. extras = other contact text for
+    the BL (CONTACT / TEL / E-MAIL / REMARKS columns, a contact sheet).
+    An e-mail whose domain is the shipper's own name (TOM@TOBEESTEEL.COM
+    with shipper "TOBEE STEEL LIMITED") is the shipper's, not the
+    customer's, and is skipped - unless the consignee/notify party carries
+    that name too (a local branch of the same group)."""
+    consignee = str(consignee or "").strip()
+    notify = str(notify or "").strip()
+    if _MF_SAME_AS_RE.match(notify):
+        notify = ""
+    to_order = bool(_MF_TO_ORDER_RE.match(_mf_party_name(consignee)))
+    name = "" if to_order else _mf_party_name(consignee)
+    sources = ([] if to_order else [consignee]) + [notify] + [x for x in extras if x]
+    shipper_key = _mf_compact(_mf_party_name(shipper))
+    party_key = _mf_compact(name + " " + _mf_party_name(notify))
+
+    def shippers_own(e):
+        labels = [_mf_compact(lb) for lb in e.split("@", 1)[1].upper().split(".")]
+        return any(len(lb) >= 4 and lb not in _MF_GENERIC_MAIL_LABELS and lb in shipper_key and lb not in party_key
+                   for lb in labels)
+    email = next((e for s in sources for e in _mf_emails(s) if not (shipper_key and shippers_own(e))), "")
+    phones = [_mf_phones(s) for s in sources]
+    phone = next((m[0] for m, _ in phones if m), "") or next((l[0] for _, l in phones if l), "")
+    return {"name": name, "email": email, "phone": phone}
+
+
+_MF_CONTACT_COL_WORDS = ("CONTACT", "TEL", "PHONE", "MOBILE", "EMAIL", "E-MAIL", "REMARK", "TERM", "联系", "备注", "电话", "邮箱")
+
+
+def _mf_contacts(tables):
+    """{bl_match_key(bl): {"name", "email", "phone"}} from the tables the
+    B/Ls were read from (and any contact/remarks sheet keyed by B/L)."""
+    ref = {}   # individual B/L -> contact text from a contact/remarks sheet
+    for t in tables:
+        if t.get("role") != "reference":
+            continue
+        rows, col = t["rows"], t["bl_col"]
+        for row in rows[t["hdr"] + 1:]:
+            if col >= len(row):
+                continue
+            text = "\n".join(str(c) for j, c in enumerate(row) if j != col and str(c).strip())
+            for b in _mf_bls_from_cell(row[col], allow_numeric=True):
+                for mbr in bl_members(b):
+                    ref.setdefault(mbr, text)
+
+    out = {}
+    for t in tables:
+        if t.get("role") != "source" or not t["data_rows"]:
+            continue
+        rows = t["rows"]
+        cols = {"party": None, "sh": None, "co": None, "nf": None, "extra": []}
+        if t["hdr"] >= 0:
+            hdr = t["hdr"]
+            # The header row, plus the row above/below when it is the other
+            # half of a bilingual (Chinese + English) header.
+            block = [rows[hdr]] + [rows[i] for i in (hdr - 1, hdr + 1)
+                                   if 0 <= i < len(rows) and _mf_row_has_cargo_words(rows[i])
+                                   and not any(i == d[0] for d in t["data_rows"])]
+            width = max(len(r) for r in block)
+            labelled_upto = -1
+            for j in range(width):
+                text = re.sub(r"\s+", "", " ".join(_mf_norm(r[j]) for r in block if j < len(r)))
+                if not text:
+                    continue
+                labelled_upto = j
+                if j == t["bl_col"]:
+                    continue
+                is_sh = "SHIPPER" in text or "货主" in text or "发货人" in text
+                is_co = "CONSIGNEE" in text or "收货人" in text
+                is_nf = "NOTIFY" in text or "通知人" in text
+                if is_sh and (is_co or is_nf):
+                    cols["party"] = j if cols["party"] is None else cols["party"]
+                elif is_sh:
+                    cols["sh"] = j if cols["sh"] is None else cols["sh"]
+                elif is_co:
+                    cols["co"] = j if cols["co"] is None else cols["co"]
+                elif is_nf:
+                    cols["nf"] = j if cols["nf"] is None else cols["nf"]
+                elif any(w in text for w in _MF_CONTACT_COL_WORDS):
+                    cols["extra"].append(j)
+            # Unlabelled columns to the right of the header often hold a
+            # consignee phone/e-mail typed in afterwards.
+            data_width = max(len(rows[i]) for i, _, _ in t["data_rows"])
+            cols["extra"].extend(range(labelled_upto + 1, data_width))
+        else:
+            # No header (a Word table): find the combined party column by its markers.
+            for j in range(max(len(r) for r in rows)):
+                hits = sum(1 for i, _, _ in t["data_rows"] if j < len(rows[i]) and _mf_split_parties(rows[i][j]))
+                if hits >= 0.5 * len(t["data_rows"]):
+                    cols["party"] = j
+                    break
+
+        def cell(row, j):
+            return str(row[j]) if j is not None and j < len(row) else ""
+
+        for i, _, bls in t["data_rows"]:
+            row = rows[i]
+            consignee, notify, shipper = cell(row, cols["co"]), cell(row, cols["nf"]), cell(row, cols["sh"])
+            if cols["party"] is not None:
+                parts = _mf_split_parties(cell(row, cols["party"]))
+                consignee = consignee or parts.get("co", "")
+                notify = notify or parts.get("nf", "")
+                shipper = shipper or parts.get("sh", "")
+            extras = [cell(row, j) for j in cols["extra"]]
+            for b in bls:
+                sheet = next((ref[m] for m in bl_members(b) if m in ref), "")
+                c = _mf_contact_from_parts(consignee, notify, extras + [sheet], shipper)
+                if c["name"] or c["email"] or c["phone"]:
+                    out.setdefault(bl_match_key(b), c)
+    return out
+
+
+def read_manifest(raw, filename):
+    """Reads one uploaded manifest file (.xlsx/.xlsm/.xls/.csv/.docx/.pdf).
+    Returns {"entries": [{"bl", "note", "contact"}...]}; entries is empty
+    when no B/L column could be found. Raises for a file that can't be
+    opened at all (corrupt / password-protected / unsupported)."""
+    name = (filename or "").lower()
+    tables, text = [], ""
+    if name.endswith(".csv"):
+        text_csv = _mf_decode_csv(raw)
+        tables = [_mf_plain_table("CSV", list(csv.reader(io.StringIO(text_csv), delimiter=_mf_sniff_delimiter(text_csv))))]
+    elif name.endswith(".docx"):
+        import docx
+        document = docx.Document(io.BytesIO(raw))
+        tables = [_mf_plain_table(f"Table {n + 1}", [[c.text for c in r.cells] for r in tb.rows])
+                  for n, tb in enumerate(document.tables)]
+        text = "\n".join(p.text for p in document.paragraphs)
+    elif name.endswith(".pdf"):
+        import pdfplumber
+        pages = []
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
+            for page in pdf.pages:
+                for tb in (page.extract_tables() or []):
+                    if tb:
+                        tables.append(_mf_plain_table(f"Page {page.page_number}", [[c or "" for c in r] for r in tb]))
+                pages.append(page.extract_text() or "")
+        text = "\n".join(pages)
+    elif name.endswith((".xlsx", ".xlsm", ".xls")):
+        if raw[:4] == _ZIP_MAGIC or raw[:8] == _OLE_MAGIC:
+            tables = _mf_tables_from_excel(raw, name)
+        else:
+            tables = _mf_tables_from_markup_or_text(raw)
+    else:
+        raise ValueError("unsupported file type")
+
+    entries = _mf_analyse(tables)
+    if not any(e["note"] is None for e in entries) and text.strip():
+        known = {bl_match_key(e["bl"]) for e in entries}
+        for b in _mf_text_bls(text):
+            if bl_match_key(b) not in known:
+                entries.append({"bl": b, "note": None})
+    contacts = _mf_contacts(tables) if entries else {}
+    for e in entries:
+        e["contact"] = contacts.get(bl_match_key(e["bl"]), {"name": "", "email": "", "phone": ""})
+    return {"entries": entries, "truncated": any(t.get("truncated") for t in tables)}
+
+
+# ----- adding manifest B/Ls to the board -----
+
+_MANIFEST_EXTS = (".xlsx", ".xlsm", ".xls", ".csv", ".docx", ".pdf")
+_MANIFEST_MAX_BYTES = 25 * 1024 * 1024
+
+
+def _manifest_board_index():
+    """bl_match_key -> the existing record, for every B/L on the board (any
+    owner, archived included) - one query instead of one per B/L."""
+    rows = get_db().execute(
+        "SELECT bl_number, vessel, port, created_by, consignee, consignee_email, consignee_phone FROM records"
+    ).fetchall()
+    return {bl_match_key(r["bl_number"]): dict(r) for r in rows}
+
+
+def _manifest_add(port, vessel, items):
+    """Adds manifest B/Ls to the board under one Port + Vessel.
+    items: [{"bl", "name", "email", "phone"}]. A B/L already on the board
+    (compared by bl_match_key, so separator/space differences don't create a
+    second copy) is skipped - re-uploading only fills in consignee contacts
+    that are still blank, never overwrites one (it may have been corrected
+    by hand), and only on the uploader's own B/Ls (or any, for an admin).
+    A B/L already on the board under a DIFFERENT port/vessel is reported
+    back, since that is either a data error or a reused number."""
+    db = get_db()
+    index = _manifest_board_index()
+    me = session.get("username")
+    is_admin = session.get("role") == "admin"
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    added = skipped = contacts_filled = 0
+    duplicate_elsewhere = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        # Same rule as reading a manifest: one clean B/L number, nothing else
+        # (so a hand-crafted request can't put junk or a spreadsheet formula
+        # on the board either).
+        cleaned = _mf_bls_from_line(str(item.get("bl") or "")[:80], allow_numeric=True)
+        if len(cleaned) != 1:
+            continue
+        bl = bl_match_key(cleaned[0])
+        found = {"name": re.sub(r"\s+", " ", str(item.get("name") or "")).strip()[:120],
+                 "email": _clean_email(item.get("email")),
+                 "phone": _normalize_phone(item.get("phone"))}
+        existing = index.get(bl)
+        if existing is None:
+            inserted = db.execute(
+                "INSERT INTO records (bl_number, port, vessel, created_at, created_by, consignee, consignee_email, consignee_phone) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (bl_number) DO NOTHING RETURNING bl_number",
+                (bl, port, vessel, now, me, found["name"], found["email"], found["phone"]),
+            ).fetchone()
+            if inserted:
+                index[bl] = {"bl_number": bl, "vessel": vessel, "port": port, "created_by": me,
+                             "consignee": found["name"], "consignee_email": found["email"], "consignee_phone": found["phone"]}
+                if found["email"] or found["phone"]:
+                    contacts_filled += 1
+                _log_audit(bl, "added", "", "", f"{port} / {vessel}")
+                added += 1
+                continue
+            # Someone else added it a moment ago - treat like any existing B/L.
+            existing = dict(db.execute(
+                "SELECT bl_number, vessel, port, created_by, consignee, consignee_email, consignee_phone FROM records WHERE bl_number = ?",
+                (bl,),
+            ).fetchone())
+            index[bl] = existing
+        skipped += 1
+        mine = is_admin or existing["created_by"] == me
+        if mine and ((existing["vessel"] or "") != vessel or (existing["port"] or "") != port):
+            duplicate_elsewhere.append({"bl_number": existing["bl_number"],
+                                        "existing_port": existing["port"], "existing_vessel": existing["vessel"]})
+        if mine:
+            fills = {k: found[src] for k, src in (("consignee", "name"), ("consignee_email", "email"), ("consignee_phone", "phone"))
+                     if found[src] and not (existing[k] or "").strip()}
+            if fills:
+                db.execute("UPDATE records SET " + ", ".join(f"{k} = ?" for k in fills) + " WHERE bl_number = ?",
+                           (*fills.values(), existing["bl_number"]))
+                existing.update(fills)
+                contacts_filled += 1
+    db.commit()
+    return {"added": added, "skipped": skipped, "duplicate_elsewhere": duplicate_elsewhere,
+            "contacts_found": contacts_filled}
+
+
+def _manifest_read_upload(file, with_truncation=False):
+    """(entries, error_code) for one uploaded manifest file - plus whether
+    a huge sheet had to be cut short, when with_truncation is set."""
+    def done(entries, err, truncated=False):
+        return (entries, err, truncated) if with_truncation else (entries, err)
+    name = file.filename or ""
+    if not name.lower().endswith(_MANIFEST_EXTS):
+        return done([], "unsupported")
+    raw = file.read(_MANIFEST_MAX_BYTES + 1)
+    if len(raw) > _MANIFEST_MAX_BYTES:
+        return done([], "too_large")
+    if not raw:
+        return done([], "empty")
+    try:
+        result = read_manifest(raw, name)
+    except Exception:
+        return done([], "unreadable")
+    return done(result["entries"], None if result["entries"] else "no_bls", result.get("truncated", False))
+
+
+_MANIFEST_ERROR_TEXT = {
+    "unsupported": "Unsupported file type. Please upload .xlsx, .xls, .csv, .docx or .pdf.",
+    "too_large": "That file is larger than 25MB.",
+    "empty": "That file is empty.",
+    "unreadable": "Couldn't read that file. Make sure it isn't corrupted or password-protected.",
+    "no_bls": "No B/L numbers were found in that file - it needs a B/L NO. column.",
+}
+
+
+@app.route("/api/manifest/preview", methods=["POST"])
+@login_required
+def manifest_preview():
+    """Reads one or more manifests WITHOUT adding anything, and reports
+    every B/L found with its status, so the user checks the list before it
+    goes on the board ("Add a manifest" -> preview -> confirm)."""
+    files = [f for f in request.files.getlist("file") if f and f.filename]
+    if not files:
+        return jsonify({"error": "No file received", "error_code": "no_file"}), 400
+    port = request.form.get("port", "").strip().upper()
+    vessel = request.form.get("vessel", "").strip().upper()
+    index = _manifest_board_index()
+    me = session.get("username")
+    is_admin = session.get("role") == "admin"
+    in_batch = set()
+    out = []
+    for f in files:
+        entries, err, truncated = _manifest_read_upload(f, with_truncation=True)
+        rows = []
+        for e in entries:
+            k = bl_match_key(e["bl"])
+            ex = index.get(k)
+            fills = False
+            if ex is not None and not (is_admin or ex["created_by"] == me):
+                # Another user's BL: say it's taken, but not where it is or
+                # whose it is (staff only ever see their own BLs).
+                status, ex = "taken", None
+            elif ex is not None:
+                same = (ex["vessel"] or "") == vessel and (ex["port"] or "") == port
+                status = "on_board" if same else "elsewhere"
+                c = e["contact"]
+                fills = any(c.get(src) and not (ex[k2] or "").strip()
+                            for k2, src in (("consignee", "name"), ("consignee_email", "email"), ("consignee_phone", "phone")))
+            elif k in in_batch:
+                status = "repeat"
+            else:
+                status = "new"
+            if status == "new" and e["note"] is None:
+                in_batch.add(k)
+            rows.append({
+                "bl": k, "note": e["note"], "status": status, "contact": e["contact"], "fills_contacts": fills,
+                "existing_bl": ex["bl_number"] if ex else None,
+                "existing_port": ex["port"] if ex else None, "existing_vessel": ex["vessel"] if ex else None,
+            })
+        out.append({"name": f.filename, "entries": rows, "error_code": err, "truncated": truncated})
+    return jsonify({"files": out, "port": port, "vessel": vessel})
+
+
+@app.route("/api/manifest/commit", methods=["POST"])
+@login_required
+def manifest_commit():
+    """Adds the B/Ls the user ticked in the manifest preview."""
+    data = request.get_json(force=True, silent=True) or {}
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        return jsonify({"error": "Nothing selected to add.", "error_code": "nothing_selected"}), 400
+    if len(items) > 5000:
+        return jsonify({"error": "Too many B/Ls in one go.", "error_code": "too_many"}), 400
+    port = str(data.get("port") or "").strip().upper()
+    vessel = str(data.get("vessel") or "").strip().upper()
+    return jsonify(_manifest_add(port, vessel, items))
 
 
 @app.route("/api/manifest/upload", methods=["POST"])
 @login_required
 def upload_manifest_excel():
+    """One-step upload (read + add everything that should be added). The
+    board itself now goes through preview + commit; this stays for anything
+    still calling the old endpoint."""
     if "file" not in request.files:
         return jsonify({"error": "No file received"}), 400
     file = request.files["file"]
     if not file.filename:
         return jsonify({"error": "No file selected"}), 400
-
-    filename = file.filename.lower()
-    # The whole manifest gets tagged with the Port and Vessel it was
-    # uploaded for, so the board can be organized Port > Vessel. Always
-    # stored upper-case for consistency, even if the field's own
-    # uppercasing-as-you-type got bypassed somehow (e.g. a pasted value).
+    entries, err = _manifest_read_upload(file)
+    if err and err != "no_bls":
+        return jsonify({"error": _MANIFEST_ERROR_TEXT[err], "error_code": err}), 400
     port = request.form.get("port", "").strip().upper()
     vessel = request.form.get("vessel", "").strip().upper()
-
-    bl_numbers = []
-    contacts = {}  # bl -> consignee name/email/phone, when the manifest has them (see _extract_contacts_from_rows)
-
-    try:
-        if filename.endswith((".xlsx", ".xlsm", ".xls")):
-            # Go through every sheet (not just the first/active one) so BLs
-            # aren't missed if the file has multiple tabs or was last saved
-            # on a different sheet. Only the FIRST sheet gets the "no
-            # header -> assume column A" fallback: a real-world manifest is
-            # commonly one main BL-list sheet plus per-BL "attachment"
-            # sheets (e.g. a vehicle's chassis/engine-number list) that
-            # have their own ITEM/serial column but no BL data at all -
-            # falling back on those would read "1, 2, 3, 4..." as BL
-            # numbers. The sheets are read by sniffing the file's real
-            # content rather than trusting its extension - a very common
-            # mismatch is a modern .xlsx saved/forwarded with an old .xls
-            # name, which would otherwise fail outright.
-            sheets = _load_excel_sheets_by_content(file.read(), filename)
-            for i, (sheet_name, rows) in enumerate(sheets):
-                # A per-BL contact/remarks tab (beyond the main sheet) is
-                # reference info, not shipment data - skip it entirely so it
-                # can't re-add (or garble) BLs already found on the main
-                # sheet. See _dtrkr_is_non_manifest_sheet_name.
-                if i > 0 and _dtrkr_is_non_manifest_sheet_name(sheet_name):
-                    continue
-                bl_numbers.extend(_extract_bl_numbers_from_rows(rows, allow_no_header_fallback=(i == 0)))
-                contacts.update(_safe_extract_contacts(rows))
-
-        elif filename.endswith(".csv"):
-            text = file.read().decode("utf-8-sig", errors="ignore")
-            rows = list(csv.reader(io.StringIO(text)))
-            bl_numbers.extend(_extract_bl_numbers_from_rows(rows))
-            contacts.update(_safe_extract_contacts(rows))
-
-        elif filename.endswith(".docx"):
-            import docx
-            document = docx.Document(file)
-            if document.tables:
-                for i, table in enumerate(document.tables):
-                    rows = [[cell.text for cell in row.cells] for row in table.rows]
-                    bl_numbers.extend(_extract_bl_numbers_from_rows(rows, allow_no_header_fallback=(i == 0)))
-                    contacts.update(_safe_extract_contacts(rows))
-            else:
-                full_text = "\n".join(p.text for p in document.paragraphs)
-                bl_numbers.extend(_extract_bl_numbers_from_lines(full_text))
-
-        elif filename.endswith(".pdf"):
-            import pdfplumber
-            all_tables = []
-            with pdfplumber.open(file) as pdf:
-                for page in pdf.pages:
-                    for table in (page.extract_tables() or []):
-                        if table:
-                            all_tables.append(table)
-                if all_tables:
-                    for i, table in enumerate(all_tables):
-                        bl_numbers.extend(_extract_bl_numbers_from_rows(table, allow_no_header_fallback=(i == 0)))
-                        contacts.update(_safe_extract_contacts(table))
-                else:
-                    for page in pdf.pages:
-                        bl_numbers.extend(_extract_bl_numbers_from_lines(page.extract_text() or ""))
-
-        else:
-            return jsonify({"error": "Unsupported file type. Please upload .xlsx, .xls, .csv, .docx or .pdf."}), 400
-    except Exception:
-        return jsonify({"error": "Couldn't read that file. Make sure it isn't corrupted or password-protected."}), 400
-
-    db = get_db()
-    added = 0
-    skipped = 0
-    # A BL number is unique board-wide (it's the primary key), so a manifest
-    # that re-lists a BL already on the board just gets silently skipped as
-    # "already there" - correct when it's the same shipment uploaded twice,
-    # but if that existing row is sitting under a DIFFERENT vessel, this is
-    # actually a real collision worth a human looking at (either a genuine
-    # data error, or a BL number a shipper has reused for a new shipment),
-    # not a routine duplicate. Collected separately and surfaced in the
-    # response instead of disappearing into the plain "skipped" count.
-    duplicate_elsewhere = []
-    contacts_filled = 0
-    is_admin = session.get("role") == "admin"
-    for bl_number in bl_numbers:
-        if not bl_number:
-            continue
-        found = contacts.get(bl_number) or {}
-        existing = db.execute(
-            "SELECT vessel, port, created_by, consignee, consignee_email, consignee_phone FROM records WHERE bl_number = ?",
-            (bl_number,),
-        ).fetchone()
-        if existing:
-            skipped += 1
-            if (existing["vessel"] or "") != vessel or (existing["port"] or "") != port:
-                duplicate_elsewhere.append({
-                    "bl_number": bl_number,
-                    "existing_port": existing["port"], "existing_vessel": existing["vessel"],
-                })
-            # Re-uploading a manifest fills in consignee contacts that are
-            # still blank - never overwrites anything already there (it may
-            # have been corrected by hand), and only on the uploader's own
-            # BLs (or any, for an admin).
-            if found and (is_admin or existing["created_by"] == session.get("username")):
-                fills = {k: found[src] for k, src in (("consignee", "name"), ("consignee_email", "email"), ("consignee_phone", "phone"))
-                         if found.get(src) and not (existing[k] or "").strip()}
-                if fills:
-                    db.execute(
-                        "UPDATE records SET " + ", ".join(f"{k} = ?" for k in fills) + " WHERE bl_number = ?",
-                        (*fills.values(), bl_number),
-                    )
-                    contacts_filled += 1
-            continue
-        db.execute(
-            "INSERT INTO records (bl_number, port, vessel, created_at, created_by, consignee, consignee_email, consignee_phone) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (bl_number, port, vessel, datetime.utcnow().strftime("%Y-%m-%d %H:%M"), session.get("username"),
-             found.get("name", ""), found.get("email", ""), found.get("phone", "")),
-        )
-        if found.get("email") or found.get("phone"):
-            contacts_filled += 1
-        _log_audit(bl_number, "added", "", "", f"{port} / {vessel}")
-        added += 1
-
-    db.commit()
-    return jsonify({"added": added, "skipped": skipped, "duplicate_elsewhere": duplicate_elsewhere,
-                    "contacts_found": contacts_filled})
+    items = [{"bl": e["bl"], **e["contact"]} for e in entries if e["note"] is None]
+    result = _manifest_add(port, vessel, items) if items else {"added": 0, "skipped": 0, "duplicate_elsewhere": [], "contacts_found": 0}
+    # Hidden rows / hidden sheets / crossed-out B/Ls aren't added; say how many.
+    result["left_out"] = sum(1 for e in entries if e["note"] is not None)
+    result["no_bls"] = not entries
+    return jsonify(result)
 
 
 # ---------- Direct Delivery Classifier ----------
@@ -3465,10 +4351,29 @@ def rename_group():
     each BL one by one."""
     data = request.get_json(force=True)
     group_type = data.get("type")
-    old_port = data.get("old_port", "")
-    new_value = data.get("new_value", "").strip()
+    # Stored upper-case, like everything a manifest upload files BLs under
+    # (otherwise "Tai Knight" and "TAI KNIGHT" become two different groups).
+    new_value = re.sub(r"\s+", " ", str(data.get("new_value") or "")).strip().upper()
     db = get_db()
     is_admin = session.get("role") == "admin"
+    if group_type not in ("port", "vessel"):
+        return jsonify({"error": "invalid type"}), 400
+    bl_numbers = data.get("bl_numbers")
+    if isinstance(bl_numbers, list):
+        # The board sends the group's own BLs - this also works for an
+        # "Unassigned" group, whose port/vessel is stored blank.
+        bls = [str(b).strip().upper() for b in bl_numbers if str(b).strip()]
+        if bls:
+            sql = f"UPDATE records SET {group_type} = ? WHERE bl_number = ANY(?)"
+            params = [new_value, bls]
+            if not is_admin:
+                sql += " AND created_by = ?"
+                params.append(session.get("username"))
+            db.execute(sql, tuple(params))
+            db.commit()
+        return jsonify({"ok": True})
+    old_port = data.get("old_port", "")
+    old_port = "" if old_port == "Unassigned" else old_port
     if group_type == "port":
         if is_admin:
             db.execute("UPDATE records SET port = ? WHERE port = ?", (new_value, old_port))
@@ -3479,6 +4384,7 @@ def rename_group():
             )
     elif group_type == "vessel":
         old_vessel = data.get("old_vessel", "")
+        old_vessel = "" if old_vessel == "Unassigned" else old_vessel
         if is_admin:
             db.execute(
                 "UPDATE records SET vessel = ? WHERE port = ? AND vessel = ?",
@@ -3644,17 +4550,30 @@ def _find_bl_in_text(text, known_bls):
     """Which of the caller's own BL numbers appear in this document's
     text - matched as a whole token (not a bare substring) so one BL
     number that happens to be a prefix of another (e.g. "BO123" inside
-    "BO1234") doesn't produce a false match. Returns the list of matches;
-    the caller treats exactly one as a confident auto-match and
-    zero-or-many as needing a human to pick."""
-    upper = text.upper()
+    "BO1234") doesn't produce a false match. A combined board entry
+    ("BO26215XJED001-003", "QCLYGJD26/27/28") also matches a document that
+    names just one of the B/Ls it covers (see bl_members). Returns
+    [(bl, exact)] - exact=False when only such a member matched; the caller
+    treats exactly one as a confident auto-match and zero-or-many as
+    needing a human to pick."""
+    upper = _mf_norm(text)
+    tokens = set(re.findall(r"[A-Z0-9]+", upper))
+
+    def present(s):
+        if s.isalnum():
+            return s in tokens
+        return re.search(r"(?<![A-Z0-9])" + re.escape(s) + r"(?![A-Z0-9])", upper) is not None
+
     found = []
     for bl in known_bls:
         bl_u = (bl or "").strip().upper()
         if not bl_u:
             continue
-        if re.search(r"(?<![A-Z0-9])" + re.escape(bl_u) + r"(?![A-Z0-9])", upper):
-            found.append(bl)
+        members = bl_members(bl_u)
+        if present(bl_u) or present(members[0]):
+            found.append((bl, True))
+        elif any(present(m) for m in members[1:]):
+            found.append((bl, False))
     return found
 
 
@@ -3695,12 +4614,26 @@ def detect_attachment():
             "SELECT bl_number FROM records WHERE created_by = ?", (session.get("username"),)
         ).fetchall()
     known_bls = [r["bl_number"] for r in bl_rows]
-    matches = _find_bl_in_text(text, known_bls)
+    found = _find_bl_in_text(text, known_bls)
+    matches = [bl for bl, _ in found]
+    reason = None
+    if len(found) == 1 and not found[0][1]:
+        # Matched only through a combined entry (the document names ONE of
+        # the B/Ls it covers, e.g. 001 of "001-003"). Attaching it marks the
+        # whole entry issued, so a person confirms instead of it happening
+        # automatically - and if the entry already has this kind of file,
+        # confirming would replace it, which the message says.
+        reason = "member_match"
+        if kind and db.execute(
+            "SELECT 1 FROM record_attachments WHERE bl_number = ? AND kind = ?", (matches[0], kind)
+        ).fetchone():
+            reason = "already_attached"
 
     return jsonify({
         "kind": kind,
-        "matched_bl": matches[0] if len(matches) == 1 else None,
-        "candidates": matches if len(matches) > 1 else [],
+        "matched_bl": matches[0] if len(matches) == 1 and not reason else None,
+        "candidates": matches if len(matches) > 1 or reason else [],
+        "reason": reason,
     })
 
 
@@ -3807,13 +4740,17 @@ def delete_attachment(bl_number, kind):
 @app.route("/api/records/<path:bl_number>/lookup", methods=["GET"])
 @login_required
 def lookup_record(bl_number):
-    """Looks up one BL by its exact number regardless of who created it.
-    Used by the Documents modal (the doc chips next to a BL's own row) -
-    not scoped to the viewer's own BLs since a record's docs are still
-    shown to an admin or anyone else who can already see that row."""
+    """Looks up one BL by its exact number for the Documents popup (the doc
+    chips next to a BL's own row). Admins can open any BL; staff only
+    their own."""
     bl_number = bl_number.strip().upper()
     if not bl_number:
         return jsonify({"error": "Enter a BL number."}), 400
+    # Staff only ever see their own BLs on the board (cross-staff "Find a
+    # BL" was removed on purpose), so this must not hand out another
+    # user's consignee contacts or tracking link either.
+    if not _owns_record(bl_number):
+        return jsonify({"error": f'No BL found matching "{bl_number}".'}), 404
     db = get_db()
     row = db.execute(
         f"""SELECT bl_number, port, vessel, created_by, invoice_issued, invoice_by, invoice_at,
@@ -4218,6 +5155,7 @@ def export_records():
             r.get("bl_number", ""),
             "Yes" if r.get("do_issued") else "No",
         ])
+        ws.cell(row=ws.max_row, column=1).data_type = "s"   # text, never a formula
     for col_cells in ws.columns:
         width = max((len(str(c.value)) for c in col_cells if c.value is not None), default=8)
         ws.column_dimensions[col_cells[0].column_letter].width = min(width + 2, 40)
@@ -8882,7 +9820,7 @@ PAGE_HTML = """
       </div>
       <div>
         <div class="dropzone-text"><b data-i18n="click_to_upload">Click to upload</b> <span data-i18n="or_drag_drop_manifest">or drag &amp; drop your manifest</span></div>
-        <div class="dropzone-sub" data-i18n="manifest_dropzone_sub">.xlsx, .xls, .csv, .docx or .pdf - the BL Number column is read automatically</div>
+        <div class="dropzone-sub" data-i18n="manifest_dropzone_sub">.xlsx, .xls, .csv, .docx or .pdf - the BL numbers are read automatically</div>
         <div class="dropzone-filename" id="dropzoneFilename"></div>
       </div>
       <input type="file" id="manifestFile" accept=".xlsx,.xlsm,.xls,.csv,.docx,.pdf" multiple style="display:none" onchange="stageManifestFile()">
@@ -9173,6 +10111,13 @@ dropzone.addEventListener('drop', e => {
   stageManifestFile();
 });
 
+// A file dropped a few pixels outside a dropzone would otherwise make the
+// browser open it in place of the board (losing an open preview and any
+// unsaved remark). Dropzones handle their own drops before this runs.
+['dragover', 'drop'].forEach(evt => window.addEventListener(evt, e => {
+  if (e.dataTransfer && [...(e.dataTransfer.types || [])].includes('Files')) e.preventDefault();
+}));
+
 // Several manifest files can be added at once (e.g. one vessel's cargo split
 // across a few files) - all go to the same Port + Vessel typed above.
 function stageManifestFile() {
@@ -9185,6 +10130,8 @@ function stageManifestFile() {
   btn.disabled = false;
 }
 
+// One file at a time, so a BL listed in two of the files is simply
+// "already on the board" by the second one instead of racing itself.
 async function uploadExcel() {
   const fileInput = document.getElementById('manifestFile');
   const files = Array.from(fileInput.files || []);
@@ -9193,13 +10140,10 @@ async function uploadExcel() {
   const btn = document.getElementById('addManifestBtn');
   btn.disabled = true;
   const originalLabel = btn.textContent;
-
   const port = document.getElementById('portField').value.trim().toUpperCase();
   const vessel = document.getElementById('vesselField').value.trim().toUpperCase();
 
-  // One file at a time, so a BL listed in two of the files is simply
-  // "already on the board" by the second one instead of racing itself.
-  let added = 0, skipped = 0, contacts = 0;
+  let added = 0, skipped = 0, contacts = 0, leftOut = 0;
   const dupElsewhere = [], failed = [];
   for (let i = 0; i < files.length; i++) {
     btn.textContent = files.length > 1 ? t('adding_progress', {i: i + 1, n: files.length}) : t('adding_ellipsis');
@@ -9214,10 +10158,16 @@ async function uploadExcel() {
     } catch (e) {
       data = {error: t('could_not_save_retry')};
     }
-    if (data.error) { failed.push(t('file_failed', {name: files[i].name, error: data.error})); continue; }
+    if (data.error) {
+      const msg = data.error_code && t('mp_err_' + data.error_code) !== 'mp_err_' + data.error_code ? t('mp_err_' + data.error_code) : data.error;
+      failed.push(t('file_failed', {name: files[i].name, error: msg}));
+      continue;
+    }
+    if (data.no_bls) { failed.push(t('file_failed', {name: files[i].name, error: t('mp_err_no_bls')})); continue; }
     added += data.added || 0;
     skipped += data.skipped || 0;
     contacts += data.contacts_found || 0;
+    leftOut += data.left_out || 0;
     (data.duplicate_elsewhere || []).forEach(d => dupElsewhere.push(d));
   }
 
@@ -9227,17 +10177,18 @@ async function uploadExcel() {
   btn.textContent = originalLabel;
   btn.disabled = true;
 
-  await fetchRecords(true);
   if (failed.length < files.length) {
-    showToast(t('bl_records_added', {added}) + (skipped ? t('already_on_board_skipped', {skipped}) : '') + (contacts ? t('contacts_found', {n: contacts}) : '') + '.');
+    showToast(t('bl_records_added', {added}) + (skipped ? t('already_on_board_skipped', {skipped}) : '') +
+      (contacts ? t('contacts_found', {n: contacts}) : '') + '.' + (leftOut ? ' ' + t('left_out_hidden', {n: leftOut}) : ''),
+      {duration: leftOut ? 8000 : 3500});
   }
   failed.forEach(msg => showToast(msg, {duration: 9000}));
+  try { await fetchRecords(true); } catch (e) {}
 
   // A BL that's already on the board under a DIFFERENT vessel than the one
   // just uploaded is worth a second look - either this file re-lists a BL
   // that's really a different shipment (a shipper reusing a number), or a
-  // genuine mistake. Either way, silently skipping it like an ordinary
-  // repeat-upload duplicate would hide it.
+  // genuine mistake.
   if (dupElsewhere.length) {
     const lines = dupElsewhere.slice(0, 5).map(d =>
       t('already_under', {bl: d.bl_number, vessel: d.existing_vessel || t('unassigned_vessel_ph'), port: d.existing_port || t('unassigned_port_ph')})
@@ -9678,9 +10629,14 @@ async function submitAttachmentFile(bl, kind, file) {
   // each caller decides how to react to the result.
   const form = new FormData();
   form.append('file', file);
-  const res = await apiWrite(`/api/records/${encodeURIComponent(bl)}/attachment/${kind}`, {method: 'POST', body: form});
-  const data = await res.json();
-  return {ok: res.ok, data};
+  try {
+    const res = await apiWrite(`/api/records/${encodeURIComponent(bl)}/attachment/${kind}`, {method: 'POST', body: form});
+    let data = {};
+    try { data = await res.json(); } catch (e) {}
+    return {ok: res.ok, data};
+  } catch (e) {
+    return {ok: false, data: {error: t('could_not_save_retry')}};
+  }
 }
 
 async function uploadAttachment(bl, kind, input) {
@@ -9833,6 +10789,10 @@ function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
   const blOptions = records.map(r => r.bl_number).sort();
   const candidates = (detect.candidates && detect.candidates.length) ? detect.candidates : blOptions;
   const statusText = errorMsg ? errorMsg
+    : detect.reason === 'already_attached' && detect.candidates && detect.candidates.length === 1
+      ? t('already_has_file_confirm', {bl: detect.candidates[0], kind: autoMatchKindLabel(detect.kind)})
+    : detect.reason === 'member_match' && detect.candidates && detect.candidates.length === 1
+      ? t('member_match_confirm', {bl: detect.candidates[0]})
     : detect.candidates && detect.candidates.length ? t('matches_multiple')
     : !detect.kind ? t('could_not_tell_kind')
     : t('no_bl_matched');
@@ -9843,7 +10803,7 @@ function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
     <div class="match-review-controls">
       <select class="review-bl">
         <option value="">${t('select_bl_ellipsis')}</option>
-        ${candidates.map(bl => `<option value="${esc(bl)}" ${bl === detect.matched_bl ? 'selected' : ''}>${esc(bl)}</option>`).join('')}
+        ${candidates.map(bl => `<option value="${esc(bl)}" ${(bl === detect.matched_bl || (detect.reason === 'member_match' && candidates.length === 1)) && detect.reason !== 'already_attached' ? 'selected' : ''}>${esc(bl)}</option>`).join('')}
       </select>
       <select class="review-kind">
         <option value="">${t('kind_ellipsis')}</option>
@@ -9885,12 +10845,16 @@ function deleteRecord(bl) {
   records.splice(idx, 1);
   render();
   suppressPollUntil = Date.now() + 4000;
-  apiWrite(`/api/records/${encodeURIComponent(bl)}`, {method: 'DELETE'}).catch(() => fetchRecords(true));
+  const deleting = apiWrite(`/api/records/${encodeURIComponent(bl)}`, {method: 'DELETE'}).catch(() => { fetchRecords(true); });
 
   showToast(t('removed_bl', {bl}), {
     actionLabel: t('undo'),
     duration: 3000,
     onAction: async () => {
+      // Undo pressed while the delete is still on its way: let it finish
+      // first, or the restore finds the BL still there, does nothing, and
+      // the delete then removes it for good.
+      await deleting;
       await apiWrite('/api/records/restore', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(removed)
@@ -9957,9 +10921,14 @@ function removePortGroup(portName) {
 
 async function renameGroup(type, oldPort, oldVessel, newValue, fallbackLabel) {
   const val = newValue.trim() || fallbackLabel;
+  // The group's own BLs (archived ones included), so an "Unassigned" group -
+  // stored with a blank port/vessel - can be named too.
+  const blNumbers = records.filter(r => (r.port || 'Unassigned') === oldPort &&
+    (type === 'port' || (r.vessel || 'Unassigned') === oldVessel)).map(r => r.bl_number);
   await apiWrite('/api/groups/rename', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({type, old_port: oldPort, old_vessel: oldVessel, new_value: val === fallbackLabel ? '' : val})
+    body: JSON.stringify({type, old_port: oldPort, old_vessel: oldVessel, bl_numbers: blNumbers,
+                          new_value: val === fallbackLabel ? '' : val.toUpperCase()})
   });
   await fetchRecords(true);
 }
@@ -10333,6 +11302,17 @@ function restoreListScroll(saved) {
   });
 }
 
+// Search match: part of the BL number as shown, or one of the individual
+// B/Ls a combined entry stands for ("...002" finds "...001-003").
+function blMatches(r, q) {
+  if (!q) return true;
+  if (r.bl_number.toLowerCase().includes(q)) return true;
+  return (r.bl_members || []).some(m => m.toLowerCase().includes(q));
+}
+function blExact(r, q) {
+  return r.bl_number.toLowerCase() === q || (r.bl_members || []).some(m => m.toLowerCase() === q);
+}
+
 function render() {
   const savedListScroll = saveListScroll();
   const q = document.getElementById('searchBox').value.trim().toLowerCase();
@@ -10346,7 +11326,7 @@ function render() {
   }
   const operatorFilter = operatorFilterEl ? operatorFilterEl.value : '';
 
-  const base = records.filter(r => r.bl_number.toLowerCase().includes(q) && (!operatorFilter || r.created_by === operatorFilter));
+  const base = records.filter(r => blMatches(r, q) && (!operatorFilter || r.created_by === operatorFilter));
   const activeList = base.filter(r => !r.archived);
   const archivedList = base.filter(r => !!r.archived);
 
@@ -10358,12 +11338,16 @@ function render() {
   // as jumpSelect/operatorFilter just above. If the previously-selected
   // port disappeared (renamed away, last BL removed, etc.) fall back to
   // "All ports" rather than showing an empty board.
-  if (selectedPortTab && !portNames.includes(selectedPortTab)) selectedPortTab = '';
+  // A search/filter with no hits in the open port shows all ports for the
+  // moment, but clearing it goes back into that port. Only a port that
+  // really disappeared (renamed away, last BL removed) is forgotten.
+  if (selectedPortTab && !portNames.includes(selectedPortTab) && !q && !operatorFilter) selectedPortTab = '';
+  const activeTab = selectedPortTab && portNames.includes(selectedPortTab) ? selectedPortTab : '';
   const portTabsEl = document.getElementById('portTabs');
   if (portTabsEl) {
     if (portNames.length === 0) {
       portTabsEl.innerHTML = '';
-    } else if (selectedPortTab === '') {
+    } else if (activeTab === '') {
       // Landing state: one clickable card per port, each summarizing that
       // port's vessel/BL counts and completion progress.
       const anchorIcon = '<svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="3"></circle><line x1="12" y1="22" x2="12" y2="8"></line><path d="M5 12H2a10 10 0 0020 0h-3"></path></svg>';
@@ -10375,7 +11359,7 @@ function render() {
         const completeCount = portRecords.filter(r => r.invoice_issued && r.approval_received && r.do_issued).length;
         const pct = blCount ? Math.round(completeCount / blCount * 100) : 0;
         const done = pct >= 100;
-        const label = esc(portName);
+        const label = esc(portName === 'Unassigned' ? t('unassigned_port_ph') : portName);
         return `<button type="button" class="port-card" onclick="selectPortTab(${jsq(portName)})">
           <div class="port-card-icon">${anchorIcon}</div>
           <div class="port-card-name">${label}</div>
@@ -10389,7 +11373,7 @@ function render() {
       // Drilled-in state: a port is selected, so the card grid is hidden
       // and replaced by a small breadcrumb/back control + heading above
       // that one port's (unchanged) groups.
-      const label = esc(selectedPortTab);
+      const label = esc(activeTab === 'Unassigned' ? t('unassigned_port_ph') : activeTab);
       const backArrow = currentLang === 'ar' ? '&rarr;' : '&larr;';
       portTabsEl.innerHTML = `<div class="port-breadcrumb">
         <button type="button" class="port-back-btn" onclick="selectPortTab('')">${backArrow} ${t('all_ports_back')}</button>
@@ -10403,7 +11387,7 @@ function render() {
   // for a BL, the grid cards don't show BL numbers, so bypass the
   // grid-only restriction and surface matching results across all ports
   // (same ports/groups the grid itself was just filtered down to above).
-  const displayPortNames = selectedPortTab ? portNames.filter(p => p === selectedPortTab) : (q ? portNames : []);
+  const displayPortNames = activeTab ? portNames.filter(p => p === activeTab) : (q ? portNames : []);
 
   const groupsEl = document.getElementById('groups');
   if (portNames.length === 0) {
@@ -10420,7 +11404,7 @@ function render() {
         const vessels = ports[portName];
         sortedVesselNames(vessels).forEach(vesselName => {
           const key = 'vessel:' + portName + ':' + vesselName;
-          options += `<option value="${esc(key)}">${esc(vesselName)}</option>`;
+          options += `<option value="${esc(key)}">${esc(vesselName === 'Unassigned' ? t('unassigned_vessel_ph') : vesselName)}</option>`;
         });
       });
       jumpEl.innerHTML = options;
@@ -10430,7 +11414,7 @@ function render() {
 
     groupsEl.innerHTML = displayPortNames.map(portName => {
       const vessels = ports[portName];
-      return portGroupHtml(portName, sortedVesselNames(vessels), vessels, false, !!selectedPortTab);
+      return portGroupHtml(portName, sortedVesselNames(vessels), vessels, false, !!activeTab);
     }).join('');
   }
 
@@ -10544,7 +11528,7 @@ function scrollToManifestForm() {
 
 function setAllGroupsCollapsed(collapsed) {
   const q = document.getElementById('searchBox').value.trim().toLowerCase();
-  records.filter(r => r.bl_number.toLowerCase().includes(q)).forEach(r => {
+  records.filter(r => blMatches(r, q)).forEach(r => {
     const port = r.port || 'Unassigned';
     const vessel = r.vessel || 'Unassigned';
     collapsedGroups['port:' + port] = collapsed;
@@ -10764,7 +11748,9 @@ function focusSearch() {
 document.addEventListener('keydown', (e) => {
   const isTyping = isTypingTarget(document.activeElement);
 
-  if ((e.key === '/' || e.code === 'Slash') && !isTyping && !e.ctrlKey && !e.metaKey && !e.altKey) {
+  const popupOpen = ['autoMatchOverlay', 'docsOverlay', 'historyOverlay']
+    .some(id => { const el = document.getElementById(id); return el && el.style.display !== 'none'; });
+  if ((e.key === '/' || e.code === 'Slash') && !isTyping && !popupOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
     e.preventDefault();
     focusSearch();
     return;
@@ -10804,8 +11790,10 @@ function onSearchKeydown(e) {
   if (!q) return;
   const opEl = document.getElementById('operatorFilter');
   const op = opEl ? opEl.value : '';
-  const matches = records.filter(r => r.bl_number.toLowerCase().includes(q) && (!op || r.created_by === op));
-  const target = matches.find(r => r.bl_number.toLowerCase() === q) || (matches.length === 1 ? matches[0] : null);
+  const matches = records.filter(r => blMatches(r, q) && (!op || r.created_by === op));
+  const exactFull = matches.filter(r => r.bl_number.toLowerCase() === q);
+  const exact = matches.filter(r => blExact(r, q));
+  const target = (exactFull.length === 1 ? exactFull[0] : null) || (exact.length === 1 ? exact[0] : null) || (matches.length === 1 ? matches[0] : null);
   if (!target) {
     showToast(matches.length ? t('many_bls_match', {n: matches.length}) : t('no_bl_match', {q: box.value.trim()}));
     return;
