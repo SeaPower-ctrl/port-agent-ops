@@ -46,6 +46,7 @@ import openpyxl
 import xlrd
 import psycopg2
 import psycopg2.extras
+import psycopg2.errors
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
@@ -945,6 +946,80 @@ def init_db():
         )"""
     )
 
+    # --- Disbursement Accounts v2: customer/voyage/vessel details, grouped rate x qty charges,
+    # USD + SAR totals, automatic PDA numbers. Everything is additive, so existing PDAs stay as they were
+    # (each old charge becomes rate = its amount, qty = 1).
+    for _col, _ddl in (
+        ("pda_no", "TEXT DEFAULT ''"), ("load_port", "TEXT DEFAULT ''"), ("load_code", "TEXT DEFAULT ''"),
+        ("dis_port", "TEXT DEFAULT ''"), ("dis_code", "TEXT DEFAULT ''"), ("customer_name", "TEXT DEFAULT ''"),
+        ("customer_address", "TEXT DEFAULT ''"), ("customer_phone", "TEXT DEFAULT ''"), ("customer_email", "TEXT DEFAULT ''"),
+        ("sales_exec", "TEXT DEFAULT ''"), ("sales_phone", "TEXT DEFAULT ''"), ("sales_email", "TEXT DEFAULT ''"),
+        ("load_type", "TEXT DEFAULT ''"), ("term", "TEXT DEFAULT ''"), ("trade", "TEXT DEFAULT ''"), ("operation", "TEXT DEFAULT ''"),
+        ("eta", "TEXT DEFAULT ''"), ("receiver", "TEXT DEFAULT ''"), ("cargo_type", "TEXT DEFAULT ''"), ("cargo_note", "TEXT DEFAULT ''"),
+        ("updated_at", "TEXT DEFAULT ''"), ("port_stay", "NUMERIC"), ("cargo_frt", "NUMERIC"), ("cargo_units", "NUMERIC"),
+        ("grt", "NUMERIC"), ("nrt", "NUMERIC"), ("dwt", "NUMERIC"), ("fx_rate", "NUMERIC DEFAULT 3.75"),
+    ):
+        cur.execute(f"ALTER TABLE pda_documents ADD COLUMN IF NOT EXISTS {_col} {_ddl}")
+    for _col, _ddl in (
+        ("group_name", "TEXT DEFAULT 'Port Charges'"), ("unit", "TEXT DEFAULT 'PER SHIPMENT'"), ("currency", "TEXT DEFAULT 'SAR'"),
+        ("rate", "NUMERIC"), ("qty", "NUMERIC DEFAULT 1"), ("qty_basis", "TEXT DEFAULT 'fixed'"),
+        ("qty_manual", "INTEGER DEFAULT 0"), ("remarks", "TEXT DEFAULT ''"),
+    ):
+        cur.execute(f"ALTER TABLE pda_line_items ADD COLUMN IF NOT EXISTS {_col} {_ddl}")
+    for _col, _ddl in (
+        ("group_name", "TEXT DEFAULT 'Port Charges'"), ("unit", "TEXT DEFAULT 'PER SHIPMENT'"), ("currency", "TEXT DEFAULT 'SAR'"),
+        ("qty_basis", "TEXT DEFAULT 'fixed'"), ("default_qty", "NUMERIC DEFAULT 1"),
+    ):
+        cur.execute(f"ALTER TABLE pda_templates ADD COLUMN IF NOT EXISTS {_col} {_ddl}")
+    cur.execute(
+        "UPDATE pda_line_items li SET currency = CASE WHEN UPPER(d.currency) = 'USD' THEN 'USD' ELSE 'SAR' END, "
+        "rate = li.estimated_amount, qty = 1 FROM pda_documents d WHERE d.id = li.pda_id AND li.rate IS NULL"
+    )
+    cur.execute("UPDATE pda_line_items SET rate = estimated_amount, qty = 1 WHERE rate IS NULL")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_pda_no ON pda_documents (pda_no) WHERE pda_no <> ''")
+    # number the PDAs made before numbering existed (oldest first)
+    cur.execute("SELECT id, created_at FROM pda_documents WHERE pda_no IS NULL OR pda_no = '' ORDER BY id")
+    _old = cur.fetchall()
+    if _old:
+        cur.execute("SELECT value FROM app_settings WHERE key = 'pda_prefix'")
+        _r = cur.fetchone()
+        _prefix = (_r[0] if _r and _r[0] else "5101")
+        _next = {}
+        for _id, _created in _old:
+            _yy = (_created or "")[2:4] if len(_created or "") >= 4 and (_created or "")[:2] == "20" else datetime.utcnow().strftime("%y")
+            if _yy not in _next:
+                cur.execute("SELECT pda_no FROM pda_documents WHERE pda_no LIKE %s", (f"{_prefix}/PDA/{_yy}/%",))
+                _tails = [x[0].rsplit("/", 1)[-1] for x in cur.fetchall()]
+                _next[_yy] = max([int(t) for t in _tails if t.isdigit()] or [0]) + 1
+            cur.execute("UPDATE pda_documents SET pda_no = %s WHERE id = %s", (f"{_prefix}/PDA/{_yy}/{_next[_yy]}", _id))
+            _next[_yy] += 1
+    # a first-time rate card (from Sea Power's own PDA) so a new install isn't empty; never re-added once deleted
+    cur.execute("SELECT COUNT(*) FROM pda_templates")
+    _n_templates = cur.fetchone()[0]
+    cur.execute("SELECT 1 FROM app_settings WHERE key = 'pda_seeded'")
+    if _n_templates == 0 and not cur.fetchone():
+        _now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+        for _i, (_grp, _name, _rate, _unit, _basis, _q) in enumerate([
+            ("Port Charges", "ARRIVAL/DEPARTURE DUES", 535, "PER SHIPMENT", "fixed", 1),
+            ("Port Charges", "GARBAGE COLLECTION DUES", 27, "PER DAY", "days", 1),
+            ("Port Charges", "TUG/PILOTAGE/MOORING/UN-MOORING (IN & OUT)", 5027, "PER SHIPMENT", "fixed", 1),
+            ("Port Charges", "BERTH HIRE", 535, "PER DAY", "days", 1),
+            ("Port Charges", "STEVEDORING CHARGES", 5.35, "PER FRT", "frt", 1),
+            ("Port Charges", "ESTIMATED FORKLIFT CHARGES", 10000, "PER SHIPMENT", "fixed", 1),
+            ("Port Charges", "LIFTING GEAR CHARGES", 12000, "PER SHIPMENT", "fixed", 1),
+            ("Port Charges", "UNITS OVER 03 TONS UPTO 10 TONS", 161, "PER UNIT", "manual", 0),
+            ("Port Charges", "UNITS OVER 10 TONS UPTO 40 TONS", 433, "PER UNIT", "manual", 0),
+            ("Port Charges", "TRAILERS OVER 40 FEET", 198, "PER UNIT", "manual", 0),
+            ("Agency Charges", "AGENCY FEES", 3000, "PER SHIPMENT", "fixed", 1),
+            ("Agency Charges", "DOCUMENTATION FOR NATIONAL SECURITY", 150, "PER SHIPMENT", "fixed", 1),
+        ]):
+            cur.execute(
+                "INSERT INTO pda_templates (port, name, default_amount, sort_order, created_at, group_name, unit, currency, qty_basis, default_qty) "
+                "VALUES ('YANBU COMMERCIAL PORT', %s, %s, %s, %s, %s, %s, 'USD', %s, %s)",
+                (_name, _rate, _i, _now, _grp, _unit, _basis, _q),
+            )
+        cur.execute("INSERT INTO app_settings (key, value) VALUES ('pda_seeded', '1') ON CONFLICT (key) DO NOTHING")
+
     # Statement of Facts - one row per vessel call, matching the company's
     # actual SOF template field-for-field (see SOF_COLUMNS) rather than a
     # generic event log, so the PDF this produces is a drop-in replacement
@@ -999,111 +1074,296 @@ class SafeFPDF(FPDF):
         return super().normalize_text(text)
 
 
-def build_pda_pdf(doc, items):
-    """Renders a PDA (while draft/sent) or FDA (once finalized) as a PDF,
-    reusing the Sea Power logo already embedded in the app. Finalized
-    documents get an extra Actual + Variance column so the agent can see
-    at a glance where the final cost diverged from the estimate."""
-    is_fda = doc["status"] == "finalized"
-    pdf = SafeFPDF(format="A4")
-    pdf.set_auto_page_break(auto=True, margin=18)
+class PdaPDF(SafeFPDF):
+    def footer(self):
+        self.set_y(-11)
+        self.set_font("Helvetica", "B", 8)
+        self.set_text_color(40, 40, 40)
+        self.cell(0, 5, f"Page {self.page_no()} of {{nb}}", align="R")
+
+
+def _pda_num(v, places=2):
+    try:
+        return "{:,.{p}f}".format(float(v or 0), p=places)
+    except (TypeError, ValueError):
+        return "0.00"
+
+
+def _pda_qty_text(v):
+    f = float(v or 0)
+    return "{:,.3f}".format(f)
+
+
+def build_pda_pdf(doc, items, _pda_calc=None, letterhead="", banks=""):
+    """Sea Power's Proforma Disbursement Account (or the Final Disbursement Account once
+    finalized): letterhead, From/To, customer, vessel particulars, voyage terms, grouped charges
+    (rate x qty, USD and SAR), sub totals per group, grand total, notes and bank details."""
+    calc = _pda_calc or _pda_compute(doc, items)
+    is_fda = doc.get("status") == "finalized"
+    NAVY, GREY, LINE = (18, 58, 86), (120, 130, 140), (214, 220, 226)
+    L, W = 12, 186
+    pdf = PdaPDF(format="A4")
+    pdf.alias_nb_pages()
+    pdf.set_auto_page_break(False)
+    pdf.set_margins(L, 10, L)
     pdf.add_page()
 
+    def txt(x, y, w, h, s, size=8.5, style="", color=(0, 0, 0), align="L"):
+        pdf.set_xy(x, y)
+        pdf.set_font("Helvetica", style, size)
+        pdf.set_text_color(*color)
+        pdf.cell(w, h, str(s), align=align)
+
+    def lines_for(s, w, size, style=""):
+        pdf.set_font("Helvetica", style, size)
+        out = []
+        for para in str(s or "").replace("\r", "").split("\n"):
+            out.extend(pdf.multi_cell(w, 4, para or " ", split_only=True) or [""])
+        return out or [""]
+
+    def box(x, y, w, h):
+        pdf.set_draw_color(120, 135, 150)
+        pdf.set_line_width(0.25)
+        pdf.rect(x, y, w, h)
+
+    # ---- letterhead
     try:
-        logo_bytes = base64.b64decode(LOGO_B64)
-        pdf.image(io.BytesIO(logo_bytes), x=15, y=12, w=20)
+        pdf.image(io.BytesIO(base64.b64decode(LOGO_B64)), x=L, y=8, w=24)
     except Exception:
         pass
+    pdf.set_font("Helvetica", "", 7)
+    pdf.set_text_color(70, 80, 90)
+    pdf.set_xy(L + 90, 8)
+    pdf.multi_cell(W - 90, 3.3, str(letterhead or "").strip()[:600], align="R")
 
-    pdf.set_xy(40, 14)
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 7, "Sea Power Marine Services Co. Ltd", ln=1)
-    pdf.set_x(40)
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_text_color(110, 120, 130)
-    pdf.cell(0, 5, "Compass - Disbursement Account", ln=1)
-    pdf.set_text_color(0, 0, 0)
+    # ---- title + number
+    y = 34
+    txt(L, y, 110, 8, "Final Disbursement Account" if is_fda else "Proforma Disbursement Account", 15, "B", (20, 20, 20))
+    txt(L + 112, y, 22, 8, "PDA No.", 12, "", GREY)
+    txt(L + 134, y, W - 134, 8, doc.get("pda_no") or f"#{doc.get('id', '')}", 12, "B", (20, 20, 20), "R")
 
-    pdf.ln(10)
-    pdf.set_font("Helvetica", "B", 16)
-    title = "FINAL DISBURSEMENT ACCOUNT (FDA)" if is_fda else "PROFORMA DISBURSEMENT ACCOUNT (PDA)"
-    pdf.cell(0, 9, title, ln=1)
+    # ---- From / To   |   file date, contact
+    y = 44
+    box(L, y, 112, 21)
+    txt(L + 3, y + 2, 20, 4, "From", 7, "", GREY)
+    txt(L + 3, y + 6.5, 52, 4, (doc.get("load_port") or "-").upper()[:34], 8.5)
+    txt(L + 3, y + 11.5, 52, 4, (doc.get("load_code") or "").upper(), 7.5, "", GREY)
+    txt(L + 60, y + 2, 20, 4, "To", 7, "", GREY)
+    to_lines = lines_for((doc.get("dis_port") or doc.get("port") or "-").upper(), 48, 8.5)[:2]
+    for i, ln in enumerate(to_lines):
+        txt(L + 60, y + 6.5 + i * 4, 48, 4, ln, 8.5)
+    txt(L + 60, y + (11.5 if len(to_lines) == 1 else 15), 48, 4, (doc.get("dis_code") or "").upper(), 7.5, "", GREY)
+    box(L + 116, y, 70, 21)
+    rows = [("File Date", doc.get("file_date") or (doc.get("created_at") or "")[:10]), ("Sales Mngr / Exec", doc.get("sales_exec") or "-"),
+            ("Tel / Mob #", doc.get("sales_phone") or ""), ("Email", doc.get("sales_email") or "")]
+    try:
+        rows[0] = ("File Date", datetime.strptime((doc.get("created_at") or "")[:10], "%Y-%m-%d").strftime("%d-%b-%Y"))
+    except ValueError:
+        pass
+    for i, (k, v) in enumerate(rows):
+        txt(L + 118, y + 1.5 + i * 4.9, 26, 4, k, 7, "", GREY)
+        txt(L + 144, y + 1.5 + i * 4.9, 41, 4, str(v)[:34], 7.5)
 
-    pdf.set_font("Helvetica", "", 10.5)
-    pdf.ln(2)
-    meta_rows = [
-        ("Port", doc.get("port") or "-"),
-        ("Vessel", doc.get("vessel") or "-"),
-        ("Reference", doc.get("reference") or "-"),
-        ("Currency", doc.get("currency") or "SAR"),
-        ("Status", (doc.get("status") or "draft").capitalize()),
-        ("Prepared by", doc.get("created_by") or "-"),
-        ("Date", doc.get("created_at") or "-"),
-    ]
+    # ---- customer (left) / voyage terms (right, tall)
+    y = 68
+    cust_lines = [(doc.get("customer_name") or "-", "B")]
+    for ln in lines_for(doc.get("customer_address") or "", 106, 8):
+        if ln.strip():
+            cust_lines.append((ln, ""))
+    contact = "   ".join(x for x in (("Tel : " + doc["customer_phone"]) if doc.get("customer_phone") else "",
+                                      ("Email : " + doc["customer_email"]) if doc.get("customer_email") else "") if x)
+    if contact:
+        cust_lines.append((contact, ""))
+    cust_h = max(24, 8 + 4.2 * len(cust_lines[:7]))
+    box(L, y, 112, cust_h)
+    txt(L + 3, y + 1.5, 20, 4, "Customer :", 8, "")
+    cy = y + 5.5
+    for ln, st in cust_lines[:7]:
+        txt(L + 3, cy, 106, 4, ln[:70], 8.5 if st else 8, st)
+        cy += 4.2
+    vy = y + cust_h + 3
+    box(L, vy, 112, 29)
+    txt(L + 3, vy + 1.5, 40, 4, "Vessel Particulars:", 8.5)
+    vp = [("Name:", (doc.get("vessel") or "-").upper()), ("GRT:", _pda_num(doc.get("grt"), 0) if doc.get("grt") else "-"),
+          ("NRT:", _pda_num(doc.get("nrt"), 0) if doc.get("nrt") else "-"), ("DWT:", f"{float(doc['dwt']):,.1f}".rstrip("0").rstrip(".") if doc.get("dwt") else "-")]
+    for i, (k, v) in enumerate(vp):
+        txt(L + 3, vy + 7 + i * 5, 14, 4, k, 7.5, "", GREY)
+        txt(L + 18, vy + 7 + i * 5, 90, 4, v, 8.5)
+    right_h = cust_h + 3 + 29
+    box(L + 116, y, 70, right_h)
+    eta_txt = doc.get("eta") or ""
+    try:
+        eta_txt = datetime.strptime(eta_txt, "%Y-%m-%d").strftime("%d-%b-%Y")
+    except ValueError:
+        pass
+    stay = doc.get("port_stay")
+    cargo = (doc.get("cargo_type") or "").strip()
+    if doc.get("cargo_frt"):
+        cargo = (cargo + " " + _pda_num(doc["cargo_frt"], 0) + " frt").strip()
+    if doc.get("cargo_units"):
+        cargo += "\n" + _pda_num(doc["cargo_units"], 0) + " units"
+    if doc.get("cargo_note"):
+        cargo += "\n" + doc["cargo_note"]
+    vt = [("Load Type", doc.get("load_type") or ""), ("Term", doc.get("term") or ""),
+          ("Trade", doc.get("trade") or ""), ("Port Stay", (f"{float(stay):g} DAYS") if stay else ""),
+          ("Origin", doc.get("operation") or ""), ("ETA", eta_txt), ("Receiver", doc.get("receiver") or "")]
+    ry = y + 2
+    for k, v in vt:
+        txt(L + 118, ry, 22, 4, k, 7, "", GREY)
+        txt(L + 141, ry, 44, 4, str(v)[:30], 7.5)
+        ry += 5.2
+    txt(L + 118, ry, 22, 4, "Cargo Details", 7, "", GREY)
+    cy2 = ry
+    for ln in lines_for(cargo, 44, 7.5)[:5]:
+        txt(L + 141, cy2, 44, 3.8, ln, 7.5)
+        cy2 += 3.8
+
+    # ---- charges table
+    y = vy + 29 + 6
+    route = f"{(doc.get('load_port') or '').upper()} to {(doc.get('dis_port') or doc.get('port') or '').upper()}".strip()
     if is_fda:
-        meta_rows.append(("Finalized by", doc.get("finalized_by") or "-"))
-        meta_rows.append(("Finalized", doc.get("finalized_at") or "-"))
-    for label, value in meta_rows:
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(38, 6.5, label + ":", border=0)
-        pdf.set_font("Helvetica", "", 10)
-        pdf.cell(0, 6.5, str(value), ln=1)
-
-    pdf.ln(4)
-    currency = doc.get("currency") or "SAR"
-    if is_fda:
-        col_w = [84, 32, 32, 32]
-        headers = ["Charge", "Estimate", "Actual", "Variance"]
+        cols = [("#", 7, "L"), ("Charge Description", 66, "L"), ("Charged Per", 25, "L"), ("Cur", 10, "L"),
+                ("Estimate", 26, "R"), ("Actual", 26, "R"), ("Variance", 26, "R")]
     else:
-        col_w = [116, 64]
-        headers = ["Charge", "Estimate"]
+        cols = [("#", 7, "L"), ("Charge Description", 46, "L"), ("Charged Per", 27, "L"), ("Cur", 9, "L"), ("Rate", 20, "R"),
+                ("Qty.", 18, "R"), ("Total (USD)", 22, "R"), ("Total (SAR)", 24, "R"), ("Remarks", 13, "L")]
+    xs = [L]
+    for _, w, _a in cols:
+        xs.append(xs[-1] + w)
 
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.set_fill_color(18, 58, 86)
-    pdf.set_text_color(255, 255, 255)
-    for w, h in zip(col_w, headers):
-        align = "L" if h == "Charge" else "R"
-        pdf.cell(w, 8, h, border=1, align=align, fill=True)
-    pdf.ln()
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_font("Helvetica", "", 10)
+    def table_head(y):
+        txt(L, y, 22, 6, "Charges", 10, "B")
+        txt(L + 21, y, W - 21, 6, route, 10, "B", (70, 110, 160))
+        y += 8
+        pdf.set_fill_color(*NAVY)
+        pdf.rect(L, y, W, 6.5, "F")
+        for (name, w, al), x0 in zip(cols, xs):
+            txt(x0 + 1, y + 0.8, w - 2, 5, name, 7, "B", (255, 255, 255), al)
+        return y + 8
 
-    est_total = 0.0
-    act_total = 0.0
-    fill = False
-    for item in items:
-        est = float(item.get("estimated_amount") or 0)
-        est_total += est
-        pdf.set_fill_color(246, 248, 250)
-        pdf.cell(col_w[0], 7.5, str(item.get("name") or ""), border=1, align="L", fill=fill)
-        pdf.cell(col_w[1], 7.5, fmt_money(est), border=1, align="R", fill=fill)
+    def ensure(y, need):
+        if y + need > 280:
+            pdf.add_page()
+            return table_head(10)
+        return y
+
+    y = table_head(y)
+
+    def money_cols(usd, sar):
+        return _pda_num(usd), _pda_num(sar)
+
+    shown_any = False
+    for gi, g in enumerate(calc["groups"], 1):
+        src = {i["id"]: i for i in items}
+        visible = []
+        for line in g["items"]:
+            it = src.get(line["id"], {})
+            est = float(it.get("estimated_amount") or 0)
+            act = it.get("actual_amount")
+            if (not is_fda and est == 0) or (is_fda and est == 0 and not float(act or 0)):
+                continue                                  # lines with nothing to charge don't print
+            visible.append((it, line))
+        if not visible:
+            continue
+        y = ensure(y, 22)
+        pdf.set_fill_color(238, 242, 246)
+        pdf.rect(L, y - 1, W, 6.5, "F")
+        txt(L + 1, y, 8, 4.5, str(gi), 9, "B", NAVY)
+        txt(L + 9, y, 100, 4.5, g["name"], 9, "B", NAVY)
+        y += 7
+        for n, (it, line) in enumerate(visible, 1):
+            d_lines = lines_for(it.get("name"), cols[1][1] - 2, 7.5)
+            p_lines = lines_for(it.get("unit"), cols[2][1] - 2, 7.5)
+            r_lines = lines_for(it.get("remarks"), cols[-1][1] - 2, 7) if not is_fda else [""]
+            h = max(len(d_lines), len(p_lines), len(r_lines)) * 3.7 + 2.2
+            y = ensure(y, h + 2)
+            txt(xs[0] + 1, y + 1, 6, 4, str(n), 7.5)
+            for i, ln in enumerate(d_lines):
+                txt(xs[1] + 1, y + 1 + i * 3.7, cols[1][1] - 2, 3.7, ln, 7.5)
+            for i, ln in enumerate(p_lines):
+                txt(xs[2] + 1, y + 1 + i * 3.7, cols[2][1] - 2, 3.7, ln, 7.5)
+            txt(xs[3] + 1, y + 1, cols[3][1] - 1, 4, it.get("currency") or "USD", 7.5)
+            if is_fda:
+                est = float(it.get("estimated_amount") or 0)
+                act = it.get("actual_amount")
+                act = float(act) if act is not None else est
+                var = act - est
+                txt(xs[4], y + 1, cols[4][1] - 1, 4, _pda_num(est), 7.5, "", (0, 0, 0), "R")
+                txt(xs[5], y + 1, cols[5][1] - 1, 4, _pda_num(act), 7.5, "", (0, 0, 0), "R")
+                txt(xs[6], y + 1, cols[6][1] - 1, 4, (("+" if var > 0 else "") + _pda_num(var)) if var else "-", 7.5, "B" if var else "",
+                    (190, 60, 50) if var > 0 else ((30, 130, 90) if var < 0 else (0, 0, 0)), "R")
+            else:
+                txt(xs[4], y + 1, cols[4][1] - 1, 4, _pda_num(it.get("rate")), 7.5, "", (0, 0, 0), "R")
+                txt(xs[5], y + 1, cols[5][1] - 1, 4, _pda_qty_text(it.get("qty")), 7.5, "", (0, 0, 0), "R")
+                txt(xs[6], y + 1, cols[6][1] - 1, 4, _pda_num(line["usd"]), 7.5, "", (0, 0, 0), "R")
+                txt(xs[7], y + 1, cols[7][1] - 1, 4, _pda_num(line["sar"]), 7.5, "", (0, 0, 0), "R")
+                for i, ln in enumerate(r_lines):
+                    txt(xs[8] + 1, y + 1 + i * 3.7, cols[8][1] - 2, 3.5, ln, 7)
+            y += h
+            pdf.set_draw_color(*LINE)
+            pdf.set_line_width(0.15)
+            pdf.line(L, y, L + W, y)
+        shown_any = True
+        # sub total
+        y = ensure(y, 14)
+        txt(L + 1, y + 1.5, 40, 4, "SUB TOTAL", 8, "B")
         if is_fda:
-            act = item.get("actual_amount")
-            act = float(act) if act is not None else est
-            act_total += act
-            variance = act - est
-            pdf.cell(col_w[2], 7.5, fmt_money(act), border=1, align="R", fill=fill)
-            pdf.cell(col_w[3], 7.5, ("+" if variance > 0 else "") + fmt_money(variance), border=1, align="R", fill=fill)
-        pdf.ln()
-        fill = not fill
+            for ci, (key_usd, key_sar) in zip((4, 5, 6), (("est_usd", "est_sar"), ("act_usd", "act_sar"), ("var_usd", "var_sar"))):
+                txt(xs[ci], y + 1.5, cols[ci][1] - 1, 4, "USD " + _pda_num(g[key_usd]), 7.5, "B", (0, 0, 0), "R")
+                txt(xs[ci], y + 5.6, cols[ci][1] - 1, 4, "SAR " + _pda_num(g[key_sar]), 7.5, "B", (0, 0, 0), "R")
+        else:
+            txt(L + 100, y + 1.5, W - 100, 4, "USD " + _pda_num(g["est_usd"]), 8, "B", (0, 0, 0), "R")
+            txt(L + 100, y + 5.6, W - 100, 4, "SAR " + _pda_num(g["est_sar"]), 8, "B", (0, 0, 0), "R")
+        y += 11.5
 
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(col_w[0], 8, "Total (" + currency + ")", border=1, align="L")
-    pdf.cell(col_w[1], 8, fmt_money(est_total), border=1, align="R")
+    if not shown_any:
+        txt(L + 1, y, W, 5, "No charges with an amount yet.", 8, "", GREY)
+        y += 8
+
+    # ---- grand total
+    y = ensure(y, 20)
+    pdf.set_draw_color(*NAVY)
+    pdf.set_line_width(0.5)
+    pdf.line(L, y, L + W, y)
+    tot = calc["total"]
+    txt(L + 1, y + 2.5, 40, 5, "TOTAL" + (" (ACTUAL)" if is_fda else ""), 10, "B", NAVY)
     if is_fda:
-        variance_total = act_total - est_total
-        pdf.cell(col_w[2], 8, fmt_money(act_total), border=1, align="R")
-        pdf.cell(col_w[3], 8, ("+" if variance_total > 0 else "") + fmt_money(variance_total), border=1, align="R")
-    pdf.ln(12)
+        for ci, (ku, ks) in zip((4, 5, 6), (("est_usd", "est_sar"), ("act_usd", "act_sar"), ("var_usd", "var_sar"))):
+            txt(xs[ci], y + 2.5, cols[ci][1] - 1, 4.5, "USD " + _pda_num(tot[ku]), 8, "B", NAVY, "R")
+            txt(xs[ci], y + 7, cols[ci][1] - 1, 4.5, "SAR " + _pda_num(tot[ks]), 8, "B", NAVY, "R")
+    else:
+        txt(L + 100, y + 2.5, W - 100, 5, "USD " + _pda_num(tot["est_usd"]), 10, "B", NAVY, "R")
+        txt(L + 100, y + 7.5, W - 100, 5, "SAR " + _pda_num(tot["est_sar"]), 10, "B", NAVY, "R")
+    y += 15
+    txt(L, y, W, 4, f"SAR amounts at an exchange rate of 1 USD = {calc['fx']:g} SAR.", 7, "", GREY)
+    y += 8
 
-    if doc.get("notes"):
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(0, 6, "Notes", ln=1)
-        pdf.set_font("Helvetica", "", 10)
-        pdf.multi_cell(0, 6, str(doc.get("notes")))
+    # ---- notes + bank details
+    notes = str(doc.get("notes") or "").strip()
+    bank_lines = [ln for ln in str(banks or "").replace("\r", "").split("\n")]
+    need = 8 + (len(lines_for(notes, W, 8)) * 4 if notes else 0) + (len(bank_lines) * 4 + 10 if banks else 0)
+    y = ensure(y, min(need, 60))
+    txt(L, y, W, 5, "Additional Notes:", 9, "B")
+    y += 6
+    if notes:
+        for ln in lines_for(notes, W, 8):
+            y = ensure(y, 5)
+            txt(L, y, W, 4, ln, 8)
+            y += 4
+        y += 3
+    if str(banks or "").strip():
+        y = ensure(y, len(bank_lines) * 4 + 10)
+        txt(L, y, W, 5, "Bank Details.", 9, "B")
+        y += 6
+        for ln in bank_lines:
+            if ln.strip():
+                pdf.set_font("Helvetica", "", 8)
+                pdf.set_text_color(0, 0, 0)
+                pdf.set_xy(L, y)
+                pdf.cell(W, 4, ln.strip()[:120])
+            y += 4
 
-    out = pdf.output(dest="S")
-    return bytes(out)
+    return bytes(pdf.output(dest="S"))
 
 
 def _sof_val(doc, key):
@@ -5895,6 +6155,263 @@ def _num_row(row, fields):
     return d
 
 
+# ---------- Disbursement Accounts (PDA / FDA) ----------
+# One document per port call: customer + voyage + vessel details, charges
+# grouped under headings (Port Charges / Agency Charges ...), every charge
+# = rate x quantity in USD or SAR, totals always shown in both currencies.
+# The same document turns into the FDA when it is finalized: each charge
+# then also carries the actual amount and the variance against the estimate.
+
+PDA_PORT_INFO = {
+    # discharge/loading port name as printed on the PDA, UN/LOCODE (blank when not certain)
+    "DAMMAM PORT": ("DAMMAM", "SADMM"),
+    "JUBAIL COMMERCIAL PORT": ("JUBAIL COMMERCIAL PORT", "SAJUB"),
+    "JEDDAH PORT": ("JEDDAH ISLAMIC PORT", "SAJED"),
+    "YANBU COMMERCIAL PORT": ("YANBU COMMERCIAL CITY", "SAYNB"),
+    "YANBU INDUSTRIAL PORT": ("YANBU INDUSTRIAL CITY", "SAYNB"),
+    "KAP": ("KING ABDULLAH PORT", ""),
+}
+PDA_BASES = ("fixed", "days", "frt", "grt", "manual")
+PDA_CURRENCIES = ("USD", "SAR")
+PDA_DEFAULT_FX = 3.75
+PDA_DEFAULT_LETTERHEAD = (
+    "International Economy Tower 3rd Floor,\nAl Baghdadiya District,\nJeddah 22231, Saudi Arabia\n"
+    "Tel: 966-12-6482045 & 27\nEmail: ops@seapower.com.sa\nC.R. No: 4030175080  License No. 522912-0019"
+)
+PDA_TEXT_FIELDS = (
+    "port", "vessel", "reference", "currency", "notes", "load_port", "load_code", "dis_port", "dis_code",
+    "customer_name", "customer_address", "customer_phone", "customer_email", "sales_exec", "sales_phone",
+    "sales_email", "load_type", "term", "trade", "operation", "eta", "receiver", "cargo_type", "cargo_note",
+)
+PDA_NUM_FIELDS = ("port_stay", "cargo_frt", "cargo_units", "grt", "nrt", "dwt", "fx_rate")
+PDA_DOC_NUMERIC = PDA_NUM_FIELDS
+PDA_ITEM_NUMERIC = ["estimated_amount", "actual_amount", "rate", "qty"]
+
+
+def _pf(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return default
+        x = float(v)
+        return x if x == x and abs(x) != float("inf") else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _pda_to_usd_sar(amount, cur, fx):
+    if (cur or "USD").upper() == "SAR":
+        return amount / fx, amount
+    return amount, amount * fx
+
+
+def _pda_compute(doc, items):
+    """Single source of truth for every figure on screen, in the PDF and in the list:
+    per-line USD/SAR, per-group subtotals, grand total, and (for an FDA) actual + variance."""
+    fx = _pf(doc.get("fx_rate"), PDA_DEFAULT_FX) or PDA_DEFAULT_FX
+    groups, index = [], {}
+    keys = ("est_usd", "est_sar", "act_usd", "act_sar")
+    for it in items:
+        est = _pf(it.get("estimated_amount"))
+        act_raw = it.get("actual_amount")
+        act = _pf(act_raw) if act_raw is not None else est
+        eu, es = _pda_to_usd_sar(est, it.get("currency"), fx)
+        au, as_ = _pda_to_usd_sar(act, it.get("currency"), fx)
+        name = (it.get("group_name") or "Charges").strip() or "Charges"
+        if name not in index:
+            index[name] = len(groups)
+            groups.append({"name": name, "items": [], "_x": dict.fromkeys(keys, 0.0)})
+        g = groups[index[name]]
+        line = {"id": it.get("id"), "usd": round(eu, 2), "sar": round(es, 2), "act_usd": round(au, 2), "act_sar": round(as_, 2),
+                "variance": round(act - est, 2) if act_raw is not None else None}
+        g["items"].append(line)
+        for k, v in zip(keys, (eu, es, au, as_)):
+            g["_x"][k] += v
+    total = dict.fromkeys(keys, 0.0)
+    for g in groups:
+        for k in keys:
+            g[k] = round(g["_x"][k], 2)
+            total[k] = round(total[k] + g[k], 2)
+        del g["_x"]
+        g["var_usd"] = round(g["act_usd"] - g["est_usd"], 2)
+        g["var_sar"] = round(g["act_sar"] - g["est_sar"], 2)
+    total["var_usd"] = round(total["act_usd"] - total["est_usd"], 2)
+    total["var_sar"] = round(total["act_sar"] - total["est_sar"], 2)
+    return {"fx": fx, "groups": groups, "total": total}
+
+
+def _pda_scope_ok(row):
+    return row is not None and (session.get("role") == "admin" or (row["created_by"] or "") == session.get("username"))
+
+
+def _pda_get(db, pda_id):
+    row = db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone()
+    return row if _pda_scope_ok(row) else None
+
+
+def _pda_item_and_doc(db, item_id):
+    item = db.execute("SELECT * FROM pda_line_items WHERE id = ?", (item_id,)).fetchone()
+    if not item:
+        return None, None
+    return item, _pda_get(db, item["pda_id"])
+
+
+def _pda_items(db, pda_id):
+    rows = db.execute("SELECT * FROM pda_line_items WHERE pda_id = ? ORDER BY sort_order, id", (pda_id,)).fetchall()
+    return [_num_row(r, PDA_ITEM_NUMERIC) for r in rows]
+
+
+def _pda_payload(db, doc_row):
+    d = _num_row(doc_row, PDA_DOC_NUMERIC)
+    items = _pda_items(db, doc_row["id"])
+    d["items"] = items
+    d["calc"] = _pda_compute(d, items)
+    return d
+
+
+def _pda_auto_qty(basis, doc):
+    if basis == "days":
+        return _pf(doc["port_stay"])
+    if basis == "frt":
+        return _pf(doc["cargo_frt"])
+    if basis == "grt":
+        return _pf(doc["grt"])
+    return None
+
+
+def _pda_recalc_auto_lines(db, pda_id):
+    """Quantities that follow the call (port stay days, cargo FRT, GRT) are refreshed whenever
+    those change - except lines the person typed a quantity into by hand."""
+    doc = db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone()
+    for it in db.execute(
+        "SELECT * FROM pda_line_items WHERE pda_id = ? AND qty_basis IN ('days','frt','grt') AND COALESCE(qty_manual, 0) = 0", (pda_id,)
+    ).fetchall():
+        q = _pda_auto_qty(it["qty_basis"], doc)
+        db.execute("UPDATE pda_line_items SET qty = ?, estimated_amount = ? WHERE id = ?",
+                   (q, round(_pf(it["rate"]) * q, 2), it["id"]))
+
+
+def _pda_clean_text(v, limit=400):
+    return str(v or "").replace("\x00", "").strip()[:limit]
+
+
+def _pda_next_no(db, yy):
+    prefix = _pda_clean_text(get_setting("pda_prefix", "5101"), 20) or "5101"
+    pat = f"{prefix}/PDA/{yy}/"
+    top = 0
+    for r in db.execute("SELECT pda_no FROM pda_documents WHERE pda_no LIKE ?", (pat + "%",)).fetchall():
+        tail = r["pda_no"][len(pat):]
+        if tail.isdigit():
+            top = max(top, int(tail))
+    start = 1
+    if get_setting("pda_start_yy", "") == yy and get_setting("pda_start", "").isdigit():
+        start = int(get_setting("pda_start"))
+    return f"{pat}{max(top + 1, start)}"
+
+
+def _pda_new_doc_row(db, fields, created_by):
+    """Inserts a document with the next free PDA number (retries if two people create at once)."""
+    now = datetime.utcnow()
+    yy = now.strftime("%y")
+    cols = list(fields.keys())
+    for _ in range(6):
+        no = _pda_next_no(db, yy)
+        try:
+            row = db.execute(
+                f"INSERT INTO pda_documents (pda_no, status, created_by, created_at, {', '.join(cols)}) "
+                f"VALUES (?, 'draft', ?, ?, {', '.join('?' for _ in cols)}) RETURNING *",
+                (no, created_by, now.strftime("%Y-%m-%d %H:%M"), *[fields[c] for c in cols]),
+            ).fetchone()
+            return row
+        except psycopg2.errors.UniqueViolation:
+            db.conn.rollback()
+    raise RuntimeError("could not allocate a PDA number")
+
+
+def _pda_insert_template_lines(db, doc_row):
+    for t in db.execute("SELECT * FROM pda_templates WHERE port = ? ORDER BY sort_order, id", (doc_row["port"],)).fetchall():
+        basis = t["qty_basis"] if t["qty_basis"] in PDA_BASES else "fixed"
+        auto = _pda_auto_qty(basis, doc_row)
+        qty = auto if auto is not None else _pf(t["default_qty"], 1.0)
+        rate = _pf(t["default_amount"])
+        db.execute(
+            """INSERT INTO pda_line_items (pda_id, name, estimated_amount, sort_order, group_name, unit, currency, rate, qty, qty_basis, qty_manual, remarks)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '')""",
+            (doc_row["id"], t["name"], round(rate * qty, 2), t["sort_order"], t["group_name"] or "Port Charges",
+             t["unit"] or "PER SHIPMENT", t["currency"] if t["currency"] in PDA_CURRENCIES else "USD", rate, qty, basis),
+        )
+
+
+def _pda_validated_doc_fields(data, existing=None):
+    """Picks the editable document fields out of a request, validating numbers. Returns (fields, error)."""
+    out = {}
+    for k in PDA_TEXT_FIELDS:
+        if k in data:
+            v = data.get(k)
+            out[k] = _pda_clean_text(v, 4000 if k in ("notes", "cargo_note", "customer_address") else 300)
+    for k in PDA_NUM_FIELDS:
+        if k in data:
+            raw = data.get(k)
+            if raw is None or str(raw).strip() == "":
+                out[k] = None if k != "fx_rate" else PDA_DEFAULT_FX
+                continue
+            try:
+                v = float(str(raw).replace(",", ""))
+            except ValueError:
+                return None, f"{k.replace('_', ' ').title()} must be a number."
+            if v != v or v < 0 or v > 1e9:
+                return None, f"{k.replace('_', ' ').title()} is out of range."
+            if k == "fx_rate" and v <= 0:
+                return None, "Exchange rate must be above zero."
+            out[k] = v
+    if "customer_email" in out and out["customer_email"] and not _clean_email(out["customer_email"].split(",")[0]):
+        return None, "That customer email doesn't look right."
+    if "currency" in out and out["currency"] not in PDA_CURRENCIES:
+        out["currency"] = "USD"
+    return out, None
+
+
+@app.route("/api/pda/settings", methods=["GET"])
+@login_required
+def get_pda_settings():
+    return jsonify({
+        "prefix": get_setting("pda_prefix", "5101") or "5101",
+        "letterhead": get_setting("pda_letterhead", PDA_DEFAULT_LETTERHEAD),
+        "banks": get_setting("pda_banks", ""),
+        "fx": _pf(get_setting("pda_fx", ""), PDA_DEFAULT_FX) or PDA_DEFAULT_FX,
+        "next_number": _pda_next_no(get_db(), datetime.utcnow().strftime("%y")),
+        "ports": {k: {"name": v[0], "code": v[1]} for k, v in PDA_PORT_INFO.items()},
+        "is_admin": session.get("role") == "admin",
+    })
+
+
+@app.route("/api/pda/settings", methods=["POST"])
+@login_required
+@admin_required
+def update_pda_settings():
+    data = request.get_json(force=True) or {}
+    if "prefix" in data:
+        p = re.sub(r"[^A-Za-z0-9-]", "", str(data.get("prefix") or ""))[:20]
+        if not p:
+            return jsonify({"error": "The PDA number prefix can't be empty (letters, digits and dashes only)."}), 400
+        set_setting("pda_prefix", p)
+    if "next_number" in data and str(data.get("next_number")).strip():
+        raw = str(data.get("next_number")).strip()
+        if not raw.isdigit() or int(raw) < 1 or int(raw) > 9999999:
+            return jsonify({"error": "The next PDA number must be a whole number."}), 400
+        set_setting("pda_start", str(int(raw)))
+        set_setting("pda_start_yy", datetime.utcnow().strftime("%y"))
+    if "letterhead" in data:
+        set_setting("pda_letterhead", _pda_clean_text(data.get("letterhead"), 600))
+    if "banks" in data:
+        set_setting("pda_banks", _pda_clean_text(data.get("banks"), 2000))
+    if "fx" in data:
+        fx = _pf(data.get("fx"), 0)
+        if fx <= 0 or fx > 1000:
+            return jsonify({"error": "Exchange rate must be a positive number (USD to SAR is 3.75)."}), 400
+        set_setting("pda_fx", str(fx))
+    return jsonify({"ok": True})
+
+
 @app.route("/api/pda/templates", methods=["GET"])
 @login_required
 def list_pda_templates():
@@ -5902,55 +6419,70 @@ def list_pda_templates():
     rows = db.execute("SELECT * FROM pda_templates ORDER BY port, sort_order, id").fetchall()
     templates = {}
     for r in rows:
-        templates.setdefault(r["port"], []).append(_num_row(r, ["default_amount"]))
+        templates.setdefault(r["port"], []).append(_num_row(r, ["default_amount", "default_qty"]))
     return jsonify(templates)
+
+
+def _pda_template_fields(data, existing=None):
+    ex = existing or {}
+    name = _pda_clean_text(data.get("name", ex.get("name", "")), 200)
+    if not name:
+        return None, "Charge name is required."
+    group = _pda_clean_text(data.get("group_name", ex.get("group_name", "Port Charges")), 80) or "Port Charges"
+    unit = _pda_clean_text(data.get("unit", ex.get("unit", "PER SHIPMENT")), 40).upper() or "PER SHIPMENT"
+    cur = str(data.get("currency", ex.get("currency", "USD")) or "USD").upper()
+    if cur not in PDA_CURRENCIES:
+        return None, "Currency must be USD or SAR."
+    basis = str(data.get("qty_basis", ex.get("qty_basis", "fixed")) or "fixed")
+    if basis not in PDA_BASES:
+        return None, "Unknown quantity rule."
+    rate = _pf(data.get("default_amount", ex.get("default_amount", 0)), None)
+    qty = _pf(data.get("default_qty", ex.get("default_qty", 1)), None)
+    if rate is None or qty is None or rate < 0 or qty < 0:
+        return None, "Rate and quantity must be numbers."
+    return {"name": name, "group_name": group, "unit": unit, "currency": cur, "qty_basis": basis,
+            "default_amount": rate, "default_qty": qty}, None
 
 
 @app.route("/api/pda/templates", methods=["POST"])
 @login_required
 @admin_required
 def add_pda_template():
-    data = request.get_json(force=True)
-    port = (data.get("port") or "").strip()
-    name = (data.get("name") or "").strip()
-    if not port or not name:
+    data = request.get_json(force=True) or {}
+    port = _pda_clean_text(data.get("port"), 80)
+    if not port:
         return jsonify({"error": "Port and charge name are required."}), 400
-    try:
-        amount = float(data.get("default_amount") or 0)
-    except (TypeError, ValueError):
-        return jsonify({"error": "Default amount must be a number."}), 400
+    f, err = _pda_template_fields(data)
+    if err:
+        return jsonify({"error": err}), 400
     db = get_db()
     order_row = db.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM pda_templates WHERE port = ?", (port,)).fetchone()
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     row = db.execute(
-        "INSERT INTO pda_templates (port, name, default_amount, sort_order, created_at) VALUES (?, ?, ?, ?, ?) RETURNING *",
-        (port, name, amount, order_row["n"], now),
+        """INSERT INTO pda_templates (port, name, default_amount, sort_order, created_at, group_name, unit, currency, qty_basis, default_qty)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *""",
+        (port, f["name"], f["default_amount"], order_row["n"], now, f["group_name"], f["unit"], f["currency"], f["qty_basis"], f["default_qty"]),
     ).fetchone()
     db.commit()
-    return jsonify(_num_row(row, ["default_amount"]))
+    return jsonify(_num_row(row, ["default_amount", "default_qty"]))
 
 
 @app.route("/api/pda/templates/<int:template_id>", methods=["PUT"])
 @login_required
 @admin_required
 def update_pda_template(template_id):
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
     db = get_db()
     existing = db.execute("SELECT * FROM pda_templates WHERE id = ?", (template_id,)).fetchone()
     if not existing:
         return jsonify({"error": "Not found."}), 404
-    name = existing["name"]
-    if "name" in data:
-        name = (data.get("name") or "").strip()
-        if not name:
-            return jsonify({"error": "Charge name can't be empty."}), 400
-    amount = existing["default_amount"]
-    if "default_amount" in data:
-        try:
-            amount = float(data.get("default_amount") or 0)
-        except (TypeError, ValueError):
-            return jsonify({"error": "Default amount must be a number."}), 400
-    db.execute("UPDATE pda_templates SET name = ?, default_amount = ? WHERE id = ?", (name, amount, template_id))
+    f, err = _pda_template_fields(data, dict(existing))
+    if err:
+        return jsonify({"error": err}), 400
+    db.execute(
+        "UPDATE pda_templates SET name = ?, default_amount = ?, group_name = ?, unit = ?, currency = ?, qty_basis = ?, default_qty = ? WHERE id = ?",
+        (f["name"], f["default_amount"], f["group_name"], f["unit"], f["currency"], f["qty_basis"], f["default_qty"], template_id),
+    )
     db.commit()
     return jsonify({"ok": True})
 
@@ -5965,22 +6497,49 @@ def delete_pda_template(template_id):
     return jsonify({"ok": True})
 
 
+@app.route("/api/pda/customers", methods=["GET"])
+@login_required
+def list_pda_customers():
+    """Customers used on earlier PDAs (latest details first) - fills the form as soon as one is picked."""
+    db = get_db()
+    sql = ("SELECT customer_name, customer_address, customer_phone, customer_email FROM pda_documents "
+           "WHERE customer_name <> ''")
+    params = []
+    if session.get("role") != "admin":
+        sql += " AND created_by = ?"
+        params.append(session.get("username"))
+    sql += " ORDER BY id DESC"
+    seen, out = set(), []
+    for r in db.execute(sql, tuple(params)).fetchall():
+        key = r["customer_name"].strip().lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(dict(r))
+    return jsonify(out[:200])
+
+
 @app.route("/api/pda/documents", methods=["GET"])
 @login_required
 def list_pda_documents():
     db = get_db()
-    rows = db.execute("SELECT * FROM pda_documents ORDER BY created_at DESC, id DESC").fetchall()
+    sql = "SELECT * FROM pda_documents"
+    params = ()
+    if session.get("role") != "admin":
+        sql += " WHERE created_by = ?"
+        params = (session.get("username"),)
+    rows = db.execute(sql + " ORDER BY id DESC", params).fetchall()
+    by_doc = {}
+    if rows:
+        ids = [r["id"] for r in rows]
+        for it in db.execute("SELECT * FROM pda_line_items WHERE pda_id = ANY(?) ORDER BY sort_order, id", (ids,)).fetchall():
+            by_doc.setdefault(it["pda_id"], []).append(_num_row(it, PDA_ITEM_NUMERIC))
     docs = []
     for r in rows:
-        d = dict(r)
-        items = db.execute(
-            "SELECT estimated_amount, actual_amount FROM pda_line_items WHERE pda_id = ?", (r["id"],)
-        ).fetchall()
-        d["estimated_total"] = round(sum(float(i["estimated_amount"] or 0) for i in items), 2)
-        d["actual_total"] = (
-            round(sum(float(i["actual_amount"]) if i["actual_amount"] is not None else float(i["estimated_amount"] or 0) for i in items), 2)
-            if d["status"] == "finalized" else None
-        )
+        d = _num_row(r, PDA_DOC_NUMERIC)
+        items = by_doc.get(r["id"], [])
+        calc = _pda_compute(d, items)
+        d["est_usd"], d["est_sar"] = calc["total"]["est_usd"], calc["total"]["est_sar"]
+        d["act_usd"], d["act_sar"] = calc["total"]["act_usd"], calc["total"]["act_sar"]
         d["line_item_count"] = len(items)
         docs.append(d)
     return jsonify(docs)
@@ -5989,70 +6548,78 @@ def list_pda_documents():
 @app.route("/api/pda/documents", methods=["POST"])
 @login_required
 def create_pda_document():
-    data = request.get_json(force=True)
-    port = (data.get("port") or "").strip()
-    vessel = (data.get("vessel") or "").strip()
+    data = request.get_json(force=True) or {}
+    fields, err = _pda_validated_doc_fields(data)
+    if err:
+        return jsonify({"error": err}), 400
+    port = fields.get("port", "")
+    vessel = fields.get("vessel", "")
     if not port or not vessel:
         return jsonify({"error": "Port and vessel are required."}), 400
-    reference = (data.get("reference") or "").strip()
-    currency = (data.get("currency") or "SAR").strip() or "SAR"
-    notes = data.get("notes") or ""
     db = get_db()
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-    doc = db.execute(
-        """INSERT INTO pda_documents (port, vessel, reference, currency, status, notes, created_by, created_at)
-           VALUES (?, ?, ?, ?, 'draft', ?, ?, ?) RETURNING *""",
-        (port, vessel, reference, currency, notes, session.get("username"), now),
-    ).fetchone()
-    templates = db.execute("SELECT * FROM pda_templates WHERE port = ? ORDER BY sort_order, id", (port,)).fetchall()
-    for t in templates:
-        db.execute(
-            "INSERT INTO pda_line_items (pda_id, name, estimated_amount, sort_order) VALUES (?, ?, ?, ?)",
-            (doc["id"], t["name"], t["default_amount"], t["sort_order"]),
-        )
-    db.commit()
-    return jsonify({"ok": True, "id": doc["id"]})
+    me = db.execute("SELECT full_name, email, username FROM users WHERE id = ?", (session.get("user_id"),)).fetchone()
+    pname, pcode = PDA_PORT_INFO.get(port, (port, ""))
+    fields["currency"] = "USD"
+    fields.setdefault("dis_port", pname)
+    fields.setdefault("dis_code", pcode)
+    if not fields.get("dis_port"):
+        fields["dis_port"], fields["dis_code"] = pname, pcode
+    fields.setdefault("sales_exec", (me and (me["full_name"] or me["username"])) or session.get("username", ""))
+    fields.setdefault("sales_email", (me and me["email"]) or "")
+    fields.setdefault("load_type", "Break Bulk")
+    fields.setdefault("term", "LINER OUT")
+    fields.setdefault("trade", "IMPORT")
+    fields.setdefault("operation", "Discharging")
+    fields.setdefault("fx_rate", _pf(get_setting("pda_fx", ""), PDA_DEFAULT_FX) or PDA_DEFAULT_FX)
+    fields.setdefault("cargo_type", "GENERAL CARGO")
+    try:
+        doc = _pda_new_doc_row(db, fields, session.get("username"))
+        _pda_insert_template_lines(db, doc)
+        db.commit()
+    except Exception:
+        db.conn.rollback()
+        return jsonify({"error": "Could not create the PDA. Please try again."}), 500
+    return jsonify({"ok": True, "id": doc["id"], "pda_no": doc["pda_no"]})
 
 
 @app.route("/api/pda/documents/<int:pda_id>", methods=["GET"])
 @login_required
 def get_pda_document(pda_id):
     db = get_db()
-    doc = db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone()
+    doc = _pda_get(db, pda_id)
     if not doc:
         return jsonify({"error": "Not found."}), 404
-    items = db.execute("SELECT * FROM pda_line_items WHERE pda_id = ? ORDER BY sort_order, id", (pda_id,)).fetchall()
-    d = dict(doc)
-    d["items"] = [_num_row(i, ["estimated_amount", "actual_amount"]) for i in items]
-    return jsonify(d)
+    return jsonify(_pda_payload(db, doc))
 
 
 @app.route("/api/pda/documents/<int:pda_id>", methods=["PUT"])
 @login_required
 def update_pda_document(pda_id):
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
     db = get_db()
-    doc = db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone()
+    doc = _pda_get(db, pda_id)
     if not doc:
         return jsonify({"error": "Not found."}), 404
-    reference = data.get("reference", doc["reference"])
-    currency = (data.get("currency", doc["currency"]) or doc["currency"])
-    notes = data.get("notes", doc["notes"])
-    vessel = (data.get("vessel", doc["vessel"]) or doc["vessel"])
-    port = (data.get("port", doc["port"]) or doc["port"])
-    db.execute(
-        "UPDATE pda_documents SET port = ?, vessel = ?, reference = ?, currency = ?, notes = ? WHERE id = ?",
-        (port, vessel, reference, currency, notes, pda_id),
-    )
-    db.commit()
-    return jsonify({"ok": True})
+    fields, err = _pda_validated_doc_fields(data)
+    if err:
+        return jsonify({"error": err}), 400
+    for req in ("port", "vessel"):
+        if req in fields and not fields[req]:
+            return jsonify({"error": f"{req.title()} can't be empty."}), 400
+    if fields:
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        db.execute(f"UPDATE pda_documents SET {sets}, updated_at = ? WHERE id = ?",
+                   (*fields.values(), datetime.utcnow().strftime("%Y-%m-%d %H:%M"), pda_id))
+        _pda_recalc_auto_lines(db, pda_id)
+        db.commit()
+    return jsonify({"ok": True, **_pda_payload(db, db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone())})
 
 
 @app.route("/api/pda/documents/<int:pda_id>/mark-sent", methods=["POST"])
 @login_required
 def mark_pda_sent(pda_id):
     db = get_db()
-    doc = db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone()
+    doc = _pda_get(db, pda_id)
     if not doc:
         return jsonify({"error": "Not found."}), 404
     if doc["status"] != "draft":
@@ -6067,20 +6634,17 @@ def mark_pda_sent(pda_id):
 @login_required
 def finalize_pda_document(pda_id):
     db = get_db()
-    doc = db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone()
+    doc = _pda_get(db, pda_id)
     if not doc:
         return jsonify({"error": "Not found."}), 404
     if doc["status"] == "finalized":
         return jsonify({"error": "This document is already finalized as an FDA."}), 400
-    items = db.execute("SELECT * FROM pda_line_items WHERE pda_id = ?", (pda_id,)).fetchall()
-    for item in items:
+    for item in db.execute("SELECT * FROM pda_line_items WHERE pda_id = ?", (pda_id,)).fetchall():
         if item["actual_amount"] is None:
             db.execute("UPDATE pda_line_items SET actual_amount = ? WHERE id = ?", (item["estimated_amount"], item["id"]))
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-    db.execute(
-        "UPDATE pda_documents SET status = 'finalized', finalized_by = ?, finalized_at = ? WHERE id = ?",
-        (session.get("username"), now, pda_id),
-    )
+    db.execute("UPDATE pda_documents SET status = 'finalized', finalized_by = ?, finalized_at = ? WHERE id = ?",
+               (session.get("username"), now, pda_id))
     db.commit()
     return jsonify({"ok": True})
 
@@ -6089,92 +6653,255 @@ def finalize_pda_document(pda_id):
 @login_required
 def delete_pda_document(pda_id):
     db = get_db()
+    if not _pda_get(db, pda_id):
+        return jsonify({"error": "Not found."}), 404
     db.execute("DELETE FROM pda_documents WHERE id = ?", (pda_id,))
     db.commit()
     return jsonify({"ok": True})
 
 
+@app.route("/api/pda/documents/<int:pda_id>/duplicate", methods=["POST"])
+@login_required
+def duplicate_pda_document(pda_id):
+    """A fresh draft with the same customer, voyage terms and charges (new number, estimates only) -
+    change the vessel and quantities and it is ready."""
+    db = get_db()
+    src = _pda_get(db, pda_id)
+    if not src:
+        return jsonify({"error": "Not found."}), 404
+    copy_fields = [k for k in PDA_TEXT_FIELDS if k not in ("notes",)] + list(PDA_NUM_FIELDS)
+    fields = {k: src[k] for k in copy_fields}
+    fields["notes"] = src["notes"] or ""
+    fields["currency"] = src["currency"] or "USD"
+    try:
+        doc = _pda_new_doc_row(db, fields, session.get("username"))
+        for it in db.execute("SELECT * FROM pda_line_items WHERE pda_id = ? ORDER BY sort_order, id", (pda_id,)).fetchall():
+            db.execute(
+                """INSERT INTO pda_line_items (pda_id, name, estimated_amount, sort_order, group_name, unit, currency, rate, qty, qty_basis, qty_manual, remarks)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (doc["id"], it["name"], it["estimated_amount"], it["sort_order"], it["group_name"], it["unit"], it["currency"],
+                 it["rate"], it["qty"], it["qty_basis"], it["qty_manual"], it["remarks"]),
+            )
+        db.commit()
+    except Exception:
+        db.conn.rollback()
+        return jsonify({"error": "Could not duplicate that PDA."}), 500
+    return jsonify({"ok": True, "id": doc["id"], "pda_no": doc["pda_no"]})
+
+
+@app.route("/api/pda/documents/<int:pda_id>/rename-group", methods=["POST"])
+@login_required
+def rename_pda_group(pda_id):
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    doc = _pda_get(db, pda_id)
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    old, new = _pda_clean_text(data.get("old"), 80), _pda_clean_text(data.get("new"), 80)
+    if not new:
+        return jsonify({"error": "The group needs a name."}), 400
+    db.execute("UPDATE pda_line_items SET group_name = ? WHERE pda_id = ? AND group_name = ?", (new, pda_id, old))
+    db.commit()
+    return jsonify({"ok": True, **_pda_payload(db, doc)})
+
+
+def _pda_item_fields(data, existing):
+    """Validated column changes for one charge line (rate x qty keeps the estimate in step)."""
+    ch = {}
+    if "name" in data:
+        n = _pda_clean_text(data.get("name"), 200)
+        if not n:
+            return None, "Charge name can't be empty."
+        ch["name"] = n
+    if "group_name" in data:
+        ch["group_name"] = _pda_clean_text(data.get("group_name"), 80) or "Charges"
+    if "unit" in data:
+        ch["unit"] = _pda_clean_text(data.get("unit"), 40).upper() or "PER SHIPMENT"
+    if "remarks" in data:
+        ch["remarks"] = _pda_clean_text(data.get("remarks"), 300)
+    if "currency" in data:
+        c = str(data.get("currency") or "").upper()
+        if c not in PDA_CURRENCIES:
+            return None, "Currency must be USD or SAR."
+        ch["currency"] = c
+    if "qty_basis" in data:
+        if data.get("qty_basis") not in PDA_BASES:
+            return None, "Unknown quantity rule."
+        ch["qty_basis"] = data.get("qty_basis")
+    for k in ("rate", "qty"):
+        if k in data:
+            v = _pf(data.get(k), None)
+            if v is None or v < 0 or v > 1e10:
+                return None, f"{k.title()} must be a number."
+            ch[k] = v
+            if k == "qty":
+                ch["qty_manual"] = 1
+    if "actual_amount" in data:
+        raw = data.get("actual_amount")
+        if raw is None or str(raw).strip() == "":
+            ch["actual_amount"] = None
+        else:
+            v = _pf(raw, None)
+            if v is None or v < 0 or v > 1e10:
+                return None, "Actual must be a number."
+            ch["actual_amount"] = v
+    return ch, None
+
+
 @app.route("/api/pda/documents/<int:pda_id>/line-items", methods=["POST"])
 @login_required
 def add_pda_line_item(pda_id):
-    data = request.get_json(force=True)
-    name = (data.get("name") or "").strip()
-    if not name:
-        return jsonify({"error": "Charge name is required."}), 400
+    data = request.get_json(force=True) or {}
     db = get_db()
-    doc = db.execute("SELECT id FROM pda_documents WHERE id = ?", (pda_id,)).fetchone()
+    doc = _pda_get(db, pda_id)
     if not doc:
         return jsonify({"error": "Not found."}), 404
-    try:
-        amount = float(data.get("estimated_amount") or 0)
-    except (TypeError, ValueError):
-        return jsonify({"error": "Amount must be a number."}), 400
+    base = {"name": data.get("name") or "New charge", "group_name": data.get("group_name") or "Port Charges",
+            "unit": data.get("unit") or "PER SHIPMENT", "currency": data.get("currency") or "USD",
+            "rate": data.get("rate", 0), "qty": data.get("qty", 1)}
+    ch, err = _pda_item_fields(base, None)
+    if err:
+        return jsonify({"error": err}), 400
     order_row = db.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM pda_line_items WHERE pda_id = ?", (pda_id,)).fetchone()
-    item = db.execute(
-        "INSERT INTO pda_line_items (pda_id, name, estimated_amount, sort_order) VALUES (?, ?, ?, ?) RETURNING *",
-        (pda_id, name, amount, order_row["n"]),
-    ).fetchone()
+    db.execute(
+        """INSERT INTO pda_line_items (pda_id, name, estimated_amount, sort_order, group_name, unit, currency, rate, qty, qty_basis, qty_manual, remarks)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'fixed', 0, '')""",
+        (pda_id, ch["name"], round(ch["rate"] * ch["qty"], 2), order_row["n"], ch["group_name"], ch["unit"], ch["currency"], ch["rate"], ch["qty"]),
+    )
     db.commit()
-    return jsonify(_num_row(item, ["estimated_amount", "actual_amount"]))
+    return jsonify({"ok": True, **_pda_payload(db, doc)})
 
 
 @app.route("/api/pda/line-items/<int:item_id>", methods=["PUT"])
 @login_required
 def update_pda_line_item(item_id):
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
     db = get_db()
-    item = db.execute("SELECT * FROM pda_line_items WHERE id = ?", (item_id,)).fetchone()
-    if not item:
+    item, doc = _pda_item_and_doc(db, item_id)
+    if not item or not doc:
         return jsonify({"error": "Not found."}), 404
-    updates = {}
-    if "name" in data:
-        name = (data.get("name") or "").strip()
-        if not name:
-            return jsonify({"error": "Charge name can't be empty."}), 400
-        updates["name"] = name
-    for field in ("estimated_amount", "actual_amount"):
-        if field in data:
-            val = data.get(field)
-            if val is None or val == "":
-                updates[field] = None
-            else:
-                try:
-                    updates[field] = float(val)
-                except (TypeError, ValueError):
-                    return jsonify({"error": field + " must be a number."}), 400
-    if not updates:
-        return jsonify({"ok": True})
-    set_clause = ", ".join(k + " = ?" for k in updates)
-    db.execute(f"UPDATE pda_line_items SET {set_clause} WHERE id = ?", (*updates.values(), item_id))
-    db.commit()
-    return jsonify({"ok": True})
+    ch, err = _pda_item_fields(data, item)
+    if err:
+        return jsonify({"error": err}), 400
+    if data.get("reset_qty"):          # back to the automatic quantity
+        ch["qty_manual"] = 0
+        q = _pda_auto_qty(ch.get("qty_basis", item["qty_basis"]), doc)
+        if q is not None:
+            ch["qty"] = q
+    elif "qty_basis" in ch and "qty" not in ch:
+        q = _pda_auto_qty(ch["qty_basis"], doc)     # picking a rule fills the quantity from the call
+        if q is not None:
+            ch["qty"], ch["qty_manual"] = q, 0
+    if ch:
+        rate = ch.get("rate", _pf(item["rate"]))
+        qty = ch.get("qty", _pf(item["qty"]))
+        if "rate" in ch or "qty" in ch:
+            ch["estimated_amount"] = round(rate * qty, 2)
+        sets = ", ".join(f"{k} = ?" for k in ch)
+        db.execute(f"UPDATE pda_line_items SET {sets} WHERE id = ?", (*ch.values(), item_id))
+        db.commit()
+    return jsonify({"ok": True, **_pda_payload(db, doc)})
 
 
 @app.route("/api/pda/line-items/<int:item_id>", methods=["DELETE"])
 @login_required
 def delete_pda_line_item(item_id):
     db = get_db()
+    item, doc = _pda_item_and_doc(db, item_id)
+    if not item or not doc:
+        return jsonify({"error": "Not found."}), 404
     db.execute("DELETE FROM pda_line_items WHERE id = ?", (item_id,))
     db.commit()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, **_pda_payload(db, doc)})
+
+
+def _pda_pdf_for(db, doc):
+    items = _pda_items(db, doc["id"])
+    d = _num_row(doc, PDA_DOC_NUMERIC)
+    return build_pda_pdf(d, items, _pda_calc=_pda_compute(d, items),
+                         letterhead=get_setting("pda_letterhead", PDA_DEFAULT_LETTERHEAD), banks=get_setting("pda_banks", ""))
+
+
+def _pda_file_name(doc):
+    kind = "FDA" if doc["status"] == "finalized" else "PDA"
+    base = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{kind}_{(doc['pda_no'] or doc['id'])}_{doc['vessel']}").strip("_")
+    return base + ".pdf"
 
 
 @app.route("/api/pda/documents/<int:pda_id>/pdf", methods=["GET"])
 @login_required
 def export_pda_pdf(pda_id):
     db = get_db()
-    doc = db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone()
+    doc = _pda_get(db, pda_id)
     if not doc:
         return "Not found.", 404
-    items = db.execute("SELECT * FROM pda_line_items WHERE pda_id = ? ORDER BY sort_order, id", (pda_id,)).fetchall()
-    pdf_bytes = build_pda_pdf(dict(doc), [dict(i) for i in items])
-    kind = "FDA" if doc["status"] == "finalized" else "PDA"
-    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{kind}_{doc['port']}_{doc['vessel']}_{doc['id']}")
-    return Response(
-        pdf_bytes,
-        mimetype="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{safe}.pdf"'},
+    return Response(_pda_pdf_for(db, doc), mimetype="application/pdf",
+                    headers={"Content-Disposition": _content_disposition(_pda_file_name(doc), "pda.pdf")})
+
+
+@app.route("/api/pda/documents/<int:pda_id>/email-draft", methods=["GET"])
+@login_required
+def pda_email_draft(pda_id):
+    """Pre-filled recipient, subject and message for the 'Email PDA' window."""
+    db = get_db()
+    doc = _pda_get(db, pda_id)
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    fda = doc["status"] == "finalized"
+    kind = "Final Disbursement Account" if fda else "Proforma Disbursement Account"
+    short = "FDA" if fda else "PDA"
+    me = session.get("display_name") or session.get("username") or ""
+    port_line = doc["dis_port"] or doc["port"]
+    body = (
+        f"Dear {doc['customer_name'] or 'Sir/Madam'},\n\n"
+        f"Please find attached the {kind} ({short} No. {doc['pda_no']}) for M/V {doc['vessel']} "
+        f"at {port_line}"
+        + (f", ETA {doc['eta']}" if doc["eta"] else "")
+        + ".\n\nI would appreciate your confirmation of the figures and remittance of the funds in favour of "
+        "Sea Power Marine Services Co. Ltd, as per the bank details stated on the account.\n\n"
+        f"Best regards,\n{me}\n{COMPANY_NAME_EN}"
     )
+    return jsonify({
+        "to": doc["customer_email"] or "",
+        "subject": f"{kind} - M/V {doc['vessel']} - {doc['pda_no']}",
+        "body": body,
+        "email_configured": email_configured(),
+    })
+
+
+@app.route("/api/pda/documents/<int:pda_id>/email", methods=["POST"])
+@login_required
+def email_pda_document(pda_id):
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    doc = _pda_get(db, pda_id)
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    addrs = []
+    for part in re.split(r"[;,\s]+", str(data.get("to") or "")):
+        if part:
+            e = _clean_email(part)
+            if not e:
+                return jsonify({"error": f"'{part}' is not a valid email address.", "error_code": "bad_address"}), 400
+            if e.lower() not in (a.lower() for a in addrs):
+                addrs.append(e)
+    if not addrs:
+        return jsonify({"error": "Enter at least one email address.", "error_code": "no_recipient"}), 400
+    if len(addrs) > 8:
+        return jsonify({"error": "That is too many recipients for one email (8 at most).", "error_code": "too_many"}), 400
+    if not email_configured():
+        return jsonify({"error": "Email isn't set up yet.", "error_code": "email_not_configured"}), 400
+    subject = re.sub(r"[\r\n]+", " ", str(data.get("subject") or "")).strip()[:200] or f"Disbursement Account - {doc['pda_no']}"
+    body = str(data.get("body") or "").replace("\x00", "")[:6000]
+    ok, err = send_email(addrs, subject, body, attachments=[(_pda_file_name(doc), _pda_pdf_for(db, doc), "application/pdf")])
+    if not ok:
+        code = {"unreachable": "email_unreachable", "auth": "email_auth", "recipient": "email_recipient"}.get(err, "send_failed")
+        return jsonify({"error": f"The email could not be sent: {err}", "error_code": code}), 502
+    if doc["status"] == "draft":
+        db.execute("UPDATE pda_documents SET status = 'sent', sent_at = ? WHERE id = ?",
+                   (datetime.utcnow().strftime("%Y-%m-%d %H:%M"), pda_id))
+        db.commit()
+    return jsonify({"ok": True, "sent_to": addrs})
 
 
 # ---------- Alerts (ETA-overdue email notifications) ----------
@@ -8512,7 +9239,7 @@ PDA_HTML = """
   .panel .panel-sub { font-size: 12px; color: var(--muted); margin: 0 0 14px; }
 
   label.field-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); display: block; margin-bottom: 5px; }
-  input[type=text], input[type=number], input[type=email], select, textarea {
+  input[type=text], input[type=number], input[type=email], input[type=date], select, textarea {
     width: 100%; padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px;
     font-size: 13.5px; font-family: inherit; background: var(--bg); color: var(--text);
   }
@@ -8588,6 +9315,76 @@ PDA_HTML = """
   .toast.fading { animation: toast-out .2s ease-in forwards; }
   @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
   @keyframes toast-out { to { opacity: 0; transform: translateY(8px); } }
+
+  /* ---- Disbursement Accounts v2 ---- */
+  .list-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .list-tools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .list-tools input[type=text] { width: 260px; max-width: 100%; }
+  #newForm { background: var(--bg); border: 1px solid var(--border); border-radius: 14px; padding: 14px 14px 4px; margin-bottom: 14px; }
+  .pda-no { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--navy); white-space: nowrap; }
+  :root[data-theme="dark"] .pda-no { color: var(--navy-light); }
+  .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .scroll-x { overflow-x: auto; }
+  .det-top { padding-bottom: 14px; }
+  .det-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 10px; }
+  .det-title { font-size: 19px; font-weight: 700; letter-spacing: -0.01em; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .fgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px 14px; }
+  .fgrid .wide { grid-column: span 2; }
+  .fgrid .full { grid-column: 1 / -1; }
+  @media (max-width: 560px) { .fgrid .wide { grid-column: span 1; } }
+  .fgrid .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .pair { display: grid; grid-template-columns: 1fr 96px; gap: 8px; }
+  .sec-title { font-size: 13px; font-weight: 700; color: var(--navy); margin: 16px 0 10px; text-transform: uppercase; letter-spacing: .05em; }
+  :root[data-theme="dark"] .sec-title { color: var(--navy-light); }
+  .sec-title:first-of-type { margin-top: 2px; }
+  table.chg { width: 100%; border-collapse: collapse; font-size: 12.5px; min-width: 900px; }
+  table.chg th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: #fff; background: var(--navy); padding: 8px 6px; font-weight: 600; }
+  :root[data-theme="dark"] table.chg th { background: var(--navy-deep); }
+  table.chg th.r { text-align: right; }
+  table.chg th:first-child { border-radius: 8px 0 0 8px; }
+  table.chg th:last-child { border-radius: 0 8px 8px 0; }
+  table.chg td { padding: 4px 4px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  table.chg td input, table.chg td select { padding: 6px 7px; font-size: 12.5px; border-radius: 7px; }
+  table.chg td input.r { text-align: right; }
+  table.chg tr.grp td { background: color-mix(in srgb, var(--navy-light) 8%, transparent); border-bottom: none; padding: 8px 6px; }
+  .grp-inner { display: flex; align-items: center; gap: 8px; }
+  .gno { font-weight: 700; color: var(--navy); width: 20px; }
+  :root[data-theme="dark"] .gno { color: var(--navy-light); }
+  input.grp-name { font-weight: 700; max-width: 280px; background: transparent; border-color: transparent; }
+  input.grp-name:hover, input.grp-name:focus { background: var(--bg); border-color: var(--border); }
+  table.chg tr.zero td { opacity: .5; }
+  table.chg tr.zero td:last-child, table.chg tr.zero td:nth-child(2) { opacity: 1; }
+  table.chg tr.sub td { border-bottom: 2px solid var(--border); padding: 7px 6px 10px; font-weight: 700; }
+  .qty-cell { display: flex; flex-direction: column; gap: 3px; }
+  .qty-cell select { font-size: 10.5px; padding: 2px 4px; color: var(--muted); background: transparent; border-color: transparent; }
+  .qty-cell select:hover { border-color: var(--border); }
+  .qty-tag { font-size: 10px; color: var(--ok); text-align: right; line-height: 1; cursor: default; }
+  .qty-tag.edited { color: var(--warn); cursor: pointer; }
+  .add-link { background: none; border: none; color: var(--navy-light); font-size: 12px; font-weight: 600; cursor: pointer; padding: 4px 6px; border-radius: 6px; }
+  .add-link:hover { background: var(--border); }
+  .totals { display: flex; justify-content: flex-end; gap: 14px; flex-wrap: wrap; margin-top: 16px; }
+  .tot-card { background: var(--bg); border: 1px solid var(--border); border-radius: 14px; padding: 12px 18px; min-width: 190px; }
+  .tot-card .lab { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; }
+  .tot-card .big { font-size: 19px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .tot-card .small { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .tot-card.var .big.pos { color: var(--danger); }
+  .tot-card.var .big.neg { color: var(--ok); }
+  .modal-bg { position: fixed; inset: 0; background: rgba(8,20,32,.55); display: none; align-items: center; justify-content: center; z-index: 900; padding: 16px; }
+  .modal-bg.open { display: flex; }
+  .modal { background: var(--card); border-radius: 18px; padding: 20px 22px; width: min(560px, 100%); max-height: 92vh; overflow: auto; box-shadow: var(--shadow-md); }
+  .modal h3 { margin: 0 0 4px; font-size: 16px; }
+  .modal .mrow { margin-top: 12px; }
+  .banner { background: var(--warn-bg); color: var(--warn); border-radius: 10px; padding: 9px 12px; font-size: 12.5px; margin-top: 10px; }
+  .tpl-table td input, .tpl-table td select { padding: 6px 7px; font-size: 12.5px; }
+  .tpl-table th { white-space: nowrap; }
+  textarea.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; min-height: 120px; }
+  table.chg { table-layout: fixed; min-width: 1040px; }
+  .modal .panel-sub { font-size: 12px; color: var(--muted); }
+  .tpl-table { table-layout: fixed; }
+  .tpl-table td input[type=text] { text-align: left; }
+  .tpl-table td input.r { text-align: right; }
+  .tpl-table th:nth-child(1) { width: 130px; } .tpl-table th:nth-child(3) { width: 150px; } .tpl-table th:nth-child(4) { width: 84px; }
+  .tpl-table th:nth-child(5) { width: 90px; } .tpl-table th:nth-child(6) { width: 112px; } .tpl-table th:nth-child(7) { width: 100px; } .tpl-table th:nth-child(8) { width: 70px; }
 </style>
 </head>
 <body>
@@ -8622,88 +9419,168 @@ PDA_HTML = """
   <div class="page-head">
     <div class="eyebrow">Compass</div>
     <h1>Disbursement Accounts</h1>
-    <p>Build a Proforma Disbursement Account (PDA) per port call from a per-port charge template, then finalize it into an FDA once the real costs are known - estimate and actual stay on the same document so the variance is never a separate reconciliation step.</p>
+    <p>Proforma Disbursement Accounts (PDA) for every port call: customer, vessel and voyage details, charges from your port rate card with quantities that fill themselves, totals in USD and SAR, a PDF in the Sea Power layout, and a one-click FDA with the variance against the estimate.</p>
   </div>
 
   <div id="toastHost"></div>
 
-  <div class="panel" id="listPanel">
-    <h2>New disbursement account</h2>
-    <p class="panel-sub">Pick the port and vessel - charges from that port's template are added automatically, ready to adjust.</p>
-    <div class="form-grid">
-      <div>
-        <label class="field-label" for="newPort">Port</label>
-        <select id="newPort">
-          <option value="DAMMAM PORT">Dammam Port</option>
-          <option value="JUBAIL COMMERCIAL PORT">Jubail Commercial Port</option>
-          <option value="JEDDAH PORT">Jeddah Port</option>
-          <option value="YANBU COMMERCIAL PORT">Yanbu Commercial Port</option>
-          <option value="YANBU INDUSTRIAL PORT">Yanbu Industrial Port</option>
-          <option value="KAP">KAP</option>
-        </select>
+  <datalist id="custList"></datalist>
+  <datalist id="unitList"><option value="PER SHIPMENT"><option value="PER DAY"><option value="PER FRT"><option value="PER GRT"><option value="PER UNIT"><option value="PER TON"><option value="PER VESSEL"><option value="LUMPSUM"></datalist>
+  <datalist id="loadTypeList"><option value="Break Bulk"><option value="Bulk"><option value="Container"><option value="Ro-Ro"><option value="Project Cargo"><option value="General Cargo"></datalist>
+  <datalist id="termList"><option value="LINER OUT"><option value="LINER IN"><option value="FIO"><option value="FIOS"><option value="FILO"><option value="FI"><option value="FO"></datalist>
+  <datalist id="cargoList"><option value="GENERAL CARGO"><option value="STEEL"><option value="VEHICLES"><option value="PROJECT CARGO"><option value="BREAK BULK"><option value="BAGGED CARGO"></datalist>
+
+  <div id="listView">
+    <div class="panel">
+      <div class="list-head">
+        <div>
+          <h2>Documents</h2>
+          <p class="panel-sub" id="docsSub">Loading...</p>
+        </div>
+        <div class="list-tools">
+          <input type="text" id="docSearch" placeholder="Search number, vessel, customer..." oninput="renderDocs()">
+          <button class="btn" onclick="toggleNew()">+ New PDA</button>
+        </div>
       </div>
-      <div>
-        <label class="field-label" for="newVessel">Vessel</label>
-        <input type="text" id="newVessel" placeholder="e.g. TAI KNIGHT">
+      <div id="newForm" style="display:none;">
+        <div class="fgrid" style="margin-bottom:12px;">
+          <div>
+            <label class="field-label" for="newPort">Port of call (rate card)</label>
+            <select id="newPort">
+              <option value="DAMMAM PORT">Dammam Port</option>
+              <option value="JUBAIL COMMERCIAL PORT">Jubail Commercial Port</option>
+              <option value="JEDDAH PORT">Jeddah Port</option>
+              <option value="YANBU COMMERCIAL PORT">Yanbu Commercial Port</option>
+              <option value="YANBU INDUSTRIAL PORT">Yanbu Industrial Port</option>
+              <option value="KAP">KAP</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label" for="newVessel">Vessel</label>
+            <input type="text" id="newVessel" placeholder="e.g. ZHONG SHAN MEN" autocomplete="off">
+          </div>
+          <div>
+            <label class="field-label" for="newCustomer">Customer</label>
+            <input type="text" id="newCustomer" list="custList" placeholder="Type or pick a previous customer" autocomplete="off">
+          </div>
+        </div>
+        <div class="form-actions" style="margin-bottom:12px;">
+          <button class="btn ghost" onclick="toggleNew()">Cancel</button>
+          <button class="btn" onclick="createDocument()">Create PDA</button>
+        </div>
       </div>
-      <div>
-        <label class="field-label" for="newReference">Reference (optional)</label>
-        <input type="text" id="newReference" placeholder="Voyage no. / call ref">
-      </div>
-      <div>
-        <label class="field-label" for="newCurrency">Currency</label>
-        <input type="text" id="newCurrency" value="SAR">
-      </div>
-    </div>
-    <div class="form-actions">
-      <button class="btn" onclick="createDocument()">Create PDA</button>
+      <div id="docsBody"></div>
     </div>
   </div>
 
-  <div class="panel" id="docsListPanel">
-    <h2>Documents</h2>
-    <p class="panel-sub" id="docsSub">Loading...</p>
-    <div id="docsBody"></div>
+  <div id="docDetail" style="display:none;">
+    <div class="panel det-top">
+      <button class="btn ghost small" onclick="closeDocument()">&larr; All documents</button>
+      <div class="det-title-row">
+        <div>
+          <div class="det-title"><span id="dNo"></span><span class="badge" id="dBadge"></span></div>
+          <div class="detail-sub" id="detailSub"></div>
+        </div>
+        <div class="detail-actions" id="detailActions"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="sec-title">Customer &amp; contact</div>
+      <div class="fgrid">
+        <div class="wide"><label class="field-label">Customer</label><input type="text" data-f="customer_name" list="custList" onchange="saveField(this)" autocomplete="off"></div>
+        <div><label class="field-label">Customer email</label><input type="text" data-f="customer_email" onchange="saveField(this)" placeholder="name@company.com"></div>
+        <div><label class="field-label">Customer phone</label><input type="text" data-f="customer_phone" onchange="saveField(this)"></div>
+        <div class="full"><label class="field-label">Customer address</label><textarea data-f="customer_address" onchange="saveField(this)" style="min-height:48px;"></textarea></div>
+        <div><label class="field-label">Sales Mngr / Exec</label><input type="text" data-f="sales_exec" onchange="saveField(this)"></div>
+        <div><label class="field-label">Tel / Mob #</label><input type="text" data-f="sales_phone" onchange="saveField(this)"></div>
+        <div><label class="field-label">Our email on the PDA</label><input type="text" data-f="sales_email" onchange="saveField(this)"></div>
+      </div>
+
+      <div class="sec-title">Voyage</div>
+      <div class="fgrid">
+        <div><label class="field-label">Port of call (rate card)</label>
+          <select data-f="port" onchange="saveField(this)">
+            <option value="DAMMAM PORT">Dammam Port</option>
+            <option value="JUBAIL COMMERCIAL PORT">Jubail Commercial Port</option>
+            <option value="JEDDAH PORT">Jeddah Port</option>
+            <option value="YANBU COMMERCIAL PORT">Yanbu Commercial Port</option>
+            <option value="YANBU INDUSTRIAL PORT">Yanbu Industrial Port</option>
+            <option value="KAP">KAP</option>
+          </select></div>
+        <div class="wide"><label class="field-label">Port of loading (From)</label><div class="pair"><input type="text" data-f="load_port" onchange="saveField(this)" placeholder="LIANYUNGANG"><input type="text" data-f="load_code" onchange="saveField(this)" placeholder="CNLYG"></div></div>
+        <div class="wide"><label class="field-label">Port of discharge (To)</label><div class="pair"><input type="text" data-f="dis_port" onchange="saveField(this)"><input type="text" data-f="dis_code" onchange="saveField(this)" placeholder="SAYNB"></div></div>
+        <div><label class="field-label">ETA</label><input type="date" data-f="eta" onchange="saveField(this)"></div>
+        <div><label class="field-label">Port stay (days)</label><input type="number" min="0" step="any" data-f="port_stay" onchange="saveField(this)"><div class="hint">Per-day charges follow this.</div></div>
+        <div><label class="field-label">Trade</label>
+          <select data-f="trade" onchange="saveField(this)"><option value="IMPORT">IMPORT</option><option value="EXPORT">EXPORT</option><option value="TRANSHIPMENT">TRANSHIPMENT</option></select></div>
+        <div><label class="field-label">Origin / operation</label>
+          <select data-f="operation" onchange="saveField(this)"><option value="Discharging">Discharging</option><option value="Loading">Loading</option><option value="Loading &amp; Discharging">Loading &amp; Discharging</option></select></div>
+        <div><label class="field-label">Load type</label><input type="text" data-f="load_type" list="loadTypeList" onchange="saveField(this)"></div>
+        <div><label class="field-label">Term</label><input type="text" data-f="term" list="termList" onchange="saveField(this)"></div>
+        <div><label class="field-label">Receiver</label><input type="text" data-f="receiver" onchange="saveField(this)"></div>
+        <div><label class="field-label">Reference</label><input type="text" data-f="reference" onchange="saveField(this)" placeholder="Voyage no. / customer ref"></div>
+      </div>
+
+      <div class="sec-title">Vessel &amp; cargo</div>
+      <div class="fgrid">
+        <div class="wide"><label class="field-label">Vessel</label><input type="text" data-f="vessel" onchange="saveField(this)"></div>
+        <div><label class="field-label">GRT</label><input type="number" min="0" step="any" data-f="grt" onchange="saveField(this)"></div>
+        <div><label class="field-label">NRT</label><input type="number" min="0" step="any" data-f="nrt" onchange="saveField(this)"></div>
+        <div><label class="field-label">DWT</label><input type="number" min="0" step="any" data-f="dwt" onchange="saveField(this)"></div>
+        <div><label class="field-label">Cargo type</label><input type="text" data-f="cargo_type" list="cargoList" onchange="saveField(this)"></div>
+        <div><label class="field-label">Cargo FRT</label><input type="number" min="0" step="any" data-f="cargo_frt" onchange="saveField(this)"><div class="hint">Per-FRT charges (stevedoring) follow this.</div></div>
+        <div><label class="field-label">Units / vehicles</label><input type="number" min="0" step="any" data-f="cargo_units" onchange="saveField(this)"></div>
+        <div class="wide"><label class="field-label">Cargo note</label><input type="text" data-f="cargo_note" onchange="saveField(this)" placeholder="Anything extra to print under Cargo Details"></div>
+        <div><label class="field-label">USD &rarr; SAR rate</label><input type="number" min="0" step="any" data-f="fx_rate" onchange="saveField(this)"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Charges</h2>
+      <p class="panel-sub" id="chgSub">Rate &times; quantity. Greyed lines have no amount and are left off the PDF.</p>
+      <div class="scroll-x"><table class="chg" id="chgTable"></table></div>
+      <div style="margin-top:8px;"><button class="add-link" onclick="addGroup()">+ Add group</button></div>
+      <div class="totals" id="totalsBox"></div>
+      <div style="margin-top:16px;">
+        <label class="field-label">Additional notes (printed on the PDF)</label>
+        <textarea data-f="notes" onchange="saveField(this)" placeholder="Anything worth stating on the account..."></textarea>
+      </div>
+    </div>
   </div>
 
-  <div class="panel" id="docDetail">
-    <div class="detail-head">
-      <div>
-        <button class="btn ghost small" onclick="closeDocument()" style="margin-bottom:8px;">&larr; All documents</button>
-        <div class="detail-title" id="detailTitle"></div>
-        <div class="detail-sub" id="detailSub"></div>
+  <div class="modal-bg" id="mailModal">
+    <div class="modal">
+      <h3>Email this <span id="mailKind">PDA</span></h3>
+      <p class="panel-sub" style="margin:0;">The PDF is attached automatically.</p>
+      <div class="banner" id="mailWarn" style="display:none;"></div>
+      <div class="mrow"><label class="field-label">To</label><input type="text" id="mailTo" placeholder="name@company.com, other@company.com"></div>
+      <div class="mrow"><label class="field-label">Subject</label><input type="text" id="mailSubject"></div>
+      <div class="mrow"><label class="field-label">Message</label><textarea id="mailBody" style="min-height:190px;"></textarea></div>
+      <div class="form-actions" style="margin-top:14px;">
+        <button class="btn ghost" onclick="closeMail()">Cancel</button>
+        <button class="btn" id="mailSendBtn" onclick="sendMail()">Send</button>
       </div>
-      <div class="detail-actions" id="detailActions"></div>
-    </div>
-
-    <div class="form-grid">
-      <div>
-        <label class="field-label" for="detRef">Reference</label>
-        <input type="text" id="detRef" onchange="saveDocField('reference', this.value)">
-      </div>
-      <div>
-        <label class="field-label" for="detCurrency">Currency</label>
-        <input type="text" id="detCurrency" onchange="saveDocField('currency', this.value)">
-      </div>
-    </div>
-    <div style="margin-bottom:14px;">
-      <label class="field-label" for="detNotes">Notes</label>
-      <textarea id="detNotes" onchange="saveDocField('notes', this.value)" placeholder="Anything worth noting on this account..."></textarea>
-    </div>
-
-    <table class="items-table" id="itemsTable">
-      <thead><tr><th>Charge</th><th style="text-align:right;">Estimate</th><th style="text-align:right;" id="actualHeader">Actual</th><th style="text-align:right;" id="varianceHeader">Variance</th><th></th></tr></thead>
-      <tbody id="itemsBody"></tbody>
-    </table>
-    <div class="form-actions" style="margin-top:10px;">
-      <button class="btn ghost small" onclick="addLineItemRow()">+ Add charge</button>
     </div>
   </div>
 
   {% if role == 'admin' %}
+  <div class="panel" id="settingsPanel">
+    <h2>PDA settings</h2>
+    <p class="panel-sub">Numbering, exchange rate and the details printed on every PDA.</p>
+    <div class="fgrid">
+      <div><label class="field-label">Number prefix</label><input type="text" id="sPrefix" placeholder="5101"><div class="hint" id="sNextHint"></div></div>
+      <div><label class="field-label">Next PDA number (this year)</label><input type="number" min="1" step="1" id="sNext" placeholder="e.g. 910"><div class="hint">Set it to carry on from your last number in Zybo.</div></div>
+      <div><label class="field-label">USD &rarr; SAR rate for new PDAs</label><input type="number" min="0" step="any" id="sFx"></div>
+      <div class="full"><label class="field-label">Letterhead (top right of the PDF)</label><textarea id="sLetter" class="mono" style="min-height:96px;"></textarea></div>
+      <div class="full"><label class="field-label">Bank details (printed at the end of every PDA)</label><textarea id="sBanks" class="mono" placeholder="Please Arrange Payment In Favour of ...&#10;RIYAD BANK - USD ..."></textarea><div class="hint">Type or paste it here once. It is stored in your database, not in the app's code.</div></div>
+    </div>
+    <div class="form-actions"><button class="btn" onclick="saveSettings()">Save settings</button></div>
+  </div>
+
   <div class="panel" id="templatesPanel">
-    <h2>Port charge templates</h2>
-    <p class="panel-sub">Default charges that pre-fill a new PDA for each port. Editing a template doesn't change documents already created from it.</p>
+    <h2>Port rate card</h2>
+    <p class="panel-sub">The charges a new PDA starts with, per port. <b>Rule</b> decides the quantity: <i>Fixed</i> uses the default qty, <i>Port stay</i> uses the days, <i>Cargo FRT</i> / <i>GRT</i> use the vessel figures, <i>Manual</i> starts at the default qty (0 = not printed until you fill it). Changing the rate card doesn't change PDAs already made.</p>
     <div id="templatesBody">Loading...</div>
   </div>
 
@@ -8769,272 +9646,493 @@ function escHtml(s) {
   return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+const IS_ADMIN = {{ 'true' if role == 'admin' else 'false' }};
 let currentDocId = null;
+let currentDoc = null;
+let currentItems = [];
+let currentCalc = null;
 let docsCache = [];
+let PORT_INFO = {};
 
+async function api(url, method, body) {
+  const opt = {method: method || 'GET', headers: {}};
+  if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  let res;
+  try { res = await fetch(url, opt); } catch (e) { showToast('No connection - check your internet and try again.', {error: true}); return {ok: false, data: {}}; }
+  if (res.status === 401) { location.href = '/login?expired=1'; return {ok: false, data: {}}; }
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  return {ok: res.ok && !data.error, data: data, status: res.status};
+}
+
+function money(n) { return fmtMoney(n); }
+function fmtQty(n) { return Number(n || 0).toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 3}); }
+
+/* ------------------------------ list ------------------------------ */
 async function loadDocuments() {
-  const res = await fetch('/api/pda/documents');
-  if (res.status === 401 || res.redirected) { location.reload(); return; }
-  const rows = await res.json();
-  docsCache = rows;
+  const r = await api('/api/pda/documents');
+  if (!r.ok) { document.getElementById('docsSub').textContent = 'Could not load documents.'; return; }
+  docsCache = r.data;
+  renderDocs();
+}
+
+function renderDocs() {
+  const q = (document.getElementById('docSearch').value || '').trim().toLowerCase();
+  const rows = docsCache.filter(d => !q || [d.pda_no, d.vessel, d.customer_name, d.port, d.reference].join(' ').toLowerCase().includes(q));
   const sub = document.getElementById('docsSub');
   const body = document.getElementById('docsBody');
-  if (!rows.length) {
+  if (!docsCache.length) {
     sub.textContent = 'No disbursement accounts yet.';
-    body.innerHTML = '<div class="empty-note">Create one above once you have a port and vessel to work from.</div>';
+    body.innerHTML = '<div class="empty-note">Press <b>+ New PDA</b> to create the first one.</div>';
     return;
   }
-  sub.textContent = rows.length + ' document(s).';
-  body.innerHTML = `
-    <table class="doc-table">
-      <thead><tr><th>Port</th><th>Vessel</th><th>Reference</th><th>Status</th><th style="text-align:right;">Estimate</th><th style="text-align:right;">Actual</th><th>Created</th><th></th></tr></thead>
-      <tbody>
-        ${rows.map(d => `
-          <tr class="doc-row" onclick="openDocument(${d.id})">
-            <td>${escHtml(d.port)}</td>
-            <td>${escHtml(d.vessel)}</td>
-            <td style="color:var(--muted);">${escHtml(d.reference) || '-'}</td>
-            <td><span class="badge ${d.status}">${d.status === 'finalized' ? 'FDA' : (d.status === 'sent' ? 'Sent' : 'Draft')}</span></td>
-            <td style="text-align:right;">${d.currency} ${fmtMoney(d.estimated_total)}</td>
-            <td style="text-align:right;">${d.actual_total !== null ? d.currency + ' ' + fmtMoney(d.actual_total) : '-'}</td>
-            <td style="color:var(--muted);font-size:12px;">${escHtml(d.created_by)}${d.created_at ? ' - ' + escHtml(d.created_at) : ''}</td>
-            <td><button class="btn ghost danger small" onclick="event.stopPropagation(); deleteDocument(${d.id})">Delete</button></td>
-          </tr>`).join('')}
-      </tbody>
-    </table>`;
+  sub.textContent = rows.length + (rows.length === 1 ? ' document' : ' documents') + (q ? ' match your search.' : '.');
+  if (!rows.length) { body.innerHTML = '<div class="empty-note">Nothing matches that search.</div>'; return; }
+  body.innerHTML = `<div class="scroll-x"><table class="doc-table">
+    <thead><tr><th>PDA No.</th><th>Vessel</th><th>Customer</th><th>Port</th><th>Status</th><th class="num">Total (USD)</th><th class="num">Total (SAR)</th><th>Created</th><th></th></tr></thead>
+    <tbody>${rows.map(d => {
+      const fda = d.status === 'finalized';
+      const usd = fda ? d.act_usd : d.est_usd, sar = fda ? d.act_sar : d.est_sar;
+      return `<tr class="doc-row" onclick="openDocument(${d.id})">
+        <td class="pda-no">${escHtml(d.pda_no || '-')}</td>
+        <td>${escHtml(d.vessel)}</td>
+        <td>${escHtml(d.customer_name) || '<span style="color:var(--muted)">-</span>'}</td>
+        <td>${escHtml(d.port)}</td>
+        <td><span class="badge ${d.status}">${fda ? 'FDA' : (d.status === 'sent' ? 'Sent' : 'Draft')}</span></td>
+        <td class="num">${money(usd)}</td>
+        <td class="num">${money(sar)}</td>
+        <td style="color:var(--muted);font-size:12px;">${escHtml(d.created_by)}${d.created_at ? '<br>' + escHtml(d.created_at.slice(0, 10)) : ''}</td>
+        <td style="white-space:nowrap;"><button class="btn ghost small" title="New draft with the same customer and charges" onclick="event.stopPropagation(); duplicateDocument(${d.id})">Duplicate</button>
+          <button class="btn ghost danger small" onclick="event.stopPropagation(); deleteDocument(${d.id})">Delete</button></td>
+      </tr>`; }).join('')}</tbody></table></div>`;
+}
+
+function toggleNew() {
+  const f = document.getElementById('newForm');
+  f.style.display = f.style.display === 'none' ? 'block' : 'none';
+  if (f.style.display === 'block') document.getElementById('newVessel').focus();
+}
+
+let custCache = [];
+async function loadCustomers() {
+  const r = await api('/api/pda/customers');
+  if (!r.ok) return;
+  custCache = r.data;
+  document.getElementById('custList').innerHTML = custCache.map(c => '<option value="' + escHtml(c.customer_name) + '">').join('');
 }
 
 async function createDocument() {
   const port = document.getElementById('newPort').value;
   const vessel = document.getElementById('newVessel').value.trim();
-  const reference = document.getElementById('newReference').value.trim();
-  const currency = document.getElementById('newCurrency').value.trim() || 'SAR';
-  if (!vessel) { showToast('Enter a vessel name.', {error:true}); return; }
-  const res = await fetch('/api/pda/documents', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({port, vessel, reference, currency})
-  });
-  const data = await res.json();
-  if (!res.ok || data.error) { showToast(data.error || 'Could not create that document.', {error:true}); return; }
+  const customer = document.getElementById('newCustomer').value.trim();
+  if (!vessel) { showToast('Enter a vessel name.', {error: true}); return; }
+  const body = {port: port, vessel: vessel};
+  if (customer) {
+    body.customer_name = customer;
+    const known = custCache.find(c => c.customer_name.toLowerCase() === customer.toLowerCase());
+    if (known) { body.customer_address = known.customer_address; body.customer_phone = known.customer_phone; body.customer_email = known.customer_email; }
+  }
+  const r = await api('/api/pda/documents', 'POST', body);
+  if (!r.ok) { showToast(r.data.error || 'Could not create that document.', {error: true}); return; }
   document.getElementById('newVessel').value = '';
-  document.getElementById('newReference').value = '';
+  document.getElementById('newCustomer').value = '';
+  document.getElementById('newForm').style.display = 'none';
   await loadDocuments();
-  openDocument(data.id);
+  loadCustomers();
+  openDocument(r.data.id);
+}
+
+async function duplicateDocument(id) {
+  const r = await api('/api/pda/documents/' + id + '/duplicate', 'POST');
+  if (!r.ok) { showToast(r.data.error || 'Could not duplicate that PDA.', {error: true}); return; }
+  await loadDocuments();
+  showToast('Created ' + r.data.pda_no + ' - change the vessel and quantities.');
+  openDocument(r.data.id);
 }
 
 async function deleteDocument(id) {
   if (!confirm('Delete this disbursement account? This cannot be undone.')) return;
-  await fetch('/api/pda/documents/' + id, {method: 'DELETE'});
+  const r = await api('/api/pda/documents/' + id, 'DELETE');
+  if (!r.ok) { showToast(r.data.error || 'Could not delete it.', {error: true}); return; }
   if (currentDocId === id) closeDocument();
   await loadDocuments();
   showToast('Document deleted.');
 }
 
-let currentDoc = null;
-let currentItems = [];
-
+/* ----------------------------- detail ----------------------------- */
 async function openDocument(id) {
-  const res = await fetch('/api/pda/documents/' + id);
-  if (!res.ok) { showToast('Could not load that document.', {error:true}); return; }
-  const doc = await res.json();
+  const r = await api('/api/pda/documents/' + id);
+  if (!r.ok) { showToast('Could not load that document.', {error: true}); return; }
   currentDocId = id;
-  currentDoc = doc;
-  currentItems = doc.items || [];
-  document.getElementById('listPanel').style.display = 'none';
-  document.getElementById('docsListPanel').style.display = 'none';
+  applyPayload(r.data);
+  document.getElementById('listView').style.display = 'none';
   document.getElementById('docDetail').style.display = 'block';
-  renderDetail();
+  try { history.replaceState(null, '', '#d' + id); } catch (e) {}
+  window.scrollTo(0, 0);
+  fillForm();
+  renderDetailHead();
+  renderCharges();
+}
+
+function applyPayload(d) {
+  currentDoc = d;
+  currentItems = d.items || [];
+  currentCalc = d.calc;
 }
 
 function closeDocument() {
   currentDocId = null;
   document.getElementById('docDetail').style.display = 'none';
-  document.getElementById('listPanel').style.display = '';
-  document.getElementById('docsListPanel').style.display = '';
-}
-
-function renderDetail() {
-  const doc = currentDoc;
-  const isFda = doc.status === 'finalized';
-  document.getElementById('detailTitle').textContent = (isFda ? 'FDA' : 'PDA') + ' - ' + doc.port + ' / ' + doc.vessel;
-  const statusLabel = isFda ? 'Finalized (FDA)' : (doc.status === 'sent' ? 'Sent' : 'Draft');
-  document.getElementById('detailSub').textContent = statusLabel + ' - prepared by ' + (doc.created_by || '-') + (doc.created_at ? ' on ' + doc.created_at : '');
-  document.getElementById('detRef').value = doc.reference || '';
-  document.getElementById('detCurrency').value = doc.currency || 'SAR';
-  document.getElementById('detNotes').value = doc.notes || '';
-
-  const actions = [];
-  if (doc.status === 'draft') {
-    actions.push('<button class="btn ghost small" onclick="markSent()">Mark as sent</button>');
-  }
-  if (doc.status !== 'finalized') {
-    actions.push('<button class="btn small" onclick="finalizeDoc()">Finalize as FDA</button>');
-  }
-  actions.push('<a class="btn ghost small" href="/api/pda/documents/' + doc.id + '/pdf">Export PDF</a>');
-  document.getElementById('detailActions').innerHTML = actions.join('');
-
-  document.getElementById('actualHeader').style.display = '';
-  document.getElementById('varianceHeader').style.display = isFda ? '' : 'none';
-  renderItems();
-}
-
-function renderItems() {
-  const isFda = currentDoc.status === 'finalized';
-  const body = document.getElementById('itemsBody');
-  let estTotal = 0, actTotal = 0;
-  const rows = currentItems.map(item => {
-    const est = Number(item.estimated_amount || 0);
-    estTotal += est;
-    const hasActual = item.actual_amount !== null && item.actual_amount !== undefined;
-    const act = hasActual ? Number(item.actual_amount) : null;
-    if (isFda) actTotal += (act !== null ? act : est);
-    const variance = (act !== null) ? (act - est) : null;
-    const varianceHtml = (isFda && variance !== null)
-      ? `<span class="${variance > 0 ? 'variance-pos' : (variance < 0 ? 'variance-neg' : '')}">${variance > 0 ? '+' : ''}${fmtMoney(variance)}</span>`
-      : '';
-    return `<tr>
-      <td><input type="text" value="${escHtml(item.name)}" onchange="updateLineItem(${item.id}, 'name', this.value)"></td>
-      <td><input type="number" step="0.01" value="${est}" onchange="updateLineItem(${item.id}, 'estimated_amount', this.value)"></td>
-      <td><input type="number" step="0.01" value="${act !== null ? act : ''}" placeholder="-" onchange="updateLineItem(${item.id}, 'actual_amount', this.value)"></td>
-      <td style="text-align:right;">${varianceHtml}</td>
-      <td><button class="row-remove" title="Remove charge" onclick="deleteLineItem(${item.id})">&times;</button></td>
-    </tr>`;
-  }).join('');
-  const varianceTotal = isFda ? (actTotal - estTotal) : null;
-  const totalRow = `<tr class="total-row">
-    <td>Total (${currentDoc.currency || 'SAR'})</td>
-    <td style="text-align:right;">${fmtMoney(estTotal)}</td>
-    <td style="text-align:right;">${isFda ? fmtMoney(actTotal) : ''}</td>
-    <td style="text-align:right;">${isFda ? `<span class="${varianceTotal > 0 ? 'variance-pos' : (varianceTotal < 0 ? 'variance-neg' : '')}">${varianceTotal > 0 ? '+' : ''}${fmtMoney(varianceTotal)}</span>` : ''}</td>
-    <td></td>
-  </tr>`;
-  body.innerHTML = rows + totalRow;
-}
-
-async function saveDocField(field, value) {
-  if (!currentDocId) return;
-  await fetch('/api/pda/documents/' + currentDocId, {
-    method: 'PUT', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({[field]: value})
-  });
-  currentDoc[field] = value;
-  if (field === 'currency') renderDetail();
-}
-
-async function addLineItemRow() {
-  const res = await fetch('/api/pda/documents/' + currentDocId + '/line-items', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({name: 'New charge', estimated_amount: 0})
-  });
-  const item = await res.json();
-  if (!res.ok || item.error) { showToast(item.error || 'Could not add that charge.', {error:true}); return; }
-  currentItems.push(item);
-  renderItems();
-}
-
-async function updateLineItem(itemId, field, value) {
-  const payload = {};
-  if (field === 'name') {
-    if (!value.trim()) { showToast('Charge name can\\'t be empty.', {error:true}); renderItems(); return; }
-    payload.name = value;
-  } else {
-    payload[field] = value === '' ? null : value;
-  }
-  const res = await fetch('/api/pda/line-items/' + itemId, {
-    method: 'PUT', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(payload)
-  });
-  if (!res.ok) { showToast('Could not save that change.', {error:true}); return; }
-  const item = currentItems.find(i => i.id === itemId);
-  if (item) item[field] = payload[field] === null ? null : (field === 'name' ? value : Number(value));
-  renderItems();
-}
-
-async function deleteLineItem(itemId) {
-  await fetch('/api/pda/line-items/' + itemId, {method: 'DELETE'});
-  currentItems = currentItems.filter(i => i.id !== itemId);
-  renderItems();
-}
-
-async function markSent() {
-  const res = await fetch('/api/pda/documents/' + currentDocId + '/mark-sent', {method: 'POST'});
-  const data = await res.json();
-  if (!res.ok || data.error) { showToast(data.error || 'Could not update status.', {error:true}); return; }
-  currentDoc.status = 'sent';
-  renderDetail();
+  document.getElementById('listView').style.display = '';
+  try { history.replaceState(null, '', location.pathname); } catch (e) {}
   loadDocuments();
+}
+
+function fillForm() {
+  document.querySelectorAll('#docDetail [data-f]').forEach(el => {
+    const v = currentDoc[el.dataset.f];
+    el.value = (v === null || v === undefined) ? '' : v;
+  });
+}
+
+function renderDetailHead() {
+  const doc = currentDoc, fda = doc.status === 'finalized';
+  document.getElementById('dNo').textContent = (fda ? 'FDA ' : 'PDA ') + (doc.pda_no || '#' + doc.id);
+  const b = document.getElementById('dBadge');
+  b.className = 'badge ' + doc.status;
+  b.textContent = fda ? 'Finalized' : (doc.status === 'sent' ? 'Sent' : 'Draft');
+  document.getElementById('detailSub').textContent = (doc.vessel || '-') + ' - ' + (doc.customer_name || 'no customer yet') + ' - prepared by ' + (doc.created_by || '-') + (doc.created_at ? ' on ' + doc.created_at.slice(0, 10) : '');
+  const acts = [];
+  if (doc.status === 'draft') acts.push('<button class="btn ghost small" onclick="markSent()">Mark as sent</button>');
+  acts.push('<button class="btn ghost small" onclick="duplicateDocument(' + doc.id + ')">Duplicate</button>');
+  acts.push('<button class="btn ghost small" onclick="openMail()">Email</button>');
+  acts.push('<a class="btn ghost small" href="/api/pda/documents/' + doc.id + '/pdf" target="_blank">Export PDF</a>');
+  if (!fda) acts.push('<button class="btn small" onclick="finalizeDoc()">Finalize as FDA</button>');
+  document.getElementById('detailActions').innerHTML = acts.join('');
+}
+
+async function saveField(el) {
+  if (!currentDocId) return;
+  const f = el.dataset.f;
+  let v = el.value;
+  const r = await api('/api/pda/documents/' + currentDocId, 'PUT', {[f]: v});
+  if (!r.ok) { showToast(r.data.error || 'Could not save that change.', {error: true}); el.value = currentDoc[f] === null || currentDoc[f] === undefined ? '' : currentDoc[f]; return; }
+  applyPayload(r.data);
+  if (f === 'customer_name') {
+    const known = custCache.find(c => c.customer_name.toLowerCase() === String(v).trim().toLowerCase());
+    if (known && !currentDoc.customer_address && !currentDoc.customer_email) {
+      const r2 = await api('/api/pda/documents/' + currentDocId, 'PUT', {customer_address: known.customer_address, customer_phone: known.customer_phone, customer_email: known.customer_email});
+      if (r2.ok) { applyPayload(r2.data); fillForm(); }
+    }
+  }
+  if (f === 'port' && !currentDoc.dis_port && PORT_INFO[v]) {
+    const r3 = await api('/api/pda/documents/' + currentDocId, 'PUT', {dis_port: PORT_INFO[v].name, dis_code: PORT_INFO[v].code});
+    if (r3.ok) { applyPayload(r3.data); fillForm(); }
+  }
+  renderDetailHead();
+  refreshCalc();
+}
+
+/* ----------------------------- charges ---------------------------- */
+const RULES = [['fixed', 'Fixed qty'], ['days', 'Port stay'], ['frt', 'Cargo FRT'], ['grt', 'GRT'], ['manual', 'Manual']];
+
+function renderCharges() {
+  const fda = currentDoc.status === 'finalized';
+  const t = document.getElementById('chgTable');
+  const head = fda
+    ? '<tr><th style="width:30px">#</th><th>Charge description</th><th style="width:140px">Charged per</th><th style="width:76px">Cur</th><th class="r" style="width:100px">Rate</th><th class="r" style="width:112px">Qty</th><th class="r" style="width:110px">Estimate</th><th class="r" style="width:120px">Actual</th><th class="r" style="width:100px">Variance</th><th style="width:30px"></th></tr>'
+    : '<tr><th style="width:30px">#</th><th>Charge description</th><th style="width:140px">Charged per</th><th style="width:76px">Cur</th><th class="r" style="width:100px">Rate</th><th class="r" style="width:112px">Qty</th><th class="r" style="width:104px">Total (USD)</th><th class="r" style="width:118px">Total (SAR)</th><th style="width:120px">Remarks</th><th style="width:30px"></th></tr>';
+  const cols = fda ? 10 : 10;
+  const byId = {};
+  currentItems.forEach(i => { byId[i.id] = i; });
+  let html = '<thead>' + head + '</thead><tbody>';
+  currentCalc.groups.forEach((g, gi) => {
+    html += `<tr class="grp"><td colspan="${cols}"><div class="grp-inner"><span class="gno">${gi + 1}</span>
+      <input type="text" class="grp-name" value="${escHtml(g.name)}" title="Rename this group" onchange="renameGroup(${gi}, this.value)">
+      <button class="add-link" onclick="addCharge(${gi})">+ Add charge</button></div></td></tr>`;
+    g.items.forEach((line, n) => {
+      const it = byId[line.id];
+      if (!it) return;
+      const id = it.id;
+      const qtyCell = `<div class="qty-cell"><input type="number" step="any" min="0" class="r" id="q_${id}" value="${it.qty === null ? '' : it.qty}" onchange="updateItem(${id}, 'qty', this.value)">
+        <select onchange="updateItem(${id}, 'qty_basis', this.value)" title="Where the quantity comes from">${RULES.map(r => `<option value="${r[0]}"${it.qty_basis === r[0] ? ' selected' : ''}>${r[1]}</option>`).join('')}</select>
+        <span id="qt_${id}"></span></div>`;
+      const common = `<td>${n + 1}</td>
+        <td><input type="text" value="${escHtml(it.name)}" onchange="updateItem(${id}, 'name', this.value)"></td>
+        <td><input type="text" list="unitList" value="${escHtml(it.unit)}" onchange="updateItem(${id}, 'unit', this.value)"></td>
+        <td><select onchange="updateItem(${id}, 'currency', this.value)"><option${it.currency === 'USD' ? ' selected' : ''}>USD</option><option${it.currency === 'SAR' ? ' selected' : ''}>SAR</option></select></td>
+        <td><input type="number" step="any" min="0" class="r" value="${it.rate === null ? '' : it.rate}" onchange="updateItem(${id}, 'rate', this.value)"></td>
+        <td>${qtyCell}</td>`;
+      if (fda) {
+        html += `<tr id="r_${id}">${common}
+          <td class="num" id="e_${id}"></td>
+          <td><input type="number" step="any" min="0" class="r" id="a_${id}" value="${it.actual_amount === null ? '' : it.actual_amount}" placeholder="same" onchange="updateItem(${id}, 'actual_amount', this.value)"></td>
+          <td class="num" id="v_${id}"></td>
+          <td><button class="row-remove" title="Remove charge" onclick="deleteItem(${id})">&times;</button></td></tr>`;
+      } else {
+        html += `<tr id="r_${id}">${common}
+          <td class="num" id="u_${id}"></td><td class="num" id="s_${id}"></td>
+          <td><input type="text" value="${escHtml(it.remarks)}" onchange="updateItem(${id}, 'remarks', this.value)"></td>
+          <td><button class="row-remove" title="Remove charge" onclick="deleteItem(${id})">&times;</button></td></tr>`;
+      }
+    });
+    html += `<tr class="sub"><td colspan="6" style="text-align:right;color:var(--muted);font-size:11px;letter-spacing:.05em;">SUB TOTAL</td>` +
+      (fda ? `<td class="num" id="gs_${gi}_e"></td><td class="num" id="gs_${gi}_a"></td><td class="num" id="gs_${gi}_v"></td><td></td></tr>`
+           : `<td class="num" id="gs_${gi}_u"></td><td class="num" id="gs_${gi}_s"></td><td></td><td></td></tr>`);
+  });
+  if (!currentCalc.groups.length) html += `<tr><td colspan="${cols}" class="empty-note">No charges yet. Use <b>+ Add group</b> below, or set up the rate card for this port in the settings at the bottom of the page.</td></tr>`;
+  t.innerHTML = html + '</tbody>';
+  refreshCalc();
+}
+
+/* Updates only the numbers (never rebuilds rows), so tabbing through the table is never interrupted. */
+function refreshCalc() {
+  if (!currentCalc) return;
+  const fda = currentDoc.status === 'finalized';
+  const byId = {};
+  currentItems.forEach(i => { byId[i.id] = i; });
+  const set = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+  currentCalc.groups.forEach((g, gi) => {
+    g.items.forEach(line => {
+      const it = byId[line.id];
+      if (!it) return;
+      const row = document.getElementById('r_' + line.id);
+      if (row) row.className = Number(it.estimated_amount) === 0 && !fda ? 'zero' : '';
+      if (fda) {
+        set('e_' + line.id, money(it.estimated_amount));
+        const act = it.actual_amount === null ? null : Number(it.actual_amount);
+        const v = act === null ? 0 : act - Number(it.estimated_amount);
+        const ve = document.getElementById('v_' + line.id);
+        if (ve) { ve.textContent = act === null ? '-' : ((v > 0 ? '+' : '') + money(v)); ve.style.color = v > 0 ? 'var(--danger)' : (v < 0 ? 'var(--ok)' : ''); }
+      } else {
+        set('u_' + line.id, money(line.usd));
+        set('s_' + line.id, money(line.sar));
+      }
+      const q = document.getElementById('q_' + line.id);
+      if (q && document.activeElement !== q) q.value = it.qty === null ? '' : it.qty;
+      const tag = document.getElementById('qt_' + line.id);
+      if (tag) {
+        const auto = it.qty_basis === 'days' || it.qty_basis === 'frt' || it.qty_basis === 'grt';
+        if (auto && Number(it.qty_manual) === 1) { tag.className = 'qty-tag edited'; tag.textContent = 'edited - reset'; tag.title = 'Go back to the automatic quantity'; tag.onclick = function () { resetQty(line.id); }; }
+        else if (auto) { tag.className = 'qty-tag'; tag.textContent = 'auto'; tag.title = 'Follows the call details above'; tag.onclick = null; }
+        else { tag.className = ''; tag.textContent = ''; tag.onclick = null; }
+      }
+    });
+    if (fda) {
+      set('gs_' + gi + '_e', 'USD ' + money(g.est_usd) + ' / SAR ' + money(g.est_sar));
+      set('gs_' + gi + '_a', 'USD ' + money(g.act_usd) + ' / SAR ' + money(g.act_sar));
+      set('gs_' + gi + '_v', 'USD ' + (g.var_usd > 0 ? '+' : '') + money(g.var_usd));
+    } else {
+      set('gs_' + gi + '_u', 'USD ' + money(g.est_usd));
+      set('gs_' + gi + '_s', 'SAR ' + money(g.est_sar));
+    }
+  });
+  const t = currentCalc.total;
+  let h = '';
+  if (fda) {
+    const vp = t.var_usd > 0 ? 'pos' : (t.var_usd < 0 ? 'neg' : '');
+    h += `<div class="tot-card"><div class="lab">Estimate (PDA)</div><div class="big">USD ${money(t.est_usd)}</div><div class="small">SAR ${money(t.est_sar)}</div></div>
+          <div class="tot-card"><div class="lab">Actual (FDA)</div><div class="big">USD ${money(t.act_usd)}</div><div class="small">SAR ${money(t.act_sar)}</div></div>
+          <div class="tot-card var"><div class="lab">Variance</div><div class="big ${vp}">USD ${t.var_usd > 0 ? '+' : ''}${money(t.var_usd)}</div><div class="small">SAR ${t.var_sar > 0 ? '+' : ''}${money(t.var_sar)}</div></div>`;
+  } else {
+    h += `<div class="tot-card"><div class="lab">Total</div><div class="big">USD ${money(t.est_usd)}</div><div class="small">SAR ${money(t.est_sar)} at ${currentCalc.fx}</div></div>`;
+  }
+  document.getElementById('totalsBox').innerHTML = h;
+  document.getElementById('chgSub').textContent = fda
+    ? 'Final account: enter the actual amount for each charge (in the charge currency). Blank = same as the estimate.'
+    : 'Rate × quantity. Greyed lines have no amount and are left off the PDF.';
+}
+
+async function updateItem(id, field, value) {
+  const r = await api('/api/pda/line-items/' + id, 'PUT', {[field]: value});
+  if (!r.ok) { showToast(r.data.error || 'Could not save that change.', {error: true}); applyPayloadKeepForm(); renderCharges(); return; }
+  applyPayloadKeepForm(r.data);
+  if (field === 'qty_basis' || field === 'currency') renderCharges(); else refreshCalc();
+}
+
+function applyPayloadKeepForm(d) { if (d) applyPayload(d); }
+
+async function resetQty(id) {
+  const r = await api('/api/pda/line-items/' + id, 'PUT', {reset_qty: true});
+  if (!r.ok) { showToast(r.data.error || 'Could not reset that quantity.', {error: true}); return; }
+  applyPayload(r.data);
+  refreshCalc();
+}
+
+async function addCharge(gi) {
+  const g = currentCalc.groups[gi];
+  const r = await api('/api/pda/documents/' + currentDocId + '/line-items', 'POST', {group_name: g ? g.name : 'Port Charges', name: 'NEW CHARGE', rate: 0, qty: 1, currency: 'USD'});
+  if (!r.ok) { showToast(r.data.error || 'Could not add that charge.', {error: true}); return; }
+  applyPayload(r.data);
+  renderCharges();
+}
+
+async function addGroup() {
+  const name = (prompt('Name of the new group (for example: Agency Charges, Other Charges):') || '').trim();
+  if (!name) return;
+  const r = await api('/api/pda/documents/' + currentDocId + '/line-items', 'POST', {group_name: name, name: 'NEW CHARGE', rate: 0, qty: 1, currency: 'USD'});
+  if (!r.ok) { showToast(r.data.error || 'Could not add that group.', {error: true}); return; }
+  applyPayload(r.data);
+  renderCharges();
+}
+
+async function renameGroup(gi, value) {
+  const g = currentCalc.groups[gi];
+  const name = (value || '').trim();
+  if (!name || name === g.name) { renderCharges(); return; }
+  const r = await api('/api/pda/documents/' + currentDocId + '/rename-group', 'POST', {old: g.name, new: name});
+  if (!r.ok) { showToast(r.data.error || 'Could not rename the group.', {error: true}); return; }
+  applyPayload(r.data);
+  renderCharges();
+}
+
+async function deleteItem(id) {
+  const r = await api('/api/pda/line-items/' + id, 'DELETE');
+  if (!r.ok) { showToast(r.data.error || 'Could not remove that charge.', {error: true}); return; }
+  applyPayload(r.data);
+  renderCharges();
+}
+
+/* ------------------------------ status ---------------------------- */
+async function markSent() {
+  const r = await api('/api/pda/documents/' + currentDocId + '/mark-sent', 'POST');
+  if (!r.ok) { showToast(r.data.error || 'Could not update status.', {error: true}); return; }
+  currentDoc.status = 'sent';
+  renderDetailHead();
   showToast('Marked as sent.');
 }
 
 async function finalizeDoc() {
-  if (!confirm('Finalize this as an FDA? Any charge without an actual amount yet will use its estimate. This can still be edited afterward, but the document moves out of draft/sent.')) return;
-  const res = await fetch('/api/pda/documents/' + currentDocId + '/finalize', {method: 'POST'});
-  const data = await res.json();
-  if (!res.ok || data.error) { showToast(data.error || 'Could not finalize.', {error:true}); return; }
+  if (!confirm('Finalize this as an FDA? Each charge without an actual amount keeps its estimate, and you can then enter the real amounts to see the variance.')) return;
+  const r = await api('/api/pda/documents/' + currentDocId + '/finalize', 'POST');
+  if (!r.ok) { showToast(r.data.error || 'Could not finalize.', {error: true}); return; }
   await openDocument(currentDocId);
-  loadDocuments();
-  showToast('Finalized as FDA.');
+  showToast('Finalized - enter the actual amounts.');
 }
+
+/* ------------------------------- email ---------------------------- */
+async function openMail() {
+  const r = await api('/api/pda/documents/' + currentDocId + '/email-draft');
+  if (!r.ok) { showToast(r.data.error || 'Could not prepare the email.', {error: true}); return; }
+  document.getElementById('mailKind').textContent = currentDoc.status === 'finalized' ? 'FDA' : 'PDA';
+  document.getElementById('mailTo').value = r.data.to;
+  document.getElementById('mailSubject').value = r.data.subject;
+  document.getElementById('mailBody').value = r.data.body;
+  const w = document.getElementById('mailWarn');
+  if (!r.data.email_configured) { w.style.display = 'block'; w.textContent = 'Email sending is not set up on the server yet, so this cannot be sent from Compass. Export the PDF and send it from Outlook instead.'; } else { w.style.display = 'none'; }
+  document.getElementById('mailSendBtn').disabled = !r.data.email_configured;
+  document.getElementById('mailModal').classList.add('open');
+}
+function closeMail() { document.getElementById('mailModal').classList.remove('open'); }
+async function sendMail() {
+  const btn = document.getElementById('mailSendBtn');
+  btn.disabled = true; btn.textContent = 'Sending...';
+  const r = await api('/api/pda/documents/' + currentDocId + '/email', 'POST', {
+    to: document.getElementById('mailTo').value, subject: document.getElementById('mailSubject').value, body: document.getElementById('mailBody').value});
+  btn.disabled = false; btn.textContent = 'Send';
+  if (!r.ok) { showToast(r.data.error || 'The email could not be sent.', {error: true, duration: 7000}); return; }
+  closeMail();
+  currentDoc.status = currentDoc.status === 'draft' ? 'sent' : currentDoc.status;
+  renderDetailHead();
+  showToast('Sent to ' + r.data.sent_to.join(', '));
+}
+
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeMail(); });
+
+(async function startPda() {
+  const s = await api('/api/pda/settings');
+  if (s.ok) PORT_INFO = s.data.ports || {};
+  await Promise.all([loadDocuments(), loadCustomers()]);
+  const m = /^#d(\\d+)$/.exec(location.hash || '');
+  if (m) openDocument(Number(m[1]));
+})();
 
 {% if role == 'admin' %}
 let templatesCache = {};
 const TEMPLATE_PORTS = ['DAMMAM PORT', 'JUBAIL COMMERCIAL PORT', 'JEDDAH PORT', 'YANBU COMMERCIAL PORT', 'YANBU INDUSTRIAL PORT', 'KAP'];
+const TPL_RULES = [['fixed', 'Fixed qty'], ['days', 'Port stay'], ['frt', 'Cargo FRT'], ['grt', 'GRT'], ['manual', 'Manual']];
 
 async function loadTemplates() {
-  const res = await fetch('/api/pda/templates');
-  templatesCache = await res.json();
+  const r = await api('/api/pda/templates');
+  if (!r.ok) { document.getElementById('templatesBody').textContent = 'Could not load the rate card.'; return; }
+  templatesCache = r.data;
   renderTemplates();
+}
+
+function tplRowInputs(t, newKey) {
+  const t0 = t || {group_name: 'Port Charges', name: '', unit: 'PER SHIPMENT', currency: 'USD', default_amount: '', qty_basis: 'fixed', default_qty: 1};
+  const on = t ? `onchange="saveTemplate(${t.id}, this)"` : '';
+  return `<td><input type="text" class="t-group" value="${escHtml(t0.group_name)}" ${on}></td>
+    <td><input type="text" class="t-name" value="${escHtml(t0.name)}" placeholder="Charge name" ${on}></td>
+    <td><input type="text" class="t-unit" list="unitList" value="${escHtml(t0.unit)}" ${on}></td>
+    <td><select class="t-cur" ${on}><option${t0.currency === 'USD' ? ' selected' : ''}>USD</option><option${t0.currency === 'SAR' ? ' selected' : ''}>SAR</option></select></td>
+    <td><input type="number" step="any" min="0" class="t-rate r" value="${t0.default_amount}" placeholder="0.00" ${on}></td>
+    <td><select class="t-rule" ${on}>${TPL_RULES.map(x => `<option value="${x[0]}"${t0.qty_basis === x[0] ? ' selected' : ''}>${x[1]}</option>`).join('')}</select></td>
+    <td><input type="number" step="any" min="0" class="t-qty r" value="${t0.default_qty}" ${on}></td>`;
 }
 
 function renderTemplates() {
   const body = document.getElementById('templatesBody');
   body.innerHTML = TEMPLATE_PORTS.map(port => {
     const items = templatesCache[port] || [];
-    const rows = items.map(t => `
-      <tr>
-        <td><input type="text" value="${escHtml(t.name)}" onchange="updateTemplateItem(${t.id}, 'name', this.value)"></td>
-        <td><input type="number" step="0.01" value="${t.default_amount}" onchange="updateTemplateItem(${t.id}, 'default_amount', this.value)"></td>
-        <td><button class="row-remove" title="Remove" onclick="deleteTemplateItem(${t.id})">&times;</button></td>
-      </tr>`).join('');
-    return `<div class="tmpl-port-group">
-      <h3>${port.replace(/\\w\\S*/g, w => w.charAt(0) + w.slice(1).toLowerCase())}</h3>
-      <table class="items-table"><tbody>${rows || '<tr><td colspan="3" style="color:var(--muted);">No charges yet.</td></tr>'}</tbody></table>
-      <div class="tmpl-add-row">
-        <input type="text" id="tmplName_${port.replace(/[^A-Za-z0-9]/g, '')}" placeholder="Charge name">
-        <input type="number" step="0.01" id="tmplAmount_${port.replace(/[^A-Za-z0-9]/g, '')}" placeholder="0.00">
-        <button class="btn ghost small" onclick="addTemplateItem('${port.replace(/'/g, "\\\\'")}')">Add</button>
-      </div>
+    const key = port.replace(/[^A-Za-z0-9]/g, '');
+    const rows = items.map(t => `<tr>${tplRowInputs(t)}<td><button class="row-remove" title="Remove" onclick="deleteTemplateItem(${t.id})">&times;</button></td></tr>`).join('');
+    return `<div class="tmpl-port-group"><h3>${escHtml(port.charAt(0) + port.slice(1).toLowerCase())}</h3>
+      <div class="scroll-x"><table class="items-table tpl-table" style="min-width:900px;">
+        <thead><tr><th>Group</th><th>Charge</th><th>Per</th><th>Cur</th><th style="text-align:right;">Rate</th><th>Rule</th><th style="text-align:right;">Default qty</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="8" style="color:var(--muted);">No charges yet.</td></tr>'}
+        <tr id="tplNew_${key}">${tplRowInputs(null)}<td><button class="btn ghost small" onclick="addTemplateItem('${key}', '${escHtml(port)}')">Add</button></td></tr></tbody></table></div>
     </div>`;
   }).join('');
 }
 
-async function addTemplateItem(port) {
-  const key = port.replace(/[^A-Za-z0-9]/g, '');
-  const nameEl = document.getElementById('tmplName_' + key);
-  const amountEl = document.getElementById('tmplAmount_' + key);
-  const name = nameEl.value.trim();
-  if (!name) { showToast('Enter a charge name.', {error:true}); return; }
-  const res = await fetch('/api/pda/templates', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({port, name, default_amount: amountEl.value || 0})
-  });
-  const data = await res.json();
-  if (!res.ok || data.error) { showToast(data.error || 'Could not add that charge.', {error:true}); return; }
-  nameEl.value = ''; amountEl.value = '';
-  await loadTemplates();
+function tplValues(tr) {
+  return {
+    group_name: tr.querySelector('.t-group').value, name: tr.querySelector('.t-name').value, unit: tr.querySelector('.t-unit').value,
+    currency: tr.querySelector('.t-cur').value, default_amount: tr.querySelector('.t-rate').value || 0,
+    qty_basis: tr.querySelector('.t-rule').value, default_qty: tr.querySelector('.t-qty').value || 0
+  };
 }
 
-async function updateTemplateItem(id, field, value) {
-  await fetch('/api/pda/templates/' + id, {
-    method: 'PUT', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({[field]: value})
-  });
+async function saveTemplate(id, el) {
+  const r = await api('/api/pda/templates/' + id, 'PUT', tplValues(el.closest('tr')));
+  if (!r.ok) { showToast(r.data.error || 'Could not save that charge.', {error: true}); loadTemplates(); }
+}
+
+async function addTemplateItem(key, port) {
+  const tr = document.getElementById('tplNew_' + key);
+  const vals = tplValues(tr);
+  if (!vals.name.trim()) { showToast('Enter a charge name.', {error: true}); return; }
+  const r = await api('/api/pda/templates', 'POST', Object.assign({port: port}, vals));
+  if (!r.ok) { showToast(r.data.error || 'Could not add that charge.', {error: true}); return; }
   await loadTemplates();
 }
 
 async function deleteTemplateItem(id) {
-  await fetch('/api/pda/templates/' + id, {method: 'DELETE'});
+  await api('/api/pda/templates/' + id, 'DELETE');
   await loadTemplates();
+}
+
+async function loadSettings() {
+  const r = await api('/api/pda/settings');
+  if (!r.ok) return;
+  document.getElementById('sPrefix').value = r.data.prefix;
+  document.getElementById('sFx').value = r.data.fx;
+  document.getElementById('sLetter').value = r.data.letterhead;
+  document.getElementById('sBanks').value = r.data.banks;
+  document.getElementById('sNext').value = '';
+  document.getElementById('sNextHint').textContent = 'The next PDA will be ' + r.data.next_number;
+}
+
+async function saveSettings() {
+  const body = {prefix: document.getElementById('sPrefix').value, fx: document.getElementById('sFx').value,
+    letterhead: document.getElementById('sLetter').value, banks: document.getElementById('sBanks').value};
+  const next = document.getElementById('sNext').value.trim();
+  if (next) body.next_number = next;
+  const r = await api('/api/pda/settings', 'POST', body);
+  if (!r.ok) { showToast(r.data.error || 'Could not save the settings.', {error: true}); return; }
+  showToast('Settings saved.');
+  loadSettings();
 }
 
 async function loadAlertSettings() {
@@ -9068,10 +10166,9 @@ async function checkOverdueNow() {
 }
 
 loadTemplates();
+loadSettings();
 loadAlertSettings();
 {% endif %}
-
-loadDocuments();
 </script>
 </body></html>
 """
