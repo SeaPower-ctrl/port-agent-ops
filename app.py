@@ -1422,6 +1422,61 @@ def _check_company_email(email):
     return email, None
 
 
+# ---------- Password rules ----------
+# At least 10 characters, not a common password (or a common word with a few digits
+# stuck on, like "Seapower123"), not made of the person's own name/email/username,
+# not all digits, not the same password as before. Length counts more than symbols,
+# so there is no forced "must contain a symbol" and no forced 90-day change.
+# PASSWORD_RULES=0 in the environment switches the checks off (used only by the
+# automated tests).
+PASSWORD_RULES = os.environ.get("PASSWORD_RULES", "1") != "0"
+PASSWORD_MIN_LENGTH = 10
+_COMMON_BASES = sorted({
+    "password", "passw", "pass", "passcode", "letmein", "welcome", "welcome1", "admin", "administrator", "root", "user", "guest",
+    "login", "signin", "qwerty", "qwertyuiop", "qwertyui", "asdfghjkl", "asdfgh", "zxcvbnm", "qazwsx", "qazwsxedc", "azerty",
+    "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh", "iloveyou", "monkey", "dragon", "master", "football", "baseball",
+    "superman", "batman", "shadow", "sunshine", "princess", "freedom", "whatever", "trustno", "changeme", "change", "temp",
+    "temporary", "temppass", "tempo", "test", "testing", "testtest", "secret", "default", "demo", "sample", "hello", "hellohello",
+    "seapower", "seapowermarine", "marine", "compass", "compassapp", "jeddah", "jedda", "dammam", "riyadh", "saudi", "saudia", "ksa",
+    "makkah", "madinah", "shipping", "shipment", "cargo", "vessel", "port", "ports", "agent", "agency", "operations", "ops", "ahmed",
+    "mohammed", "muhammad", "mohammad", "allah", "bismillah", "alhamdulillah", "inshallah", "ramadan", "arabic", "company", "office",
+    "work", "worker", "staff", "employee", "manager", "supervisor", "outlook", "microsoft", "google", "windows", "computer", "internet",
+    "summer", "winter", "spring", "autumn", "january", "february", "march", "april", "may", "june", "july", "august", "september",
+    "october", "november", "december", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+})
+
+
+def _password_problem(pw, username="", email="", full_name="", old_hash=None):
+    """Returns a short, plain message if the password is not acceptable, else None."""
+    if not PASSWORD_RULES:
+        return None
+    pw = pw or ""
+    if len(pw) < PASSWORD_MIN_LENGTH:
+        return f"Use at least {PASSWORD_MIN_LENGTH} characters."
+    low = pw.lower()
+    if low.isdigit():
+        return "Use letters as well as numbers."
+    if len(set(low)) <= 3:
+        return "Avoid repeating the same few characters."
+    letters = re.sub(r"[^a-z]", "", low)
+    leftovers = len(low) - len(letters)
+    if letters in _COMMON_BASES and leftovers <= 6:
+        return "That password is too common. Pick something harder to guess."
+    personal = set()
+    for piece in (username, (email or "").split("@")[0]):
+        piece = re.sub(r"[^a-z0-9]", "", (piece or "").lower())
+        if len(piece) >= 3:
+            personal.add(piece)
+    for token in re.split(r"[^a-z0-9]+", (full_name or "").lower()):
+        if len(token) >= 4:
+            personal.add(token)
+    if any(p in re.sub(r"[^a-z0-9]", "", low) for p in personal):
+        return "Don't use your name, email or username inside the password."
+    if old_hash and check_password_hash(old_hash, pw):
+        return "Choose a new password - it can't be the same as the old one."
+    return None
+
+
 def _unique_username(db, base):
     base = re.sub(r"[^a-z0-9._\-]", "", (base or "").lower()) or "user"
     name, n = base, 1
@@ -1533,10 +1588,11 @@ def _session_guards():
 
 @app.context_processor
 def _inject_names():
+    out = {"pw_config": {"on": PASSWORD_RULES, "min": PASSWORD_MIN_LENGTH, "common": _COMMON_BASES}}
     if "user_id" in session:
         dn = session.get("display_name") or session.get("username") or ""
-        return {"display_name": dn, "first_name": (dn.split() or [""])[0]}
-    return {}
+        out.update({"display_name": dn, "first_name": (dn.split() or [""])[0]})
+    return out
 
 
 _IDLE_SNIPPET = """<script>
@@ -1632,6 +1688,8 @@ def setup():
             error = email_err
         elif not username or not password:
             error = "Please fill in all the fields."
+        elif _password_problem(password, username, email, full_name):
+            error = _password_problem(password, username, email, full_name)
         else:
             db = get_db()
             db.execute(
@@ -1888,6 +1946,9 @@ def add_user():
         username = _unique_username(db, email.split("@")[0])
     if not username or not password:
         return jsonify({"error": "Missing fields"}), 400
+    problem = _password_problem(password, username, email, full_name)
+    if problem:
+        return jsonify({"error": problem, "error_code": "weak_password"}), 400
     if db.execute("SELECT 1 FROM users WHERE LOWER(username) = LOWER(?)", (username,)).fetchone():
         return jsonify({"error": "Username already exists"}), 400
     if email and db.execute("SELECT 1 FROM users WHERE LOWER(email) = LOWER(?)", (email,)).fetchone():
@@ -1924,6 +1985,14 @@ def edit_user(user_id):
             return jsonify({"error": "That email already has an account."}), 400
         sets.append("email = ?"); vals.append(email)
     if data.get("password"):
+        problem = _password_problem(
+            data["password"], u["username"],
+            (data.get("email") if "email" in data else u["email"]) or "",
+            (data.get("full_name") if "full_name" in data else u["full_name"]) or "",
+            u["password_hash"],
+        )
+        if problem:
+            return jsonify({"error": problem, "error_code": "weak_password"}), 400
         sets.append("password_hash = ?"); vals.append(generate_password_hash(data["password"]))
     if data.get("role") in ("admin", "staff"):
         if user_id == session.get("user_id") and data["role"] != u["role"]:
@@ -6382,6 +6451,17 @@ AUTH_STYLE = """
   .ok-badge { width: 54px; height: 54px; border-radius: 50%; margin: 4px auto 14px; display: flex; align-items: center; justify-content: center; background: color-mix(in srgb, #2e9e6b 16%, transparent); color: #2e9e6b; }
   .ok-badge svg { width: 28px; height: 28px; }
 
+  /* live password hint */
+  .pw-meter { margin-top: 8px; }
+  .pw-meter .bar { height: 4px; border-radius: 99px; background: var(--border); overflow: hidden; }
+  .pw-meter .bar i { display: block; height: 100%; width: 0; border-radius: 99px; background: var(--danger); transition: width .25s ease, background .25s ease; }
+  .pw-meter .hint { font-size: 12px; margin-top: 5px; min-height: 16px; color: var(--muted); font-weight: 500; }
+  .pw-meter.bad .hint { color: var(--danger); }
+  .pw-meter.ok .bar i { background: var(--gold); }
+  .pw-meter.ok .hint { color: var(--text); }
+  .pw-meter.strong .bar i { background: #2e9e6b; }
+  .pw-meter.strong .hint { color: #2e9e6b; }
+
   /* Keep me signed in */
   .remember-row { margin-top: 16px; }
   .remember-row label.remember {
@@ -6479,6 +6559,52 @@ PW_TOGGLE_BTN = """<button type="button" class="pw-toggle" onclick="togglePw(thi
     </button>"""
 
 
+PW_METER_JS = """<script>
+(function () {
+  var CFG = {{ pw_config|tojson }};
+  function personal(ctx) {
+    var out = [];
+    (ctx || []).forEach(function (c) {
+      c = (c || '').toLowerCase();
+      if (c.indexOf('@') > -1) c = c.split('@')[0];
+      var whole = c.replace(/[^a-z0-9]/g, '');
+      if (whole.length >= 3) out.push(whole);
+      c.split(/[^a-z0-9]+/).forEach(function (t) { if (t.length >= 4) out.push(t); });
+    });
+    return out;
+  }
+  window.pwCheck = function (pw, ctx) {
+    if (!CFG.on) return {state: pw ? 'ok' : '', pct: pw ? 100 : 0, msg: ''};
+    if (!pw) return {state: '', pct: 0, msg: 'At least ' + CFG.min + ' characters. Longer is stronger.'};
+    var low = pw.toLowerCase(), pct = Math.min(100, Math.round(pw.length / 14 * 100));
+    if (pw.length < CFG.min) return {state: 'bad', pct: Math.min(pct, 55), msg: pw.length + ' of ' + CFG.min + ' characters - keep going.'};
+    if (/^[0-9]+$/.test(low)) return {state: 'bad', pct: 35, msg: 'Use letters as well as numbers.'};
+    var uniq = {}; low.split('').forEach(function (ch) { uniq[ch] = 1; });
+    if (Object.keys(uniq).length <= 3) return {state: 'bad', pct: 30, msg: 'Avoid repeating the same few characters.'};
+    var letters = low.replace(/[^a-z]/g, ''), left = low.length - letters.length;
+    if (CFG.common.indexOf(letters) > -1 && left <= 6) return {state: 'bad', pct: 40, msg: 'That password is too common. Pick something harder to guess.'};
+    var flat = low.replace(/[^a-z0-9]/g, ''), hit = personal(ctx).some(function (p) { return flat.indexOf(p) > -1; });
+    if (hit) return {state: 'bad', pct: 45, msg: "Don't use your name, email or username inside the password."};
+    var classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/].filter(function (r) { return r.test(pw); }).length;
+    if (pw.length >= 14 || (pw.length >= 12 && classes >= 3)) return {state: 'strong', pct: 100, msg: 'Strong password.'};
+    return {state: 'ok', pct: 75, msg: 'Good enough. A few more characters would make it stronger.'};
+  };
+  window.attachPwMeter = function (input, box, getCtx) {
+    function paint() {
+      var r = window.pwCheck(input.value, getCtx ? getCtx() : []);
+      box.className = 'pw-meter ' + r.state;
+      box.querySelector('.bar i').style.width = r.pct + '%';
+      box.querySelector('.hint').textContent = r.msg;
+    }
+    input.addEventListener('input', paint);
+    if (getCtx) { (box.dataset.watch || '').split(',').forEach(function (id) { var el = id && document.getElementById(id); if (el) el.addEventListener('input', paint); }); }
+    paint();
+  };
+})();
+</script>"""
+
+PW_METER_HTML = """<div class="pw-meter"><div class="bar"><i></i></div><div class="hint"></div></div>"""
+
 SETUP_HTML = """
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Compass - Set up</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + """">""" + AUTH_STYLE + """</head><body>
@@ -6496,17 +6622,28 @@ SETUP_HTML = """
   {% if error %}<div class="error">{{ error }}</div>{% endif %}
   <form method="post">
     <label>Your full name</label>
-    <input type="text" name="full_name" required autofocus autocomplete="name" placeholder="e.g. Ahmed Al-Harbi">
+    <input type="text" name="full_name" id="setupName" required autofocus autocomplete="name" placeholder="e.g. Ahmed Al-Harbi">
     <label>Company email</label>
-    <input type="email" name="email" required autocomplete="email" placeholder="name@seapower.com.sa">
+    <input type="email" name="email" id="setupEmail" required autocomplete="email" placeholder="name@seapower.com.sa">
     <label>Choose a password</label>
     <div class="pw-wrap">
-      <input type="password" name="password" required>
+      <input type="password" name="password" id="setupPw" required autocomplete="new-password">
       """ + PW_TOGGLE_BTN + """
     </div>
+    <div id="setupMeter" data-watch="setupName,setupEmail">""" + PW_METER_HTML + """</div>
     <button type="submit">Create Admin Account</button>
   </form>
 </div>
+""" + PW_METER_JS + """
+<script>
+(function () {
+  var box = document.querySelector('#setupMeter .pw-meter');
+  box.dataset.watch = 'setupName,setupEmail';
+  attachPwMeter(document.getElementById('setupPw'), box, function () {
+    return [document.getElementById('setupName').value, document.getElementById('setupEmail').value];
+  });
+})();
+</script>
 </body></html>
 """
 
@@ -6720,6 +6857,15 @@ USERS_HTML = """
   .del { background: none; color: var(--danger); font-size: 12px; font-weight: 600; padding: 5px 10px; border-radius: 999px; }
   .del:hover { background: var(--danger-bg); }
   .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .pw-meter { margin-top: 8px; }
+  .pw-meter .bar { height: 4px; border-radius: 99px; background: var(--border); overflow: hidden; }
+  .pw-meter .bar i { display: block; height: 100%; width: 0; border-radius: 99px; background: var(--danger); transition: width .25s ease, background .25s ease; }
+  .pw-meter .hint { font-size: 12px; margin-top: 5px; min-height: 16px; color: var(--muted); font-weight: 500; }
+  .pw-meter.bad .hint { color: var(--danger); }
+  .pw-meter.ok .bar i { background: var(--gold); }
+  .pw-meter.ok .hint { color: var(--text); }
+  .pw-meter.strong .bar i { background: #2e9e6b; }
+  .pw-meter.strong .hint { color: #2e9e6b; }
   #toastHost { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; pointer-events: none; max-width: min(320px, calc(100vw - 40px)); }
   #toastHost .toast { pointer-events: auto; }
   .toast { background: var(--navy-deep); color: #fff; padding: 11px 16px; border-radius: 12px; font-size: 13px; display: flex; align-items: center; gap: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); animation: toast-in .18s ease-out; max-width: 320px; }
@@ -6782,6 +6928,7 @@ function setTheme(mode) {
       <select id="newRole"><option value="staff">Staff</option><option value="admin">Admin</option></select>
       <button onclick="addUser()">Add User</button>
     </div>
+    <div id="newPwMeter" data-watch="newName,newEmail">""" + PW_METER_HTML + """</div>
     <div style="font-size:12px;color:var(--muted);margin-top:10px;">They sign in with this email and set up their authenticator app the first time.</div>
   </div>
   <div class="card">
@@ -6797,7 +6944,7 @@ function setTheme(mode) {
           <td class="local-time" data-utc="{{ u['created_at'] }}">{{ u['created_at'] }}</td>
           <td style="white-space:nowrap;"><button class="del" style="color:var(--navy-light);" onclick="toggleEdit({{ u['id'] }})">Edit</button><button class="del" onclick='delUser({{ u["id"] }}, {{ (u["full_name"] or u["username"])|tojson }})'>Remove</button></td>
         </tr>
-        <tr class="edit-row" id="e{{ u['id'] }}" style="display:none;">
+        <tr class="edit-row" id="e{{ u['id'] }}" data-username="{{ u['username'] }}" style="display:none;">
           <td colspan="6" style="background:color-mix(in srgb,var(--border) 30%,transparent);">
             <div class="row">
               <input type="text" id="en{{ u['id'] }}" value="{{ u['full_name'] }}" placeholder="Full name" style="flex:1 1 160px;">
@@ -6806,6 +6953,7 @@ function setTheme(mode) {
               <button onclick="saveUser({{ u['id'] }})">Save</button>
               {% if u['totp_enabled'] %}<button class="del" style="border:1px solid var(--border);" onclick="reset2fa({{ u['id'] }})">Reset 2-step</button>{% endif %}
             </div>
+            <div class="pw-meter" id="epm{{ u['id'] }}" style="display:none;max-width:420px;"><div class="bar"><i></i></div><div class="hint"></div></div>
           </td>
         </tr>
         {% endfor %}
@@ -6813,6 +6961,7 @@ function setTheme(mode) {
     </table>
   </div>
   <div id="toastHost"></div>
+""" + PW_METER_JS + """
 <script>
 // The server stores "Created" timestamps as naive UTC - convert each one to
 // the viewer's own timezone before displaying it.
@@ -6862,6 +7011,22 @@ function toggleEdit(id) {
   const r = document.getElementById('e' + id);
   r.style.display = r.style.display === 'none' ? '' : 'none';
 }
+// live password hints
+(function () {
+  var nb = document.querySelector('#newPwMeter .pw-meter');
+  nb.dataset.watch = 'newName,newEmail';
+  attachPwMeter(document.getElementById('newPassword'), nb, function () {
+    return [document.getElementById('newName').value, document.getElementById('newEmail').value];
+  });
+  document.querySelectorAll('.edit-row').forEach(function (row) {
+    var id = row.id.slice(1), pw = document.getElementById('ep' + id), box = document.getElementById('epm' + id);
+    if (!pw || !box) return;
+    box.dataset.watch = 'en' + id + ',ee' + id;
+    attachPwMeter(pw, box, function () { return [document.getElementById('en' + id).value, document.getElementById('ee' + id).value, row.dataset.username || '']; });
+    box.style.display = 'none';
+    pw.addEventListener('input', function () { box.style.display = pw.value ? '' : 'none'; });
+  });
+})();
 async function saveUser(id) {
   const body = {full_name: document.getElementById('en' + id).value.trim(), email: document.getElementById('ee' + id).value.trim()};
   const pw = document.getElementById('ep' + id).value;
