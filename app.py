@@ -25,6 +25,10 @@ import io
 import time
 import secrets
 import base64
+import hashlib
+import hmac
+import json
+import struct
 import smtplib
 import socket
 import ssl
@@ -33,6 +37,7 @@ from email.utils import formataddr
 from datetime import datetime, date, timedelta
 from functools import wraps
 from urllib.parse import quote as url_quote
+import segno
 from flask import Flask, request, jsonify, g, render_template_string, session, redirect, url_for, send_file, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 import openpyxl
@@ -738,6 +743,11 @@ def init_db():
             created_at TEXT DEFAULT ''
         )"""
     )
+    # Company-email accounts + two-step verification (Google/Microsoft Authenticator).
+    for _col, _ddl in (("email", "TEXT DEFAULT ''"), ("full_name", "TEXT DEFAULT ''"), ("totp_secret", "TEXT DEFAULT ''"),
+                       ("totp_enabled", "INTEGER DEFAULT 0"), ("totp_last_step", "BIGINT DEFAULT 0"), ("recovery_codes", "TEXT DEFAULT ''")):
+        cur.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {_col} {_ddl}")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users (LOWER(email)) WHERE email <> ''")
     cur.execute(
         """CREATE TABLE IF NOT EXISTS records (
             bl_number TEXT PRIMARY KEY,
@@ -1372,6 +1382,8 @@ def login_required(f):
         if not any_users_exist():
             return redirect(url_for("setup"))
         if "user_id" not in session:
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Please sign in again.", "error_code": "session_expired"}), 401
             return redirect(url_for("login"))
         return f(*args, **kwargs)
     return wrapper
@@ -1388,21 +1400,243 @@ def admin_required(f):
 
 # ---------- Auth routes ----------
 
+# ---------- Accounts, two-step verification, inactivity ----------
+COMPANY_EMAIL_DOMAIN = os.environ.get("COMPANY_EMAIL_DOMAIN", "seapower.com.sa").strip().lower().lstrip("@")
+REQUIRE_2FA = os.environ.get("REQUIRE_2FA", "1") != "0"
+try:
+    IDLE_MINUTES = max(2, int(os.environ.get("IDLE_MINUTES", "30") or 30))
+except ValueError:
+    IDLE_MINUTES = 30
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def _check_company_email(email):
+    """Returns (clean_email, error). Empty is allowed (older accounts)."""
+    email = (email or "").strip().lower()
+    if not email:
+        return "", None
+    if not _EMAIL_RE.match(email):
+        return "", "That doesn't look like an email address."
+    if COMPANY_EMAIL_DOMAIN and not email.endswith("@" + COMPANY_EMAIL_DOMAIN):
+        return "", f"Use the company email (name@{COMPANY_EMAIL_DOMAIN})."
+    return email, None
+
+
+def _unique_username(db, base):
+    base = re.sub(r"[^a-z0-9._\-]", "", (base or "").lower()) or "user"
+    name, n = base, 1
+    while db.execute("SELECT 1 FROM users WHERE LOWER(username) = LOWER(?)", (name,)).fetchone():
+        n += 1
+        name = f"{base}{n}"
+    return name
+
+
+# TOTP (RFC 6238) - the same 6-digit code Google Authenticator and Microsoft
+# Authenticator show. Written with the standard library, so no new package.
+def _totp_new_secret():
+    return base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+
+
+def _totp_at(secret, step):
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8))
+    d = hmac.new(key, struct.pack(">Q", step), hashlib.sha1).digest()
+    o = d[-1] & 15
+    return f"{(struct.unpack('>I', d[o:o + 4])[0] & 0x7fffffff) % 10 ** 6:06d}"
+
+
+def _totp_check(secret, code, last_step=0):
+    """Returns the matched time-step, or None. A code can't be used twice
+    (step must be newer than the last accepted one); +/-30 s of clock drift is allowed."""
+    code = re.sub(r"\s", "", code or "")
+    if not secret or not re.fullmatch(r"\d{6}", code):
+        return None
+    now = int(time.time() // 30)
+    for step in (now, now - 1, now + 1):
+        if step > (last_step or 0) and hmac.compare_digest(_totp_at(secret, step), code):
+            return step
+    return None
+
+
+def _new_recovery_codes():
+    alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+    return ["".join(secrets.choice(alphabet) for _ in range(4)) + "-" + "".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(8)]
+
+
+def _hash_recovery(code):
+    return hashlib.sha256(re.sub(r"[^a-z0-9]", "", (code or "").lower()).encode()).hexdigest()
+
+
+def _use_recovery_code(db, user, code):
+    try:
+        hashes = json.loads(user["recovery_codes"] or "[]")
+    except ValueError:
+        hashes = []
+    h = _hash_recovery(code)
+    for x in hashes:
+        if hmac.compare_digest(x, h):
+            hashes.remove(x)
+            db.execute("UPDATE users SET recovery_codes = ? WHERE id = ?", (json.dumps(hashes), user["id"]))
+            db.commit()
+            return True
+    return False
+
+
+def _complete_login(user, remember):
+    session.clear()
+    session["user_id"] = user["id"]
+    session["username"] = user["username"]          # the saved spelling - used for record ownership
+    session["display_name"] = (user["full_name"] or "").strip() or user["username"]
+    session["role"] = user["role"]
+    session["remember"] = bool(remember)
+    session["last_seen"] = int(time.time())
+    session["chk"] = int(time.time())
+    session.permanent = bool(remember)
+    if REQUIRE_2FA and not user["totp_enabled"]:
+        session["needs_2fa_setup"] = True
+        return redirect(url_for("account_security"))
+    return redirect(url_for("index"))
+
+
+@app.before_request
+def _session_guards():
+    if "user_id" not in session:
+        return None
+    p = request.path
+    now = int(time.time())
+    expired_json = lambda: (jsonify({"error": "Your session ended. Please sign in again.", "error_code": "session_expired"}), 401)
+    # 1. inactivity. Background refreshes (GET /api/...) don't count as activity - only
+    # clicks/typing do (the page pings /api/ping while the person is active).
+    if not session.get("remember"):
+        if now - session.get("last_seen", now) > IDLE_MINUTES * 60 + 30:
+            session.clear()
+            return expired_json() if p.startswith("/api/") else redirect(url_for("login", expired=1))
+        if request.method != "GET" or not p.startswith("/api/") or p == "/api/ping":
+            session["last_seen"] = now
+    # 2. every few minutes re-check the account still exists (removed staff lose access
+    # even if their cookie is still valid) and pick up name/role changes.
+    if now - session.get("chk", 0) > 300:
+        row = get_db().execute("SELECT username, full_name, role FROM users WHERE id = ?", (session["user_id"],)).fetchone()
+        if not row:
+            session.clear()
+            return expired_json() if p.startswith("/api/") else redirect(url_for("login"))
+        session["role"] = row["role"]
+        session["username"] = row["username"]
+        session["display_name"] = (row["full_name"] or "").strip() or row["username"]
+        session["chk"] = now
+    # 3. someone who still has to set up their authenticator can't use anything else yet
+    if session.get("needs_2fa_setup") and p not in ("/account/security", "/logout", "/api/ping"):
+        if p.startswith("/api/"):
+            return jsonify({"error": "Set up two-step verification first.", "error_code": "2fa_setup_required"}), 403
+        return redirect(url_for("account_security"))
+    return None
+
+
+@app.context_processor
+def _inject_names():
+    if "user_id" in session:
+        dn = session.get("display_name") or session.get("username") or ""
+        return {"display_name": dn, "first_name": (dn.split() or [""])[0]}
+    return {}
+
+
+_IDLE_SNIPPET = """<script>
+(function () {
+  var IDLE = __IDLE__ * 1000, WARN = 60000, USE_TIMER = __TIMER__;
+  var lang = 'en'; try { lang = localStorage.getItem('lang') || 'en'; } catch (e) {}
+  var AR = lang === 'ar';
+  var T = AR ? {h: 'هل ما زلت هنا؟', b: 'سيتم تسجيل خروجك خلال', s: 'بسبب عدم النشاط، لحماية بياناتك.', stay: 'البقاء متصلاً', out: 'تسجيل الخروج'}
+             : {h: 'Still there?', b: 'You will be signed out in', s: 'because of inactivity, to keep your data safe.', stay: 'Stay signed in', out: 'Sign out'};
+  // a finished session (removed account, expired cookie) -> straight to the sign-in page
+  var _fetch = window.fetch;
+  window.fetch = function () {
+    return _fetch.apply(this, arguments).then(function (r) {
+      if (r.status === 401) { try { if (new URL(r.url).pathname.indexOf('/api/') === 0) location.href = '/login?expired=1'; } catch (e) {} }
+      return r;
+    });
+  };
+  if (!USE_TIMER) return;
+  var last = Date.now(), lastPing = Date.now(), shown = false, box, tick;
+  function mark() { last = Date.now(); try { localStorage.setItem('compass_active', String(last)); } catch (e) {} }
+  ['mousedown', 'keydown', 'touchstart', 'scroll', 'wheel', 'pointerdown'].forEach(function (ev) { window.addEventListener(ev, function () { if (!shown) mark(); }, {passive: true, capture: true}); });
+  var mt = 0; window.addEventListener('mousemove', function () { var n = Date.now(); if (n - mt > 5000 && !shown) { mt = n; mark(); } }, {passive: true});
+  function shared() { try { return parseInt(localStorage.getItem('compass_active') || '0', 10) || 0; } catch (e) { return 0; } }
+  function ping() { lastPing = Date.now(); return _fetch('/api/ping', {method: 'POST', credentials: 'same-origin'}).then(function (r) { if (r.status === 401) location.href = '/login?expired=1'; }).catch(function () {}); }
+  function fmt(ms) { var s = Math.max(0, Math.ceil(ms / 1000)); return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); }
+  function build() {
+    box = document.createElement('div');
+    box.setAttribute('role', 'alertdialog'); box.setAttribute('aria-modal', 'true');
+    box.style.cssText = 'position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(8,20,32,.55);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;';
+    if (AR) box.setAttribute('dir', 'rtl');
+    box.innerHTML = '<div style="background:var(--card,#fff);color:var(--text,#1c2b3a);border:1px solid var(--border,#e6e9ed);border-radius:20px;padding:28px 26px 22px;max-width:360px;width:100%;text-align:center;box-shadow:0 24px 70px rgba(0,0,0,.35);">' +
+      '<div style="width:46px;height:46px;border-radius:50%;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;background:rgba(201,162,39,.16);color:#c9a227;"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div>' +
+      '<div style="font-size:18px;font-weight:700;margin-bottom:6px;">' + T.h + '</div>' +
+      '<div style="font-size:13.5px;color:var(--muted,#7a8794);line-height:1.5;">' + T.b + '</div>' +
+      '<div id="idleCount" style="font-size:34px;font-weight:700;letter-spacing:.02em;margin:6px 0 4px;color:var(--navy,#123a56);font-variant-numeric:tabular-nums;"></div>' +
+      '<div style="font-size:12.5px;color:var(--muted,#7a8794);margin-bottom:18px;">' + T.s + '</div>' +
+      '<button id="idleStay" style="width:100%;border:0;border-radius:999px;padding:12px;font-size:14px;font-weight:700;background:var(--navy,#123a56);color:#fff;cursor:pointer;">' + T.stay + '</button>' +
+      '<button id="idleOut" style="width:100%;border:0;background:none;margin-top:6px;padding:9px;font-size:13px;font-weight:600;color:var(--muted,#7a8794);cursor:pointer;">' + T.out + '</button></div>';
+    document.body.appendChild(box);
+    box.querySelector('#idleStay').onclick = stay;
+    box.querySelector('#idleOut').onclick = function () { location.href = '/logout'; };
+    box.querySelector('#idleStay').focus();
+  }
+  function stay() { shown = false; if (box) { box.remove(); box = null; } mark(); ping(); }
+  tick = setInterval(function () {
+    var now = Date.now(), act = Math.max(last, shared()), idle = now - act;
+    if (shown) {
+      if (act > last) { last = act; }
+      if (idle < IDLE - WARN) { stay(); return; }       // activity in another tab
+    }
+    if (idle >= IDLE) { location.href = '/logout?idle=1'; return; }
+    if (idle >= IDLE - WARN && !shown) { shown = true; build(); }
+    if (shown && box) { box.querySelector('#idleCount').textContent = fmt(IDLE - idle); }
+    if (!shown && idle < 60000 && now - lastPing > 55000) { ping(); }   // keep the server's clock in step while the person is active
+  }, 1000);
+})();
+</script>"""
+
+
+@app.after_request
+def _add_idle_script(resp):
+    try:
+        if ("user_id" in session and resp.status_code == 200 and resp.mimetype == "text/html"
+                and not resp.direct_passthrough and request.path not in ("/login", "/setup")):
+            body = resp.get_data(as_text=True)
+            i = body.rfind("</body>")
+            if i != -1:
+                timer = "false" if session.get("remember") else "true"
+                snippet = _IDLE_SNIPPET.replace("__IDLE__", str(IDLE_MINUTES * 60)).replace("__TIMER__", timer)
+                resp.set_data(body[:i] + snippet + body[i:])
+    except Exception:
+        pass
+    return resp
+
+
+@app.route("/api/ping", methods=["POST"])
+@login_required
+def api_ping():
+    return jsonify({"ok": True})
+
+
 @app.route("/setup", methods=["GET", "POST"])
 def setup():
     if any_users_exist():
         return redirect(url_for("login"))
     error = None
     if request.method == "POST":
-        username = request.form.get("username", "").strip()
+        full_name = request.form.get("full_name", "").strip()
+        email, email_err = _check_company_email(request.form.get("email", ""))
+        username = request.form.get("username", "").strip() or (email.split("@")[0] if email else "")
         password = request.form.get("password", "")
-        if not username or not password:
-            error = "Please fill in both fields."
+        if email_err:
+            error = email_err
+        elif not username or not password:
+            error = "Please fill in all the fields."
         else:
             db = get_db()
             db.execute(
-                "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
-                (username, generate_password_hash(password), datetime.utcnow().strftime("%Y-%m-%d %H:%M")),
+                "INSERT INTO users (username, password_hash, role, created_at, full_name, email) VALUES (?, ?, 'admin', ?, ?, ?)",
+                (username, generate_password_hash(password), datetime.utcnow().strftime("%Y-%m-%d %H:%M"), full_name, email),
             )
             db.commit()
             return redirect(url_for("login"))
@@ -1475,6 +1709,7 @@ def login():
         return redirect(url_for("setup"))
     error = None
     typed = ""
+    notice = "You were signed out after a period of inactivity. Please sign in again." if request.args.get("expired") else None
     if request.method == "POST":
         ip = _client_ip()
         username = request.form.get("username", "").strip()
@@ -1482,33 +1717,103 @@ def login():
         typed = username
         if _login_locked_out(ip, username):
             error = "Too many failed attempts. Please wait 15 minutes and try again."
-            return render_template_string(LOGIN_HTML, error=error, typed=typed)
+            return render_template_string(LOGIN_HTML, error=error, typed=typed, notice=None)
         db = get_db()
-        # Usernames are matched without regard to capital letters, so
-        # "Ahmed", "ahmed" and "AHMED" are the same person. If two accounts
-        # somehow differ only by case (made before this rule), the exact
-        # spelling is tried first and the password decides.
+        # Sign in with the company email or the username, in any capitalisation.
+        # If two accounts somehow differ only by case (made before this rule),
+        # the exact spelling is tried first and the password decides.
         candidates = db.execute(
-            "SELECT * FROM users WHERE LOWER(username) = LOWER(?) ORDER BY (username = ?) DESC, id",
-            (username, username),
+            "SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR (email <> '' AND LOWER(email) = LOWER(?)) "
+            "ORDER BY (username = ?) DESC, id",
+            (username, username, username),
         ).fetchall()
         user = next((u for u in candidates if check_password_hash(u["password_hash"], password)), None)
         if user:
-            session.clear()
-            session["user_id"] = user["id"]
-            session["username"] = user["username"]   # always the spelling saved on the account
-            session["role"] = user["role"]
-            session.permanent = bool(request.form.get("remember"))
-            return redirect(url_for("index"))
+            remember = bool(request.form.get("remember"))
+            if user["totp_enabled"]:
+                session.clear()
+                session["pre2fa"] = {"id": user["id"], "remember": remember, "t": int(time.time())}
+                return redirect(url_for("login_verify"))
+            return _complete_login(user, remember)
         _record_login_failure(ip, username)
-        error = "Wrong username or password."
-    return render_template_string(LOGIN_HTML, error=error, typed=typed)
+        error = "Wrong email/username or password."
+    return render_template_string(LOGIN_HTML, error=error, typed=typed, notice=notice)
+
+
+@app.route("/login/verify", methods=["GET", "POST"])
+def login_verify():
+    pre = session.get("pre2fa")
+    if not pre or int(time.time()) - pre.get("t", 0) > 300:
+        session.pop("pre2fa", None)
+        return redirect(url_for("login"))
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE id = ?", (pre["id"],)).fetchone()
+    if not user:
+        session.clear()
+        return redirect(url_for("login"))
+    error = None
+    if request.method == "POST":
+        ip = _client_ip()
+        if _login_locked_out(ip, user["username"]):
+            return render_template_string(VERIFY_HTML, error="Too many failed attempts. Please wait 15 minutes and try again.", name=user["full_name"] or user["username"])
+        code = request.form.get("code", "")
+        step = _totp_check(user["totp_secret"], code, user["totp_last_step"])
+        if step:
+            db.execute("UPDATE users SET totp_last_step = ? WHERE id = ?", (step, user["id"]))
+            db.commit()
+            return _complete_login(user, pre.get("remember"))
+        if re.search(r"[a-zA-Z]", code or "") and _use_recovery_code(db, user, code):
+            return _complete_login(user, pre.get("remember"))
+        _record_login_failure(ip, user["username"])
+        error = "That code isn't right. Check the code in your authenticator app and try again."
+    return render_template_string(VERIFY_HTML, error=error, name=user["full_name"] or user["username"])
+
+
+@app.route("/account/security", methods=["GET", "POST"])
+@login_required
+def account_security():
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE id = ?", (session["user_id"],)).fetchone()
+    if not user:
+        session.clear()
+        return redirect(url_for("login"))
+    name = user["full_name"] or user["username"]
+    if user["totp_enabled"] and not session.get("show_codes"):
+        return render_template_string(SECURITY_HTML, mode="on", name=name, error=None, codes=None, qr=None, secret=None, email=user["email"])
+    if session.get("show_codes"):
+        codes = session.pop("show_codes")
+        session.pop("needs_2fa_setup", None)
+        return render_template_string(SECURITY_HTML, mode="codes", name=name, error=None, codes=codes, qr=None, secret=None, email=user["email"])
+    error = None
+    if request.method == "POST":
+        pending = session.get("totp_pending")
+        step = _totp_check(pending, request.form.get("code", ""), 0) if pending else None
+        if step:
+            codes = _new_recovery_codes()
+            db.execute(
+                "UPDATE users SET totp_secret = ?, totp_enabled = 1, totp_last_step = ?, recovery_codes = ? WHERE id = ?",
+                (pending, step, json.dumps([_hash_recovery(c) for c in codes]), user["id"]),
+            )
+            db.commit()
+            session.pop("totp_pending", None)
+            session["show_codes"] = codes
+            return redirect(url_for("account_security"))
+        error = "That code isn't right. Check the code in your authenticator app and try again."
+    secret = session.get("totp_pending")
+    if not secret:
+        secret = session["totp_pending"] = _totp_new_secret()
+    label = user["email"] or user["username"]
+    uri = f"otpauth://totp/Compass:{url_quote(label)}?secret={secret}&issuer=Compass&algorithm=SHA1&digits=6&period=30"
+    qr = segno.make(uri, error="m").svg_data_uri(scale=5, border=2, dark="#123a56")
+    pretty = " ".join(secret[i:i + 4] for i in range(0, len(secret), 4))
+    return render_template_string(SECURITY_HTML, mode="setup", name=name, error=error, codes=None, qr=qr, secret=pretty, email=user["email"])
 
 
 @app.route("/logout")
 def logout():
+    idle = request.args.get("idle")
     session.clear()
-    return redirect(url_for("login"))
+    return redirect(url_for("login", expired=1) if idle else url_for("login"))
 
 
 # ---------- Main app ----------
@@ -1560,7 +1865,7 @@ def sof_page():
 @admin_required
 def users_page():
     db = get_db()
-    users = db.execute("SELECT id, username, role, created_at FROM users ORDER BY created_at").fetchall()
+    users = db.execute("SELECT id, username, full_name, email, role, created_at, totp_enabled FROM users ORDER BY created_at, id").fetchall()
     return render_template_string(USERS_HTML, users=users, username=session.get("username"))
 
 
@@ -1569,25 +1874,67 @@ def users_page():
 @admin_required
 def add_user():
     data = request.get_json(force=True)
-    username = data.get("username", "").strip()
+    full_name = (data.get("full_name") or "").strip()
+    email, email_err = _check_company_email(data.get("email"))
+    if email_err:
+        return jsonify({"error": email_err}), 400
+    username = (data.get("username") or "").strip()
     password = data.get("password", "")
     role = data.get("role", "staff")
     if role not in ("admin", "staff"):
         role = "staff"
+    db = get_db()
+    if not username and email:
+        username = _unique_username(db, email.split("@")[0])
     if not username or not password:
         return jsonify({"error": "Missing fields"}), 400
-    db = get_db()
     if db.execute("SELECT 1 FROM users WHERE LOWER(username) = LOWER(?)", (username,)).fetchone():
         return jsonify({"error": "Username already exists"}), 400
+    if email and db.execute("SELECT 1 FROM users WHERE LOWER(email) = LOWER(?)", (email,)).fetchone():
+        return jsonify({"error": "That email already has an account."}), 400
     try:
         db.execute(
-            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
-            (username, generate_password_hash(password), role, datetime.utcnow().strftime("%Y-%m-%d %H:%M")),
+            "INSERT INTO users (username, password_hash, role, created_at, full_name, email) VALUES (?, ?, ?, ?, ?, ?)",
+            (username, generate_password_hash(password), role, datetime.utcnow().strftime("%Y-%m-%d %H:%M"), full_name, email),
         )
         db.commit()
     except psycopg2.IntegrityError:
         db.conn.rollback()
         return jsonify({"error": "Username already exists"}), 400
+    return jsonify({"ok": True, "username": username})
+
+
+@app.route("/api/users/<int:user_id>", methods=["PATCH"])
+@login_required
+@admin_required
+def edit_user(user_id):
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    u = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not u:
+        return jsonify({"error": "User not found."}), 404
+    sets, vals = [], []
+    if "full_name" in data:
+        sets.append("full_name = ?"); vals.append((data.get("full_name") or "").strip())
+    if "email" in data:
+        email, err = _check_company_email(data.get("email"))
+        if err:
+            return jsonify({"error": err}), 400
+        if email and db.execute("SELECT 1 FROM users WHERE LOWER(email) = LOWER(?) AND id <> ?", (email, user_id)).fetchone():
+            return jsonify({"error": "That email already has an account."}), 400
+        sets.append("email = ?"); vals.append(email)
+    if data.get("password"):
+        sets.append("password_hash = ?"); vals.append(generate_password_hash(data["password"]))
+    if data.get("role") in ("admin", "staff"):
+        if user_id == session.get("user_id") and data["role"] != u["role"]:
+            return jsonify({"error": "You can't change your own role."}), 400
+        sets.append("role = ?"); vals.append(data["role"])
+    if data.get("reset_2fa"):
+        sets += ["totp_secret = ''", "totp_enabled = 0", "totp_last_step = 0", "recovery_codes = ''"]
+    if not sets:
+        return jsonify({"ok": True})
+    db.execute(f"UPDATE users SET {', '.join(sets)} WHERE id = ?", (*vals, user_id))
+    db.commit()
     return jsonify({"ok": True})
 
 
@@ -6011,6 +6358,30 @@ AUTH_STYLE = """
     30%,50%,70% { transform: translateX(-4px); } 40%,60% { transform: translateX(4px); }
   }
 
+  .notice {
+    background: color-mix(in srgb, var(--gold) 16%, transparent); color: var(--text); padding: 10px 12px; border-radius: 10px;
+    font-size: 13px; margin-top: 16px; text-align: center; font-weight: 600; border: 1px solid color-mix(in srgb, var(--gold) 40%, transparent);
+  }
+  input.code { text-align: center; font-size: 24px; font-weight: 700; letter-spacing: .32em; padding: 13px 10px; font-variant-numeric: tabular-nums; }
+  input.code.recovery { font-size: 18px; letter-spacing: .12em; }
+  .auth-link { display: block; text-align: center; margin-top: 16px; font-size: 13px; font-weight: 600; color: var(--muted); text-decoration: none; background: none; border: 0; width: 100%; padding: 6px; cursor: pointer; }
+  .auth-link:hover { color: var(--text); }
+  .step { display: flex; gap: 12px; align-items: flex-start; margin-top: 18px; font-size: 13.5px; line-height: 1.5; }
+  .step b.n { flex: none; width: 24px; height: 24px; border-radius: 50%; background: var(--navy); color: #fff; font-size: 12px; display: inline-flex; align-items: center; justify-content: center; margin-top: 1px; }
+  .qr-wrap { margin: 14px auto 0; width: 190px; height: 190px; padding: 8px; background: #fff; border-radius: 14px; border: 1px solid var(--border); }
+  .qr-wrap img { width: 100%; height: 100%; display: block; }
+  .manual { margin-top: 10px; text-align: center; font-size: 12px; color: var(--muted); }
+  .manual code { display: block; margin-top: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13.5px; letter-spacing: .06em; color: var(--text); user-select: all; word-break: break-all; }
+  .codes-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 16px; }
+  .codes-grid span { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14.5px; font-weight: 600; text-align: center; padding: 9px 4px; border-radius: 9px; background: var(--bg); border: 1px solid var(--border); letter-spacing: .05em; user-select: all; }
+  .btn-row { display: flex; gap: 10px; margin-top: 14px; }
+  .btn-row button { margin-top: 0; background: none; color: var(--text); border: 1px solid var(--border); font-size: 13px; padding: 10px; }
+  .btn-row button:hover { background: var(--border); }
+  a.btn-link { display: block; text-align: center; text-decoration: none; width: 100%; background: var(--navy); color: #fff; border-radius: 999px; padding: 13px; font-size: 14px; font-weight: 700; margin-top: 22px; }
+  a.btn-link:hover { background: var(--navy-light); }
+  .ok-badge { width: 54px; height: 54px; border-radius: 50%; margin: 4px auto 14px; display: flex; align-items: center; justify-content: center; background: color-mix(in srgb, #2e9e6b 16%, transparent); color: #2e9e6b; }
+  .ok-badge svg { width: 28px; height: 28px; }
+
   /* Keep me signed in */
   .remember-row { margin-top: 16px; }
   .remember-row label.remember {
@@ -6124,8 +6495,10 @@ SETUP_HTML = """
   <div class="sub">First time here - create the Admin account to get started.</div>
   {% if error %}<div class="error">{{ error }}</div>{% endif %}
   <form method="post">
-    <label>Choose a username</label>
-    <input type="text" name="username" required autofocus>
+    <label>Your full name</label>
+    <input type="text" name="full_name" required autofocus autocomplete="name" placeholder="e.g. Ahmed Al-Harbi">
+    <label>Company email</label>
+    <input type="email" name="email" required autocomplete="email" placeholder="name@seapower.com.sa">
     <label>Choose a password</label>
     <div class="pw-wrap">
       <input type="password" name="password" required>
@@ -6151,11 +6524,12 @@ LOGIN_HTML = """
   </div>
   <h1>Sign in to Compass</h1>
   <div class="sub">Your shared workspace.</div>
+  {% if notice %}<div class="notice">{{ notice }}</div>{% endif %}
   {% if error %}<div class="error">{{ error }}</div>{% endif %}
   <form method="post">
-    <label>Username</label>
+    <label>Email or username</label>
     <input type="text" name="username" value="{{ typed or '' }}" required {% if not typed %}autofocus{% endif %}
-           autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false">
+           placeholder="name@seapower.com.sa" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false">
     <label>Password</label>
     <div class="pw-wrap">
       <input type="password" name="password" required {% if typed %}autofocus{% endif %} autocomplete="current-password">
@@ -6165,11 +6539,111 @@ LOGIN_HTML = """
       <label class="remember">
         <input type="checkbox" name="remember" value="1">
         <span class="remember-box" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></span>
-        <span class="remember-text">Keep me signed in<small>for 30 days on this device</small></span>
+        <span class="remember-text">Keep me signed in</span>
       </label>
     </div>
     <button type="submit">Sign In</button>
   </form>
+</div>
+</body></html>
+"""
+
+VERIFY_HTML = """
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compass - Verify</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + """">""" + AUTH_STYLE + """</head><body>
+<div class="blob blob1"></div>
+<div class="blob blob2"></div>
+""" + THEME_TOGGLE_SNIPPET + """
+<div class="box">
+  <div class="brand-mark">
+    <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
+    <span class="co">Compass</span>
+    <span class="tag">Sea Power Marine Services Co. Ltd</span>
+  </div>
+  <h1>Hello, {{ name }}</h1>
+  <div class="sub" id="vsub">Enter the 6-digit code from your authenticator app.</div>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="post" id="vform">
+    <label id="vlabel">Verification code</label>
+    <input class="code" type="text" name="code" id="vcode" required autofocus inputmode="numeric" autocomplete="one-time-code"
+           autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="12" placeholder="000000">
+    <button type="submit">Verify</button>
+  </form>
+  <button type="button" class="auth-link" id="vtoggle" style="margin-top:12px;">Lost your phone? Use a recovery code</button>
+  <a class="auth-link" href="/login" style="margin-top:0;">&larr; Back to sign in</a>
+</div>
+<script>
+(function () {
+  var inp = document.getElementById('vcode'), form = document.getElementById('vform'), tog = document.getElementById('vtoggle'), recovery = false;
+  inp.addEventListener('input', function () {
+    if (!recovery && /^\\d{6}$/.test(inp.value.replace(/\\s/g, ''))) { form.requestSubmit(); }
+  });
+  tog.addEventListener('click', function () {
+    recovery = !recovery;
+    inp.value = ''; inp.classList.toggle('recovery', recovery);
+    inp.placeholder = recovery ? 'xxxx-xxxx' : '000000';
+    inp.inputMode = recovery ? 'text' : 'numeric'; inp.maxLength = recovery ? 12 : 12;
+    document.getElementById('vlabel').textContent = recovery ? 'Recovery code' : 'Verification code';
+    document.getElementById('vsub').textContent = recovery ? 'Enter one of the recovery codes you saved. Each one works once.' : 'Enter the 6-digit code from your authenticator app.';
+    tog.textContent = recovery ? 'Use my authenticator app instead' : 'Lost your phone? Use a recovery code';
+    inp.focus();
+  });
+})();
+</script>
+</body></html>
+"""
+
+SECURITY_HTML = """
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compass - Two-step verification</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + """">""" + AUTH_STYLE + """
+<style>body { overflow-y: auto; align-items: flex-start; } .box { max-width: 420px; margin: 24px auto; }</style></head><body>
+<div class="blob blob1"></div>
+<div class="blob blob2"></div>
+""" + THEME_TOGGLE_SNIPPET + """
+<div class="box">
+  <div class="brand-mark">
+    <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
+    <span class="co">Compass</span>
+    <span class="tag">Sea Power Marine Services Co. Ltd</span>
+  </div>
+  {% if mode == 'setup' %}
+    <h1>Secure your account</h1>
+    <div class="sub">Hello {{ name }} - one quick step. Compass now asks for a code from your phone each time you sign in.</div>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    <div class="step"><b class="n">1</b><div>Open <b>Google Authenticator</b> or <b>Microsoft Authenticator</b> on your phone, tap <b>+</b>, and scan this code.</div></div>
+    <div class="qr-wrap"><img src="{{ qr }}" alt="QR code"></div>
+    <div class="manual">Can't scan? Enter this key by hand:<code>{{ secret }}</code></div>
+    <div class="step"><b class="n">2</b><div>Type the 6-digit code the app shows to finish.</div></div>
+    <form method="post" id="sform">
+      <input class="code" type="text" name="code" id="scode" required autofocus inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="000000" style="margin-top:12px;">
+      <button type="submit">Turn on two-step verification</button>
+    </form>
+    <a class="auth-link" href="/logout">Sign out</a>
+    <script>
+      var sc = document.getElementById('scode');
+      sc.addEventListener('input', function () { if (/^\\d{6}$/.test(sc.value.replace(/\\s/g, ''))) document.getElementById('sform').requestSubmit(); });
+    </script>
+  {% elif mode == 'codes' %}
+    <h1>Save your recovery codes</h1>
+    <div class="sub">Two-step verification is on. If you ever lose your phone, each of these codes lets you in once. Keep them somewhere safe - they are shown only now.</div>
+    <div class="codes-grid" id="codesGrid">{% for c in codes %}<span>{{ c }}</span>{% endfor %}</div>
+    <div class="btn-row">
+      <button type="button" onclick="copyCodes(this)">Copy</button>
+      <button type="button" onclick="downloadCodes()">Download</button>
+    </div>
+    <a class="btn-link" href="/">I've saved them - continue</a>
+    <script>
+      function codesText() { return 'Compass recovery codes\\n' + [].map.call(document.querySelectorAll('#codesGrid span'), function (x) { return x.textContent; }).join('\\n') + '\\n'; }
+      function copyCodes(b) { try { navigator.clipboard.writeText(codesText()); } catch (e) {} b.textContent = 'Copied'; setTimeout(function () { b.textContent = 'Copy'; }, 1600); }
+      function downloadCodes() { var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([codesText()], {type: 'text/plain'})); a.download = 'compass-recovery-codes.txt'; a.click(); }
+    </script>
+  {% else %}
+    <div class="ok-badge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></div>
+    <h1>Two-step verification is on</h1>
+    <div class="sub">{{ name }}{% if email %} &middot; {{ email }}{% endif %}<br>Your account asks for an authenticator code at every sign-in. Lost your phone? Ask an admin to reset it.</div>
+    <a class="btn-link" href="/">Back to Compass</a>
+    <a class="auth-link" href="/logout">Sign out</a>
+  {% endif %}
 </div>
 </body></html>
 """
@@ -6294,7 +6768,7 @@ function setTheme(mode) {
         </span>
       </label>
       <a href="/">&larr; Back to board</a>
-      <span style="padding:6px 4px;">Signed in as <b>{{ username }}</b></span>
+      <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
   </div>
@@ -6302,22 +6776,37 @@ function setTheme(mode) {
   <div class="card">
     <div class="card-label">Add a user</div>
     <div class="row">
-      <input type="text" id="newUsername" placeholder="Username">
-      <input type="password" id="newPassword" placeholder="Password">
+      <input type="text" id="newName" placeholder="Full name" autocomplete="off" style="flex:1 1 170px;">
+      <input type="text" id="newEmail" placeholder="Company email (name@seapower.com.sa)" autocomplete="off" autocapitalize="none" style="flex:1.4 1 230px;">
+      <input type="password" id="newPassword" placeholder="Temporary password" autocomplete="new-password" style="flex:1 1 150px;">
       <select id="newRole"><option value="staff">Staff</option><option value="admin">Admin</option></select>
       <button onclick="addUser()">Add User</button>
     </div>
+    <div style="font-size:12px;color:var(--muted);margin-top:10px;">They sign in with this email and set up their authenticator app the first time.</div>
   </div>
   <div class="card">
     <table>
-      <thead><tr><th>Username</th><th>Role</th><th>Created</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Email / username</th><th>Role</th><th>2-step</th><th>Created</th><th></th></tr></thead>
       <tbody>
         {% for u in users %}
-        <tr>
-          <td>{{ u['username'] }}</td>
+        <tr id="u{{ u['id'] }}">
+          <td><b>{{ u['full_name'] or u['username'] }}</b></td>
+          <td>{% if u['email'] %}{{ u['email'] }}<div style="font-size:11.5px;color:var(--muted);">{{ u['username'] }}</div>{% else %}{{ u['username'] }}<div style="font-size:11.5px;color:var(--muted);">no email yet</div>{% endif %}</td>
           <td><span class="role-pill {{ u['role'] }}">{{ u['role'] }}</span></td>
+          <td>{% if u['totp_enabled'] %}<span class="role-pill staff" style="background:color-mix(in srgb,#2e9e6b 16%,transparent);color:#2e9e6b;">On</span>{% else %}<span class="role-pill" style="background:var(--border);color:var(--muted);">Not yet</span>{% endif %}</td>
           <td class="local-time" data-utc="{{ u['created_at'] }}">{{ u['created_at'] }}</td>
-          <td><button class="del" onclick='delUser({{ u["id"] }}, {{ u["username"]|tojson }})'>Remove</button></td>
+          <td style="white-space:nowrap;"><button class="del" style="color:var(--navy-light);" onclick="toggleEdit({{ u['id'] }})">Edit</button><button class="del" onclick='delUser({{ u["id"] }}, {{ (u["full_name"] or u["username"])|tojson }})'>Remove</button></td>
+        </tr>
+        <tr class="edit-row" id="e{{ u['id'] }}" style="display:none;">
+          <td colspan="6" style="background:color-mix(in srgb,var(--border) 30%,transparent);">
+            <div class="row">
+              <input type="text" id="en{{ u['id'] }}" value="{{ u['full_name'] }}" placeholder="Full name" style="flex:1 1 160px;">
+              <input type="text" id="ee{{ u['id'] }}" value="{{ u['email'] }}" placeholder="name@seapower.com.sa" autocapitalize="none" style="flex:1.3 1 220px;">
+              <input type="password" id="ep{{ u['id'] }}" placeholder="New password (optional)" autocomplete="new-password" style="flex:1 1 150px;">
+              <button onclick="saveUser({{ u['id'] }})">Save</button>
+              {% if u['totp_enabled'] %}<button class="del" style="border:1px solid var(--border);" onclick="reset2fa({{ u['id'] }})">Reset 2-step</button>{% endif %}
+            </div>
+          </td>
         </tr>
         {% endfor %}
       </tbody>
@@ -6357,16 +6846,38 @@ function showToast(message, opts) {
   }
 }
 async function addUser() {
-  const username = document.getElementById('newUsername').value.trim();
+  const full_name = document.getElementById('newName').value.trim();
+  const email = document.getElementById('newEmail').value.trim();
   const password = document.getElementById('newPassword').value;
   const role = document.getElementById('newRole').value;
-  if (!username || !password) { showToast('Fill in username and password', {error:true}); return; }
+  if (!full_name || !email || !password) { showToast('Fill in the name, company email and a temporary password.', {error:true}); return; }
   const res = await fetch('/api/users', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({username, password, role})});
+    body: JSON.stringify({full_name, email, password, role})});
   const data = await res.json();
   if (!res.ok || data.error) { showToast(data.error || 'Could not add that user.', {error:true}); return; }
-  showToast('User ' + username + ' added.');
+  showToast(full_name + ' added.');
   setTimeout(() => location.reload(), 500);
+}
+function toggleEdit(id) {
+  const r = document.getElementById('e' + id);
+  r.style.display = r.style.display === 'none' ? '' : 'none';
+}
+async function saveUser(id) {
+  const body = {full_name: document.getElementById('en' + id).value.trim(), email: document.getElementById('ee' + id).value.trim()};
+  const pw = document.getElementById('ep' + id).value;
+  if (pw) body.password = pw;
+  const res = await fetch('/api/users/' + id, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) { showToast(data.error || 'Could not save.', {error:true}); return; }
+  showToast('Saved.');
+  setTimeout(() => location.reload(), 500);
+}
+async function reset2fa(id) {
+  const res = await fetch('/api/users/' + id, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({reset_2fa: true})});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) { showToast(data.error || 'Could not reset.', {error:true}); return; }
+  showToast('Two-step reset. They will set it up again at their next sign-in.');
+  setTimeout(() => location.reload(), 900);
 }
 async function delUser(id, username) {
   const res = await fetch('/api/users/' + id, {method:'DELETE'});
@@ -6489,13 +7000,14 @@ HUB_HTML = """
         </span>
       </label>
       {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
-      <span style="padding:6px 4px;">Signed in as <b>{{ username }}</b></span>
+      <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
+      <a href="/account/security">Security</a>
       <a href="/logout">Log out</a>
     </div>
   </div>
 
   <div class="hero">
-    <div class="eyebrow">Compass</div>
+    <div class="eyebrow">Welcome, {{ first_name }}</div>
     <h1>What are you working on?</h1>
     <p>Pick a workspace below. More will show up here as they're added.</p>
   </div>
@@ -6754,7 +7266,7 @@ VESSEL_TRACKER_HTML = """
         </span>
       </label>
       <a href="/do-tracker">DO Tracker</a>
-      <span style="padding:6px 4px;">Signed in as <b>{{ username }}</b></span>
+      <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
   </div>
@@ -7213,7 +7725,7 @@ KPI_HTML = """
       </label>
       <a href="/do-tracker">DO Tracker</a>
       {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
-      <span style="padding:6px 4px;">Signed in as <b>{{ username }}</b></span>
+      <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
   </div>
@@ -7480,7 +7992,7 @@ DIRECT_DELIVERY_HTML = """
       </label>
       <a href="/do-tracker">DO Tracker</a>
       {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
-      <span style="padding:6px 4px;">Signed in as <b>{{ username }}</b></span>
+      <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
   </div>
@@ -7882,7 +8394,7 @@ PDA_HTML = """
       </label>
       <a href="/do-tracker">DO Tracker</a>
       {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
-      <span style="padding:6px 4px;">Signed in as <b>{{ username }}</b></span>
+      <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
   </div>
@@ -8484,7 +8996,7 @@ SOF_HTML = """
       <a href="/pda">Disbursement Accounts</a>
       <a href="/do-tracker">DO Tracker</a>
       {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
-      <span style="padding:6px 4px;">Signed in as <b>{{ username }}</b></span>
+      <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
   </div>
@@ -9855,7 +10367,7 @@ PAGE_HTML = """
         </span>
       </label>
       {% if role == 'admin' %}<a href="/users" data-i18n="manage_users">Manage Users</a>{% endif %}
-      <span class="who"><span class="who-label" data-i18n="signed_in_as">Signed in as</span> <b>{{ username }}</b></span>
+      <span class="who"><span class="who-label" data-i18n="signed_in_as">Signed in as</span> <b>{{ display_name }}</b></span>
       <a href="/logout" data-i18n="log_out">Log out</a>
     </div>
   </div>
