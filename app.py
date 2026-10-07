@@ -26,6 +26,7 @@ import time
 import secrets
 import base64
 import smtplib
+import socket
 import ssl
 from email.message import EmailMessage
 from email.utils import formataddr
@@ -337,6 +338,10 @@ const I18N = {
     err_no_do: "Attach the Delivery Order PDF to email it.",
     err_email_not_configured: "Email isn't set up yet - an admin needs to add the company mailbox.",
     err_send_failed: "The email could not be sent. Check the mailbox settings and try again.",
+    err_email_unreachable: "Couldn't reach the mail server. Check the mail host and port, or whether the hosting plan allows outgoing email.",
+    err_email_auth: "The mailbox rejected the login. Check the mailbox username and password with IT.",
+    err_email_recipient: "The recipient's email address was refused. Check the address and try again.",
+    err_email_timeout: "The email is taking too long, so it was stopped. Nothing was confirmed as sent. Try again in a moment.",
     err_no_phone: "No phone number saved for that contact.",
     contacts_found: " · contact details found for {n}",
     action_contacts: "updated the contact details",
@@ -576,6 +581,10 @@ const I18N = {
     err_no_do: "أرفق ملف أمر التسليم (PDF) لإرساله بالبريد.",
     err_email_not_configured: "لم يتم إعداد البريد بعد - يلزم أن يضيف المسؤول بريد الشركة.",
     err_send_failed: "تعذر إرسال البريد. تحقق من إعدادات البريد وحاول مرة أخرى.",
+    err_email_unreachable: "تعذر الوصول إلى خادم البريد. تحقق من عنوان الخادم والمنفذ، أو من أن خطة الاستضافة تسمح بإرسال البريد.",
+    err_email_auth: "رفض صندوق البريد بيانات الدخول. تحقق من اسم المستخدم وكلمة المرور مع قسم تقنية المعلومات.",
+    err_email_recipient: "تم رفض عنوان البريد الإلكتروني للمستلم. تحقق من العنوان وحاول مرة أخرى.",
+    err_email_timeout: "استغرق إرسال البريد وقتاً طويلاً فتم إيقافه. لم يتأكد إرسال الرسالة. حاول مرة أخرى بعد قليل.",
     err_no_phone: "لا يوجد رقم هاتف محفوظ لجهة الاتصال هذه.",
     contacts_found: " · تم العثور على بيانات اتصال لـ {n}",
     action_contacts: "حدّث بيانات الاتصال",
@@ -1285,15 +1294,25 @@ def send_email(to_addrs, subject, body, attachments=None):
             msg.add_attachment(data, maintype=maintype, subtype=subtype or "octet-stream", filename=fname)
         ctx = ssl.create_default_context()
         if port == 465:
-            with smtplib.SMTP_SSL(host, port, timeout=20, context=ctx) as server:
+            with smtplib.SMTP_SSL(host, port, timeout=12, context=ctx) as server:
                 server.login(user, password)
                 server.send_message(msg, from_addr=sender, to_addrs=to_addrs)
         else:
-            with smtplib.SMTP(host, port, timeout=20) as server:
+            with smtplib.SMTP(host, port, timeout=12) as server:
                 server.starttls(context=ctx)
                 server.login(user, password)
                 server.send_message(msg, from_addr=sender, to_addrs=to_addrs)
         return True, None
+    except smtplib.SMTPAuthenticationError:
+        return False, "auth"
+    except smtplib.SMTPRecipientsRefused:
+        return False, "recipient"
+    except ssl.SSLError as e:
+        return False, f"secure connection failed ({e.reason or e})"
+    except (socket.timeout, TimeoutError, ConnectionError, socket.gaierror, OSError):
+        # Couldn't reach the mail server at all - wrong host/port, or the
+        # hosting plan blocks outgoing mail (Render's free plan does).
+        return False, "unreachable"
     except Exception as e:
         return False, str(e)
 
@@ -4959,7 +4978,8 @@ def notify_email(bl_number):
     fname = att["filename"] or f"DO_{bl_number}.pdf"
     ok, err = send_email(addrs, subject, body, attachments=[(fname, bytes(att["data"]), "application/pdf")])
     if not ok:
-        return jsonify({"error": f"The email could not be sent: {err}", "error_code": "send_failed"}), 502
+        code = {"unreachable": "email_unreachable", "auth": "email_auth", "recipient": "email_recipient"}.get(err, "send_failed")
+        return jsonify({"error": f"The email could not be sent: {err}", "error_code": code}), 502
     _log_audit(bl_number, "notified", "email", "", ", ".join(addrs))
     db.commit()
     return jsonify({"ok": True, "sent_to": addrs})
@@ -10050,7 +10070,7 @@ function showToast(message, opts) {
 }
 
 function naturalCompare(a, b) {
-  const re = /(\d+)|(\D+)/g;
+  const re = /(\\d+)|(\\D+)/g;
   const ax = String(a || '').match(re) || [];
   const bx = String(b || '').match(re) || [];
   const len = Math.max(ax.length, bx.length);
@@ -10594,14 +10614,19 @@ async function emailDo(bl) {
   const btn = document.getElementById('emailDoBtn');
   const label = btn.textContent;
   btn.disabled = true; btn.textContent = t('sending_ellipsis');
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 35000);
   try {
     const res = await apiWrite(`/api/records/${encodeURIComponent(bl)}/notify/email`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({to})
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({to}), signal: ctl.signal
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) { showToast(apiErrorText(data), {duration: 8000}); return; }
+    if (!res.ok) { showToast(apiErrorText(data), {duration: 9000}); return; }
     showToast(t('do_emailed', {to: data.sent_to.join(', ')}));
+  } catch (e) {
+    showToast(t('err_email_timeout'), {duration: 9000});
   } finally {
+    clearTimeout(timer);
     btn.disabled = false; btn.textContent = label;
   }
 }
