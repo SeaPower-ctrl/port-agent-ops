@@ -18,6 +18,8 @@ Then open http://localhost:5000
 
 import os
 import re
+import zipfile
+from urllib.parse import urlparse
 import csv
 import unicodedata
 import html.parser
@@ -708,6 +710,14 @@ SOF_TIMELINE_PAIRS = [
 # Invoice / DO file attachments on a DO Tracker record - kind -> display
 # label, shared between the upload/download routes and the UI.
 ATTACHMENT_KINDS = {"invoice": "Invoice", "do": "Delivery Order"}
+app.config["MAX_CONTENT_LENGTH"] = 40 * 1024 * 1024   # nothing legitimate here is bigger; stops giant uploads early
+
+
+@app.errorhandler(413)
+def _too_big(e):
+    return jsonify({"error": "That file is too large.", "error_code": "too_large"}), 413
+
+
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10MB - comfortably more than a scanned invoice PDF needs
 
 
@@ -1553,6 +1563,23 @@ def _complete_login(user, remember):
 
 
 @app.before_request
+def _same_origin_only():
+    """Browsers always say where a form/fetch came from. A write that claims
+    to come from another website is refused (a second wall behind SameSite)."""
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        src = request.headers.get("Origin") or ""
+        if not src:
+            ref = request.headers.get("Referer") or ""
+            m = re.match(r"^(https?://[^/]+)", ref)
+            src = m.group(1) if m else ""
+        if src and src != "null" and urlparse(src).netloc.lower() != request.host.lower():
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Request refused (it came from another site).", "error_code": "bad_origin"}), 403
+            return "Request refused (it came from another site).", 403
+    return None
+
+
+@app.before_request
 def _session_guards():
     if "user_id" not in session:
         return None
@@ -1650,6 +1677,22 @@ _IDLE_SNIPPET = """<script>
   }, 1000);
 })();
 </script>"""
+
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+    resp.headers.setdefault("Referrer-Policy", "same-origin" if not request.path.startswith("/t/") else "no-referrer")
+    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if os.environ.get("RENDER"):
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    if not request.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-store"
+    if request.path.startswith("/t/"):
+        resp.headers.setdefault("X-Robots-Tag", "noindex, nofollow")
+    return resp
 
 
 @app.after_request
@@ -1761,6 +1804,9 @@ def _record_login_failure(ip, username=""):
         _login_failures_user.setdefault(user_key, []).append(time.time())
 
 
+_DUMMY_HASH = generate_password_hash("not-a-real-password")
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if not any_users_exist():
@@ -1786,6 +1832,8 @@ def login():
             (username, username, username),
         ).fetchall()
         user = next((u for u in candidates if check_password_hash(u["password_hash"], password)), None)
+        if not candidates:
+            check_password_hash(_DUMMY_HASH, password)   # same work for unknown names, so timing doesn't reveal who has an account
         if user:
             remember = bool(request.form.get("remember"))
             if user["totp_enabled"]:
@@ -3217,6 +3265,13 @@ def read_manifest(raw, filename):
     when no B/L column could be found. Raises for a file that can't be
     opened at all (corrupt / password-protected / unsupported)."""
     name = (filename or "").lower()
+    if raw[:2] == b"PK":   # xlsx/docx are zip files: refuse ones that swell to an absurd size when opened
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                if sum(i.file_size for i in z.infolist()) > 300 * 1024 * 1024 or len(z.infolist()) > 5000:
+                    raise ValueError("archive too large when unpacked")
+        except zipfile.BadZipFile:
+            pass
     tables, text = [], ""
     if name.endswith(".csv"):
         text_csv = _mf_decode_csv(raw)
