@@ -745,6 +745,7 @@ def _content_disposition(filename, fallback="download"):
 def init_db():
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
+    cur.execute("SELECT pg_advisory_lock(7105002)")  # only one starter-upper at a time; released when the connection closes
     cur.execute(
         """CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -6395,7 +6396,10 @@ def _pda_new_doc_row(db, fields, created_by):
     now = datetime.utcnow()
     yy = now.strftime("%y")
     cols = list(fields.keys())
-    for _ in range(6):
+    for _attempt in range(25):
+        # One at a time: the lock is held until this request commits, so two people
+        # creating in the same second can never be given the same number.
+        db.execute("SELECT pg_advisory_xact_lock(7105001)")
         no = _pda_next_no(db, yy)
         try:
             row = db.execute(
@@ -6406,6 +6410,7 @@ def _pda_new_doc_row(db, fields, created_by):
             return row
         except psycopg2.errors.UniqueViolation:
             db.conn.rollback()
+            time.sleep(0.02 + 0.03 * (_attempt % 5))
     raise RuntimeError("could not allocate a PDA number")
 
 
@@ -14221,6 +14226,13 @@ setInterval(fetchRecords, 4000);
 </body>
 </html>
 """
+
+if __name__ != "__main__":
+    # Started by a production server (gunicorn app:app): set the tables up on start.
+    try:
+        init_db()
+    except Exception as _e:
+        print("init_db failed:", _e)
 
 if __name__ == "__main__":
     init_db()
