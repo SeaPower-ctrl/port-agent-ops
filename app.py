@@ -958,8 +958,22 @@ def init_db():
         ("eta", "TEXT DEFAULT ''"), ("receiver", "TEXT DEFAULT ''"), ("cargo_type", "TEXT DEFAULT ''"), ("cargo_note", "TEXT DEFAULT ''"),
         ("updated_at", "TEXT DEFAULT ''"), ("port_stay", "NUMERIC"), ("cargo_frt", "NUMERIC"), ("cargo_units", "NUMERIC"),
         ("grt", "NUMERIC"), ("nrt", "NUMERIC"), ("dwt", "NUMERIC"), ("fx_rate", "NUMERIC DEFAULT 3.75"),
+        # quotation-style fields (service type, payment, validity, pricing person, optional sections ...)
+        ("service_type", "TEXT DEFAULT ''"), ("lead_no", "TEXT DEFAULT ''"), ("payment_type", "TEXT DEFAULT ''"),
+        ("entry_date", "TEXT DEFAULT ''"), ("validity_date", "TEXT DEFAULT ''"), ("pricing_person", "TEXT DEFAULT ''"),
+        ("cargo_insurance", "TEXT DEFAULT ''"), ("remarks", "TEXT DEFAULT ''"),
+        ("sailing_schedule", "TEXT DEFAULT ''"), ("terms", "TEXT DEFAULT ''"),
     ):
         cur.execute(f"ALTER TABLE pda_documents ADD COLUMN IF NOT EXISTS {_col} {_ddl}")
+    # master list of charge names (the searchable "Charge Description" list); admins can add to it
+    cur.execute("CREATE TABLE IF NOT EXISTS pda_charge_catalog (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL)")
+    cur.execute("SELECT COUNT(*) FROM pda_charge_catalog")
+    _n_catalog = cur.fetchone()[0]
+    cur.execute("SELECT 1 FROM app_settings WHERE key = 'pda_catalog_seeded'")
+    if _n_catalog == 0 and not cur.fetchone():
+        for _nm in PDA_CATALOG_SEED:
+            cur.execute("INSERT INTO pda_charge_catalog (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (_nm,))
+        cur.execute("INSERT INTO app_settings (key, value) VALUES ('pda_catalog_seeded', '1') ON CONFLICT (key) DO NOTHING")
     for _col, _ddl in (
         ("group_name", "TEXT DEFAULT 'Port Charges'"), ("unit", "TEXT DEFAULT 'PER SHIPMENT'"), ("currency", "TEXT DEFAULT 'SAR'"),
         ("rate", "NUMERIC"), ("qty", "NUMERIC DEFAULT 1"), ("qty_basis", "TEXT DEFAULT 'fixed'"),
@@ -1157,7 +1171,7 @@ def build_pda_pdf(doc, items, _pda_calc=None, letterhead="", banks=""):
     rows = [("File Date", doc.get("file_date") or (doc.get("created_at") or "")[:10]), ("Sales Mngr / Exec", doc.get("sales_exec") or "-"),
             ("Tel / Mob #", doc.get("sales_phone") or ""), ("Email", doc.get("sales_email") or "")]
     try:
-        rows[0] = ("File Date", datetime.strptime((doc.get("created_at") or "")[:10], "%Y-%m-%d").strftime("%d-%b-%Y"))
+        rows[0] = ("File Date", datetime.strptime((doc.get("entry_date") or (doc.get("created_at") or ""))[:10], "%Y-%m-%d").strftime("%d-%b-%Y"))
     except ValueError:
         pass
     for i, (k, v) in enumerate(rows):
@@ -1204,6 +1218,8 @@ def build_pda_pdf(doc, items, _pda_calc=None, letterhead="", banks=""):
         cargo += "\n" + _pda_num(doc["cargo_units"], 0) + " units"
     if doc.get("cargo_note"):
         cargo += "\n" + doc["cargo_note"]
+    if doc.get("cargo_insurance"):
+        cargo += "\nCARGO INSURANCE REQUIRED"
     vt = [("Load Type", doc.get("load_type") or ""), ("Term", doc.get("term") or ""),
           ("Trade", doc.get("trade") or ""), ("Port Stay", (f"{float(stay):g} DAYS") if stay else ""),
           ("Origin", doc.get("operation") or ""), ("ETA", eta_txt), ("Receiver", doc.get("receiver") or "")]
@@ -1335,10 +1351,15 @@ def build_pda_pdf(doc, items, _pda_calc=None, letterhead="", banks=""):
         txt(L + 100, y + 2.5, W - 100, 5, "USD " + _pda_num(tot["est_usd"]), 10, "B", NAVY, "R")
         txt(L + 100, y + 7.5, W - 100, 5, "SAR " + _pda_num(tot["est_sar"]), 10, "B", NAVY, "R")
     y += 15
-    txt(L, y, W, 4, f"SAR amounts at an exchange rate of 1 USD = {calc['fx']:g} SAR.", 7, "", GREY)
+    fx_line = f"SAR amounts at an exchange rate of 1 USD = {calc['fx']:g} SAR."
+    try:
+        fx_line += "   Valid until " + datetime.strptime(doc.get("validity_date") or "", "%Y-%m-%d").strftime("%d-%b-%Y") + "."
+    except ValueError:
+        pass
+    txt(L, y, W, 4, fx_line, 7, "", GREY)
     y += 8
 
-    # ---- notes + bank details
+    # ---- notes, sailing schedule, terms + bank details
     notes = str(doc.get("notes") or "").strip()
     bank_lines = [ln for ln in str(banks or "").replace("\r", "").split("\n")]
     need = 8 + (len(lines_for(notes, W, 8)) * 4 if notes else 0) + (len(bank_lines) * 4 + 10 if banks else 0)
@@ -1347,6 +1368,18 @@ def build_pda_pdf(doc, items, _pda_calc=None, letterhead="", banks=""):
     y += 6
     if notes:
         for ln in lines_for(notes, W, 8):
+            y = ensure(y, 5)
+            txt(L, y, W, 4, ln, 8)
+            y += 4
+        y += 3
+    for title, key in (("Sailing Schedule:", "sailing_schedule"), ("Terms & Conditions:", "terms")):
+        body = str(doc.get(key) or "").strip()
+        if not body:
+            continue
+        y = ensure(y, 14)
+        txt(L, y, W, 5, title, 9, "B")
+        y += 6
+        for ln in lines_for(body, W, 8):
             y = ensure(y, 5)
             txt(L, y, W, 4, ln, 8)
             y += 4
@@ -6174,6 +6207,52 @@ PDA_PORT_INFO = {
 PDA_BASES = ("fixed", "days", "frt", "grt", "manual")
 PDA_CURRENCIES = ("USD", "SAR")
 PDA_DEFAULT_FX = 3.75
+PDA_GROUPS = ["Port Charges", "Menas Light Due", "Freight Tax", "Operational Expenses", "Agency Charges", "Owner Expenses"]
+PDA_UNITS = ["PER BAG", "PER BL", "PER CBM", "PER DAY", "PER FRT", "PER GRT", "PER HEAD", "PER HOUR", "PER MT", "PER SHIPMENT", "PER UNIT"]
+PDA_LOAD_TYPES = ["Sea FVL", "Break Bulk", "Live Stock", "Bunker Call", "Cars"]
+PDA_INCO_TERMS = ["FREE IN", "FREE OUT", "LINER IN", "LINER OUT"]
+PDA_SERVICE_TYPES = ["Freight Forwarding", "Ship Agency"]
+PDA_PAYMENT_TYPES = ["Cash", "Credit"]
+PDA_VALIDITY_DAYS = 8
+PDA_CATALOG_SEED = [
+    "24 HRS VSL-PORT/CUSTOMS/C.GUARD/LIAISON", "ADDITIONAL AGENCY SERVICES", "ADDITIONAL CHARGES", "ADDITIONAL OCEAN FREIGHT CHARGES",
+    "ADDITIONAL SERVICE CHARGE FOR DANGEROUS GOODS", "ADDITIONAL TRANSPORTATION CHARGES", "AGENCY FEES",
+    "AIRWAY BILL & TRANSPORTATION CHARGES", "AMBULANCE CHARGES", "AMENDMENT CHARGES", "ANCH. DUES",
+    "FORKLIFT CHARGES", "FORKLIFT LESS THAN 06 TONS", "FREIGHT TAX", "FREIGHT (ZAKAT TAX FILLING/EXEMPTION FILLING)",
+    "FRESH WATER SUPPLY", "FUEL SUPPLY CHARGES", "FUMIGANT MATERIAL DISPOSAL", "FUMIGATION CHARGES", "GARBAGE BARGE CHARGES",
+    "GARBAGE COLLECTION DUES", "GARBAGE DISPOSAL CHARGES", "GARBAGE TUG BOAT", "GATE HANDLING CHARGES", "GATE PASS CHARGES",
+    "GENERAL EXPENSES", "GOTTWALD CRANE 100 TONS", "GOTTWALD CRANE 30 TONS LESS THAN 90 TONS", "GOTTWALD CRANE CHARGES",
+    "GRABS HIRING CHARGES", "HATCH SEALING CHARGES", "HOLDS CLEANING", "HOOPER HIRING CHARGES", "HOSPITAL CHARGES",
+    "HOT WORK PERMIT CHARGES", "HOTEL CHARGES", "IDLE GANG CHARGES", "IMMIGRATION CHARGES", "INITIAL & FINAL DRAFT SURVEYS",
+    "INSPECTION CHARGES", "INSURANCE CHARGES", "INVOICE CANCELLATION CHARGES", "LIBER CRANE 100 TONS", "LIBER CRANE 80 TONS",
+    "LIFE RAFTS SUPPLY", "LIFT ON / LIFT OFF CHARGES", "LIFTING GEAR CHARGES", "LOCAL HANDLING CHARGES", "LOWBED TRUCK",
+    "LOWERING LIFE BOAT", "MAINTENANCE CHARGES", "MANIFEST AMENDMENT CHARGES", "MANIFEST/DOC. TRANSLATION", "MARINE CRAFTS CHARGES",
+    "MATERIAL PASS ( ENTRY & EXIT )", "MATERIAL PASS ENTRY", "MATERIAL PASS EXIT", "MATERIAL SUPPLY CHARGES", "MEDICAL TEST / PCR TEST",
+    "MENAS LIGHT DUES AS PER TARIFF", "MGO SUPPLY", "MOBILE RECHARGE", "MOBILIZATION & DEMOBILIZATION", "MOH PENALTY",
+    "MOORING BOAT CREW / MOVE", "MOORING BOATS /HRS.", "NYLON/ROPE SLINGS", "OCEAN FREIGHT CHARGES",
+    "OFF HIRE BUNKER & CONDITION SURVEY", "OFF HIRE BUNKER SURVEY", "ON HIRE BUNKER AND CONDITION SURVEY", "ON HIRE BUNKER SURVEY",
+    "OPERATION EXPENSES", "OTHER PILOTAGE", "OVERSEAS COMMUNICATIONS", "OWNERS PARTIAL OF D.A AS ADVISED BY CHARTERERS",
+    "PARTIAL DELIVERY", "PAY LOADER CHARGES", "PEST CONTROL SERVICE", "PILOTAGE SERVICES / MOVES", "PORT DUES", "PORT ENTRY PASS",
+    "PORT EXPENSES", "PORT MEDICAL CHARGES", "PORT PASS CHARGES", "PORT PENALTY", "PORT SERVICE CHARGE", "PRE FABRICATED HOMES",
+    "PRE-FABRICATED HOMES LESS THAN 20 FEET", "PRE-FABRICATED HOMES OVER 20 FEET", "PROVISION SUPPLY", "QUARANTINE FEE",
+    "RE-BUNDLING CHARGES", "RECOUPING CHARGES", "REPAIR CHARGES", "REPAIRING CHARGES", "RESTOW CHARGES", "RIGGERS CHARGES",
+    "ROAD TRANSPORT", "RUBBER PADS", "SAFETY EQUIPMENTS", "SEAPA CHARGES", "SERVICE CHARGES", "SEWAGE DISPOSAL CHARGES",
+    "SHACKLES", "SHACKLES MORE THAN 20 TONS", "SHACKLES UPTO 10 TONS", "SHACKLES UPTO 20 TONS", "SHACKLES UPTO 5 TONS",
+    "SHIFTING CHARGES", "SHORE CRANE CHARGES", "SIM CARD PURCHASE CHARGES", "SLINGS", "SLUDGE DISPOSAL CHARGES",
+    "SPARE SHIPMENT CHARGES", "SPARES DELIVERY CHARGES", "SPREADER 20 FEET", "SPREADER 30 FEET", "SPREADER 40 FEET",
+    "SPREADER HIRING CHARGES", "SSEC RENEWAL CHARGES", "STATIONERY/POSTAGE/PETTIES", "STEVEDORING CHARGES", "STEVEDORING COMMISSION",
+    "STORAGE CHARGES", "STOWAWAY CHARGES", "SUEZ CANAL CERTIFICATE CHARGES", "SUEZ REBATE CERTIFICATE CHARGES", "SUPERVISION FEE",
+    "SUPPORT SERVICES", "SURVEY & INSPECTION CHARGES", "SURVEYOR/TECHNICIAN/HANDLING CHARGES", "SWITCH BL CHARGES", "TALLY SURVEY",
+    "TARPAULIN FIXING COST", "TERMINAL STORAGE CHARGES", "THURAYA SATELLITE PHONE", "TICKET CHARGES", "TRAILER HIRING CHARGE",
+    "TRAILER LESS THAN 40", "TRAILERS 20 FEET", "TRAILERS 40 FEET", "TRAILERS LESS THAN 20 FEET", "TRAILERS OVER 20 FEET",
+    "TRAILERS OVER 40 FEET", "TRANSLATION CHARGES", "TRANSPORT DELAY CHARGES", "TRANSPORTATION CHARGES", "TRANSSHIPMENT CHARGES",
+    "TUG HIRES", "TUG LINE CHARGES", "TUG/PILOTAGE/MOORING/UN-MOORING (IN & OUT)", "UNDER ACCOUNT", "UNITS LESS THAN 03 TONS",
+    "UNITS OVER 03 TONS UPTO 10 TONS", "UNITS OVER 10 TONS UPTO 40 TONS", "UNITS OVER 40 TONS", "UNLASHING CHARGES",
+    "VEHICLE DISCHARGE CHARGES", "VIRUS CERTIFICATE", "VISA INVITATION CHARGES", "WELDING CHARGES", "WIRE", "WIRE SLINGS 06 TONS",
+    "WIRE SLINGS 10 TONS", "WIRE SLINGS 2.5 TONS", "WIRE SLINGS 4.5 TONS", "WIRE SLINGS OVER 10 TONS",
+    # charges from Sea Power's own port tariff
+    "ARRIVAL/DEPARTURE DUES", "BERTH HIRE", "DOCUMENTATION FOR NATIONAL SECURITY", "ESTIMATED FORKLIFT CHARGES",
+]
 PDA_DEFAULT_LETTERHEAD = (
     "International Economy Tower 3rd Floor,\nAl Baghdadiya District,\nJeddah 22231, Saudi Arabia\n"
     "Tel: 966-12-6482045 & 27\nEmail: ops@seapower.com.sa\nC.R. No: 4030175080  License No. 522912-0019"
@@ -6182,7 +6261,10 @@ PDA_TEXT_FIELDS = (
     "port", "vessel", "reference", "currency", "notes", "load_port", "load_code", "dis_port", "dis_code",
     "customer_name", "customer_address", "customer_phone", "customer_email", "sales_exec", "sales_phone",
     "sales_email", "load_type", "term", "trade", "operation", "eta", "receiver", "cargo_type", "cargo_note",
+    "service_type", "lead_no", "payment_type", "entry_date", "validity_date", "pricing_person", "cargo_insurance",
+    "remarks", "sailing_schedule", "terms",
 )
+PDA_LONG_TEXT = ("notes", "cargo_note", "customer_address", "sailing_schedule", "terms")
 PDA_NUM_FIELDS = ("port_stay", "cargo_frt", "cargo_units", "grt", "nrt", "dwt", "fx_rate")
 PDA_DOC_NUMERIC = PDA_NUM_FIELDS
 PDA_ITEM_NUMERIC = ["estimated_amount", "actual_amount", "rate", "qty"]
@@ -6347,7 +6429,15 @@ def _pda_validated_doc_fields(data, existing=None):
     for k in PDA_TEXT_FIELDS:
         if k in data:
             v = data.get(k)
-            out[k] = _pda_clean_text(v, 4000 if k in ("notes", "cargo_note", "customer_address") else 300)
+            out[k] = _pda_clean_text(v, 4000 if k in PDA_LONG_TEXT else 300)
+    for k in ("entry_date", "validity_date"):
+        if out.get(k):
+            try:
+                datetime.strptime(out[k], "%Y-%m-%d")
+            except ValueError:
+                return None, f"{k.replace('_', ' ').title()} must be a valid date."
+    if "cargo_insurance" in out:
+        out["cargo_insurance"] = "1" if out["cargo_insurance"] in ("1", "true", "True", "yes") else ""
     for k in PDA_NUM_FIELDS:
         if k in data:
             raw = data.get(k)
@@ -6381,7 +6471,66 @@ def get_pda_settings():
         "next_number": _pda_next_no(get_db(), datetime.utcnow().strftime("%y")),
         "ports": {k: {"name": v[0], "code": v[1]} for k, v in PDA_PORT_INFO.items()},
         "is_admin": session.get("role") == "admin",
+        "pricing_people": get_setting("pda_pricing_people", ""),
     })
+
+
+def _pda_people(db):
+    names = []
+    for r in db.execute("SELECT full_name, username FROM users ORDER BY LOWER(COALESCE(NULLIF(full_name, ''), username))").fetchall():
+        n = (r["full_name"] or r["username"] or "").strip()
+        if n and n not in names:
+            names.append(n)
+    return names
+
+
+@app.route("/api/pda/lookups", methods=["GET"])
+@login_required
+def pda_lookups():
+    """Everything the quotation form's dropdowns need in one call: fixed lists, the charge catalogue,
+    staff names and - so a picked charge can fill itself in - the rate card of every port."""
+    db = get_db()
+    rates, names = {}, set(r["name"] for r in db.execute("SELECT name FROM pda_charge_catalog").fetchall())
+    for t in db.execute("SELECT * FROM pda_templates ORDER BY port, sort_order, id").fetchall():
+        rates.setdefault(t["port"], {})[t["name"].upper()] = {
+            "group_name": t["group_name"], "unit": t["unit"], "currency": t["currency"], "rate": _pf(t["default_amount"]),
+            "qty_basis": t["qty_basis"], "qty": _pf(t["default_qty"], 1.0)}
+        names.add(t["name"])
+    people = _pda_people(db)
+    pricing = [x.strip() for x in get_setting("pda_pricing_people", "").splitlines() if x.strip()]
+    for n in people:
+        if n not in pricing:
+            pricing.append(n)
+    return jsonify({
+        "groups": PDA_GROUPS, "units": PDA_UNITS, "load_types": PDA_LOAD_TYPES, "inco_terms": PDA_INCO_TERMS,
+        "service_types": PDA_SERVICE_TYPES, "payment_types": PDA_PAYMENT_TYPES, "validity_days": PDA_VALIDITY_DAYS,
+        "catalog": sorted(names, key=lambda s: s.upper()), "sales_people": people, "pricing_people": pricing, "rates": rates,
+        "branch": get_setting("pda_branch", "SEA POWER FOR MARINE SERVICES LTD CO."),
+    })
+
+
+@app.route("/api/pda/catalog", methods=["POST"])
+@login_required
+@admin_required
+def add_pda_catalog_name():
+    name = re.sub(r"\s+", " ", _pda_clean_text((request.get_json(force=True) or {}).get("name"), 200)).upper()
+    if not name:
+        return jsonify({"error": "Enter a charge name."}), 400
+    db = get_db()
+    db.execute("INSERT INTO pda_charge_catalog (name) VALUES (?) ON CONFLICT (name) DO NOTHING", (name,))
+    db.commit()
+    return jsonify({"ok": True, "name": name})
+
+
+@app.route("/api/pda/catalog/delete", methods=["POST"])
+@login_required
+@admin_required
+def delete_pda_catalog_name():
+    name = _pda_clean_text((request.get_json(force=True) or {}).get("name"), 200)
+    db = get_db()
+    db.execute("DELETE FROM pda_charge_catalog WHERE name = ?", (name,))
+    db.commit()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/pda/settings", methods=["POST"])
@@ -6404,6 +6553,8 @@ def update_pda_settings():
         set_setting("pda_letterhead", _pda_clean_text(data.get("letterhead"), 600))
     if "banks" in data:
         set_setting("pda_banks", _pda_clean_text(data.get("banks"), 2000))
+    if "pricing_people" in data:
+        set_setting("pda_pricing_people", "\n".join(x.strip()[:80] for x in str(data.get("pricing_people") or "").splitlines() if x.strip())[:4000])
     if "fx" in data:
         fx = _pf(data.get("fx"), 0)
         if fx <= 0 or fx > 1000:
@@ -6559,7 +6710,13 @@ def create_pda_document():
     db = get_db()
     me = db.execute("SELECT full_name, email, username FROM users WHERE id = ?", (session.get("user_id"),)).fetchone()
     pname, pcode = PDA_PORT_INFO.get(port, (port, ""))
-    fields["currency"] = "USD"
+    if fields.get("currency") not in PDA_CURRENCIES or "currency" not in data:
+        fields["currency"] = "SAR"
+    today = datetime.utcnow()
+    fields.setdefault("entry_date", today.strftime("%Y-%m-%d"))
+    fields.setdefault("validity_date", (today + timedelta(days=PDA_VALIDITY_DAYS)).strftime("%Y-%m-%d"))
+    fields.setdefault("service_type", PDA_SERVICE_TYPES[0])
+    fields.setdefault("payment_type", PDA_PAYMENT_TYPES[0])
     fields.setdefault("dis_port", pname)
     fields.setdefault("dis_code", pcode)
     if not fields.get("dis_port"):
@@ -6672,7 +6829,10 @@ def duplicate_pda_document(pda_id):
     copy_fields = [k for k in PDA_TEXT_FIELDS if k not in ("notes",)] + list(PDA_NUM_FIELDS)
     fields = {k: src[k] for k in copy_fields}
     fields["notes"] = src["notes"] or ""
-    fields["currency"] = src["currency"] or "USD"
+    fields["currency"] = src["currency"] or "SAR"
+    today = datetime.utcnow()
+    fields["entry_date"] = today.strftime("%Y-%m-%d")
+    fields["validity_date"] = (today + timedelta(days=PDA_VALIDITY_DAYS)).strftime("%Y-%m-%d")
     try:
         doc = _pda_new_doc_row(db, fields, session.get("username"))
         for it in db.execute("SELECT * FROM pda_line_items WHERE pda_id = ? ORDER BY sort_order, id", (pda_id,)).fetchall():
@@ -6756,17 +6916,25 @@ def add_pda_line_item(pda_id):
     doc = _pda_get(db, pda_id)
     if not doc:
         return jsonify({"error": "Not found."}), 404
+    basis = data.get("qty_basis") if data.get("qty_basis") in PDA_BASES else "fixed"
+    auto = _pda_auto_qty(basis, doc)
+    qty_given = data.get("qty") not in (None, "")
     base = {"name": data.get("name") or "New charge", "group_name": data.get("group_name") or "Port Charges",
-            "unit": data.get("unit") or "PER SHIPMENT", "currency": data.get("currency") or "USD",
-            "rate": data.get("rate", 0), "qty": data.get("qty", 1)}
+            "unit": data.get("unit") or "PER SHIPMENT", "currency": data.get("currency") or doc["currency"] or "SAR",
+            "rate": data.get("rate") if data.get("rate") not in (None, "") else 0,
+            "qty": data.get("qty") if qty_given else (auto if auto is not None else 1),
+            "remarks": data.get("remarks") or ""}
     ch, err = _pda_item_fields(base, None)
     if err:
         return jsonify({"error": err}), 400
+    # a quantity that follows the call (port stay / FRT / GRT) stays automatic unless the person typed one
+    manual = 1 if (qty_given and (auto is None or abs(_pf(ch["qty"]) - auto) > 1e-9)) else 0
     order_row = db.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM pda_line_items WHERE pda_id = ?", (pda_id,)).fetchone()
     db.execute(
         """INSERT INTO pda_line_items (pda_id, name, estimated_amount, sort_order, group_name, unit, currency, rate, qty, qty_basis, qty_manual, remarks)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'fixed', 0, '')""",
-        (pda_id, ch["name"], round(ch["rate"] * ch["qty"], 2), order_row["n"], ch["group_name"], ch["unit"], ch["currency"], ch["rate"], ch["qty"]),
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (pda_id, ch["name"], round(ch["rate"] * ch["qty"], 2), order_row["n"], ch["group_name"], ch["unit"], ch["currency"],
+         ch["rate"], ch["qty"], basis, 0 if auto is None else manual, ch.get("remarks", "")),
     )
     db.commit()
     return jsonify({"ok": True, **_pda_payload(db, doc)})
@@ -9378,6 +9546,59 @@ PDA_HTML = """
   .tpl-table td input, .tpl-table td select { padding: 6px 7px; font-size: 12.5px; }
   .tpl-table th { white-space: nowrap; }
   textarea.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; min-height: 120px; }
+
+  /* ---- quotation-style form (Sales Quotation layout) ---- */
+  .qhead { display: grid; grid-template-columns: 150px 1fr 1fr auto; gap: 12px 14px; align-items: end; padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
+  .qh-note { text-transform: none; font-weight: 500; letter-spacing: 0; }
+  .qh-save { text-align: right; min-width: 120px; }
+  .save-state { font-size: 12px; color: var(--ok); font-weight: 600; }
+  .save-state.err { color: var(--danger); }
+  .qrow { margin-bottom: 4px; }
+  .sec-bar { background: var(--bg); border-radius: 8px; padding: 9px 12px; font-size: 13px; font-weight: 700; margin: 18px 0 14px; }
+  .cust-wrap { display: grid; grid-template-columns: 1fr 34px; gap: 6px; }
+  .plus-btn { background: var(--ok-bg); color: var(--ok); border: 1px solid var(--border); border-radius: 9px; font-size: 20px; line-height: 1; cursor: pointer; font-weight: 700; }
+  .plus-btn:hover { background: var(--ok); color: #fff; }
+  .unit-wrap { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; }
+  .unit-wrap span { font-size: 11px; font-weight: 700; color: var(--muted); letter-spacing: .04em; }
+  .ins-cell { display: flex; align-items: flex-end; padding-bottom: 8px; }
+  .tgl { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; font-size: 13.5px; user-select: none; }
+  .tgl input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .tgl-track { width: 34px; height: 18px; border-radius: 999px; background: var(--border); position: relative; transition: background .2s ease; flex: none; }
+  .tgl-knob { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.3); transition: transform .2s ease; }
+  .tgl input:checked + .tgl-track { background: var(--ok); }
+  .tgl input:checked + .tgl-track .tgl-knob { transform: translateX(16px); }
+  .tgl input:focus-visible + .tgl-track { outline: 2px solid var(--navy-light); outline-offset: 2px; }
+  .tgl-sections { margin-top: 18px; border-top: 1px solid var(--border); }
+  .tgl-sec { padding: 14px 0; border-bottom: 1px solid var(--border); }
+  .tgl-sec textarea { margin-top: 10px; min-height: 80px; }
+  .save-bar { margin-top: 16px; }
+  .btn.ok { background: var(--ok); }
+  .btn.ok:hover { background: color-mix(in srgb, var(--ok) 80%, #000); }
+  .add-grid { display: grid; grid-template-columns: 170px minmax(240px, 1.6fr) 150px 86px 100px 84px minmax(120px, 1fr) 70px; gap: 8px; min-width: 1000px; align-items: center; }
+  .add-head { background: var(--navy); color: #fff; border-radius: 8px; padding: 8px 8px; font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  :root[data-theme="dark"] .add-head { background: var(--navy-deep); }
+  .add-head .r { text-align: right; }
+  .add-row { padding: 10px 8px 4px; }
+  .add-row select, .add-row input { padding: 8px 9px; font-size: 13px; }
+  .add-row input.r { text-align: right; }
+  .add-hint { min-height: 18px; font-size: 11.5px; color: var(--muted); padding: 2px 8px 0; min-width: 980px; }
+  .cbox { position: relative; }
+  .cbox-btn { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); color: var(--text); font-size: 13px; font-family: inherit; cursor: pointer; text-align: left; }
+  .cbox-btn span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cbox-btn .ph { color: var(--muted); }
+  .cbox-btn .caret { color: var(--muted); font-size: 11px; flex: none; }
+  .cbox-panel { display: none; position: fixed; z-index: 400; left: 0; top: 0; width: 420px; max-width: calc(100vw - 16px); background: var(--card); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow-md); padding: 8px; }
+  .cbox-panel.open { display: block; }
+  .cbox-list { max-height: 230px; overflow-y: auto; margin-top: 6px; }
+  .cbox-item { padding: 7px 10px; font-size: 13px; border-radius: 7px; cursor: pointer; }
+  .cbox-item.hi { background: var(--navy-light); color: #fff; }
+  .cbox-item.custom { font-style: italic; }
+  .cbox-empty { padding: 10px; font-size: 12.5px; color: var(--muted); }
+  @media (max-width: 700px) { .qhead { grid-template-columns: 1fr 1fr; } }
+  .cat-add { display: flex; gap: 8px; }
+  .cat-list { max-height: 260px; overflow-y: auto; margin-top: 8px; border: 1px solid var(--border); border-radius: 10px; }
+  .cat-row { display: flex; justify-content: space-between; align-items: center; padding: 5px 10px; font-size: 12.5px; border-bottom: 1px solid var(--border); }
+  .cat-row:last-child { border-bottom: none; }
   table.chg { table-layout: fixed; min-width: 1040px; }
   .modal .panel-sub { font-size: 12px; color: var(--muted); }
   .tpl-table { table-layout: fixed; }
@@ -9486,19 +9707,33 @@ PDA_HTML = """
     </div>
 
     <div class="panel">
-      <div class="sec-title">Customer &amp; contact</div>
-      <div class="fgrid">
-        <div class="wide"><label class="field-label">Customer</label><input type="text" data-f="customer_name" list="custList" onchange="saveField(this)" autocomplete="off"></div>
-        <div><label class="field-label">Customer email</label><input type="text" data-f="customer_email" onchange="saveField(this)" placeholder="name@company.com"></div>
-        <div><label class="field-label">Customer phone</label><input type="text" data-f="customer_phone" onchange="saveField(this)"></div>
-        <div class="full"><label class="field-label">Customer address</label><textarea data-f="customer_address" onchange="saveField(this)" style="min-height:48px;"></textarea></div>
-        <div><label class="field-label">Sales Mngr / Exec</label><input type="text" data-f="sales_exec" onchange="saveField(this)"></div>
-        <div><label class="field-label">Tel / Mob #</label><input type="text" data-f="sales_phone" onchange="saveField(this)"></div>
-        <div><label class="field-label">Our email on the PDA</label><input type="text" data-f="sales_email" onchange="saveField(this)"></div>
+      <div class="qhead">
+        <div class="qh-cell"><label class="field-label">Currency <span class="qh-note">(new charges)</span></label>
+          <select data-f="currency" onchange="saveField(this)"><option value="SAR">SAR</option><option value="USD">USD</option></select></div>
+        <div class="qh-cell"><label class="field-label">Lead No</label><input type="text" data-f="lead_no" onchange="saveField(this)"></div>
+        <div class="qh-cell"><label class="field-label">Agent Quote Reference</label><input type="text" data-f="reference" onchange="saveField(this)"></div>
+        <div class="qh-save"><span class="save-state" id="saveState"></span></div>
       </div>
 
-      <div class="sec-title">Voyage</div>
-      <div class="fgrid">
+      <div class="fgrid qrow">
+        <div><label class="field-label">Branch</label><input type="text" id="branchTxt" readonly></div>
+        <div class="cust-cell"><label class="field-label">Customer</label>
+          <div class="cust-wrap"><input type="text" data-f="customer_name" list="custList" onchange="saveField(this)" autocomplete="off" placeholder="Type or pick a customer">
+            <button type="button" class="plus-btn" title="Customer address, phone and email" onclick="openCust()">+</button></div></div>
+        <div><label class="field-label">Sales Person</label><select data-f="sales_exec" data-opts="sales_people" data-blank="Sales Person" onchange="saveField(this)"></select></div>
+        <div><label class="field-label">Payment</label><select data-f="payment_type" data-opts="payment_types" onchange="saveField(this)"></select></div>
+        <div><label class="field-label">Entry Date</label><input type="date" data-f="entry_date" onchange="saveField(this)"></div>
+        <div><label class="field-label">Validity Date</label><input type="date" data-f="validity_date" onchange="saveField(this)"></div>
+      </div>
+
+      <div class="sec-bar">Shipment Details</div>
+      <div class="fgrid qrow">
+        <div><label class="field-label">Service Type</label><select data-f="service_type" data-opts="service_types" onchange="saveField(this)"></select></div>
+        <div><label class="field-label">Load Type</label><select data-f="load_type" data-opts="load_types" data-blank="Load Type" onchange="saveField(this)"></select></div>
+        <div><label class="field-label">Inco Terms</label><select data-f="term" data-opts="inco_terms" data-blank="Inco Terms" onchange="saveField(this)"></select></div>
+        <div><label class="field-label">Trade</label>
+          <select data-f="trade" onchange="saveField(this)"><option value="IMPORT">IMPORT</option><option value="EXPORT">EXPORT</option><option value="TRANSHIPMENT">TRANSHIPMENT</option></select></div>
+        <div><label class="field-label">Port Stay</label><div class="unit-wrap"><input type="number" min="0" step="any" data-f="port_stay" onchange="saveField(this)"><span>DAYS</span></div></div>
         <div><label class="field-label">Port of call (rate card)</label>
           <select data-f="port" onchange="saveField(this)">
             <option value="DAMMAM PORT">Dammam Port</option>
@@ -9508,44 +9743,81 @@ PDA_HTML = """
             <option value="YANBU INDUSTRIAL PORT">Yanbu Industrial Port</option>
             <option value="KAP">KAP</option>
           </select></div>
-        <div class="wide"><label class="field-label">Port of loading (From)</label><div class="pair"><input type="text" data-f="load_port" onchange="saveField(this)" placeholder="LIANYUNGANG"><input type="text" data-f="load_code" onchange="saveField(this)" placeholder="CNLYG"></div></div>
-        <div class="wide"><label class="field-label">Port of discharge (To)</label><div class="pair"><input type="text" data-f="dis_port" onchange="saveField(this)"><input type="text" data-f="dis_code" onchange="saveField(this)" placeholder="SAYNB"></div></div>
-        <div><label class="field-label">ETA</label><input type="date" data-f="eta" onchange="saveField(this)"></div>
-        <div><label class="field-label">Port stay (days)</label><input type="number" min="0" step="any" data-f="port_stay" onchange="saveField(this)"><div class="hint">Per-day charges follow this.</div></div>
-        <div><label class="field-label">Trade</label>
-          <select data-f="trade" onchange="saveField(this)"><option value="IMPORT">IMPORT</option><option value="EXPORT">EXPORT</option><option value="TRANSHIPMENT">TRANSHIPMENT</option></select></div>
-        <div><label class="field-label">Origin / operation</label>
-          <select data-f="operation" onchange="saveField(this)"><option value="Discharging">Discharging</option><option value="Loading">Loading</option><option value="Loading &amp; Discharging">Loading &amp; Discharging</option></select></div>
-        <div><label class="field-label">Load type</label><input type="text" data-f="load_type" list="loadTypeList" onchange="saveField(this)"></div>
-        <div><label class="field-label">Term</label><input type="text" data-f="term" list="termList" onchange="saveField(this)"></div>
-        <div><label class="field-label">Receiver</label><input type="text" data-f="receiver" onchange="saveField(this)"></div>
-        <div><label class="field-label">Reference</label><input type="text" data-f="reference" onchange="saveField(this)" placeholder="Voyage no. / customer ref"></div>
-      </div>
-
-      <div class="sec-title">Vessel &amp; cargo</div>
-      <div class="fgrid">
+        <div class="wide"><label class="field-label">Port of Loading</label><div class="pair"><input type="text" data-f="load_port" onchange="saveField(this)" placeholder="LIANYUNGANG"><input type="text" data-f="load_code" onchange="saveField(this)" placeholder="CNLYG"></div></div>
+        <div class="wide"><label class="field-label">Port of Discharge</label><div class="pair"><input type="text" data-f="dis_port" onchange="saveField(this)"><input type="text" data-f="dis_code" onchange="saveField(this)" placeholder="SAYNB"></div></div>
         <div class="wide"><label class="field-label">Vessel</label><input type="text" data-f="vessel" onchange="saveField(this)"></div>
         <div><label class="field-label">GRT</label><input type="number" min="0" step="any" data-f="grt" onchange="saveField(this)"></div>
         <div><label class="field-label">NRT</label><input type="number" min="0" step="any" data-f="nrt" onchange="saveField(this)"></div>
         <div><label class="field-label">DWT</label><input type="number" min="0" step="any" data-f="dwt" onchange="saveField(this)"></div>
-        <div><label class="field-label">Cargo type</label><input type="text" data-f="cargo_type" list="cargoList" onchange="saveField(this)"></div>
-        <div><label class="field-label">Cargo FRT</label><input type="number" min="0" step="any" data-f="cargo_frt" onchange="saveField(this)"><div class="hint">Per-FRT charges (stevedoring) follow this.</div></div>
+        <div><label class="field-label">ETA</label><input type="date" data-f="eta" onchange="saveField(this)"></div>
+        <div><label class="field-label">Origin</label>
+          <select data-f="operation" onchange="saveField(this)"><option value="Discharging">Discharging</option><option value="Loading">Loading</option><option value="Loading &amp; Discharging">Loading &amp; Discharging</option></select></div>
+        <div><label class="field-label">Cargo Type</label><input type="text" data-f="cargo_type" list="cargoList" onchange="saveField(this)"></div>
+        <div><label class="field-label">Cargo FRT</label><input type="number" min="0" step="any" data-f="cargo_frt" onchange="saveField(this)"></div>
         <div><label class="field-label">Units / vehicles</label><input type="number" min="0" step="any" data-f="cargo_units" onchange="saveField(this)"></div>
-        <div class="wide"><label class="field-label">Cargo note</label><input type="text" data-f="cargo_note" onchange="saveField(this)" placeholder="Anything extra to print under Cargo Details"></div>
+        <div class="wide"><label class="field-label">Cargo Details</label><input type="text" data-f="cargo_note" onchange="saveField(this)" placeholder="Printed under Cargo Details on the PDA"></div>
+        <div class="ins-cell"><label class="tgl"><input type="checkbox" id="insChk" onchange="saveToggleField('cargo_insurance', this.checked ? '1' : '')"><span class="tgl-track"><span class="tgl-knob"></span></span><span>Cargo Insurance</span></label></div>
+        <div><label class="field-label">Pricing Person</label><select data-f="pricing_person" data-opts="pricing_people" data-blank="Pricing Person" onchange="saveField(this)"></select></div>
+        <div class="wide"><label class="field-label">Remarks</label><input type="text" data-f="remarks" onchange="saveField(this)"></div>
+        <div><label class="field-label">Receiver</label><input type="text" data-f="receiver" onchange="saveField(this)"></div>
         <div><label class="field-label">USD &rarr; SAR rate</label><input type="number" min="0" step="any" data-f="fx_rate" onchange="saveField(this)"></div>
       </div>
     </div>
 
     <div class="panel">
       <h2>Charges</h2>
-      <p class="panel-sub" id="chgSub">Rate &times; quantity. Greyed lines have no amount and are left off the PDF.</p>
-      <div class="scroll-x"><table class="chg" id="chgTable"></table></div>
-      <div style="margin-top:8px;"><button class="add-link" onclick="addGroup()">+ Add group</button></div>
-      <div class="totals" id="totalsBox"></div>
-      <div style="margin-top:16px;">
-        <label class="field-label">Additional notes (printed on the PDF)</label>
-        <textarea data-f="notes" onchange="saveField(this)" placeholder="Anything worth stating on the account..."></textarea>
+      <p class="panel-sub" id="chgSub">Rate &times; quantity.</p>
+      <div class="scroll-x" id="addWrap">
+        <div class="add-grid add-head"><div>Group</div><div>Charge Description</div><div>Charged Per</div><div>Currency</div><div class="r">Rate</div><div class="r">Qty</div><div>Remarks</div><div>Actions</div></div>
+        <div class="add-grid add-row" id="addRow">
+          <select id="addGroup"></select>
+          <div class="cbox" id="chgBox">
+            <button type="button" class="cbox-btn" id="chgBtn" onclick="toggleChg(event)"><span id="chgLabel" class="ph">Select</span><span class="caret">&#9662;</span></button>
+            <div class="cbox-panel" id="chgPanel">
+              <input type="text" id="chgSearch" placeholder="Search charges..." autocomplete="off" oninput="chgHi = 0; renderChgList()" onkeydown="chgKey(event)">
+              <div class="cbox-list" id="chgList"></div>
+            </div>
+          </div>
+          <select id="addUnit"></select>
+          <select id="addCur"><option value="SAR">SAR</option><option value="USD">USD</option></select>
+          <input type="number" step="any" min="0" class="r" id="addRate" placeholder="0.00">
+          <input type="number" step="any" min="0" class="r" id="addQty" placeholder="0.00" oninput="addQtyTouched = true">
+          <input type="text" id="addRemarks" placeholder="Remarks" onkeydown="if (event.key === 'Enter') addCharge()">
+          <button type="button" class="btn ok small" onclick="addCharge()">Add</button>
+        </div>
+        <div class="add-hint" id="addHint"></div>
       </div>
+      <div class="scroll-x" style="margin-top:14px;"><table class="chg" id="chgTable"></table></div>
+      <div class="totals" id="totalsBox"></div>
+
+      <div class="tgl-sections">
+        <div class="tgl-sec"><label class="tgl"><input type="checkbox" id="tglNotes" onchange="toggleSection('notes', this.checked)"><span class="tgl-track"><span class="tgl-knob"></span></span><span>Additional Notes</span></label>
+          <textarea data-f="notes" id="txtNotes" onchange="saveField(this)" placeholder="Anything worth stating on the account..." style="display:none;"></textarea></div>
+        <div class="tgl-sec"><label class="tgl"><input type="checkbox" id="tglSail" onchange="toggleSection('sailing_schedule', this.checked)"><span class="tgl-track"><span class="tgl-knob"></span></span><span>Sailing Schedule</span></label>
+          <textarea data-f="sailing_schedule" id="txtSail" onchange="saveField(this)" placeholder="e.g. ETA / ETD by port, one per line" style="display:none;"></textarea></div>
+        <div class="tgl-sec"><label class="tgl"><input type="checkbox" id="tglTerms" onchange="toggleSection('terms', this.checked)"><span class="tgl-track"><span class="tgl-knob"></span></span><span>Terms &amp; Conditions</span></label>
+          <textarea data-f="terms" id="txtTerms" onchange="saveField(this)" placeholder="Payment terms, validity, exclusions..." style="display:none;"></textarea></div>
+      </div>
+      <div class="save-bar"><button type="button" class="btn ok" onclick="saveAndClose()">&#10003; Save</button></div>
+    </div>
+  </div>
+
+  <div class="modal-bg" id="custModal">
+    <div class="modal">
+      <h3>Customer details</h3>
+      <p class="panel-sub" style="margin:0;">Printed under the customer name on the PDA. Saved automatically and remembered for the next PDA to this customer.</p>
+      <div class="mrow"><label class="field-label">Customer</label><input type="text" data-f="customer_name" list="custList" onchange="saveField(this)" autocomplete="off"></div>
+      <div class="mrow"><label class="field-label">Address</label><textarea data-f="customer_address" onchange="saveField(this)" style="min-height:64px;"></textarea></div>
+      <div class="mrow fgrid">
+        <div><label class="field-label">Phone</label><input type="text" data-f="customer_phone" onchange="saveField(this)"></div>
+        <div><label class="field-label">Email</label><input type="text" data-f="customer_email" onchange="saveField(this)" placeholder="name@company.com"></div>
+      </div>
+      <div class="sec-title" style="margin-top:16px;">Our contact on the PDA</div>
+      <div class="fgrid">
+        <div><label class="field-label">Tel / Mob #</label><input type="text" data-f="sales_phone" onchange="saveField(this)"></div>
+        <div><label class="field-label">Email</label><input type="text" data-f="sales_email" onchange="saveField(this)"></div>
+      </div>
+      <div class="form-actions" style="margin-top:14px;"><button class="btn" onclick="closeCust()">Done</button></div>
     </div>
   </div>
 
@@ -9574,8 +9846,17 @@ PDA_HTML = """
       <div><label class="field-label">USD &rarr; SAR rate for new PDAs</label><input type="number" min="0" step="any" id="sFx"></div>
       <div class="full"><label class="field-label">Letterhead (top right of the PDF)</label><textarea id="sLetter" class="mono" style="min-height:96px;"></textarea></div>
       <div class="full"><label class="field-label">Bank details (printed at the end of every PDA)</label><textarea id="sBanks" class="mono" placeholder="Please Arrange Payment In Favour of ...&#10;RIYAD BANK - USD ..."></textarea><div class="hint">Type or paste it here once. It is stored in your database, not in the app's code.</div></div>
+      <div class="full"><label class="field-label">Pricing Person list (one name per line)</label><textarea id="sPricing" style="min-height:70px;" placeholder="Staff names shown in the Pricing Person dropdown"></textarea><div class="hint">Everyone with a Compass login is always included as well.</div></div>
     </div>
     <div class="form-actions"><button class="btn" onclick="saveSettings()">Save settings</button></div>
+  </div>
+
+  <div class="panel" id="catalogPanel">
+    <h2>Charge catalogue</h2>
+    <p class="panel-sub">The searchable list behind <b>Charge Description</b>. Anyone can also type a one-off charge name when adding a line.</p>
+    <div class="cat-add"><input type="text" id="catNew" placeholder="New charge name, e.g. CUSTOMS CLEARANCE CHARGES" onkeydown="if (event.key === 'Enter') addCatalogName()"><button class="btn small" onclick="addCatalogName()">Add to catalogue</button></div>
+    <input type="text" id="catFilter" placeholder="Filter the list..." oninput="renderCatalogAdmin()" style="margin-top:10px;">
+    <div class="cat-list" id="catList"></div>
   </div>
 
   <div class="panel" id="templatesPanel">
@@ -9653,6 +9934,9 @@ let currentItems = [];
 let currentCalc = null;
 let docsCache = [];
 let PORT_INFO = {};
+let LK = {};               // dropdown lists, charge catalogue, rate cards (from /api/pda/lookups)
+let addBasis = 'fixed', addQtyTouched = false, chgSel = '', chgHi = 0, chgShown = [];
+const $id = function (i) { return document.getElementById(i); };
 
 async function api(url, method, body) {
   const opt = {method: method || 'GET', headers: {}};
@@ -9788,12 +10072,66 @@ function closeDocument() {
   loadDocuments();
 }
 
+function fillSelectOptions(sel, list, cur, blank) {
+  const items = (list || []).slice();
+  let match = items.find(x => String(x).toLowerCase() === String(cur || '').toLowerCase());
+  if (cur && !match) { items.unshift(cur); match = cur; }
+  sel.innerHTML = (blank ? '<option value="">' + escHtml(blank) + '</option>' : '') + items.map(x => '<option value="' + escHtml(x) + '">' + escHtml(x) + '</option>').join('');
+  sel.value = match || '';
+}
+
 function fillForm() {
-  document.querySelectorAll('#docDetail [data-f]').forEach(el => {
+  document.querySelectorAll('select[data-opts]').forEach(sel => {
+    fillSelectOptions(sel, LK[sel.dataset.opts], currentDoc[sel.dataset.f], sel.dataset.blank);
+  });
+  document.querySelectorAll('[data-f]').forEach(el => {
+    if (el.dataset.opts) return;
     const v = currentDoc[el.dataset.f];
     el.value = (v === null || v === undefined) ? '' : v;
   });
+  $id('branchTxt').value = LK.branch || '';
+  $id('insChk').checked = currentDoc.cargo_insurance === '1';
+  [['tglNotes', 'txtNotes'], ['tglSail', 'txtSail'], ['tglTerms', 'txtTerms']].forEach(p => {
+    const has = !!String($id(p[1]).value || '').trim();
+    $id(p[0]).checked = has;
+    $id(p[1]).style.display = has ? 'block' : 'none';
+  });
+  $id('saveState').textContent = '';
+  resetAddRow(true);
 }
+
+function setSaved(ok) {
+  const e = $id('saveState');
+  if (!e) return;
+  e.className = 'save-state' + (ok ? '' : ' err');
+  e.textContent = ok ? '✓ All changes saved' : 'Not saved';
+}
+
+function openCust() { $id('custModal').classList.add('open'); }
+function closeCust() { $id('custModal').classList.remove('open'); renderDetailHead(); }
+
+async function saveToggleField(field, value) {
+  const r = await api('/api/pda/documents/' + currentDocId, 'PUT', {[field]: value});
+  if (!r.ok) { setSaved(false); showToast(r.data.error || 'Could not save that change.', {error: true}); return; }
+  applyPayload(r.data);
+  setSaved(true);
+}
+
+async function toggleSection(field, on) {
+  const ids = {notes: 'txtNotes', sailing_schedule: 'txtSail', terms: 'txtTerms'};
+  const ta = $id(ids[field]);
+  if (on) { ta.style.display = 'block'; ta.focus(); return; }
+  if (String(ta.value || '').trim() && !confirm('Remove this section and its text from the PDA?')) {
+    const chk = {notes: 'tglNotes', sailing_schedule: 'tglSail', terms: 'tglTerms'};
+    $id(chk[field]).checked = true;
+    return;
+  }
+  ta.value = '';
+  ta.style.display = 'none';
+  await saveToggleField(field, '');
+}
+
+function saveAndClose() { closeDocument(); showToast('Saved.'); }
 
 function renderDetailHead() {
   const doc = currentDoc, fda = doc.status === 'finalized';
@@ -9816,18 +10154,22 @@ async function saveField(el) {
   const f = el.dataset.f;
   let v = el.value;
   const r = await api('/api/pda/documents/' + currentDocId, 'PUT', {[f]: v});
-  if (!r.ok) { showToast(r.data.error || 'Could not save that change.', {error: true}); el.value = currentDoc[f] === null || currentDoc[f] === undefined ? '' : currentDoc[f]; return; }
+  if (!r.ok) { setSaved(false); showToast(r.data.error || 'Could not save that change.', {error: true}); el.value = currentDoc[f] === null || currentDoc[f] === undefined ? '' : currentDoc[f]; return; }
   applyPayload(r.data);
+  setSaved(true);
+  document.querySelectorAll('[data-f="' + f + '"]').forEach(e => { if (e !== el && !e.dataset.opts) e.value = el.value; });
+  if (f === 'currency') { $id('addCur').value = currentDoc.currency || 'SAR'; }
+  if (['port_stay', 'cargo_frt', 'grt', 'port'].includes(f)) renderAddHint();
   if (f === 'customer_name') {
     const known = custCache.find(c => c.customer_name.toLowerCase() === String(v).trim().toLowerCase());
     if (known && !currentDoc.customer_address && !currentDoc.customer_email) {
       const r2 = await api('/api/pda/documents/' + currentDocId, 'PUT', {customer_address: known.customer_address, customer_phone: known.customer_phone, customer_email: known.customer_email});
-      if (r2.ok) { applyPayload(r2.data); fillForm(); }
+      if (r2.ok) { applyPayload(r2.data); document.querySelectorAll('[data-f="customer_address"],[data-f="customer_phone"],[data-f="customer_email"]').forEach(e => { e.value = currentDoc[e.dataset.f] || ''; }); }
     }
   }
   if (f === 'port' && !currentDoc.dis_port && PORT_INFO[v]) {
     const r3 = await api('/api/pda/documents/' + currentDocId, 'PUT', {dis_port: PORT_INFO[v].name, dis_code: PORT_INFO[v].code});
-    if (r3.ok) { applyPayload(r3.data); fillForm(); }
+    if (r3.ok) { applyPayload(r3.data); document.querySelectorAll('[data-f="dis_port"],[data-f="dis_code"]').forEach(e => { e.value = currentDoc[e.dataset.f] || ''; }); }
   }
   renderDetailHead();
   refreshCalc();
@@ -9848,8 +10190,7 @@ function renderCharges() {
   let html = '<thead>' + head + '</thead><tbody>';
   currentCalc.groups.forEach((g, gi) => {
     html += `<tr class="grp"><td colspan="${cols}"><div class="grp-inner"><span class="gno">${gi + 1}</span>
-      <input type="text" class="grp-name" value="${escHtml(g.name)}" title="Rename this group" onchange="renameGroup(${gi}, this.value)">
-      <button class="add-link" onclick="addCharge(${gi})">+ Add charge</button></div></td></tr>`;
+      <input type="text" class="grp-name" value="${escHtml(g.name)}" title="Rename this group" onchange="renameGroup(${gi}, this.value)"></div></td></tr>`;
     g.items.forEach((line, n) => {
       const it = byId[line.id];
       if (!it) return;
@@ -9880,7 +10221,7 @@ function renderCharges() {
       (fda ? `<td class="num" id="gs_${gi}_e"></td><td class="num" id="gs_${gi}_a"></td><td class="num" id="gs_${gi}_v"></td><td></td></tr>`
            : `<td class="num" id="gs_${gi}_u"></td><td class="num" id="gs_${gi}_s"></td><td></td><td></td></tr>`);
   });
-  if (!currentCalc.groups.length) html += `<tr><td colspan="${cols}" class="empty-note">No charges yet. Use <b>+ Add group</b> below, or set up the rate card for this port in the settings at the bottom of the page.</td></tr>`;
+  if (!currentCalc.groups.length) html += `<tr><td colspan="${cols}" class="empty-note">No charges yet. Pick a charge in the row above and press <b>Add</b>.</td></tr>`;
   t.innerHTML = html + '</tbody>';
   refreshCalc();
 }
@@ -9959,21 +10300,123 @@ async function resetQty(id) {
   refreshCalc();
 }
 
-async function addCharge(gi) {
-  const g = currentCalc.groups[gi];
-  const r = await api('/api/pda/documents/' + currentDocId + '/line-items', 'POST', {group_name: g ? g.name : 'Port Charges', name: 'NEW CHARGE', rate: 0, qty: 1, currency: 'USD'});
-  if (!r.ok) { showToast(r.data.error || 'Could not add that charge.', {error: true}); return; }
-  applyPayload(r.data);
-  renderCharges();
+/* ---- the add-a-charge row (Group | Charge Description | Charged Per | Currency | Rate | Qty | Remarks | Add) ---- */
+function autoQtyFor(basis) {
+  const d = currentDoc || {};
+  if (basis === 'days') return Number(d.port_stay || 0);
+  if (basis === 'frt') return Number(d.cargo_frt || 0);
+  if (basis === 'grt') return Number(d.grt || 0);
+  return null;
 }
 
-async function addGroup() {
-  const name = (prompt('Name of the new group (for example: Agency Charges, Other Charges):') || '').trim();
-  if (!name) return;
-  const r = await api('/api/pda/documents/' + currentDocId + '/line-items', 'POST', {group_name: name, name: 'NEW CHARGE', rate: 0, qty: 1, currency: 'USD'});
-  if (!r.ok) { showToast(r.data.error || 'Could not add that group.', {error: true}); return; }
+function resetAddRow(full) {
+  if (!currentDoc) return;
+  const groups = LK.groups ? LK.groups.slice() : [];
+  (currentCalc ? currentCalc.groups : []).forEach(g => { if (!groups.some(x => x.toLowerCase() === g.name.toLowerCase())) groups.push(g.name); });
+  const keepG = full ? '' : $id('addGroup').value;
+  fillSelectOptions($id('addGroup'), groups, keepG || groups[0], '');
+  fillSelectOptions($id('addUnit'), LK.units || [], 'PER SHIPMENT', '');
+  if (full) $id('addCur').value = currentDoc.currency || 'SAR';
+  chgSel = ''; addBasis = 'fixed'; addQtyTouched = false;
+  $id('chgLabel').textContent = 'Select'; $id('chgLabel').className = 'ph';
+  $id('addRate').value = ''; $id('addQty').value = ''; $id('addRemarks').value = '';
+  $id('unitList').innerHTML = (LK.units || []).map(u => '<option value="' + escHtml(u) + '">').join('');
+  renderAddHint();
+}
+
+function renderAddHint() {
+  const h = $id('addHint');
+  if (!h || !currentDoc) return;
+  if (['days', 'frt', 'grt'].includes(addBasis)) {
+    const lab = {days: 'port stay', frt: 'cargo FRT', grt: 'GRT'}[addBasis];
+    h.textContent = 'Quantity follows the ' + lab + ' (' + fmtQty(autoQtyFor(addBasis)) + ') unless you type one.';
+    if (!addQtyTouched) $id('addQty').value = autoQtyFor(addBasis);
+  } else if (chgSel && !(((LK.rates || {})[currentDoc.port] || {})[chgSel.toUpperCase()])) {
+    h.textContent = 'Not on the ' + (currentDoc.port || 'port') + ' rate card - enter the rate.';
+  } else { h.textContent = ''; }
+}
+
+function toggleChg(e) {
+  e.stopPropagation();
+  const p = $id('chgPanel');
+  if (p.classList.contains('open')) { closeChg(); return; }
+  p.classList.add('open');
+  placeChg();
+  $id('chgSearch').value = ''; chgHi = 0;
+  renderChgList();
+  $id('chgSearch').focus();
+}
+function placeChg() {
+  const p = $id('chgPanel'), r = $id('chgBtn').getBoundingClientRect();
+  const w = Math.min(420, window.innerWidth - 16);
+  p.style.width = w + 'px';
+  p.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + 'px';
+  const below = window.innerHeight - r.bottom;
+  p.style.top = (below > 300 || below > r.top ? r.bottom + 4 : Math.max(8, r.top - 4 - 300)) + 'px';
+}
+function closeChg() { const p = $id('chgPanel'); if (p) p.classList.remove('open'); }
+window.addEventListener('resize', function () { if ($id('chgPanel') && $id('chgPanel').classList.contains('open')) placeChg(); });
+window.addEventListener('scroll', function () { if ($id('chgPanel') && $id('chgPanel').classList.contains('open')) placeChg(); }, true);
+
+function renderChgList() {
+  const q = ($id('chgSearch').value || '').trim().toUpperCase();
+  const all = LK.catalog || [];
+  const list = all.filter(n => !q || n.toUpperCase().includes(q));
+  chgShown = list.slice(0, 300).map(n => ({v: n, custom: false}));
+  if (q && !all.some(n => n.toUpperCase() === q)) chgShown.push({v: q, custom: true});
+  if (chgHi >= chgShown.length) chgHi = Math.max(0, chgShown.length - 1);
+  const box = $id('chgList');
+  if (!chgShown.length) { box.innerHTML = '<div class="cbox-empty">Nothing in the charge list yet.</div>'; return; }
+  box.innerHTML = chgShown.map((o, i) => '<div class="cbox-item' + (i === chgHi ? ' hi' : '') + (o.custom ? ' custom' : '') + '" data-i="' + i + '" onmousedown="pickCharge(' + i + ')">' + (o.custom ? 'Use &ldquo;' + escHtml(o.v) + '&rdquo; as typed' : escHtml(o.v)) + '</div>').join('');
+  const hi = box.querySelector('.hi');
+  if (hi) hi.scrollIntoView({block: 'nearest'});
+}
+
+function chgKey(e) {
+  if (e.key === 'ArrowDown') { e.preventDefault(); chgHi = Math.min(chgShown.length - 1, chgHi + 1); renderChgList(); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); chgHi = Math.max(0, chgHi - 1); renderChgList(); }
+  else if (e.key === 'Enter') { e.preventDefault(); if (chgShown.length) pickCharge(chgHi); }
+  else if (e.key === 'Escape') { e.preventDefault(); closeChg(); }
+}
+
+function pickCharge(i) {
+  const o = chgShown[i];
+  if (!o) return;
+  chgSel = o.v;
+  $id('chgLabel').textContent = o.v; $id('chgLabel').className = '';
+  closeChg();
+  const rt = ((LK.rates || {})[currentDoc.port] || {})[o.v.toUpperCase()];
+  addQtyTouched = false;
+  if (rt) {
+    fillSelectOptions($id('addGroup'), (LK.groups || []).concat((LK.groups || []).some(x => x.toLowerCase() === (rt.group_name || '').toLowerCase()) ? [] : [rt.group_name]), rt.group_name, '');
+    fillSelectOptions($id('addUnit'), LK.units || [], rt.unit || 'PER SHIPMENT', '');
+    $id('addCur').value = rt.currency === 'USD' ? 'USD' : 'SAR';
+    $id('addRate').value = rt.rate || '';
+    addBasis = rt.qty_basis || 'fixed';
+    $id('addQty').value = ['days', 'frt', 'grt'].includes(addBasis) ? autoQtyFor(addBasis) : rt.qty;
+  } else {
+    addBasis = 'fixed';
+    $id('addQty').value = '1';
+    $id('addRate').value = '';
+    $id('addCur').value = currentDoc.currency || 'SAR';
+  }
+  renderAddHint();
+  $id('addRate').focus();
+}
+
+async function addCharge() {
+  if (!chgSel) { showToast('Pick a charge description first.', {error: true}); $id('chgBtn').click(); return; }
+  const body = {name: chgSel, group_name: $id('addGroup').value, unit: $id('addUnit').value, currency: $id('addCur').value,
+    rate: $id('addRate').value || 0, remarks: $id('addRemarks').value, qty_basis: addBasis};
+  const qv = String($id('addQty').value).trim();
+  const auto = autoQtyFor(addBasis);
+  if (qv !== '' && !(auto !== null && Number(qv) === auto && !addQtyTouched)) body.qty = qv;
+  const r = await api('/api/pda/documents/' + currentDocId + '/line-items', 'POST', body);
+  if (!r.ok) { setSaved(false); showToast(r.data.error || 'Could not add that charge.', {error: true}); return; }
   applyPayload(r.data);
+  setSaved(true);
   renderCharges();
+  resetAddRow(false);
 }
 
 async function renameGroup(gi, value) {
@@ -10037,11 +10480,15 @@ async function sendMail() {
   showToast('Sent to ' + r.data.sent_to.join(', '));
 }
 
-document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeMail(); });
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { closeMail(); closeChg(); if ($id('custModal').classList.contains('open')) closeCust(); } });
+document.addEventListener('click', function (e) { if (!e.target.closest('#chgBox')) closeChg(); });
 
 (async function startPda() {
   const s = await api('/api/pda/settings');
   if (s.ok) PORT_INFO = s.data.ports || {};
+  const lk = await api('/api/pda/lookups');
+  if (lk.ok) LK = lk.data;
+  if (document.getElementById('catList') && typeof renderCatalogAdmin === 'function') renderCatalogAdmin();
   await Promise.all([loadDocuments(), loadCustomers()]);
   const m = /^#d(\\d+)$/.exec(location.hash || '');
   if (m) openDocument(Number(m[1]));
@@ -10120,19 +10567,52 @@ async function loadSettings() {
   document.getElementById('sFx').value = r.data.fx;
   document.getElementById('sLetter').value = r.data.letterhead;
   document.getElementById('sBanks').value = r.data.banks;
+  document.getElementById('sPricing').value = r.data.pricing_people || '';
   document.getElementById('sNext').value = '';
   document.getElementById('sNextHint').textContent = 'The next PDA will be ' + r.data.next_number;
 }
 
 async function saveSettings() {
   const body = {prefix: document.getElementById('sPrefix').value, fx: document.getElementById('sFx').value,
-    letterhead: document.getElementById('sLetter').value, banks: document.getElementById('sBanks').value};
+    letterhead: document.getElementById('sLetter').value, banks: document.getElementById('sBanks').value,
+    pricing_people: document.getElementById('sPricing').value};
   const next = document.getElementById('sNext').value.trim();
   if (next) body.next_number = next;
   const r = await api('/api/pda/settings', 'POST', body);
   if (!r.ok) { showToast(r.data.error || 'Could not save the settings.', {error: true}); return; }
   showToast('Settings saved.');
   loadSettings();
+  const lk = await api('/api/pda/lookups');
+  if (lk.ok) LK = lk.data;
+}
+
+function renderCatalogAdmin() {
+  const q = (document.getElementById('catFilter').value || '').trim().toUpperCase();
+  const names = (LK.catalog || []).filter(n => !q || n.toUpperCase().includes(q));
+  document.getElementById('catList').innerHTML = names.length
+    ? names.map(n => '<div class="cat-row"><span>' + escHtml(n) + '</span><button class="row-remove" title="Remove from the catalogue" onclick="removeCatalogName(' + escHtml(JSON.stringify(n)) + ')">&times;</button></div>').join('')
+    : '<div class="cbox-empty">Nothing matches.</div>';
+}
+
+async function addCatalogName() {
+  const el = document.getElementById('catNew');
+  const name = el.value.trim();
+  if (!name) { showToast('Enter a charge name.', {error: true}); return; }
+  const r = await api('/api/pda/catalog', 'POST', {name: name});
+  if (!r.ok) { showToast(r.data.error || 'Could not add that charge.', {error: true}); return; }
+  el.value = '';
+  const lk = await api('/api/pda/lookups');
+  if (lk.ok) LK = lk.data;
+  renderCatalogAdmin();
+  showToast('Added ' + r.data.name + '.');
+}
+
+async function removeCatalogName(name) {
+  if (!confirm('Remove "' + name + '" from the catalogue? PDAs that already use it are not changed.')) return;
+  await api('/api/pda/catalog/delete', 'POST', {name: name});
+  const lk = await api('/api/pda/lookups');
+  if (lk.ok) LK = lk.data;
+  renderCatalogAdmin();
 }
 
 async function loadAlertSettings() {
