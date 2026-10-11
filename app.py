@@ -6803,9 +6803,9 @@ def create_pda_document():
     if err:
         return jsonify({"error": err}), 400
     port = fields.get("port", "")
-    vessel = fields.get("vessel", "")
-    if not port or not vessel:
-        return jsonify({"error": "Port and vessel are required."}), 400
+    fields.setdefault("vessel", "")
+    if not port:
+        return jsonify({"error": "Choose the port of call."}), 400
     db = get_db()
     me = db.execute("SELECT full_name, email, username FROM users WHERE id = ?", (session.get("user_id"),)).fetchone()
     pname, pcode = PDA_PORT_INFO.get(port, (port, ""))
@@ -6860,7 +6860,7 @@ def update_pda_document(pda_id):
     fields, err = _pda_validated_doc_fields(data)
     if err:
         return jsonify({"error": err}), 400
-    for req in ("port", "vessel"):
+    for req in ("port",):
         if req in fields and not fields[req]:
             return jsonify({"error": f"{req.title()} can't be empty."}), 400
     if fields:
@@ -7137,7 +7137,7 @@ def pda_email_draft(pda_id):
     port_line = doc["dis_port"] or doc["port"]
     body = (
         f"Dear {doc['customer_name'] or 'Sir/Madam'},\n\n"
-        f"Please find attached the {kind} ({short} No. {doc['pda_no']}) for M/V {doc['vessel']} "
+        f"Please find attached the {kind} ({short} No. {doc['pda_no']}) for M/V {doc['vessel'] or 'TBA'} "
         f"at {port_line}"
         + (f", ETA {doc['eta']}" if doc["eta"] else "")
         + ".\n\nI would appreciate your confirmation of the figures and remittance of the funds in favour of "
@@ -7146,7 +7146,7 @@ def pda_email_draft(pda_id):
     )
     return jsonify({
         "to": doc["customer_email"] or "",
-        "subject": f"{kind} - M/V {doc['vessel']} - {doc['pda_no']}",
+        "subject": f"{kind} - M/V {doc['vessel'] or 'TBA'} - {doc['pda_no']}",
         "body": body,
         "email_configured": email_configured(),
     })
@@ -10425,7 +10425,7 @@ JOBS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta
 <div class="topbar noprint">
   <a href="/" class="brand"><img src="data:image/png;base64,""" + LOGO_B64 + r"""" alt="Sea Power"><div class="brand-text"><span class="app-name">Compass</span><span class="app-tag">Sea Power Marine Services Co. Ltd</span></div></a>
   <nav class="nav" aria-label="Main">
-    <a href="#/" id="nav-jobs">Jobs</a><a href="#/clients" id="nav-clients">Clients</a><a href="/do-tracker">DO Tracker</a><a href="/sof">SOF</a>
+    <a href="#/" id="nav-jobs">Jobs</a><a href="#/clients" id="nav-clients">Clients</a>
   </nav>
   <div class="topbar-right">
     <label class="theme-switch" title="Switch between light and dark"><input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')"><span class="theme-track"><span class="theme-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg></span><span class="theme-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg></span><span class="theme-knob"></span></span></label>
@@ -10554,7 +10554,7 @@ function drawBoard() {
   else if (!list.length) body = '<div class="empty">Nothing matches. Clear the search or pick another stage.</div>';
   else if (S.view === 'cards') body = '<div class="cards">' + list.map(j => {
     const w = warnText(j);
-    return '<div class="jcard bt' + jobCls(j) + '" data-act="open" data-id="' + j.id + '"><div class="spread" style="flex-wrap:nowrap"><div><div class="vn">' + esc(j.vessel) + '</div><div class="no">Job ' + esc(j.pda_no) + '</div></div>' +
+    return '<div class="jcard bt' + jobCls(j) + '" data-act="open" data-id="' + j.id + '"><div class="spread" style="flex-wrap:nowrap"><div><div class="vn">' + esc(j.vessel || 'VESSEL TO BE ADVISED') + '</div><div class="no">Job ' + esc(j.pda_no) + '</div></div>' +
       '<button class="pin' + (j.pinned ? ' on' : '') + '" data-act="pin" data-id="' + j.id + '" title="Pinned jobs stay at the top">' + (j.pinned ? 'Pinned' : 'Pin') + '</button></div>' +
       '<div style="font-size:13.5px;margin-top:12px;font-weight:600">' + esc(j.customer_name || 'No customer yet') + '</div>' +
       '<div style="font-size:12.5px;color:var(--muted);margin-top:2px">' + esc(portName(j)) + (j.eta ? ' &middot; ETA ' + esc(fdShort(j.eta)) : '') + '</div>' +
@@ -10564,7 +10564,7 @@ function drawBoard() {
       '<div class="spread" style="padding-top:12px;border-top:1px solid var(--border);align-items:center"><span style="font-size:12px;color:var(--muted)">Handled by ' + esc(j.handler || j.created_by) + '</span><span style="font-size:13px;font-weight:700;color:var(--navy)">Open job file &rarr;</span></div></div>';
   }).join('') + '</div>';
   else body = '<div class="scroll-x"><table class="t" style="min-width:880px"><thead><tr><th>Job no.</th><th>Vessel</th><th>Customer</th><th>Port</th><th>ETA</th><th>Stage</th><th class="num">Total (SAR)</th><th class="num">To collect</th><th></th></tr></thead><tbody>' +
-    list.map(j => '<tr class="click" data-act="open" data-id="' + j.id + '"><td style="font-weight:700;color:var(--navy);white-space:nowrap">' + esc(j.pda_no) + '</td><td style="font-weight:600">' + (j.pinned ? '&#9733; ' : '') + esc(j.vessel) + '</td><td>' + esc(j.customer_name) + '</td><td>' + esc(portName(j)) + '</td><td>' + esc(fdShort(j.eta)) + '</td><td>' + chipFor(j) + (warnText(j) ? ' <span class="pos" style="font-size:11.5px;font-weight:700">&#9888;</span>' : '') + '</td><td class="num">' + fmt(j.stage >= 3 ? j.final_sar : j.pro_sar) + '</td><td class="num">' + (j.owed > 0 ? fmt(j.owed) : '-') + '</td><td class="num"><span class="btn ghost small">Open</span></td></tr>').join('') + '</tbody></table></div>';
+    list.map(j => '<tr class="click" data-act="open" data-id="' + j.id + '"><td style="font-weight:700;color:var(--navy);white-space:nowrap">' + esc(j.pda_no) + '</td><td style="font-weight:600">' + (j.pinned ? '&#9733; ' : '') + esc(j.vessel || 'VESSEL TO BE ADVISED') + '</td><td>' + esc(j.customer_name) + '</td><td>' + esc(portName(j)) + '</td><td>' + esc(fdShort(j.eta)) + '</td><td>' + chipFor(j) + (warnText(j) ? ' <span class="pos" style="font-size:11.5px;font-weight:700">&#9888;</span>' : '') + '</td><td class="num">' + fmt(j.stage >= 3 ? j.final_sar : j.pro_sar) + '</td><td class="num">' + (j.owed > 0 ? fmt(j.owed) : '-') + '</td><td class="num"><span class="btn ghost small">Open</span></td></tr>').join('') + '</tbody></table></div>';
   $('view').innerHTML = '<div class="pghead"><div><div class="eyebrow">Compass</div><h1 class="pg">Jobs and PDAs</h1><div class="sub">Every vessel call in one place. Click a vessel to open its job file.</div></div>' +
     '<div class="row"><a class="btn" href="#/new">+ New PDA</a></div></div>' +
     '<div class="tiles"><div class="tile"><div class="k">Open jobs</div><div class="v">' + openN + '</div><div class="d">Appointed or alongside</div></div>' +
@@ -10606,23 +10606,17 @@ function drawNew() {
   const n = NP, v = n.vessel;
   const portOpts = '<option value="">Choose the port...</option>' + Object.keys(PORTS).map(k => '<option value="' + esc(k) + '"' + (n.port === k ? ' selected' : '') + '>' + esc(nice(k)) + '</option>').join('');
   const ops = ['Discharging', 'Loading', 'Loading & Discharging', 'Bunkering', 'Other'].map(o => '<option' + (n.op === o ? ' selected' : '') + '>' + esc(o) + '</option>').join('');
-  $('view').innerHTML = '<div style="max-width:760px;margin:0 auto"><div class="pghead"><div><a class="btn ghost small" href="#/">&larr; All jobs</a><h1 class="pg" style="margin-top:12px">New PDA</h1><div class="sub">Three short steps. Anything Compass already knows is filled in for you. Fields marked <span style="color:var(--danger-text);font-weight:700">required</span> must be filled.</div></div></div>' +
+  $('view').innerHTML = '<div style="max-width:760px;margin:0 auto"><div class="pghead"><div><a class="btn ghost small" href="#/">&larr; All jobs</a><h1 class="pg" style="margin-top:12px">New PDA</h1><div class="sub">Two short steps. You can add the vessel later, once the customer tells you. Fields marked <span style="color:var(--danger-text);font-weight:700">required</span> must be filled.</div></div></div>' +
     '<div id="npErr">' + (n.err ? '<div class="alert" role="alert">' + esc(n.err) + '</div>' : '') + '</div>' +
     '<div class="stack">' +
     '<div class="panel"><div class="step"><span class="n">1</span><span class="t">Who is the customer?</span></div>' +
     '<div class="seg" role="group" aria-label="Customer type"><button class="' + (n.mode === 'regular' ? 'on' : '') + '" data-act="npMode" data-m="regular">Regular customer</button><button class="' + (n.mode === 'oneoff' ? 'on' : '') + '" data-act="npMode" data-m="oneoff">One-off customer</button></div>' +
     '<div id="custBox" style="margin-top:14px">' + custBoxHtml() + '</div></div>' +
-    '<div class="panel"><div class="step"><span class="n">2</span><span class="t">Which vessel?</span></div>' +
-    '<div class="fgrid"><div><label class="lb" for="npImo">IMO number <span class="opt">optional, 7 digits</span></label><input id="npImo" type="text" inputmode="numeric" maxlength="7" placeholder="For example 9407067" data-in="npImo" value="' + esc(n.imo) + '" autocomplete="off"><div class="help" id="imoNote">' + esc(n.imoNote || 'Type the IMO and a vessel Compass has seen before fills in by itself.') + '</div></div>' +
-    '<div><label class="lb" for="npVname">Vessel name <span class="req">required</span></label><input id="npVname" type="text" data-in="npVname" value="' + esc(v.name) + '" placeholder="As on the Bill of Lading" autocomplete="off"><div class="help">Turns into capital letters as you type. Known vessels appear below.</div><div id="vesSug"></div></div></div>' +
-    '<div id="vesselBox" style="margin-top:14px">' + vesselBoxHtml() + '</div></div>' +
-    '<div class="panel"><div class="step"><span class="n">3</span><span class="t">Which port call?</span></div>' +
+    '<div class="panel"><div class="step"><span class="n">2</span><span class="t">Which port call?</span></div>' +
     '<div class="fgrid"><div><label class="lb" for="npPort">Port of call <span class="req">required</span></label><select id="npPort" data-ch="npf" data-k="port">' + portOpts + '</select><div class="help">Charges come from this port\'s rate card.</div></div>' +
     '<div><label class="lb" for="npOp">Activity</label><select id="npOp" data-ch="npf" data-k="op">' + ops + '</select></div>' +
     '<div><label class="lb" for="npEta">ETA</label><input id="npEta" type="date" data-ch="npf" data-k="eta" value="' + esc(n.eta) + '"><div class="help">Expected arrival date.</div></div>' +
-    '<div><label class="lb" for="npStay">Port stay (days)</label><input id="npStay" type="number" min="0" step="any" data-in="npf" data-k="stay" value="' + esc(n.stay) + '"><div class="help">Days at berth. Daily charges use this.</div></div>' +
-    '<div><label class="lb" for="npVoy">Voyage no. <span class="opt">optional</span></label><input id="npVoy" type="text" data-in="npf" data-k="voyage" value="' + esc(n.voyage) + '"></div>' +
-    '<div><label class="lb" for="npRef">Principal\'s reference <span class="opt">optional</span></label><input id="npRef" type="text" data-in="npf" data-k="pref" value="' + esc(n.pref) + '"></div></div></div>' +
+    '</div></div>' +
     '<div class="row" style="justify-content:flex-end"><a class="btn ghost" href="#/">Cancel</a><button class="btn" data-act="npCreate" id="npGo"' + (n.busy ? ' disabled' : '') + '>Create PDA</button></div></div></div>';
 }
 function custBoxHtml() {
@@ -10650,10 +10644,9 @@ function vesselBoxHtml() {
   if (n.known && !n.editV) {
     return '<div class="box"><div class="spread" style="align-items:center"><b style="font-size:16px">' + esc(v.name) + '</b><span class="noteok">&#10003; Filled in from the Compass vessel list</span></div>' +
       '<div class="kv three" style="margin-top:10px">' + VFIELDS.map(f => '<div><span class="k">' + f[1] + '</span><br>' + esc(v[f[0]] === '' || v[f[0]] == null ? '-' : v[f[0]]) + '</div>').join('') + '</div>' +
-      '<div class="row" style="margin-top:10px"><span class="help" style="margin:0">Nothing to type. Something wrong? </span><button class="btn ghost small" data-act="npEditV">Correct these details</button></div></div>';
+      '<div class="help" style="margin-top:10px">Nothing to type. These come from the vessel list.</div></div>';
   }
-  return '<div class="help" style="margin:0 0 10px">' + (n.known ? 'Correcting the saved details for this vessel.' : 'New vessel? Fill these in once. Compass saves them' + (n.imo.length === 7 ? ' under IMO ' + esc(n.imo) : ' when you give an IMO number') + ' and next time they fill themselves in. All optional.') + '</div>' +
-    '<div class="fgrid">' + VFIELDS.map(f => '<div><label class="lb" for="npv_' + f[0] + '">' + f[1] + '</label><input id="npv_' + f[0] + '" type="' + (f[2] === 'number' ? 'number' : 'text') + '"' + (f[2] === 'number' ? ' step="any" min="0"' : '') + ' data-in="npv" data-k="' + f[0] + '" value="' + esc(v[f[0]]) + '"></div>').join('') + '</div>';
+  return '';
 }
 function applyVessel(r) { // r = row from /api/fleet
   const v = NP.vessel;
@@ -10686,7 +10679,7 @@ const imoLookup = debounce(async function (imo) {
   if (!r.ok || NP.imo !== imo) return;
   const note = $('imoNote');
   if (r.data.found) { applyVessel(r.data.vessel); NP.known = true; NP.editV = false; NP.imoNote = 'Found: ' + r.data.vessel.name + '. Details filled in below.'; $('npVname').value = NP.vessel.name; $('vesselBox').innerHTML = vesselBoxHtml(); if (note) note.textContent = NP.imoNote; }
-  else { NP.known = false; NP.imoNote = r.data.checksum_ok ? 'New to Compass. Fill in the vessel details once and they are saved.' : 'This IMO number does not pass the standard check. Please re-check the digits.'; if (note) note.textContent = NP.imoNote; $('vesselBox').innerHTML = vesselBoxHtml(); }
+  else { NP.known = false; NP.imoNote = r.data.checksum_ok ? 'New to Compass. Just type the vessel name; the IMO is remembered for next time.' : 'This IMO number does not pass the standard check. Please re-check the digits.'; if (note) note.textContent = NP.imoNote; $('vesselBox').innerHTML = vesselBoxHtml(); }
 }, 200);
 IN.npImo = (t) => {
   t.value = t.value.replace(/\D/g, '').slice(0, 7); NP.imo = t.value;
@@ -10717,19 +10710,16 @@ ACT.npCreate = async () => {
   const n = NP, v = n.vessel;
   const cust = n.mode === 'regular' ? (n.client ? n.client.name : '') : (n.name || '').trim();
   if (!cust) return npFail(n.mode === 'regular' ? 'Choose a customer first. Type the first letters of a saved client, or switch to One-off customer.' : 'Type the customer\'s name. It is the only thing required here.', n.mode === 'regular' ? 'npCust' : 'npName');
-  if (!(v.name || '').trim()) return npFail('Type the vessel name. It is required.', 'npVname');
-  if (n.imo && n.imo.length !== 7) return npFail('An IMO number has 7 digits. Fix it or leave it empty.', 'npImo');
   if (!n.port) return npFail('Choose the port of call.', 'npPort');
-  const body = {port: n.port, vessel: v.name.trim(), operation: n.op, eta: n.eta, voyage: n.voyage, principal_ref: n.pref, imo: n.imo, vessel_type: v.vtype, flag: v.flag, built: v.built, call_sign: v.call_sign};
+  const body = {port: n.port, vessel: '', operation: n.op, eta: n.eta, voyage: n.voyage, principal_ref: n.pref, imo: n.imo, vessel_type: v.vtype, flag: v.flag, built: v.built, call_sign: v.call_sign};
   ['grt', 'nrt', 'dwt', 'loa', 'beam'].forEach(k => { if (v[k] !== '' && v[k] != null) body[k] = v[k]; });
-  if (n.stay !== '') body.port_stay = n.stay;
   if (n.mode === 'regular') { body.client_id = n.client.id; body.customer_name = n.client.name; body.customer_address = n.client.address || ''; body.customer_phone = n.client.phone || ''; body.customer_email = n.client.email || ''; }
   else { body.customer_name = cust; body.customer_address = n.address; body.customer_phone = n.phone; body.customer_email = n.email; body.save_client = !!n.save; }
   n.busy = true; $('npGo').disabled = true;
   const r = await api('/api/pda/documents', 'POST', body);
   n.busy = false; $('npGo') && ($('npGo').disabled = false);
   if (!r.ok) return npFail(r.data.error || 'Could not create the PDA. Please try again.');
-  toast('PDA ' + r.data.pda_no + ' created for ' + body.vessel.toUpperCase() + '.');
+  toast('PDA ' + r.data.pda_no + ' created for ' + 'vessel to be advised' + '.');
   location.hash = '#/job/' + r.data.id;
 };
 
@@ -10759,7 +10749,7 @@ function drawJob() {
   const steps = J.stages.map((n, i) => '<div><div class="bar ' + (i < st ? 'done' : (i === st ? 'cur' : '')) + '"></div><div class="nm" style="color:' + (i <= st ? 'var(--text)' : 'var(--muted)') + '">' + esc(n) + '</div><div class="nt">' + esc(i < st ? 'Done' : (i === st ? 'Current' : J.stage_notes[i])) + '</div></div>').join('');
   $('view').innerHTML = '<div class="stack">' +
     '<div class="panel"><a class="btn ghost small" href="#/">&larr; All jobs</a>' +
-    '<div class="spread" style="margin-top:12px"><div><div class="row" style="gap:12px"><span style="font-size:26px;font-weight:700">' + esc(d.vessel) + '</span><span class="chip s' + chipCls + '" style="font-size:12px;padding:5px 14px">' + esc(chipTxt) + '</span></div>' +
+    '<div class="spread" style="margin-top:12px"><div><div class="row" style="gap:12px"><span style="font-size:26px;font-weight:700">' + esc(d.vessel || 'VESSEL TO BE ADVISED') + '</span><span class="chip s' + chipCls + '" style="font-size:12px;padding:5px 14px">' + esc(chipTxt) + '</span></div>' +
     '<div style="font-size:13px;color:var(--muted);margin-top:4px">Job ' + esc(d.pda_no) + ' &middot; opened ' + esc(fd((d.created_at || '').slice(0, 10))) + ' &middot; handled by ' + esc(d.handler || d.created_by) + '</div></div>' +
     '<div class="row"><button class="btn ' + (J.pinned ? '' : 'ghost') + '" data-act="jpin" style="' + (J.pinned ? 'background:var(--gold);border-color:var(--gold)' : '') + '">' + (J.pinned ? 'Pinned' : 'Pin to top') + '</button><a class="btn ghost" href="#/report/' + d.id + '">Final job report</a><a class="btn ghost" href="/api/pda/documents/' + d.id + '/pdf" target="_blank" rel="noopener">Download ' + (d.status === 'finalized' ? 'FDA' : 'PDA') + '</a>' +
     (st < 5 ? '<button class="btn" data-act="advance" title="Moves the job to the next stage and records it in History">Move to: ' + esc(next) + '</button>' : '<button class="btn" disabled>Job closed</button>') + '</div></div>' +
@@ -10789,9 +10779,9 @@ function tabOverview() {
     (c && c.contacts ? '<div style="border-top:1px solid var(--border);padding-top:10px;font-size:13px"><span style="color:var(--muted)">Contacts</span><br>' + esc(c.contacts).replace(/\n/g, '<br>') + '</div>' : '') +
     '<div class="row">' + (c ? ['cr', 'vat'].map(k => '<span class="chip ' + (c.docs.some(x => x.kind === k) ? 'paid' : 'reqd') + '">' + (k === 'cr' ? 'CR copy' : 'VAT certificate') + (c.docs.some(x => x.kind === k) ? ' on file' : ' missing') + '</span>').join('') + '<a class="btn ghost small" href="#/clients/' + c.id + '">Open client</a>' : '<span class="help">' + (d.one_off ? 'One-off customer: not in the Clients list.' : '') + '</span>') + '</div></div>';
   const vf = [['Type', d.vessel_type], ['Flag', d.flag], ['Built', d.built], ['GRT', d.grt ? Number(d.grt).toLocaleString() : ''], ['NRT', d.nrt ? Number(d.nrt).toLocaleString() : ''], ['DWT', d.dwt ? Number(d.dwt).toLocaleString() : ''], ['LOA (m)', d.loa || ''], ['Beam (m)', d.beam || ''], ['Call sign', d.call_sign]];
-  const ves = '<div class="panel stack" style="gap:12px"><div class="spread" style="align-items:center"><h2>Vessel</h2>' + (d.imo ? '<span class="noteok">IMO ' + esc(d.imo) + '</span>' : '<span class="help" style="margin:0">No IMO number saved</span>') + '</div><div style="font-size:15px;font-weight:700">' + esc(d.vessel) + '</div>' +
+  const ves = '<div class="panel stack" style="gap:12px"><div class="spread" style="align-items:center"><h2>Vessel</h2>' + (d.imo ? '<span class="noteok">IMO ' + esc(d.imo) + '</span>' : '<span class="help" style="margin:0">No IMO number saved</span>') + '</div><div style="font-size:15px;font-weight:700">' + esc(d.vessel || 'VESSEL TO BE ADVISED') + '</div>' +
     '<div class="kv three">' + vf.map(x => '<div><span class="k">' + x[0] + '</span><br>' + esc(x[1] === '' || x[1] == null ? '-' : x[1]) + '</div>').join('') + '</div>' +
-    '<div class="help">Change any detail in <a href="' + editorUrl() + '">the quotation editor</a>. Vessels with an IMO number are remembered for next time.</div></div>';
+    '<div class="row"><button class="btn ghost small" data-act="editVessel">' + (d.vessel ? 'Change vessel' : 'Add the vessel') + '</button></div></div>';
   const instr = '<div class="panel stack" style="gap:10px"><h2>Principal\'s instructions</h2><div class="hint" style="margin:0">Saved once on the job, so everyone handling it sees the same rules.</div>' +
     (d.instructions ? '<div class="stack" style="gap:8px">' + d.instructions.split('\n').filter(x => x.trim()).map(l => '<div class="instr">' + esc(l) + '</div>').join('') + '</div>' : '<div class="help">None saved yet.</div>') +
     '<div class="row"><button class="btn ghost small" data-act="editInstr">' + (d.instructions ? 'Edit instructions' : 'Add instructions') + '</button></div></div>';
@@ -10801,6 +10791,21 @@ function tabOverview() {
 }
 function editorUrl() { return '/pda?job=' + S.job.job.id + '#d' + S.job.job.id; }
 ACT.saveClient = async () => { const r = await api('/api/jobs/' + S.job.job.id + '/save-client', 'POST'); if (!r.ok) return toast(r.data.error || 'Could not save the client.', true); toast('Saved to your Clients list.'); setJob(r.data); };
+ACT.editVessel = () => {
+  const d = S.job.job;
+  modal({title: 'Vessel', text: 'Type the IMO number and a vessel Compass already knows fills in by itself.', ok: 'Save vessel',
+    body: '<div class="stack" style="gap:12px"><div><label class="lb" for="mImo">IMO number <span class="opt">optional, 7 digits</span></label><input id="mImo" type="text" inputmode="numeric" maxlength="7" value="' + esc(d.imo || '') + '"></div><div><label class="lb" for="mVes">Vessel name <span class="req">required</span></label><input id="mVes" type="text" data-in="upper" value="' + esc(d.vessel || '') + '" placeholder="As on the Bill of Lading"></div></div>',
+    onOk: async () => {
+      const name = $('mVes').value.trim(), imo = $('mImo').value.replace(/\D/g, '');
+      if (!name) { $('mVes').classList.add('bad'); toast('Type the vessel name.', true); return false; }
+      if (imo && imo.length !== 7) { $('mImo').classList.add('bad'); toast('An IMO number has 7 digits.', true); return false; }
+      const body = {vessel: name, imo: imo};
+      if (imo) { const f = await api('/api/fleet/' + imo); if (f.ok && f.data.found) { const v = f.data.vessel; body.vessel_type = v.vtype; body.flag = v.flag; body.built = v.built; body.call_sign = v.call_sign; ['grt', 'nrt', 'dwt', 'loa', 'beam'].forEach(k => { if (v[k] != null && !d[k]) body[k] = v[k]; }); } }
+      const r = await api('/api/pda/documents/' + d.id, 'PUT', body);
+      if (!r.ok) { toast(r.data.error || 'Could not save the vessel.', true); return false; }
+      await reloadJob(); toast('Vessel saved.');
+    }});
+};
 ACT.editInstr = () => {
   modal({title: "Principal's instructions", text: 'One instruction per line. These show on the job for everyone.', body: '<textarea id="mInstr" rows="7">' + esc(S.job.job.instructions || '') + '</textarea><div class="row" style="margin-top:8px"><button class="btn ghost small" data-act="stdInstr">Insert the standard four lines</button></div>', ok: 'Save instructions',
     onOk: async () => { const r = await api('/api/pda/documents/' + S.job.job.id, 'PUT', {instructions: $('mInstr').value}); if (!r.ok) { toast(r.data.error || 'Could not save.', true); return false; } await reloadJob(); toast('Instructions saved.'); } });
@@ -10847,13 +10852,18 @@ function tabCharges() {
   if (!d.calc.groups.length) rows = '<tr><td colspan="4" class="empty">No charges yet. Add them in the quotation editor.</td></tr>';
   const mainAmt = fin ? m.final_sar : m.pro_sar, supp = m.by_kind.supplementary || 0, vend = m.by_kind.vendor || 0;
   return '<div class="panel"><div class="spread" style="align-items:flex-end;margin-bottom:10px"><div><h2>Consolidated account</h2><div class="hint" style="margin:0">Estimate and actual side by side. ' + (fin ? (editable ? 'Type each actual cost in the Final column; it saves as you leave the box. Grey numbers are the estimate.' : '') : 'The Final column opens once the vessel has sailed.') + '</div></div>' +
-    '<div class="row"><span class="help" style="margin:0">All amounts in SAR</span><a class="btn ghost small" href="' + editorUrl() + '">Edit charges in the quotation editor</a>' +
+    '<div class="row"><label class="help" style="margin:0" for="stayIn">Port stay (days)</label><input id="stayIn" type="number" min="0" step="any" data-ch="stay" value="' + (d.port_stay == null ? '' : d.port_stay) + '" style="width:80px;min-height:34px" title="Daily charges such as berth hire use this"><span class="help" style="margin:0">All amounts in SAR</span><a class="btn ghost small" href="' + editorUrl() + '">Edit charges in the quotation editor</a>' +
     (fin && d.status !== 'finalized' && J.stage < 5 ? '<button class="btn small" data-act="finalize" title="Locks the actual amounts and turns the PDA into the Final Disbursement Account">Prepare final account (FDA)</button>' : '') + '</div></div>' +
     '<div class="scroll-x"><table class="t" style="min-width:640px"><tbody>' + rows + '</tbody></table></div>' +
     '<div class="sumrow"><div class="box"><div class="k">Main DA</div><div class="v">' + fmt(mainAmt) + '</div></div><div class="box"><div class="k">Supplementary DA</div><div class="v">' + fmt(supp) + '</div></div><div class="box"><div class="k">Vendor invoices</div><div class="v">' + fmt(vend) + '</div></div><div class="box dark"><div class="k">Total</div><div class="v">' + fmt(mainAmt + supp + vend) + '</div></div></div>' +
     '<div class="help" style="margin-top:8px">Supplementary and vendor amounts come from the invoices you add in the Invoices tab.</div></div>';
 }
 function fmtQtyJ(n) { return Number(n || 0).toLocaleString('en-US', {maximumFractionDigits: 3}); }
+CH.stay = async (t) => {
+  const r = await api('/api/pda/documents/' + S.job.job.id, 'PUT', {port_stay: t.value});
+  if (!r.ok) { toast(r.data.error || 'Could not save the port stay.', true); t.classList.add('bad'); return; }
+  await reloadJob(); toast('Port stay saved. Daily charges updated.');
+};
 CH.final = async (t) => {
   const v = t.value.trim();
   const r = await api('/api/pda/line-items/' + t.dataset.id, 'PUT', {actual_amount: v === '' ? null : v});
@@ -11008,7 +11018,7 @@ function clientDetailHtml() {
     '<div id="cdErr"></div><div class="fgrid">' + [['name', 'Company name', 'upper'], ['operator', 'Operator name', ''], ['country', 'Country', ''], ['phone', 'Phone', ''], ['email', 'Email', ''], ['address', 'Address', 'full'], ['contacts', 'Other contacts', 'full'], ['notes', 'Notes', 'full']].map(f => '<div' + (f[2] === 'full' ? ' class="full"' : '') + '><label class="lb" for="cd_' + f[0] + '">' + f[1] + '</label>' + (f[2] === 'full' && f[0] !== 'address' ? '<textarea id="cd_' + f[0] + '" rows="2">' + esc(c[f[0]] || '') + '</textarea>' : '<input id="cd_' + f[0] + '" type="text" value="' + esc(c[f[0]] || '') + '"' + (f[2] === 'upper' ? ' data-in="upper"' : '') + '>') + '</div>').join('') + '</div>' +
     '<div class="row"><button class="btn" data-act="clientSave">Save changes</button>' + (ROLE === 'admin' ? '<button class="btn danger" data-act="clientDel">Delete client</button>' : '') + '</div>' +
     '<div><h2 style="margin-bottom:8px">Documents</h2><div class="docgrid">' + docs + '</div><div class="help" style="margin-top:8px">These are attached automatically to every job for this client.</div></div>' +
-    '<div><h2 style="margin-bottom:8px">Recent jobs</h2>' + (jobsFor.length ? '<div class="stack" style="gap:6px">' + jobsFor.map(j => '<a href="#/job/' + j.id + '" class="instr" style="display:flex;justify-content:space-between;text-decoration:none;color:var(--text)"><span><b>' + esc(j.vessel) + '</b> &middot; ' + esc(j.pda_no) + '</span><span>' + esc(jobLabel(j)) + '</span></a>').join('') + '</div>' : '<div class="help">No jobs for this client yet.</div>') + '</div></div>';
+    '<div><h2 style="margin-bottom:8px">Recent jobs</h2>' + (jobsFor.length ? '<div class="stack" style="gap:6px">' + jobsFor.map(j => '<a href="#/job/' + j.id + '" class="instr" style="display:flex;justify-content:space-between;text-decoration:none;color:var(--text)"><span><b>' + esc(j.vessel || 'VESSEL TO BE ADVISED') + '</b> &middot; ' + esc(j.pda_no) + '</span><span>' + esc(jobLabel(j)) + '</span></a>').join('') + '</div>' : '<div class="help">No jobs for this client yet.</div>') + '</div></div>';
 }
 ACT.clientSave = async () => {
   const c = S.clientSel, body = {};
@@ -11046,7 +11056,7 @@ async function viewReport(id) {
   const hist = J.history.slice().reverse();
   $('view').innerHTML = '<div class="row noprint" style="justify-content:space-between;margin-bottom:18px"><a class="btn ghost" href="#/job/' + id + '">&larr; Back to the job file</a><div class="row"><button class="btn ghost" onclick="window.print()">Print</button><a class="btn" href="/api/jobs/' + id + '/report.pdf" target="_blank" rel="noopener">Download PDF</a></div></div>' +
     '<div class="paper"><div class="spread" style="border-bottom:3px solid #123a56;padding-bottom:16px;align-items:flex-start"><div><div style="font-size:20px;font-weight:700;color:#123a56">SEA POWER MARINE SERVICES CO. LTD</div><div style="font-size:12px;color:#7a8794;margin-top:2px">Ship agency &middot; Saudi Arabia</div></div><div style="text-align:right"><div style="font-size:18px;font-weight:700;letter-spacing:.04em">FINAL JOB REPORT</div><div style="font-size:12px;color:#7a8794;margin-top:2px">Job ' + esc(d.pda_no) + '</div></div></div>' +
-    '<div class="kv" style="font-size:13px">' + [['Vessel', '<b>' + esc(d.vessel) + '</b>' + (d.imo ? ' (IMO ' + esc(d.imo) + ')' : '')], ['Customer', '<b>' + esc(d.customer_name || '-') + '</b>'], ['Port', esc(portName(d) || d.dis_port || '-')], ['Activity', esc(d.operation || '-') + (d.voyage ? ', voyage ' + esc(d.voyage) : '')], ['ETA', esc(d.eta ? fd(d.eta) : '-')], ['Sailed', esc(d.sail_date ? fd(d.sail_date) : '-')], ['Handled by', esc(d.handler || d.sales_exec || d.created_by)], ['Report date', esc(fd(today))], ['Stage', esc(J.stage_name)], ['Principal ref', esc(d.principal_ref || '-')]].map(x => '<div><span style="color:#7a8794">' + x[0] + '</span><br>' + x[1] + '</div>').join('') + '</div>' +
+    '<div class="kv" style="font-size:13px">' + [['Vessel', '<b>' + esc(d.vessel || 'VESSEL TO BE ADVISED') + '</b>' + (d.imo ? ' (IMO ' + esc(d.imo) + ')' : '')], ['Customer', '<b>' + esc(d.customer_name || '-') + '</b>'], ['Port', esc(portName(d) || d.dis_port || '-')], ['Activity', esc(d.operation || '-') + (d.voyage ? ', voyage ' + esc(d.voyage) : '')], ['ETA', esc(d.eta ? fd(d.eta) : '-')], ['Sailed', esc(d.sail_date ? fd(d.sail_date) : '-')], ['Handled by', esc(d.handler || d.sales_exec || d.created_by)], ['Report date', esc(fd(today))], ['Stage', esc(J.stage_name)], ['Principal ref', esc(d.principal_ref || '-')]].map(x => '<div><span style="color:#7a8794">' + x[0] + '</span><br>' + x[1] + '</div>').join('') + '</div>' +
     '<div><h4>1. PORT COSTS AND AGENCY FEES (SAR)</h4><table><thead><tr><th>Group</th><th class="r">Pro forma</th><th class="r">Final</th><th class="r">Difference</th></tr></thead><tbody>' + (grp || '<tr><td colspan="4">No charges.</td></tr>') + '<tr class="tot"><td>Total</td><td class="r">' + fmt(t.est_sar) + '</td><td class="r">' + (fin ? fmt(t.act_sar) : '-') + '</td><td class="r">' + (fin && Math.abs(td) > 0.004 ? (td > 0 ? '+' : '') + fmt(td) : '-') + '</td></tr></tbody></table></div>' +
     '<div><h4>2. HUSBANDRY AND SERVICES PROVIDED (SAR)</h4><table><thead><tr><th>Service</th><th>Status</th><th>Invoice</th><th class="r">Amount</th></tr></thead><tbody>' + (svcs.map(s => '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.status) + '</td><td>' + esc(s.invoice_no || '-') + '</td><td class="r">' + fmt(s.cost) + '</td></tr>').join('') || '<tr><td colspan="4">None recorded.</td></tr>') + '<tr class="tot"><td colspan="3">Total services</td><td class="r">' + fmt(m.services) + '</td></tr></tbody></table></div>' +
     '<div><h4>3. INVOICES ON THIS JOB (SAR)</h4><table><thead><tr><th>Invoice</th><th>For</th><th>Status</th><th class="r">Amount</th></tr></thead><tbody>' + (invs.map(i => '<tr><td>' + esc(i.no) + '</td><td>' + esc(i.description) + '</td><td style="font-weight:700;color:' + (i.paid ? '#1c8a5a' : '#a3322b') + '">' + (i.paid ? 'Paid' : 'Unpaid') + '</td><td class="r">' + fmt(i.amount) + '</td></tr>').join('') || '<tr><td colspan="4">No invoices yet.</td></tr>') +
