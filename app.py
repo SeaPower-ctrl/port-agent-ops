@@ -966,6 +966,69 @@ def init_db():
         ("sailing_schedule", "TEXT DEFAULT ''"), ("terms", "TEXT DEFAULT ''"),
     ):
         cur.execute(f"ALTER TABLE pda_documents ADD COLUMN IF NOT EXISTS {_col} {_ddl}")
+    # --- Jobs (Compass v2): a job is the PDA number itself. Everything below is additive.
+    for _col, _ddl in (
+        ("job_stage", "INTEGER DEFAULT 0"), ("appointed_at", "TEXT DEFAULT ''"), ("alongside_at", "TEXT DEFAULT ''"),
+        ("sail_date", "TEXT DEFAULT ''"), ("invoiced_at", "TEXT DEFAULT ''"), ("closed_at", "TEXT DEFAULT ''"),
+        ("time_bar_days", "INTEGER DEFAULT 60"), ("instructions", "TEXT DEFAULT ''"), ("imo", "TEXT DEFAULT ''"),
+        ("voyage", "TEXT DEFAULT ''"), ("principal_ref", "TEXT DEFAULT ''"), ("client_id", "INTEGER"),
+        ("one_off", "INTEGER DEFAULT 0"), ("vessel_type", "TEXT DEFAULT ''"), ("flag", "TEXT DEFAULT ''"),
+        ("built", "TEXT DEFAULT ''"), ("loa", "NUMERIC"), ("beam", "NUMERIC"), ("call_sign", "TEXT DEFAULT ''"),
+    ):
+        cur.execute(f"ALTER TABLE pda_documents ADD COLUMN IF NOT EXISTS {_col} {_ddl}")
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS pda_clients (
+            id SERIAL PRIMARY KEY, name TEXT NOT NULL, operator TEXT DEFAULT '', country TEXT DEFAULT '',
+            address TEXT DEFAULT '', phone TEXT DEFAULT '', email TEXT DEFAULT '', contacts TEXT DEFAULT '',
+            notes TEXT DEFAULT '', created_by TEXT DEFAULT '', created_at TEXT DEFAULT ''
+        )""")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_pda_clients_name ON pda_clients (UPPER(name))")
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS pda_client_docs (
+            id SERIAL PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES pda_clients(id) ON DELETE CASCADE,
+            kind TEXT DEFAULT 'other', filename TEXT DEFAULT '', mime TEXT DEFAULT '', data BYTEA,
+            uploaded_by TEXT DEFAULT '', uploaded_at TEXT DEFAULT ''
+        )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pda_client_docs_client ON pda_client_docs (client_id)")
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS pda_vessels (
+            id SERIAL PRIMARY KEY, imo TEXT UNIQUE NOT NULL, name TEXT DEFAULT '', vtype TEXT DEFAULT '',
+            flag TEXT DEFAULT '', built TEXT DEFAULT '', grt NUMERIC, nrt NUMERIC, dwt NUMERIC, loa NUMERIC,
+            beam NUMERIC, call_sign TEXT DEFAULT '', updated_at TEXT DEFAULT ''
+        )""")
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS pda_history (
+            id SERIAL PRIMARY KEY, pda_id INTEGER NOT NULL REFERENCES pda_documents(id) ON DELETE CASCADE,
+            at TEXT DEFAULT '', who TEXT DEFAULT '', text TEXT DEFAULT '', doc TEXT DEFAULT ''
+        )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pda_history_pda ON pda_history (pda_id)")
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS pda_services (
+            id SERIAL PRIMARY KEY, pda_id INTEGER NOT NULL REFERENCES pda_documents(id) ON DELETE CASCADE,
+            name TEXT NOT NULL, status TEXT DEFAULT 'Requested', cost NUMERIC DEFAULT 0, invoice_no TEXT DEFAULT '',
+            note TEXT DEFAULT '', created_by TEXT DEFAULT '', created_at TEXT DEFAULT ''
+        )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pda_services_pda ON pda_services (pda_id)")
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS pda_invoices (
+            id SERIAL PRIMARY KEY, pda_id INTEGER NOT NULL REFERENCES pda_documents(id) ON DELETE CASCADE,
+            no TEXT DEFAULT '', kind TEXT DEFAULT 'main', description TEXT DEFAULT '', amount NUMERIC DEFAULT 0,
+            paid INTEGER DEFAULT 0, paid_at TEXT DEFAULT '', created_by TEXT DEFAULT '', created_at TEXT DEFAULT ''
+        )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pda_invoices_pda ON pda_invoices (pda_id)")
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS pda_job_docs (
+            id SERIAL PRIMARY KEY, pda_id INTEGER NOT NULL REFERENCES pda_documents(id) ON DELETE CASCADE,
+            title TEXT DEFAULT '', filename TEXT DEFAULT '', mime TEXT DEFAULT '', data BYTEA,
+            uploaded_by TEXT DEFAULT '', uploaded_at TEXT DEFAULT ''
+        )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pda_job_docs_pda ON pda_job_docs (pda_id)")
+    cur.execute("CREATE TABLE IF NOT EXISTS pda_pins (username TEXT NOT NULL, pda_id INTEGER NOT NULL, PRIMARY KEY (username, pda_id))")
+    # PDAs made before jobs existed: sent ones are 'Quotation sent', finalized ones are Invoiced; drafts stay stage 0
+    cur.execute("SELECT 1 FROM app_settings WHERE key = 'jobs_backfilled'")
+    if not cur.fetchone():
+        cur.execute("UPDATE pda_documents SET job_stage = 4 WHERE status = 'finalized'")
+        cur.execute("INSERT INTO app_settings (key, value) VALUES ('jobs_backfilled', '1') ON CONFLICT (key) DO NOTHING")
     # master list of charge names (the searchable "Charge Description" list); admins can add to it
     cur.execute("CREATE TABLE IF NOT EXISTS pda_charge_catalog (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL)")
     cur.execute("SELECT COUNT(*) FROM pda_charge_catalog")
@@ -5984,7 +6047,7 @@ def export_records():
 
 @app.route("/api/vessels", methods=["GET"])
 @login_required
-def list_vessels():
+def api_vessels_list():
     db = get_db()
     rows = db.execute("SELECT name, mmsi, operator FROM vessels ORDER BY name").fetchall()
     return jsonify([dict(r) for r in rows])
@@ -6264,9 +6327,10 @@ PDA_TEXT_FIELDS = (
     "sales_email", "load_type", "term", "trade", "operation", "eta", "receiver", "cargo_type", "cargo_note",
     "service_type", "lead_no", "payment_type", "entry_date", "validity_date", "pricing_person", "cargo_insurance",
     "remarks", "sailing_schedule", "terms",
+    "voyage", "principal_ref", "instructions", "imo", "vessel_type", "flag", "built", "call_sign", "sail_date",
 )
-PDA_LONG_TEXT = ("notes", "cargo_note", "customer_address", "sailing_schedule", "terms")
-PDA_NUM_FIELDS = ("port_stay", "cargo_frt", "cargo_units", "grt", "nrt", "dwt", "fx_rate")
+PDA_LONG_TEXT = ("notes", "cargo_note", "customer_address", "sailing_schedule", "terms", "instructions")
+PDA_NUM_FIELDS = ("port_stay", "cargo_frt", "cargo_units", "grt", "nrt", "dwt", "fx_rate", "loa", "beam")
 PDA_DOC_NUMERIC = PDA_NUM_FIELDS
 PDA_ITEM_NUMERIC = ["estimated_amount", "actual_amount", "rate", "qty"]
 
@@ -6435,7 +6499,14 @@ def _pda_validated_doc_fields(data, existing=None):
         if k in data:
             v = data.get(k)
             out[k] = _pda_clean_text(v, 4000 if k in PDA_LONG_TEXT else 300)
-    for k in ("entry_date", "validity_date"):
+    for k in ("vessel", "customer_name", "call_sign"):
+        if k in out:
+            out[k] = re.sub(r"\s+", " ", out[k]).upper()
+    if "imo" in out:
+        out["imo"] = re.sub(r"\D", "", out["imo"])[:7]
+        if out["imo"] and len(out["imo"]) != 7:
+            return None, "An IMO number has 7 digits."
+    for k in ("entry_date", "validity_date", "sail_date"):
         if out.get(k):
             try:
                 datetime.strptime(out[k], "%Y-%m-%d")
@@ -6701,6 +6772,29 @@ def list_pda_documents():
     return jsonify(docs)
 
 
+def _job_after_create(db, doc, data):
+    """Links the new PDA to a saved client (or saves a new one when asked) and remembers the vessel."""
+    cid, one_off = None, 1
+    if data.get("client_id"):
+        try:
+            c = db.execute("SELECT id FROM pda_clients WHERE id = ?", (int(data.get("client_id")),)).fetchone()
+        except (TypeError, ValueError):
+            c = None
+        if c:
+            cid, one_off = c["id"], 0
+    elif data.get("save_client") and (doc["customer_name"] or "").strip():
+        c = db.execute("SELECT id FROM pda_clients WHERE UPPER(name) = ?", (doc["customer_name"].strip().upper(),)).fetchone()
+        if not c:
+            c = db.execute(
+                "INSERT INTO pda_clients (name, operator, country, address, phone, email, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                (doc["customer_name"].strip().upper(), _pda_clean_text(data.get("operator"), 120), _pda_clean_text(data.get("country"), 80),
+                 doc["customer_address"] or "", doc["customer_phone"] or "", doc["customer_email"] or "", session.get("username"), _now_stamp())).fetchone()
+        cid, one_off = c["id"], 0
+    db.execute("UPDATE pda_documents SET client_id = ?, one_off = ? WHERE id = ?", (cid, one_off, doc["id"]))
+    _vessel_from_doc(db, dict(doc))
+    _job_log(db, doc["id"], "PDA created." + (" Customer is a one-off and was not saved." if one_off and doc["customer_name"] else ""))
+
+
 @app.route("/api/pda/documents", methods=["POST"])
 @login_required
 def create_pda_document():
@@ -6737,6 +6831,7 @@ def create_pda_document():
     try:
         doc = _pda_new_doc_row(db, fields, session.get("username"))
         _pda_insert_template_lines(db, doc)
+        _job_after_create(db, doc, data)
         db.commit()
     except Exception:
         db.conn.rollback()
@@ -6773,6 +6868,10 @@ def update_pda_document(pda_id):
         db.execute(f"UPDATE pda_documents SET {sets}, updated_at = ? WHERE id = ?",
                    (*fields.values(), datetime.utcnow().strftime("%Y-%m-%d %H:%M"), pda_id))
         _pda_recalc_auto_lines(db, pda_id)
+        changed = [lab for k, lab in JOB_WATCHED if k in fields and str(fields[k] if fields[k] is not None else "") != str(doc[k] if doc[k] is not None else "")]
+        if changed:
+            _job_log(db, pda_id, "Details updated: " + ", ".join(changed) + ".")
+        _vessel_from_doc(db, {**dict(doc), **fields})
         db.commit()
     return jsonify({"ok": True, **_pda_payload(db, db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone())})
 
@@ -6788,6 +6887,7 @@ def mark_pda_sent(pda_id):
         return jsonify({"error": "Only a draft PDA can be marked as sent."}), 400
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     db.execute("UPDATE pda_documents SET status = 'sent', sent_at = ? WHERE id = ?", (now, pda_id))
+    _job_log(db, pda_id, "PDA marked as sent to the client.", "PDA letter")
     db.commit()
     return jsonify({"ok": True})
 
@@ -6807,6 +6907,7 @@ def finalize_pda_document(pda_id):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     db.execute("UPDATE pda_documents SET status = 'finalized', finalized_by = ?, finalized_at = ? WHERE id = ?",
                (session.get("username"), now, pda_id))
+    _job_log(db, pda_id, "Final account (FDA) prepared. Actual amounts locked in.", "FDA")
     db.commit()
     return jsonify({"ok": True})
 
@@ -6834,6 +6935,7 @@ def duplicate_pda_document(pda_id):
     copy_fields = [k for k in PDA_TEXT_FIELDS if k not in ("notes",)] + list(PDA_NUM_FIELDS)
     fields = {k: src[k] for k in copy_fields}
     fields["notes"] = src["notes"] or ""
+    fields["sail_date"] = ""
     fields["currency"] = src["currency"] or "SAR"
     today = datetime.utcnow()
     fields["entry_date"] = today.strftime("%Y-%m-%d")
@@ -6847,6 +6949,8 @@ def duplicate_pda_document(pda_id):
                 (doc["id"], it["name"], it["estimated_amount"], it["sort_order"], it["group_name"], it["unit"], it["currency"],
                  it["rate"], it["qty"], it["qty_basis"], it["qty_manual"], it["remarks"]),
             )
+        db.execute("UPDATE pda_documents SET client_id = ?, one_off = ? WHERE id = ?", (src["client_id"], src["one_off"] or 0, doc["id"]))
+        _job_log(db, doc["id"], f"PDA created as a copy of {src['pda_no']}.")
         db.commit()
     except Exception:
         db.conn.rollback()
@@ -6941,6 +7045,7 @@ def add_pda_line_item(pda_id):
         (pda_id, ch["name"], round(ch["rate"] * ch["qty"], 2), order_row["n"], ch["group_name"], ch["unit"], ch["currency"],
          ch["rate"], ch["qty"], basis, 0 if auto is None else manual, ch.get("remarks", "")),
     )
+    _job_log(db, pda_id, f"Charge added: {ch['name']}.")
     db.commit()
     return jsonify({"ok": True, **_pda_payload(db, doc)})
 
@@ -6972,6 +7077,10 @@ def update_pda_line_item(item_id):
             ch["estimated_amount"] = round(rate * qty, 2)
         sets = ", ".join(f"{k} = ?" for k in ch)
         db.execute(f"UPDATE pda_line_items SET {sets} WHERE id = ?", (*ch.values(), item_id))
+        if "estimated_amount" in ch and abs(ch["estimated_amount"] - _pf(item["estimated_amount"])) > 0.004:
+            _job_log(db, doc["id"], f"Charge changed: {item['name']} from {fmt_money(item['estimated_amount'])} to {fmt_money(ch['estimated_amount'])} ({item['currency']}).")
+        if "actual_amount" in ch and ch["actual_amount"] != (None if item["actual_amount"] is None else float(item["actual_amount"])):
+            _job_log(db, doc["id"], f"Final amount set: {item['name']} = {fmt_money(ch['actual_amount']) if ch['actual_amount'] is not None else 'cleared'} ({item['currency']}).")
         db.commit()
     return jsonify({"ok": True, **_pda_payload(db, doc)})
 
@@ -6984,6 +7093,7 @@ def delete_pda_line_item(item_id):
     if not item or not doc:
         return jsonify({"error": "Not found."}), 404
     db.execute("DELETE FROM pda_line_items WHERE id = ?", (item_id,))
+    _job_log(db, doc["id"], f"Charge removed: {item['name']}.")
     db.commit()
     return jsonify({"ok": True, **_pda_payload(db, doc)})
 
@@ -7073,8 +7183,790 @@ def email_pda_document(pda_id):
     if doc["status"] == "draft":
         db.execute("UPDATE pda_documents SET status = 'sent', sent_at = ? WHERE id = ?",
                    (datetime.utcnow().strftime("%Y-%m-%d %H:%M"), pda_id))
-        db.commit()
+    _job_log(db, pda_id, "Account emailed to " + ", ".join(addrs) + ".", "FDA" if doc["status"] == "finalized" else "PDA letter")
+    db.commit()
     return jsonify({"ok": True, "sent_to": addrs})
+
+
+# ---------- Jobs (Compass): one job = one PDA number, followed from quotation to closed ----------
+JOB_STAGES = ["Quotation sent", "Appointed", "Alongside", "Sailed", "Invoiced", "Closed"]
+JOB_STAGE_NOTES = ["PDA with the customer", "Job opened", "Vessel at berth", "Costs are final", "Invoices issued", "All paid, filed"]
+JOB_INVOICE_KINDS = {"main": "Main DA", "supplementary": "Supplementary DA", "vendor": "Vendor invoice", "service": "Husbandry / service"}
+JOB_SERVICE_STATUS = ("Requested", "Done", "Cancelled")
+JOB_UPLOAD_OK = (".pdf", ".png", ".jpg", ".jpeg", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".txt")
+JOB_UPLOAD_MAX = 10 * 1024 * 1024
+JOB_WATCHED = (("customer_name", "Customer"), ("vessel", "Vessel"), ("port", "Port"), ("eta", "ETA"), ("voyage", "Voyage"),
+               ("principal_ref", "Principal ref"), ("operation", "Activity"), ("imo", "IMO"), ("currency", "Currency"),
+               ("fx_rate", "Exchange rate"), ("port_stay", "Port stay"), ("instructions", "Principal's instructions"))
+
+
+def _now_stamp():
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+
+
+def _riyadh_today():
+    return (datetime.utcnow() + timedelta(hours=3)).date()
+
+
+def _who():
+    return session.get("display_name") or session.get("username") or ""
+
+
+def _job_log(db, pda_id, text, doc=""):
+    """Adds one line to a job's history (who / what / when). Rows are never edited or deleted."""
+    db.execute("INSERT INTO pda_history (pda_id, at, who, text, doc) VALUES (?, ?, ?, ?, ?)",
+               (pda_id, _now_stamp(), _who(), str(text)[:500], str(doc or "")[:120]))
+
+
+def _job_timebar(doc):
+    stage = int(doc["job_stage"] or 0)
+    days = int(doc["time_bar_days"] or 60)
+    out = {"days": days, "state": "waiting", "deadline": "", "days_left": None, "sail_date": doc["sail_date"] or ""}
+    if stage >= 5:
+        out["state"] = "closed"
+        return out
+    if stage < 3 or not doc["sail_date"]:
+        return out
+    try:
+        sd = datetime.strptime(doc["sail_date"], "%Y-%m-%d").date()
+    except ValueError:
+        return out
+    dl = sd + timedelta(days=days)
+    left = (dl - _riyadh_today()).days
+    out.update({"deadline": dl.isoformat(), "days_left": left, "state": "over" if left < 0 else ("warn" if left <= 14 else "ok")})
+    return out
+
+
+def _vessel_row(r):
+    d = dict(r)
+    for k in ("grt", "nrt", "dwt", "loa", "beam"):
+        if d.get(k) is not None:
+            d[k] = float(d[k])
+    return d
+
+
+def _imo_ok(v):
+    v = re.sub(r"\D", "", str(v or ""))
+    return v if len(v) == 7 else ""
+
+
+def _imo_checksum_ok(v):
+    v = _imo_ok(v)
+    return bool(v) and sum(int(c) * w for c, w in zip(v[:6], (7, 6, 5, 4, 3, 2))) % 10 == int(v[6])
+
+
+def _vessel_upsert(db, imo, name="", vtype="", flag="", built="", grt=None, nrt=None, dwt=None, loa=None, beam=None, call_sign=""):
+    """Remembers a vessel by IMO so the next time its particulars fill themselves in."""
+    imo = _imo_ok(imo)
+    if not imo:
+        return
+    db.execute(
+        """INSERT INTO pda_vessels (imo, name, vtype, flag, built, grt, nrt, dwt, loa, beam, call_sign, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (imo) DO UPDATE SET
+             name = CASE WHEN EXCLUDED.name <> '' THEN EXCLUDED.name ELSE pda_vessels.name END,
+             vtype = CASE WHEN EXCLUDED.vtype <> '' THEN EXCLUDED.vtype ELSE pda_vessels.vtype END,
+             flag = CASE WHEN EXCLUDED.flag <> '' THEN EXCLUDED.flag ELSE pda_vessels.flag END,
+             built = CASE WHEN EXCLUDED.built <> '' THEN EXCLUDED.built ELSE pda_vessels.built END,
+             grt = COALESCE(EXCLUDED.grt, pda_vessels.grt), nrt = COALESCE(EXCLUDED.nrt, pda_vessels.nrt),
+             dwt = COALESCE(EXCLUDED.dwt, pda_vessels.dwt), loa = COALESCE(EXCLUDED.loa, pda_vessels.loa),
+             beam = COALESCE(EXCLUDED.beam, pda_vessels.beam),
+             call_sign = CASE WHEN EXCLUDED.call_sign <> '' THEN EXCLUDED.call_sign ELSE pda_vessels.call_sign END,
+             updated_at = EXCLUDED.updated_at""",
+        (imo, (name or "").upper()[:120], (vtype or "")[:60], (flag or "")[:60], (built or "")[:10],
+         grt, nrt, dwt, loa, beam, (call_sign or "").upper()[:20], _now_stamp()))
+
+
+def _vessel_from_doc(db, d):
+    if _imo_ok(d.get("imo")):
+        _vessel_upsert(db, d["imo"], d.get("vessel"), d.get("vessel_type"), d.get("flag"), d.get("built"),
+                       d.get("grt"), d.get("nrt"), d.get("dwt"), d.get("loa"), d.get("beam"), d.get("call_sign"))
+
+
+@app.route("/api/fleet", methods=["GET"])
+@login_required
+def api_fleet_list():
+    q = _pda_clean_text(request.args.get("q"), 60)
+    db = get_db()
+    if q:
+        like = "%" + q.replace("%", "").replace("_", "") + "%"
+        rows = db.execute("SELECT * FROM pda_vessels WHERE imo LIKE ? OR name ILIKE ? ORDER BY name LIMIT 30", (like, like)).fetchall()
+    else:
+        rows = db.execute("SELECT * FROM pda_vessels ORDER BY name LIMIT 300").fetchall()
+    return jsonify([_vessel_row(r) for r in rows])
+
+
+@app.route("/api/fleet/<imo>", methods=["GET"])
+@login_required
+def api_fleet_get(imo):
+    i = _imo_ok(imo)
+    if not i:
+        return jsonify({"error": "An IMO number has 7 digits."}), 400
+    r = get_db().execute("SELECT * FROM pda_vessels WHERE imo = ?", (i,)).fetchone()
+    if not r:
+        return jsonify({"found": False, "checksum_ok": _imo_checksum_ok(i)})
+    return jsonify({"found": True, "checksum_ok": _imo_checksum_ok(i), "vessel": _vessel_row(r)})
+
+
+# ----- clients -----
+
+def _client_row(r, docs=None):
+    d = dict(r)
+    if docs is not None:
+        d["docs"] = docs
+    return d
+
+
+def _client_docs(db, cid):
+    return [dict(x) for x in db.execute(
+        "SELECT id, client_id, kind, filename, mime, uploaded_by, uploaded_at, LENGTH(data) AS size FROM pda_client_docs WHERE client_id = ? ORDER BY id",
+        (cid,)).fetchall()]
+
+
+def _client_fields(data):
+    name = re.sub(r"\s+", " ", _pda_clean_text(data.get("name"), 160)).upper()
+    out = {"name": name}
+    for k, lim in (("operator", 120), ("country", 80), ("address", 600), ("phone", 60), ("contacts", 1200), ("notes", 1200)):
+        out[k] = _pda_clean_text(data.get(k), lim)
+    email = _pda_clean_text(data.get("email"), 200)
+    if email and not _clean_email(email.split(",")[0]):
+        return None, "That email doesn't look right."
+    out["email"] = email
+    return out, None
+
+
+@app.route("/api/clients", methods=["GET"])
+@login_required
+def list_clients():
+    q = _pda_clean_text(request.args.get("q"), 60)
+    db = get_db()
+    sql = ("SELECT c.*, (SELECT COUNT(*) FROM pda_documents d WHERE d.client_id = c.id) AS jobs, "
+           "(SELECT COUNT(*) FROM pda_client_docs x WHERE x.client_id = c.id AND x.kind = 'cr') AS has_cr, "
+           "(SELECT COUNT(*) FROM pda_client_docs x WHERE x.client_id = c.id AND x.kind = 'vat') AS has_vat FROM pda_clients c")
+    params = ()
+    if q:
+        like = "%" + q.replace("%", "").replace("_", "") + "%"
+        sql += " WHERE c.name ILIKE ? OR c.operator ILIKE ? OR c.country ILIKE ?"
+        params = (like, like, like)
+    rows = db.execute(sql + " ORDER BY c.name LIMIT 500", params).fetchall()
+    return jsonify([_client_row(r) for r in rows])
+
+
+@app.route("/api/clients", methods=["POST"])
+@login_required
+def add_client():
+    f, err = _client_fields(request.get_json(force=True) or {})
+    if err:
+        return jsonify({"error": err}), 400
+    if not f["name"]:
+        return jsonify({"error": "Enter the client's name. It is the only thing required."}), 400
+    db = get_db()
+    if db.execute("SELECT 1 FROM pda_clients WHERE UPPER(name) = ?", (f["name"],)).fetchone():
+        return jsonify({"error": f"{f['name']} is already in your Clients list."}), 409
+    row = db.execute(
+        """INSERT INTO pda_clients (name, operator, country, address, phone, email, contacts, notes, created_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *""",
+        (f["name"], f["operator"], f["country"], f["address"], f["phone"], f["email"], f["contacts"], f["notes"],
+         session.get("username"), _now_stamp())).fetchone()
+    db.commit()
+    return jsonify({"ok": True, "client": _client_row(row, [])})
+
+
+@app.route("/api/clients/<int:cid>", methods=["GET"])
+@login_required
+def get_client(cid):
+    db = get_db()
+    r = db.execute("SELECT * FROM pda_clients WHERE id = ?", (cid,)).fetchone()
+    if not r:
+        return jsonify({"error": "Not found."}), 404
+    return jsonify(_client_row(r, _client_docs(db, cid)))
+
+
+@app.route("/api/clients/<int:cid>", methods=["PUT"])
+@login_required
+def update_client(cid):
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    old = db.execute("SELECT * FROM pda_clients WHERE id = ?", (cid,)).fetchone()
+    if not old:
+        return jsonify({"error": "Not found."}), 404
+    merged = {**dict(old), **data}
+    f, err = _client_fields(merged)
+    if err:
+        return jsonify({"error": err}), 400
+    if not f["name"]:
+        return jsonify({"error": "The client needs a name."}), 400
+    if db.execute("SELECT 1 FROM pda_clients WHERE UPPER(name) = ? AND id <> ?", (f["name"], cid)).fetchone():
+        return jsonify({"error": f"{f['name']} is already in your Clients list."}), 409
+    db.execute("UPDATE pda_clients SET name = ?, operator = ?, country = ?, address = ?, phone = ?, email = ?, contacts = ?, notes = ? WHERE id = ?",
+               (f["name"], f["operator"], f["country"], f["address"], f["phone"], f["email"], f["contacts"], f["notes"], cid))
+    db.commit()
+    return jsonify({"ok": True, "client": _client_row(db.execute("SELECT * FROM pda_clients WHERE id = ?", (cid,)).fetchone(), _client_docs(db, cid))})
+
+
+@app.route("/api/clients/<int:cid>", methods=["DELETE"])
+@login_required
+@admin_required
+def delete_client(cid):
+    db = get_db()
+    db.execute("UPDATE pda_documents SET client_id = NULL WHERE client_id = ?", (cid,))
+    db.execute("DELETE FROM pda_clients WHERE id = ?", (cid,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+def _read_upload():
+    """Returns (filename, mime, bytes, error) for the 'file' part of a multipart request."""
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return None, None, None, "Choose a file first."
+    name = re.sub(r"[^A-Za-z0-9._ ()-]+", "_", os.path.basename(f.filename)).strip(" .")[:120] or "file"
+    if not name.lower().endswith(JOB_UPLOAD_OK):
+        return None, None, None, "That file type isn't allowed. Use PDF, a picture, Word, Excel, CSV or text."
+    data = f.read(JOB_UPLOAD_MAX + 1)
+    if len(data) > JOB_UPLOAD_MAX:
+        return None, None, None, "That file is over 10 MB."
+    if not data:
+        return None, None, None, "That file is empty."
+    ext = name.lower().rsplit(".", 1)[-1]
+    mime = {"pdf": "application/pdf", "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "csv": "text/csv",
+            "txt": "text/plain", "doc": "application/msword", "xls": "application/vnd.ms-excel",
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}.get(ext, "application/octet-stream")
+    return name, mime, data, None
+
+
+def _file_response(name, mime, data):
+    inline = mime in ("application/pdf", "image/png", "image/jpeg")
+    disp = _content_disposition(name, "file")
+    if inline:
+        disp = disp.replace("attachment", "inline", 1)
+    return Response(bytes(data), mimetype=mime, headers={"Content-Disposition": disp, "X-Content-Type-Options": "nosniff"})
+
+
+@app.route("/api/clients/<int:cid>/docs", methods=["POST"])
+@login_required
+def upload_client_doc(cid):
+    db = get_db()
+    if not db.execute("SELECT 1 FROM pda_clients WHERE id = ?", (cid,)).fetchone():
+        return jsonify({"error": "Not found."}), 404
+    kind = request.form.get("kind", "other")
+    if kind not in ("cr", "vat", "profile", "other"):
+        kind = "other"
+    name, mime, data, err = _read_upload()
+    if err:
+        return jsonify({"error": err}), 400
+    db.execute("INSERT INTO pda_client_docs (client_id, kind, filename, mime, data, uploaded_by, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+               (cid, kind, name, mime, psycopg2.Binary(data), _who(), _now_stamp()))
+    db.commit()
+    return jsonify({"ok": True, "docs": _client_docs(db, cid)})
+
+
+@app.route("/api/clients/docs/<int:did>", methods=["GET"])
+@login_required
+def download_client_doc(did):
+    r = get_db().execute("SELECT filename, mime, data FROM pda_client_docs WHERE id = ?", (did,)).fetchone()
+    if not r:
+        return "Not found.", 404
+    return _file_response(r["filename"], r["mime"], r["data"])
+
+
+@app.route("/api/clients/docs/<int:did>", methods=["DELETE"])
+@login_required
+def delete_client_doc(did):
+    db = get_db()
+    r = db.execute("SELECT client_id FROM pda_client_docs WHERE id = ?", (did,)).fetchone()
+    if not r:
+        return jsonify({"error": "Not found."}), 404
+    db.execute("DELETE FROM pda_client_docs WHERE id = ?", (did,))
+    db.commit()
+    return jsonify({"ok": True, "docs": _client_docs(db, r["client_id"])})
+
+
+# ----- the job file -----
+
+def _job_money(db, doc, d=None):
+    d = d or _pda_payload(db, doc)
+    calc = d["calc"]["total"]
+    inv = db.execute("SELECT kind, amount, paid FROM pda_invoices WHERE pda_id = ?", (doc["id"],)).fetchall()
+    invoiced = sum(float(i["amount"] or 0) for i in inv)
+    paid = sum(float(i["amount"] or 0) for i in inv if i["paid"])
+    by_kind = {k: 0.0 for k in JOB_INVOICE_KINDS}
+    for i in inv:
+        by_kind[i["kind"] if i["kind"] in by_kind else "service"] += float(i["amount"] or 0)
+    svc = db.execute("SELECT status, cost FROM pda_services WHERE pda_id = ?", (doc["id"],)).fetchall()
+    services = sum(float(s["cost"] or 0) for s in svc if s["status"] != "Cancelled")
+    return {"pro_sar": calc["est_sar"], "final_sar": calc["act_sar"], "pro_usd": calc["est_usd"], "final_usd": calc["act_usd"],
+            "invoiced": round(invoiced, 2), "paid": round(paid, 2), "owed": round(invoiced - paid, 2),
+            "services": round(services, 2), "by_kind": {k: round(v, 2) for k, v in by_kind.items()}}
+
+
+def _job_service_view(r, limit_sar):
+    d = dict(r)
+    d["cost"] = float(d["cost"] or 0)
+    d["over_limit"] = d["cost"] > limit_sar and d["status"] != "Cancelled"
+    return d
+
+
+def _job_limit_sar(fx):
+    usd = _pf(get_setting("husbandry_limit_usd", "1000"), 1000.0) or 1000.0
+    return usd, round(usd * fx, 2)
+
+
+def _user_names(db):
+    return {u["username"]: ((u["full_name"] or "").strip() or u["username"]) for u in db.execute("SELECT username, full_name FROM users").fetchall()}
+
+
+def _job_full(db, doc):
+    d = _pda_payload(db, doc)
+    d["handler"] = _user_names(db).get(doc["created_by"], doc["created_by"])
+    fx = _pf(d.get("fx_rate"), PDA_DEFAULT_FX) or PDA_DEFAULT_FX
+    limit_usd, limit_sar = _job_limit_sar(fx)
+    client = None
+    if doc["client_id"]:
+        c = db.execute("SELECT * FROM pda_clients WHERE id = ?", (doc["client_id"],)).fetchone()
+        if c:
+            client = _client_row(c, _client_docs(db, c["id"]))
+    stage = int(doc["job_stage"] or 0)
+    invs = []
+    for i in db.execute("SELECT * FROM pda_invoices WHERE pda_id = ? ORDER BY id", (doc["id"],)).fetchall():
+        x = dict(i)
+        x["amount"] = float(x["amount"] or 0)
+        x["paid"] = bool(x["paid"])
+        x["kind_label"] = JOB_INVOICE_KINDS.get(x["kind"], "Invoice")
+        invs.append(x)
+    return {
+        "job": d, "stage": stage, "stage_name": JOB_STAGES[min(stage, 5)], "stages": JOB_STAGES, "stage_notes": JOB_STAGE_NOTES,
+        "timebar": _job_timebar(doc), "client": client, "money": _job_money(db, doc, d),
+        "services": [_job_service_view(s, limit_sar) for s in db.execute("SELECT * FROM pda_services WHERE pda_id = ? ORDER BY id", (doc["id"],)).fetchall()],
+        "invoices": invs, "invoice_kinds": JOB_INVOICE_KINDS,
+        "history": [dict(h) for h in db.execute("SELECT at, who, text, doc FROM pda_history WHERE pda_id = ? ORDER BY id DESC", (doc["id"],)).fetchall()],
+        "files": [dict(f) for f in db.execute("SELECT id, title, filename, mime, uploaded_by, uploaded_at FROM pda_job_docs WHERE pda_id = ? ORDER BY id", (doc["id"],)).fetchall()],
+        "pinned": bool(db.execute("SELECT 1 FROM pda_pins WHERE username = ? AND pda_id = ?", (session.get("username"), doc["id"])).fetchone()),
+        "limit_usd": limit_usd, "limit_sar": limit_sar,
+    }
+
+
+@app.route("/jobs")
+@login_required
+def jobs_page():
+    return render_template_string(JOBS_HTML, username=session.get("username"), role=session.get("role"),
+                                  display_name=session.get("display_name") or session.get("username"))
+
+
+@app.route("/api/jobs", methods=["GET"])
+@login_required
+def list_jobs():
+    db = get_db()
+    sql = "SELECT * FROM pda_documents"
+    params = ()
+    if session.get("role") != "admin":
+        sql += " WHERE created_by = ?"
+        params = (session.get("username"),)
+    rows = db.execute(sql + " ORDER BY id DESC LIMIT 2000", params).fetchall()
+    ids = [r["id"] for r in rows]
+    items_by, inv_by, pins = {}, {}, set()
+    if ids:
+        for it in db.execute("SELECT * FROM pda_line_items WHERE pda_id = ANY(?) ORDER BY sort_order, id", (ids,)).fetchall():
+            items_by.setdefault(it["pda_id"], []).append(_num_row(it, PDA_ITEM_NUMERIC))
+        for i in db.execute("SELECT pda_id, SUM(amount) AS a, SUM(CASE WHEN paid = 1 THEN amount ELSE 0 END) AS p FROM pda_invoices WHERE pda_id = ANY(?) GROUP BY pda_id", (ids,)).fetchall():
+            inv_by[i["pda_id"]] = (float(i["a"] or 0), float(i["p"] or 0))
+        pins = {p["pda_id"] for p in db.execute("SELECT pda_id FROM pda_pins WHERE username = ?", (session.get("username"),)).fetchall()}
+    names = _user_names(db)
+    out = []
+    for r in rows:
+        d = _num_row(r, PDA_DOC_NUMERIC)
+        calc = _pda_compute(d, items_by.get(r["id"], []))
+        inv = inv_by.get(r["id"], (0.0, 0.0))
+        tb = _job_timebar(r)
+        out.append({
+            "id": r["id"], "pda_no": r["pda_no"], "vessel": r["vessel"], "customer_name": r["customer_name"], "port": r["port"],
+            "dis_port": r["dis_port"], "eta": r["eta"], "voyage": r["voyage"], "operation": r["operation"], "status": r["status"],
+            "stage": int(r["job_stage"] or 0), "stage_name": JOB_STAGES[min(int(r["job_stage"] or 0), 5)],
+            "created_by": r["created_by"], "created_at": r["created_at"], "sail_date": r["sail_date"], "imo": r["imo"],
+            "pro_sar": calc["total"]["est_sar"], "final_sar": calc["total"]["act_sar"],
+            "invoiced": round(inv[0], 2), "paid": round(inv[1], 2), "owed": round(inv[0] - inv[1], 2),
+            "timebar": {"state": tb["state"], "days_left": tb["days_left"], "deadline": tb["deadline"]},
+            "pinned": r["id"] in pins, "one_off": bool(r["one_off"]), "principal_ref": r["principal_ref"],
+            "client_id": r["client_id"], "handler": names.get(r["created_by"], r["created_by"]),
+        })
+    return jsonify({"jobs": out, "stages": JOB_STAGES, "is_admin": session.get("role") == "admin"})
+
+
+@app.route("/api/jobs/<int:pda_id>", methods=["GET"])
+@login_required
+def get_job(pda_id):
+    db = get_db()
+    doc = _pda_get(db, pda_id)
+    if not doc:
+        return jsonify({"error": "That job wasn't found, or it belongs to someone else."}), 404
+    return jsonify(_job_full(db, doc))
+
+
+@app.route("/api/jobs/<int:pda_id>/stage", methods=["POST"])
+@login_required
+def set_job_stage(pda_id):
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    doc = _pda_get(db, pda_id)
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    cur_stage = int(doc["job_stage"] or 0)
+    try:
+        to = int(data.get("to"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Choose a stage."}), 400
+    if to < 0 or to > 5 or abs(to - cur_stage) != 1:
+        return jsonify({"error": "A job moves one step at a time."}), 400
+    if to < cur_stage and session.get("role") != "admin":
+        return jsonify({"error": "Only an admin can move a job back a step."}), 403
+    now = _now_stamp()
+    sets, vals = {"job_stage": to}, []
+    today = _riyadh_today().isoformat()
+    if to == 1:
+        sets["appointed_at"] = now
+    elif to == 2:
+        sets["alongside_at"] = now
+    elif to == 3:
+        sd = _pda_clean_text(data.get("sail_date"), 10) or today
+        try:
+            datetime.strptime(sd, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "The sailing date must be a valid date."}), 400
+        sets["sail_date"] = sd
+    elif to == 4:
+        sets["invoiced_at"] = now
+    elif to == 5:
+        sets["closed_at"] = now
+        unpaid = db.execute("SELECT COUNT(*) AS n FROM pda_invoices WHERE pda_id = ? AND paid = 0", (pda_id,)).fetchone()["n"]
+        if unpaid and not data.get("confirm"):
+            return jsonify({"error": f"{unpaid} invoice(s) are still unpaid. Close the job anyway?", "needs_confirm": True}), 409
+    if to < cur_stage:
+        sets["sail_date"] = "" if cur_stage == 3 else doc["sail_date"]
+    cols = ", ".join(f"{k} = ?" for k in sets)
+    db.execute(f"UPDATE pda_documents SET {cols}, updated_at = ? WHERE id = ?", (*sets.values(), now, pda_id))
+    if to > cur_stage:
+        extra = {1: "Appointment received. Job opened under this number.", 2: "Vessel is alongside.",
+                 3: f"Vessel sailed on {sets.get('sail_date')}. Time bar runs {int(doc['time_bar_days'] or 60)} days from this date.",
+                 4: "Invoices issued.", 5: "Job closed."}[to]
+        _job_log(db, pda_id, f"Stage changed to {JOB_STAGES[to]}. {extra}")
+    else:
+        _job_log(db, pda_id, f"Stage moved back to {JOB_STAGES[to]} (admin).")
+    db.commit()
+    return jsonify({"ok": True, **_job_full(db, db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone())})
+
+
+@app.route("/api/jobs/<int:pda_id>/pin", methods=["POST"])
+@login_required
+def toggle_job_pin(pda_id):
+    db = get_db()
+    if not _pda_get(db, pda_id):
+        return jsonify({"error": "Not found."}), 404
+    u = session.get("username")
+    if db.execute("SELECT 1 FROM pda_pins WHERE username = ? AND pda_id = ?", (u, pda_id)).fetchone():
+        db.execute("DELETE FROM pda_pins WHERE username = ? AND pda_id = ?", (u, pda_id))
+        pinned = False
+    else:
+        db.execute("INSERT INTO pda_pins (username, pda_id) VALUES (?, ?) ON CONFLICT DO NOTHING", (u, pda_id))
+        pinned = True
+    db.commit()
+    return jsonify({"ok": True, "pinned": pinned})
+
+
+@app.route("/api/jobs/<int:pda_id>/save-client", methods=["POST"])
+@login_required
+def job_save_client(pda_id):
+    """Turns a one-off customer into a saved client (and links it to this job)."""
+    db = get_db()
+    doc = _pda_get(db, pda_id)
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    name = (doc["customer_name"] or "").strip().upper()
+    if not name:
+        return jsonify({"error": "Add the customer's name to the job first."}), 400
+    c = db.execute("SELECT id FROM pda_clients WHERE UPPER(name) = ?", (name,)).fetchone()
+    if not c:
+        c = db.execute(
+            "INSERT INTO pda_clients (name, address, phone, email, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+            (name, doc["customer_address"] or "", doc["customer_phone"] or "", doc["customer_email"] or "", session.get("username"), _now_stamp())).fetchone()
+    db.execute("UPDATE pda_documents SET client_id = ?, one_off = 0 WHERE id = ?", (c["id"], pda_id))
+    _job_log(db, pda_id, f"{name} saved to the Clients list.")
+    db.commit()
+    return jsonify({"ok": True, **_job_full(db, db.execute("SELECT * FROM pda_documents WHERE id = ?", (pda_id,)).fetchone())})
+
+
+# ----- husbandry and services -----
+
+def _svc_fields(data, old=None):
+    name = _pda_clean_text(data.get("name", old["name"] if old else ""), 160)
+    if not name:
+        return None, "Name the service (for example Fresh water supply)."
+    status = data.get("status", old["status"] if old else "Requested")
+    if status not in JOB_SERVICE_STATUS:
+        return None, "Status must be Requested, Done or Cancelled."
+    cost = _pf(data.get("cost", old["cost"] if old else 0), None)
+    if cost is None or cost < 0 or cost > 1e10:
+        return None, "Cost must be a number in SAR."
+    return {"name": name, "status": status, "cost": cost,
+            "invoice_no": _pda_clean_text(data.get("invoice_no", old["invoice_no"] if old else ""), 60),
+            "note": _pda_clean_text(data.get("note", old["note"] if old else ""), 300)}, None
+
+
+@app.route("/api/jobs/<int:pda_id>/services", methods=["POST"])
+@login_required
+def add_job_service(pda_id):
+    db = get_db()
+    doc = _pda_get(db, pda_id)
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    f, err = _svc_fields(request.get_json(force=True) or {})
+    if err:
+        return jsonify({"error": err}), 400
+    db.execute("INSERT INTO pda_services (pda_id, name, status, cost, invoice_no, note, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+               (pda_id, f["name"], f["status"], f["cost"], f["invoice_no"], f["note"], _who(), _now_stamp()))
+    _job_log(db, pda_id, f"Service added: {f['name']} (SAR {fmt_money(f['cost'])}).")
+    db.commit()
+    return jsonify({"ok": True, **_job_full(db, doc)})
+
+
+@app.route("/api/jobs/services/<int:sid>", methods=["PUT", "DELETE"])
+@login_required
+def edit_job_service(sid):
+    db = get_db()
+    s = db.execute("SELECT * FROM pda_services WHERE id = ?", (sid,)).fetchone()
+    doc = _pda_get(db, s["pda_id"]) if s else None
+    if not s or not doc:
+        return jsonify({"error": "Not found."}), 404
+    if request.method == "DELETE":
+        db.execute("DELETE FROM pda_services WHERE id = ?", (sid,))
+        _job_log(db, doc["id"], f"Service removed: {s['name']}.")
+    else:
+        f, err = _svc_fields(request.get_json(force=True) or {}, s)
+        if err:
+            return jsonify({"error": err}), 400
+        db.execute("UPDATE pda_services SET name = ?, status = ?, cost = ?, invoice_no = ?, note = ? WHERE id = ?",
+                   (f["name"], f["status"], f["cost"], f["invoice_no"], f["note"], sid))
+        if f["status"] != s["status"]:
+            _job_log(db, doc["id"], f"Service {f['name']} marked {f['status']}.")
+        elif abs(f["cost"] - float(s["cost"] or 0)) > 0.004:
+            _job_log(db, doc["id"], f"Service {f['name']}: cost changed from {fmt_money(s['cost'])} to {fmt_money(f['cost'])}.")
+    db.commit()
+    return jsonify({"ok": True, **_job_full(db, doc)})
+
+
+# ----- invoices -----
+
+@app.route("/api/jobs/<int:pda_id>/invoices", methods=["POST"])
+@login_required
+def add_job_invoice(pda_id):
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    doc = _pda_get(db, pda_id)
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    kind = data.get("kind") if data.get("kind") in JOB_INVOICE_KINDS else "service"
+    desc = _pda_clean_text(data.get("description"), 200)
+    amount = _pf(data.get("amount"), None)
+    if not desc:
+        return jsonify({"error": "Say what the invoice is for."}), 400
+    if amount is None or amount <= 0 or amount > 1e10:
+        return jsonify({"error": "Enter the invoice amount in SAR (more than zero)."}), 400
+    no = _pda_clean_text(data.get("no"), 60)
+    if not no:
+        n = db.execute("SELECT COUNT(*) AS n FROM pda_invoices WHERE pda_id = ?", (pda_id,)).fetchone()["n"] + 1
+        no = f"{doc['pda_no']}-I{n}"
+    db.execute("INSERT INTO pda_invoices (pda_id, no, kind, description, amount, paid, created_by, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+               (pda_id, no, kind, desc, amount, _who(), _now_stamp()))
+    _job_log(db, pda_id, f"Invoice {no} created, SAR {fmt_money(amount)} ({desc}).", no)
+    db.commit()
+    return jsonify({"ok": True, **_job_full(db, doc)})
+
+
+@app.route("/api/jobs/invoices/<int:iid>", methods=["POST", "DELETE"])
+@login_required
+def edit_job_invoice(iid):
+    """POST {paid: true/false} marks paid or unpaid. DELETE removes an invoice entered by mistake."""
+    db = get_db()
+    inv = db.execute("SELECT * FROM pda_invoices WHERE id = ?", (iid,)).fetchone()
+    doc = _pda_get(db, inv["pda_id"]) if inv else None
+    if not inv or not doc:
+        return jsonify({"error": "Not found."}), 404
+    if request.method == "DELETE":
+        db.execute("DELETE FROM pda_invoices WHERE id = ?", (iid,))
+        _job_log(db, doc["id"], f"Invoice {inv['no']} removed.", inv["no"])
+    else:
+        paid = 1 if (request.get_json(force=True) or {}).get("paid") else 0
+        db.execute("UPDATE pda_invoices SET paid = ?, paid_at = ? WHERE id = ?", (paid, _now_stamp() if paid else "", iid))
+        _job_log(db, doc["id"], f"Invoice {inv['no']} marked {'paid' if paid else 'unpaid'}.", inv["no"])
+    db.commit()
+    return jsonify({"ok": True, **_job_full(db, doc)})
+
+
+# ----- documents on a job -----
+
+@app.route("/api/jobs/<int:pda_id>/docs", methods=["POST"])
+@login_required
+def upload_job_doc(pda_id):
+    db = get_db()
+    doc = _pda_get(db, pda_id)
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    name, mime, data, err = _read_upload()
+    if err:
+        return jsonify({"error": err}), 400
+    title = _pda_clean_text(request.form.get("title"), 120) or name
+    db.execute("INSERT INTO pda_job_docs (pda_id, title, filename, mime, data, uploaded_by, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+               (pda_id, title, name, mime, psycopg2.Binary(data), _who(), _now_stamp()))
+    _job_log(db, pda_id, f"Document uploaded: {title}.", title)
+    db.commit()
+    return jsonify({"ok": True, **_job_full(db, doc)})
+
+
+@app.route("/api/jobs/docs/<int:did>", methods=["GET", "DELETE"])
+@login_required
+def job_doc(did):
+    db = get_db()
+    r = db.execute("SELECT * FROM pda_job_docs WHERE id = ?", (did,)).fetchone()
+    doc = _pda_get(db, r["pda_id"]) if r else None
+    if not r or not doc:
+        return jsonify({"error": "Not found."}), 404
+    if request.method == "DELETE":
+        db.execute("DELETE FROM pda_job_docs WHERE id = ?", (did,))
+        _job_log(db, doc["id"], f"Document removed: {r['title']}.", r["title"])
+        db.commit()
+        return jsonify({"ok": True, **_job_full(db, doc)})
+    return _file_response(r["filename"], r["mime"], r["data"])
+
+
+# ----- final job report -----
+
+def build_job_report_pdf(j):
+    d, m = j["job"], j["money"]
+    NAVY, GREY = (18, 58, 86), (120, 130, 140)
+    pdf = PdaPDF(format="A4")
+    pdf.alias_nb_pages()
+    pdf.set_auto_page_break(True, 16)
+    pdf.set_margins(14, 12, 14)
+    pdf.add_page()
+    W = 182
+
+    def text(s, size=9, style="", color=(0, 0, 0), h=5, align="L", w=0, ln=1):
+        pdf.set_font("Helvetica", style, size)
+        pdf.set_text_color(*color)
+        pdf.cell(w, h, str(s), align=align, ln=ln)
+
+    def table(head, rows, widths, aligns, total_rows=()):
+        pdf.set_font("Helvetica", "B", 7.5)
+        pdf.set_text_color(*GREY)
+        for h, w, a in zip(head, widths, aligns):
+            pdf.cell(w, 6, h.upper(), border="B", align=a)
+        pdf.ln(6)
+        for r in rows:
+            pdf.set_font("Helvetica", "", 8.5)
+            pdf.set_text_color(0, 0, 0)
+            for v, w, a in zip(r, widths, aligns):
+                pdf.cell(w, 6, str(v)[:60], border="B", align=a)
+            pdf.ln(6)
+        for label, val, col in total_rows:
+            pdf.set_font("Helvetica", "B", 8.5)
+            pdf.set_text_color(*col)
+            pdf.cell(sum(widths[:-1]), 6, label, align="L")
+            pdf.cell(widths[-1], 6, val, align="R")
+            pdf.ln(6)
+
+    try:
+        pdf.image(io.BytesIO(base64.b64decode(LOGO_B64)), x=14, y=10, w=20)
+    except Exception:
+        pass
+    pdf.set_xy(40, 11)
+    text(COMPANY_NAME_EN.upper(), 13, "B", NAVY, 6, w=100)
+    pdf.set_x(40)
+    text("Ship agency, Saudi Arabia", 8, "", GREY, 4, w=100)
+    pdf.set_xy(120, 11)
+    text("FINAL JOB REPORT", 14, "B", (20, 20, 20), 6, "R", 76)
+    pdf.set_x(120)
+    text("Job " + (d.get("pda_no") or ""), 9, "", GREY, 4, "R", 76)
+    pdf.set_draw_color(*NAVY)
+    pdf.set_line_width(0.7)
+    pdf.line(14, 34, 196, 34)
+    pdf.set_y(38)
+
+    def dstr(v):
+        try:
+            return datetime.strptime(str(v)[:10], "%Y-%m-%d").strftime("%d %b %Y")
+        except ValueError:
+            return str(v or "-") or "-"
+
+    info = [("Vessel", f"{d.get('vessel') or '-'}" + (f"  (IMO {d['imo']})" if d.get("imo") else "")), ("Customer", d.get("customer_name") or "-"),
+            ("Port", d.get("dis_port") or d.get("port") or "-"), ("Activity", (d.get("operation") or "-") + (f", voyage {d['voyage']}" if d.get("voyage") else "")),
+            ("ETA", dstr(d.get("eta")) if d.get("eta") else "-"), ("Sailed", dstr(d.get("sail_date")) if d.get("sail_date") else "-"),
+            ("Handled by", d.get("sales_exec") or d.get("created_by") or "-"), ("Report date", _riyadh_today().strftime("%d %b %Y")),
+            ("Stage", j["stage_name"]), ("Principal ref", d.get("principal_ref") or "-")]
+    y0 = pdf.get_y()
+    for i, (k, v) in enumerate(info):
+        x = 14 + (i % 2) * 94
+        y = y0 + (i // 2) * 11
+        pdf.set_xy(x, y)
+        text(k, 7.5, "", GREY, 4, w=90)
+        pdf.set_x(x)
+        text(v, 9, "B", (0, 0, 0), 5, w=90)
+    pdf.set_y(y0 + 5 * 11 + 4)
+
+    def heading(s):
+        pdf.ln(2)
+        text(s, 10, "B", NAVY, 7)
+
+    heading("1. PORT COSTS AND AGENCY FEES (SAR)")
+    rows = []
+    for g in d["calc"]["groups"]:
+        diff = g["act_sar"] - g["est_sar"]
+        rows.append((g["name"], _pda_num(g["est_sar"]), _pda_num(g["act_sar"]) if j["stage"] >= 3 else "-", ("-" if abs(diff) < 0.005 or j["stage"] < 3 else f"{diff:+,.2f}")))
+    tot = d["calc"]["total"]
+    td = tot["act_sar"] - tot["est_sar"]
+    table(("Group", "Pro forma", "Final", "Difference"), rows, (82, 34, 34, 32), ("L", "R", "R", "R"),
+          [("Total", _pda_num(tot["est_sar"]) + "  /  " + (_pda_num(tot["act_sar"]) if j["stage"] >= 3 else "-") + ("" if abs(td) < 0.005 or j["stage"] < 3 else f"  /  {td:+,.2f}"), NAVY)])
+    heading("2. HUSBANDRY AND SERVICES PROVIDED (SAR)")
+    srv = [s for s in j["services"] if s["status"] != "Cancelled"]
+    table(("Service", "Status", "Invoice", "Amount"), [(s["name"], s["status"], s["invoice_no"] or "-", _pda_num(s["cost"])) for s in srv] or [("None recorded", "", "", "")],
+          (84, 30, 34, 34), ("L", "L", "L", "R"), [("Total services", _pda_num(m["services"]), NAVY)])
+    heading("3. INVOICES ON THIS JOB (SAR)")
+    table(("Invoice", "For", "Status", "Amount"), [(i["no"], i["description"], "Paid" if i["paid"] else "Unpaid", _pda_num(i["amount"])) for i in j["invoices"]] or [("None yet", "", "", "")],
+          (46, 76, 26, 34), ("L", "L", "L", "R"),
+          [("Total invoiced", _pda_num(m["invoiced"]), NAVY), ("Paid so far", _pda_num(m["paid"]), (28, 138, 90)), ("Still to collect", _pda_num(m["owed"]), (163, 50, 43))])
+    heading("4. TIMELINE")
+    for h in reversed(j["history"][-60:] if len(j["history"]) > 60 else j["history"]):
+        pdf.set_font("Helvetica", "", 8)
+        pdf.set_text_color(*GREY)
+        pdf.cell(34, 5, h["at"])
+        pdf.set_text_color(0, 0, 0)
+        pdf.multi_cell(0, 5, f"{h['text']} ({h['who']})", new_x="LMARGIN", new_y="NEXT")
+    tb = j["timebar"]
+    if tb["deadline"]:
+        pdf.ln(1)
+        text(f"Time bar: {tb['days']} days from departure, ends {dstr(tb['deadline'])}.", 8.5, "B", NAVY, 5)
+    pdf.ln(10)
+    y = pdf.get_y()
+    pdf.set_draw_color(40, 40, 40)
+    pdf.set_line_width(0.2)
+    pdf.line(14, y, 90, y)
+    pdf.line(120, y, 196, y)
+    pdf.set_xy(14, y + 1)
+    text("Prepared by: " + _who(), 8, "", GREY, 4, w=80)
+    pdf.set_xy(120, y + 1)
+    text("Approved by:", 8, "", GREY, 4, w=76)
+    return bytes(pdf.output(dest="S"))
+
+
+@app.route("/api/jobs/<int:pda_id>/report.pdf", methods=["GET"])
+@login_required
+def job_report_pdf(pda_id):
+    db = get_db()
+    doc = _pda_get(db, pda_id)
+    if not doc:
+        return "Not found.", 404
+    j = _job_full(db, doc)
+    name = re.sub(r"[^A-Za-z0-9_-]+", "_", f"JobReport_{doc['pda_no'] or doc['id']}_{doc['vessel']}").strip("_") + ".pdf"
+    return Response(build_job_report_pdf(j), mimetype="application/pdf", headers={"Content-Disposition": _content_disposition(name, "job-report.pdf")})
 
 
 # ---------- Alerts (ETA-overdue email notifications) ----------
@@ -8169,12 +9061,12 @@ HUB_HTML = """
       <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
     </a>
 
-    <a class="tile" href="/pda">
+    <a class="tile" href="/jobs">
       <div class="tile-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h8M8 17h4"/></svg>
       </div>
-      <h3>Disbursement Accounts</h3>
-      <p>Build a PDA from a per-port charge template, then finalize it into an FDA once actual costs are known.</p>
+      <h3>Jobs and PDAs</h3>
+      <p>Every vessel call in one place: PDA, appointment, charges, services, invoices and history, through to the final job report.</p>
       <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
     </a>
 
@@ -9349,6 +10241,826 @@ loadReview();
 </body></html>
 """
 
+JOBS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compass - Jobs</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + r"""">
+<style>
+  :root {
+    --bg: #f2f4f7; --card: #ffffff; --text: #1c2b3a; --muted: #7a8794; --border: #e6e9ed;
+    --navy: #123a56; --navy-deep: #0b2740; --navy-light: #1f5c85; --gold: #c9a227; --gold-light: #e0bd53;
+    --danger: #d1483f; --danger-text: #a3322b; --danger-bg: #fbeceb; --ok: #1c8a5a; --ok-bg: #e7f5ee;
+    --warn: #8a6d1f; --warn-bg: rgba(212,160,23,0.16); --warn-soft: #fff7e0; --warn-line: #c9a227; --warn-ink: #6b5314;
+    --blue: #1f5c85; --blue-bg: #e3eef7; --teal: #1b7a70; --teal-bg: #e1f3f1;
+    --shadow-sm: 0 1px 2px rgba(18,58,86,0.05); --shadow-md: 0 10px 30px rgba(18,58,86,0.10);
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --bg: #131a23; --card: #1a232f; --text: #e9eef3; --muted: #93a1b1; --border: #29323f;
+    --navy: #3f86ba; --navy-deep: #274a67; --navy-light: #5aa2d1; --gold: #e3bb4c; --gold-light: #f0cf72;
+    --danger: #e2685f; --danger-text: #f0948d; --danger-bg: #3a2220; --ok: #3ecb8e; --ok-bg: #163329;
+    --warn: #f0cf72; --warn-bg: rgba(227,187,76,0.16); --warn-soft: #302a14; --warn-line: #a88a2a; --warn-ink: #f0cf72;
+    --blue: #7fbbe3; --blue-bg: #1b3144; --teal: #5fd0c3; --teal-bg: #143531;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.25); --shadow-md: 0 10px 30px rgba(0,0,0,0.35);
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0 16px 60px; }
+  a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid var(--navy-light); outline-offset: 2px; }
+  .topbar { position: sticky; top: 0; z-index: 50; display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 16px; margin: 0 -16px 20px; background: color-mix(in srgb, var(--bg) 86%, transparent); backdrop-filter: saturate(180%) blur(14px); -webkit-backdrop-filter: saturate(180%) blur(14px); border-bottom: 1px solid var(--border); }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+  .brand img { height: 32px; width: auto; }
+  .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
+  .brand-text .app-name { font-size: 14.5px; font-weight: 700; color: var(--text); }
+  .brand-text .app-tag { font-size: 11px; color: var(--muted); }
+  .nav { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+  .nav a { padding: 7px 14px; border-radius: 999px; color: var(--navy); font-size: 13px; font-weight: 700; text-decoration: none; }
+  .nav a:hover { background: var(--border); }
+  .nav a.on { background: var(--navy); color: #fff; }
+  :root[data-theme="dark"] .nav a.on { color: #0b1620; }
+  .topbar-right { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+  .topbar-right a { color: var(--navy); text-decoration: none; font-weight: 600; font-size: 13px; padding: 6px 12px; border-radius: 20px; }
+  .topbar-right a:hover { background: var(--border); }
+  .theme-switch { position: relative; display: inline-flex; width: 54px; height: 29px; cursor: pointer; }
+  .theme-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .theme-track { position: absolute; inset: 0; border-radius: 999px; display: flex; align-items: center; justify-content: space-between; padding: 0 7px; background: linear-gradient(135deg,#8fcaf0,#f4d58d); transition: background .3s ease; }
+  :root[data-theme="dark"] .theme-track { background: linear-gradient(135deg,#1f2b42,#33456a); }
+  .theme-icon { width: 13px; height: 13px; color: #fff; opacity: .9; z-index: 1; }
+  .theme-icon svg { width: 100%; height: 100%; }
+  .theme-knob { position: absolute; top: 3px; left: 3px; width: 23px; height: 23px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.3); transition: transform .3s cubic-bezier(.4,0,.2,1); }
+  input:checked + .theme-track .theme-knob { transform: translateX(25px); background: #0b2740; }
+
+  #view { max-width: 1180px; margin: 0 auto; }
+  .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--gold); margin-bottom: 4px; }
+  h1.pg { font-size: 26px; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13.5px; margin-top: 4px; }
+  .pghead { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 18px; box-shadow: var(--shadow-sm); padding: 18px 22px; }
+  .panel h2 { font-size: 16px; margin: 0 0 2px; }
+  .panel .hint { font-size: 12.5px; color: var(--muted); margin: 0 0 12px; }
+  .stack { display: flex; flex-direction: column; gap: 18px; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 18px; }
+  @media (max-width: 420px) { .grid2 { grid-template-columns: 1fr; } }
+
+  .btn { background: var(--navy); color: #fff; border: 1px solid var(--navy); border-radius: 999px; padding: 9px 17px; font-size: 13px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; font-family: inherit; min-height: 38px; }
+  :root[data-theme="dark"] .btn { color: #0b1620; }
+  :root[data-theme="dark"] .btn.ghost { color: var(--navy); }
+  :root[data-theme="dark"] .btn.danger { color: var(--danger-text); }
+  .help a, .hint a { color: var(--navy-light); font-weight: 700; }
+  .btn:hover { filter: brightness(1.12); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.ghost { background: var(--card); color: var(--navy); border: 1px solid var(--border); }
+  .btn.ghost:hover { background: var(--border); filter: none; }
+  .btn.danger { background: var(--card); color: var(--danger-text); border: 1px solid var(--border); }
+  .btn.small { padding: 5px 12px; font-size: 12px; min-height: 30px; }
+  .pill { padding: 8px 14px; border-radius: 999px; font-size: 13px; font-weight: 700; cursor: pointer; background: var(--card); color: var(--navy); border: 1px solid var(--border); font-family: inherit; }
+  .pill.on { background: var(--navy); color: #fff; border-color: var(--navy); }
+  :root[data-theme="dark"] .pill.on { color: #0b1620; }
+  .pill .ct { display: inline-block; margin-left: 4px; padding: 1px 7px; border-radius: 999px; font-size: 11px; background: var(--bg); color: var(--muted); }
+  .pill.on .ct { background: rgba(255,255,255,0.22); color: inherit; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .spread { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+
+  label.lb { display: block; font-size: 12px; font-weight: 700; margin-bottom: 5px; }
+  label.lb .req { color: var(--danger-text); font-weight: 700; margin-left: 4px; font-size: 11px; }
+  label.lb .opt { color: var(--muted); font-weight: 500; margin-left: 4px; font-size: 11px; }
+  .help { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  input[type=text], input[type=number], input[type=email], input[type=date], input[type=search], select, textarea { width: 100%; padding: 9px 11px; border: 1px solid var(--border); border-radius: 10px; font-size: 14px; font-family: inherit; background: var(--bg); color: var(--text); min-height: 40px; }
+  textarea { resize: vertical; min-height: 80px; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--navy-light); }
+  input.bad, select.bad { border-color: var(--danger); background: var(--danger-bg); }
+  .fgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; }
+  .fgrid .full { grid-column: 1 / -1; }
+  .alert { padding: 11px 14px; border-radius: 12px; font-size: 13px; font-weight: 600; background: var(--danger-bg); color: var(--danger-text); margin-bottom: 14px; border: 1px solid var(--danger); }
+  .okbox { padding: 11px 14px; border-radius: 12px; font-size: 13px; font-weight: 600; background: var(--ok-bg); color: var(--ok); margin-bottom: 14px; }
+  .noteok { font-size: 12px; font-weight: 700; color: var(--ok); }
+
+  .chip { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 10.5px; font-weight: 700; letter-spacing: .3px; text-transform: uppercase; white-space: nowrap; }
+  .s0 { background: color-mix(in srgb, var(--muted) 16%, transparent); color: var(--muted); }
+  .s0b { background: var(--warn-bg); color: var(--warn); }
+  .s1, .s2 { background: var(--blue-bg); color: var(--blue); }
+  .s3 { background: var(--teal-bg); color: var(--teal); }
+  .s4, .s5, .paid { background: var(--ok-bg); color: var(--ok); }
+  .unpaid { background: var(--danger-bg); color: var(--danger-text); }
+  .reqd { background: var(--warn-bg); color: var(--warn); }
+  .cancelled { background: color-mix(in srgb, var(--muted) 16%, transparent); color: var(--muted); }
+  .bt0 { border-top-color: var(--muted) !important; } .bt0b { border-top-color: var(--gold) !important; } .bt1, .bt2 { border-top-color: var(--blue) !important; } .bt3 { border-top-color: var(--teal) !important; } .bt4, .bt5 { border-top-color: var(--ok) !important; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 18px; }
+  .tile { background: var(--card); border: 1px solid var(--border); border-radius: 18px; padding: 16px 18px; box-shadow: var(--shadow-sm); }
+  .tile .k { font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+  .tile .v { font-size: 28px; font-weight: 700; margin-top: 4px; }
+  .tile .d { font-size: 12.5px; color: var(--muted); }
+  .tile.alarm { background: var(--danger-bg); border-color: var(--danger); }
+  .tile.alarm .k, .tile.alarm .v, .tile.alarm .d { color: var(--danger-text); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 16px; }
+  .jcard { background: var(--card); border: 1px solid var(--border); border-top: 4px solid var(--muted); border-radius: 18px; padding: 16px 18px; box-shadow: var(--shadow-sm); cursor: pointer; display: flex; flex-direction: column; }
+  .jcard:hover { box-shadow: var(--shadow-md); }
+  .jcard .vn { font-size: 17px; font-weight: 700; }
+  .jcard .no { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .warnbar { margin-top: 10px; padding: 7px 10px; border-radius: 10px; font-size: 12px; font-weight: 700; background: var(--danger-bg); color: var(--danger-text); }
+  .pin { padding: 4px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 700; cursor: pointer; background: var(--card); color: var(--muted); border: 1px solid var(--border); font-family: inherit; height: fit-content; }
+  .pin.on { background: var(--gold); color: #fff; border-color: var(--gold); }
+  table.t { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  table.t th { text-align: left; font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); padding: 10px; white-space: nowrap; }
+  table.t td { padding: 11px 10px; border-top: 1px solid var(--border); vertical-align: middle; }
+  table.t tr.click { cursor: pointer; } table.t tr.click:hover td { background: color-mix(in srgb, var(--navy-light) 6%, transparent); }
+  table.t .num, table.t th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  table.t tr.grp td { background: var(--bg); font-weight: 700; }
+  table.t tr.sub td { border-top: 2px solid var(--border); font-weight: 700; }
+  table.t input[type=text], table.t input[type=number], table.t select { min-height: 34px; padding: 5px 8px; font-size: 13px; }
+  .scroll-x { overflow-x: auto; }
+  .empty { padding: 36px 10px; text-align: center; font-size: 14px; color: var(--muted); }
+  .pos { color: var(--danger-text); } .neg { color: var(--ok); }
+  .box { background: var(--bg); border: 1px solid var(--border); border-radius: 14px; padding: 12px 16px; }
+  .box .k { font-size: 10.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+  .box .v { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .box.dark { background: var(--navy); border-color: var(--navy); color: #fff; } .box.dark .k { color: #cfd9e3; }
+  :root[data-theme="dark"] .box.dark { color: #0b1620; } :root[data-theme="dark"] .box.dark .k { color: #14324a; }
+  .box.red { background: var(--danger-bg); } .box.red .k, .box.red .v { color: var(--danger-text); }
+  .sumrow { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 14px; }
+  .kv { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; font-size: 13px; }
+  .kv.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .kv .full { grid-column: 1 / -1; }
+  .kv span.k { color: var(--muted); }
+  .sugg { border: 1px solid var(--border); border-radius: 12px; background: var(--card); margin-top: 6px; overflow: hidden; box-shadow: var(--shadow-md); }
+  .sugg button { display: flex; justify-content: space-between; gap: 10px; width: 100%; text-align: left; padding: 10px 14px; border: 0; border-bottom: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 14px; cursor: pointer; font-family: inherit; }
+  .sugg button:last-child { border-bottom: 0; } .sugg button:hover { background: var(--bg); } .sugg button span { color: var(--muted); font-size: 12.5px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 999px; overflow: hidden; }
+  .seg button { padding: 9px 18px; border: 0; background: var(--card); color: var(--navy); font-weight: 700; font-size: 13px; cursor: pointer; font-family: inherit; }
+  .seg button.on { background: var(--navy); color: #fff; } :root[data-theme="dark"] .seg button.on { color: #0b1620; }
+  .step { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .step .n { width: 26px; height: 26px; border-radius: 50%; background: var(--navy); color: #fff; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; }
+  :root[data-theme="dark"] .step .n { color: #0b1620; }
+  .step .t { font-size: 16px; font-weight: 700; }
+  .stages { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; margin-top: 20px; }
+  .stages .bar { height: 6px; border-radius: 3px; margin-bottom: 8px; background: var(--border); }
+  .stages .bar.done { background: var(--ok); } .stages .bar.cur { background: var(--navy); }
+  .stages .nm { font-size: 13px; font-weight: 700; } .stages .nt { font-size: 11px; color: var(--muted); }
+  @media (max-width: 640px) { .stages .nm { font-size: 11px; } .stages .nt { display: none; } }
+  .tb { border-radius: 14px; padding: 12px 18px; border: 1px solid var(--border); background: var(--card); }
+  .tb .k { font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; } .tb .t { font-size: 14px; font-weight: 700; margin-top: 3px; } .tb .d { font-size: 12.5px; margin-top: 2px; }
+  .tb.warn { background: var(--warn-soft); border-color: var(--warn-line); color: var(--warn-ink); }
+  .tb.over { background: var(--danger-bg); border-color: var(--danger); color: var(--danger-text); }
+  .tb.closed { background: var(--ok-bg); border-color: var(--ok); color: var(--ok); }
+  .docgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+  .doc { padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg); display: flex; flex-direction: column; gap: 4px; }
+  .doc.missing { border-style: dashed; border-color: var(--muted); background: transparent; color: var(--muted); }
+  .doc .s { font-size: 12px; color: var(--muted); }
+  .instr { padding: 9px 12px; border-radius: 10px; background: var(--bg); font-size: 13px; }
+
+  #toastHost { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; pointer-events: none; max-width: min(340px, calc(100vw - 40px)); }
+  .toast { pointer-events: auto; background: var(--navy-deep); color: #fff; padding: 11px 16px; border-radius: 12px; font-size: 13px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+  .toast.error { background: var(--danger); }
+  #modalHost { position: fixed; inset: 0; background: rgba(8,20,32,.55); display: none; align-items: center; justify-content: center; z-index: 900; padding: 16px; }
+  #modalHost.open { display: flex; }
+  .modal { background: var(--card); border-radius: 18px; padding: 22px; width: 460px; max-width: 100%; box-shadow: var(--shadow-md); }
+  .modal h3 { margin: 0 0 6px; font-size: 18px; } .modal p { margin: 0 0 14px; color: var(--muted); font-size: 13.5px; }
+
+  .paper { max-width: 860px; margin: 0 auto; background: #fff; color: #1c2b3a; border: 1px solid var(--border); border-radius: 6px; box-shadow: var(--shadow-md); padding: 48px 56px; display: flex; flex-direction: column; gap: 26px; }
+  .paper table { width: 100%; border-collapse: collapse; font-size: 12.5px; } .paper th { text-align: left; font-size: 10.5px; letter-spacing: .05em; text-transform: uppercase; color: #7a8794; border-bottom: 2px solid #e6e9ed; padding: 8px 6px; } .paper td { padding: 8px 6px; border-bottom: 1px solid #e6e9ed; } .paper .r { text-align: right; } .paper tr.tot td { font-weight: 700; border-top: 2px solid #123a56; }
+  .paper h4 { font-size: 14px; margin: 0 0 8px; letter-spacing: .03em; }
+  @media (max-width: 640px) { .paper { padding: 22px 16px; } }
+  @media print { .topbar, .noprint, #toastHost { display: none !important; } body { background: #fff; padding: 0; } .paper { box-shadow: none; border: 0; padding: 0; } }
+</style></head>
+<body>
+<div class="topbar noprint">
+  <a href="/" class="brand"><img src="data:image/png;base64,""" + LOGO_B64 + r"""" alt="Sea Power"><div class="brand-text"><span class="app-name">Compass</span><span class="app-tag">Sea Power Marine Services Co. Ltd</span></div></a>
+  <nav class="nav" aria-label="Main">
+    <a href="#/" id="nav-jobs">Jobs</a><a href="#/clients" id="nav-clients">Clients</a><a href="/do-tracker">DO Tracker</a><a href="/sof">SOF</a>
+  </nav>
+  <div class="topbar-right">
+    <label class="theme-switch" title="Switch between light and dark"><input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')"><span class="theme-track"><span class="theme-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg></span><span class="theme-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg></span><span class="theme-knob"></span></span></label>
+    {% if role == 'admin' %}<a href="/pda" title="Rate cards, charge list, bank details and numbering">Settings</a><a href="/users">Users</a>{% endif %}
+    <span>Signed in as <b>{{ display_name }}</b></span><a href="/logout">Log out</a>
+  </div>
+</div>
+<div id="toastHost" aria-live="polite"></div>
+<div id="modalHost" role="dialog" aria-modal="true"></div>
+<main id="view"></main>
+<script>
+(function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem('theme'); } catch (e) {}
+  const mode = saved || 'light';
+  document.documentElement.setAttribute('data-theme', mode);
+  window.addEventListener('DOMContentLoaded', function () { const cb = document.getElementById('themeToggle'); if (cb) cb.checked = mode === 'dark'; });
+})();
+function setTheme(mode) { document.documentElement.setAttribute('data-theme', mode); try { localStorage.setItem('theme', mode); } catch (e) {} }
+
+const ROLE = {{ role|tojson }};
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+const fmt = (n) => Number(n || 0).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+function fd(s) { const m = /^(\d{4})-(\d\d)-(\d\d)/.exec(s || ''); return m ? (+m[3]) + ' ' + MON[+m[2] - 1] + ' ' + m[1] : (s || '-'); }
+function fdShort(s) { const m = /^(\d{4})-(\d\d)-(\d\d)/.exec(s || ''); return m ? (+m[3]) + ' ' + MON[+m[2] - 1] : (s || '-'); }
+function fdt(s) { // history times are stored in UTC; show Riyadh time
+  const m = /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)/.exec(s || ''); if (!m) return s || '';
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) + 3 * 3600 * 1000);
+  const p = (x) => String(x).padStart(2, '0');
+  return d.getUTCDate() + ' ' + MON[d.getUTCMonth()] + ' ' + d.getUTCFullYear() + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes());
+}
+function toast(msg, err) {
+  const h = $('toastHost'), t = document.createElement('div'); t.className = 'toast' + (err ? ' error' : ''); t.textContent = msg; h.appendChild(t);
+  setTimeout(function () { t.remove(); }, err ? 6000 : 3500);
+}
+async function api(url, method, body) {
+  const opt = {method: method || 'GET', headers: {}};
+  if (body instanceof FormData) { opt.body = body; } else if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  let res;
+  try { res = await fetch(url, opt); } catch (e) { toast('No connection. Check your internet and try again.', true); return {ok: false, data: {}}; }
+  if (res.status === 401) { location.href = '/login?expired=1'; return {ok: false, data: {}}; }
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  return {ok: res.ok && !data.error, data: data, status: res.status};
+}
+function modal(opts) { // {title, text, body, ok, cancel, onOk}
+  const h = $('modalHost');
+  h.innerHTML = '<div class="modal"><h3>' + esc(opts.title) + '</h3>' + (opts.text ? '<p>' + esc(opts.text) + '</p>' : '') + (opts.body || '') +
+    '<div class="row" style="justify-content:flex-end;margin-top:16px"><button class="btn ghost" data-act="modalCancel">' + esc(opts.cancel || 'Cancel') + '</button><button class="btn" id="modalOk">' + esc(opts.ok || 'OK') + '</button></div></div>';
+  h.classList.add('open'); h._ok = opts.onOk;
+  const first = h.querySelector('input,select,textarea'); if (first) first.focus(); else $('modalOk').focus();
+}
+function closeModal() { const h = $('modalHost'); h.classList.remove('open'); h.innerHTML = ''; h._ok = null; }
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+document.addEventListener('click', async function (e) {
+  if (e.target.id === 'modalOk') { const f = $('modalHost')._ok; if (f) { const keep = await f(); if (keep !== false) closeModal(); } return; }
+  if (e.target.id === 'modalHost') { closeModal(); return; }
+  const t = e.target.closest('[data-act]'); if (!t) return;
+  if (t.tagName === 'A' && t.getAttribute('href')) { /* real links navigate normally */ }
+  const f = ACT[t.dataset.act]; if (f) { e.stopPropagation(); f(t, e); }
+});
+document.addEventListener('input', function (e) { const t = e.target.closest('[data-in]'); if (t && IN[t.dataset.in]) IN[t.dataset.in](t, e); });
+document.addEventListener('change', function (e) { const t = e.target.closest('[data-ch]'); if (t && CH[t.dataset.ch]) CH[t.dataset.ch](t, e); });
+const ACT = {modalCancel: closeModal}, IN = {}, CH = {};
+function upperInput(el) { const s = el.selectionStart, e = el.selectionEnd; const v = el.value.toUpperCase(); if (v !== el.value) { el.value = v; try { el.setSelectionRange(s, e); } catch (x) {} } }
+const debounce = (fn, ms) => { let t; return function () { const a = arguments; clearTimeout(t); t = setTimeout(function () { fn.apply(null, a); }, ms); }; };
+
+const TAB_NAMES = ['All', 'Draft', 'Quotation sent', 'Appointed', 'Alongside', 'Sailed', 'Invoiced', 'Closed'];
+function jobLabel(j) { return j.stage === 0 ? (j.status === 'draft' ? 'Draft' : 'Quotation sent') : ['', 'Appointed', 'Alongside', 'Sailed', 'Invoiced', 'Closed'][j.stage]; }
+function jobCls(j) { return j.stage === 0 ? (j.status === 'draft' ? '0' : '0b') : String(j.stage); }
+function chipFor(j) { return '<span class="chip s' + jobCls(j) + '">' + esc(jobLabel(j)) + '</span>'; }
+function warnText(j) {
+  const tb = j.timebar || {};
+  if (tb.state === 'over') return 'Time bar passed ' + Math.abs(tb.days_left) + ' day' + (Math.abs(tb.days_left) === 1 ? '' : 's') + ' ago. Invoice now.';
+  if (tb.state === 'warn') return 'Time bar: ' + tb.days_left + ' day' + (tb.days_left === 1 ? '' : 's') + ' left to invoice';
+  return '';
+}
+
+/* ---------------- state ---------------- */
+let PORTS = {};
+const S = {jobs: [], tab: 'All', q: '', view: 'cards', job: null, jobTab: 'Overview', clients: [], clientSel: null, clientQ: '', stages: []};
+try { S.view = localStorage.getItem('jobsView') || 'cards'; } catch (e) {}
+
+/* ---------------- router ---------------- */
+async function route() {
+  closeModal();
+  const h = (location.hash || '#/').replace(/^#/, '');
+  const parts = h.split('?')[0].split('/').filter(Boolean);
+  const qs = new URLSearchParams(h.split('?')[1] || '');
+  $('nav-jobs').className = (parts[0] === 'clients') ? '' : 'on';
+  $('nav-clients').className = (parts[0] === 'clients') ? 'on' : '';
+  window.scrollTo(0, 0);
+  if (parts[0] === 'new') return viewNew(qs.get('client'));
+  if (parts[0] === 'job' && parts[1]) return viewJob(+parts[1], parts[2]);
+  if (parts[0] === 'report' && parts[1]) return viewReport(+parts[1]);
+  if (parts[0] === 'clients') return viewClients(parts[1] ? +parts[1] : null);
+  return viewBoard();
+}
+window.addEventListener('hashchange', route);
+
+/* ---------------- board ---------------- */
+async function viewBoard() {
+  $('view').innerHTML = '<div class="empty">Loading jobs...</div>';
+  const r = await api('/api/jobs');
+  if (!r.ok) { $('view').innerHTML = '<div class="empty">Could not load the jobs. Refresh the page to try again.</div>'; return; }
+  S.jobs = r.data.jobs; S.stages = r.data.stages;
+  drawBoard();
+}
+function drawBoard() {
+  const J = S.jobs;
+  const openN = J.filter(j => j.stage === 1 || j.stage === 2).length;
+  const waitN = J.filter(j => j.stage === 0 && j.status !== 'draft').length;
+  const sailN = J.filter(j => j.stage === 3).length;
+  const bar = J.filter(j => j.timebar && (j.timebar.state === 'warn' || j.timebar.state === 'over')).sort((a, b) => a.timebar.days_left - b.timebar.days_left);
+  const cnt = (t) => J.filter(j => t === 'All' || jobLabel(j) === t).length;
+  const q = S.q.trim().toLowerCase();
+  let list = J.filter(j => (S.tab === 'All' || jobLabel(j) === S.tab) && (!q || [j.vessel, j.customer_name, j.pda_no, j.imo, j.port, j.voyage, j.principal_ref].join(' ').toLowerCase().includes(q)));
+  list = list.slice().sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.id - a.id);
+  let alarm;
+  if (bar.length) alarm = '<div class="tile alarm"><div class="k">Time bar warning</div><div class="v">' + bar.length + (bar.length === 1 ? ' job' : ' jobs') + '</div><div class="d">' + esc(bar[0].vessel) + ': ' + esc(warnText(bar[0]).replace('Time bar: ', '')) + '</div></div>';
+  else alarm = '<div class="tile"><div class="k">Time bar warning</div><div class="v">None</div><div class="d">Nothing close to its deadline</div></div>';
+  let body;
+  if (!J.length) body = '<div class="empty"><b>No jobs yet.</b><br>Press <b>+ New PDA</b> to start the first one. Every PDA you create becomes a job you can follow to the end.</div>';
+  else if (!list.length) body = '<div class="empty">Nothing matches. Clear the search or pick another stage.</div>';
+  else if (S.view === 'cards') body = '<div class="cards">' + list.map(j => {
+    const w = warnText(j);
+    return '<div class="jcard bt' + jobCls(j) + '" data-act="open" data-id="' + j.id + '"><div class="spread" style="flex-wrap:nowrap"><div><div class="vn">' + esc(j.vessel) + '</div><div class="no">Job ' + esc(j.pda_no) + '</div></div>' +
+      '<button class="pin' + (j.pinned ? ' on' : '') + '" data-act="pin" data-id="' + j.id + '" title="Pinned jobs stay at the top">' + (j.pinned ? 'Pinned' : 'Pin') + '</button></div>' +
+      '<div style="font-size:13.5px;margin-top:12px;font-weight:600">' + esc(j.customer_name || 'No customer yet') + '</div>' +
+      '<div style="font-size:12.5px;color:var(--muted);margin-top:2px">' + esc(portName(j)) + (j.eta ? ' &middot; ETA ' + esc(fdShort(j.eta)) : '') + '</div>' +
+      '<div class="spread" style="margin-top:14px;align-items:center;flex-wrap:nowrap">' + chipFor(j) + '<span style="font-size:15px;font-weight:700;font-variant-numeric:tabular-nums">SAR ' + fmt(j.stage >= 3 ? j.final_sar : j.pro_sar) + '</span></div>' +
+      (w ? '<div class="warnbar">' + esc(w) + '</div>' : '') +
+      (j.owed > 0 ? '<div style="margin-top:8px;font-size:12px;color:var(--danger-text);font-weight:700">Still to collect: SAR ' + fmt(j.owed) + '</div>' : '') + '<div style="flex:1;min-height:14px"></div>' +
+      '<div class="spread" style="padding-top:12px;border-top:1px solid var(--border);align-items:center"><span style="font-size:12px;color:var(--muted)">Handled by ' + esc(j.handler || j.created_by) + '</span><span style="font-size:13px;font-weight:700;color:var(--navy)">Open job file &rarr;</span></div></div>';
+  }).join('') + '</div>';
+  else body = '<div class="scroll-x"><table class="t" style="min-width:880px"><thead><tr><th>Job no.</th><th>Vessel</th><th>Customer</th><th>Port</th><th>ETA</th><th>Stage</th><th class="num">Total (SAR)</th><th class="num">To collect</th><th></th></tr></thead><tbody>' +
+    list.map(j => '<tr class="click" data-act="open" data-id="' + j.id + '"><td style="font-weight:700;color:var(--navy);white-space:nowrap">' + esc(j.pda_no) + '</td><td style="font-weight:600">' + (j.pinned ? '&#9733; ' : '') + esc(j.vessel) + '</td><td>' + esc(j.customer_name) + '</td><td>' + esc(portName(j)) + '</td><td>' + esc(fdShort(j.eta)) + '</td><td>' + chipFor(j) + (warnText(j) ? ' <span class="pos" style="font-size:11.5px;font-weight:700">&#9888;</span>' : '') + '</td><td class="num">' + fmt(j.stage >= 3 ? j.final_sar : j.pro_sar) + '</td><td class="num">' + (j.owed > 0 ? fmt(j.owed) : '-') + '</td><td class="num"><span class="btn ghost small">Open</span></td></tr>').join('') + '</tbody></table></div>';
+  $('view').innerHTML = '<div class="pghead"><div><div class="eyebrow">Compass</div><h1 class="pg">Jobs and PDAs</h1><div class="sub">Every vessel call in one place. Click a vessel to open its job file.</div></div>' +
+    '<div class="row"><a class="btn" href="#/new">+ New PDA</a></div></div>' +
+    '<div class="tiles"><div class="tile"><div class="k">Open jobs</div><div class="v">' + openN + '</div><div class="d">Appointed or alongside</div></div>' +
+    '<div class="tile"><div class="k">Waiting for reply</div><div class="v">' + waitN + '</div><div class="d">PDAs sent, no appointment yet</div></div>' +
+    '<div class="tile"><div class="k">Sailed, to invoice</div><div class="v">' + sailN + '</div><div class="d">Send the final invoices</div></div>' + alarm + '</div>' +
+    '<div class="panel"><div class="spread" style="align-items:center;margin-bottom:16px"><div class="row">' +
+    TAB_NAMES.map(t => '<button class="pill' + (S.tab === t ? ' on' : '') + '" data-act="tab" data-t="' + esc(t) + '">' + esc(t) + ' <span class="ct">' + cnt(t) + '</span></button>').join('') + '</div>' +
+    '<div class="row"><input type="search" id="boardQ" data-in="boardQ" placeholder="Search vessel, customer, number..." aria-label="Search jobs" value="' + esc(S.q) + '" style="width:260px;max-width:100%">' +
+    '<button class="pill' + (S.view === 'cards' ? ' on' : '') + '" data-act="view" data-v="cards">Cards</button><button class="pill' + (S.view === 'table' ? ' on' : '') + '" data-act="view" data-v="table">Table</button></div></div>' + body + '</div>';
+  const qi = $('boardQ'); if (qi && S.keepFocus) { qi.focus(); qi.setSelectionRange(qi.value.length, qi.value.length); S.keepFocus = false; }
+}
+function nice(s) { return String(s || '').toLowerCase().replace(/\b[a-z]/g, c => c.toUpperCase()); }
+function portName(j) { return nice(j.port || j.dis_port); }
+IN.boardQ = debounce(function (el) { S.q = el.value; S.keepFocus = true; drawBoard(); }, 120);
+ACT.tab = (t) => { S.tab = t.dataset.t; drawBoard(); };
+ACT.view = (t) => { S.view = t.dataset.v; try { localStorage.setItem('jobsView', S.view); } catch (e) {} drawBoard(); };
+ACT.open = (t) => { location.hash = '#/job/' + t.dataset.id; };
+ACT.pin = async (t, e) => {
+  e.stopPropagation(); const id = +t.dataset.id;
+  const r = await api('/api/jobs/' + id + '/pin', 'POST'); if (!r.ok) { toast(r.data.error || 'Could not pin that job.', true); return; }
+  const j = S.jobs.find(x => x.id === id); if (j) j.pinned = r.data.pinned; drawBoard();
+};
+
+/* ---------------- new PDA ---------------- */
+let NP = null;
+const VFIELDS = [['vtype', 'Type', 'text'], ['flag', 'Flag', 'text'], ['built', 'Built (year)', 'text'], ['grt', 'GRT', 'number'], ['nrt', 'NRT', 'number'], ['dwt', 'DWT', 'number'], ['loa', 'LOA (m)', 'number'], ['beam', 'Beam (m)', 'number'], ['call_sign', 'Call sign', 'text']];
+function freshNP() {
+  return {mode: 'regular', client: null, name: '', save: false, email: '', phone: '', address: '', imo: '', known: false, vessel: {name: '', vtype: '', flag: '', built: '', grt: '', nrt: '', dwt: '', loa: '', beam: '', call_sign: ''},
+    port: '', op: 'Discharging', eta: '', stay: '5', voyage: '', pref: '', err: '', busy: false, editV: false, imoNote: ''};
+}
+async function viewNew(clientId) {
+  NP = freshNP();
+  if (!Object.keys(PORTS).length) { const s = await api('/api/pda/settings'); if (s.ok) PORTS = s.data.ports || {}; }
+  NP.port = '';
+  if (clientId) { const c = await api('/api/clients/' + clientId); if (c.ok) NP.client = c.data; }
+  drawNew();
+}
+function drawNew() {
+  const n = NP, v = n.vessel;
+  const portOpts = '<option value="">Choose the port...</option>' + Object.keys(PORTS).map(k => '<option value="' + esc(k) + '"' + (n.port === k ? ' selected' : '') + '>' + esc(nice(k)) + '</option>').join('');
+  const ops = ['Discharging', 'Loading', 'Loading & Discharging', 'Bunkering', 'Other'].map(o => '<option' + (n.op === o ? ' selected' : '') + '>' + esc(o) + '</option>').join('');
+  $('view').innerHTML = '<div style="max-width:760px;margin:0 auto"><div class="pghead"><div><a class="btn ghost small" href="#/">&larr; All jobs</a><h1 class="pg" style="margin-top:12px">New PDA</h1><div class="sub">Three short steps. Anything Compass already knows is filled in for you. Fields marked <span style="color:var(--danger-text);font-weight:700">required</span> must be filled.</div></div></div>' +
+    '<div id="npErr">' + (n.err ? '<div class="alert" role="alert">' + esc(n.err) + '</div>' : '') + '</div>' +
+    '<div class="stack">' +
+    '<div class="panel"><div class="step"><span class="n">1</span><span class="t">Who is the customer?</span></div>' +
+    '<div class="seg" role="group" aria-label="Customer type"><button class="' + (n.mode === 'regular' ? 'on' : '') + '" data-act="npMode" data-m="regular">Regular customer</button><button class="' + (n.mode === 'oneoff' ? 'on' : '') + '" data-act="npMode" data-m="oneoff">One-off customer</button></div>' +
+    '<div id="custBox" style="margin-top:14px">' + custBoxHtml() + '</div></div>' +
+    '<div class="panel"><div class="step"><span class="n">2</span><span class="t">Which vessel?</span></div>' +
+    '<div class="fgrid"><div><label class="lb" for="npImo">IMO number <span class="opt">optional, 7 digits</span></label><input id="npImo" type="text" inputmode="numeric" maxlength="7" placeholder="For example 9407067" data-in="npImo" value="' + esc(n.imo) + '" autocomplete="off"><div class="help" id="imoNote">' + esc(n.imoNote || 'Type the IMO and a vessel Compass has seen before fills in by itself.') + '</div></div>' +
+    '<div><label class="lb" for="npVname">Vessel name <span class="req">required</span></label><input id="npVname" type="text" data-in="npVname" value="' + esc(v.name) + '" placeholder="As on the Bill of Lading" autocomplete="off"><div class="help">Turns into capital letters as you type. Known vessels appear below.</div><div id="vesSug"></div></div></div>' +
+    '<div id="vesselBox" style="margin-top:14px">' + vesselBoxHtml() + '</div></div>' +
+    '<div class="panel"><div class="step"><span class="n">3</span><span class="t">Which port call?</span></div>' +
+    '<div class="fgrid"><div><label class="lb" for="npPort">Port of call <span class="req">required</span></label><select id="npPort" data-ch="npf" data-k="port">' + portOpts + '</select><div class="help">Charges come from this port\'s rate card.</div></div>' +
+    '<div><label class="lb" for="npOp">Activity</label><select id="npOp" data-ch="npf" data-k="op">' + ops + '</select></div>' +
+    '<div><label class="lb" for="npEta">ETA</label><input id="npEta" type="date" data-ch="npf" data-k="eta" value="' + esc(n.eta) + '"><div class="help">Expected arrival date.</div></div>' +
+    '<div><label class="lb" for="npStay">Port stay (days)</label><input id="npStay" type="number" min="0" step="any" data-in="npf" data-k="stay" value="' + esc(n.stay) + '"><div class="help">Days at berth. Daily charges use this.</div></div>' +
+    '<div><label class="lb" for="npVoy">Voyage no. <span class="opt">optional</span></label><input id="npVoy" type="text" data-in="npf" data-k="voyage" value="' + esc(n.voyage) + '"></div>' +
+    '<div><label class="lb" for="npRef">Principal\'s reference <span class="opt">optional</span></label><input id="npRef" type="text" data-in="npf" data-k="pref" value="' + esc(n.pref) + '"></div></div></div>' +
+    '<div class="row" style="justify-content:flex-end"><a class="btn ghost" href="#/">Cancel</a><button class="btn" data-act="npCreate" id="npGo"' + (n.busy ? ' disabled' : '') + '>Create PDA</button></div></div></div>';
+}
+function custBoxHtml() {
+  const n = NP;
+  if (n.mode === 'regular') {
+    if (n.client) {
+      const c = n.client;
+      return '<div class="box"><div class="spread" style="align-items:center"><b style="font-size:16px">' + esc(c.name) + '</b><button class="btn ghost small" data-act="npClearClient">Change</button></div>' +
+        '<div class="kv" style="margin-top:10px"><div><span class="k">Operator</span><br>' + esc(c.operator || '-') + '</div><div><span class="k">Address</span><br>' + esc(c.address || '-') + '</div><div><span class="k">Phone</span><br>' + esc(c.phone || '-') + '</div><div><span class="k">Email</span><br>' + esc(c.email || '-') + '</div></div>' +
+        '<div class="noteok" style="margin-top:10px">&#10003; Filled in from your saved clients.' + (c.docs && c.docs.some(d => d.kind === 'cr') ? ' CR copy is on file.' : '') + '</div></div>';
+    }
+    return '<label class="lb" for="npCust">Customer <span class="req">required</span></label><input id="npCust" type="text" data-in="npCust" placeholder="Start typing, for example: hon" autocomplete="off" value="' + esc(n.name) + '">' +
+      '<div class="help">Type the first letters. Saved clients appear below and their details fill in automatically.</div><div id="custSug"></div>';
+  }
+  return '<label class="lb" for="npName">Customer name <span class="req">required</span></label><input id="npName" type="text" data-in="npName" placeholder="Type the name. Nothing else is needed." value="' + esc(n.name) + '" autocomplete="off">' +
+    '<label style="display:flex;align-items:center;gap:10px;margin-top:14px;font-size:14px;font-weight:600;cursor:pointer"><input type="checkbox" data-ch="npSave"' + (n.save ? ' checked' : '') + ' style="width:20px;height:20px"> Save this customer for next time</label>' +
+    '<div class="help">' + (n.save ? 'This customer will be added to your Clients list, so you can pick it next time.' : 'Left unticked, this customer is used for this PDA only and is not added to your Clients list.') + '</div>' +
+    '<details style="margin-top:12px"' + ((n.email || n.phone || n.address) ? ' open' : '') + '><summary style="cursor:pointer;font-size:13px;font-weight:700;color:var(--navy)">Add contact details (optional)</summary><div class="fgrid" style="margin-top:10px">' +
+    '<div><label class="lb" for="npEmail">Email <span class="opt">needed to email the PDA</span></label><input id="npEmail" type="email" data-in="npf" data-k="email" value="' + esc(n.email) + '"></div>' +
+    '<div><label class="lb" for="npPhone">Phone</label><input id="npPhone" type="text" data-in="npf" data-k="phone" value="' + esc(n.phone) + '"></div>' +
+    '<div class="full"><label class="lb" for="npAddr">Address</label><input id="npAddr" type="text" data-in="npf" data-k="address" value="' + esc(n.address) + '"></div></div></details>';
+}
+function vesselBoxHtml() {
+  const n = NP, v = n.vessel;
+  if (n.known && !n.editV) {
+    return '<div class="box"><div class="spread" style="align-items:center"><b style="font-size:16px">' + esc(v.name) + '</b><span class="noteok">&#10003; Filled in from the Compass vessel list</span></div>' +
+      '<div class="kv three" style="margin-top:10px">' + VFIELDS.map(f => '<div><span class="k">' + f[1] + '</span><br>' + esc(v[f[0]] === '' || v[f[0]] == null ? '-' : v[f[0]]) + '</div>').join('') + '</div>' +
+      '<div class="row" style="margin-top:10px"><span class="help" style="margin:0">Nothing to type. Something wrong? </span><button class="btn ghost small" data-act="npEditV">Correct these details</button></div></div>';
+  }
+  return '<div class="help" style="margin:0 0 10px">' + (n.known ? 'Correcting the saved details for this vessel.' : 'New vessel? Fill these in once. Compass saves them' + (n.imo.length === 7 ? ' under IMO ' + esc(n.imo) : ' when you give an IMO number') + ' and next time they fill themselves in. All optional.') + '</div>' +
+    '<div class="fgrid">' + VFIELDS.map(f => '<div><label class="lb" for="npv_' + f[0] + '">' + f[1] + '</label><input id="npv_' + f[0] + '" type="' + (f[2] === 'number' ? 'number' : 'text') + '"' + (f[2] === 'number' ? ' step="any" min="0"' : '') + ' data-in="npv" data-k="' + f[0] + '" value="' + esc(v[f[0]]) + '"></div>').join('') + '</div>';
+}
+function applyVessel(r) { // r = row from /api/fleet
+  const v = NP.vessel;
+  v.name = r.name || v.name;
+  VFIELDS.forEach(f => { const k = f[0] === 'vtype' ? 'vtype' : f[0]; v[f[0]] = r[k] == null ? '' : r[k]; });
+}
+ACT.npMode = (t) => { NP.mode = t.dataset.m; NP.client = null; NP.err = ''; if (NP.mode === 'oneoff') NP.save = false; $('custBox').innerHTML = custBoxHtml(); document.querySelectorAll('.seg button').forEach(b => b.classList.toggle('on', b.dataset.m === NP.mode)); };
+ACT.npClearClient = () => { NP.client = null; NP.name = ''; $('custBox').innerHTML = custBoxHtml(); const i = $('npCust'); if (i) i.focus(); };
+ACT.npEditV = () => { NP.editV = true; $('vesselBox').innerHTML = vesselBoxHtml(); };
+CH.npSave = (t) => { NP.save = t.checked; $('custBox').innerHTML = custBoxHtml(); const i = $('npName'); if (i) { i.focus(); i.setSelectionRange(i.value.length, i.value.length); } };
+CH.npf = (t) => { NP[t.dataset.k] = t.value; };
+IN.npf = (t) => { NP[t.dataset.k] = t.value; };
+IN.npv = (t) => { NP.vessel[t.dataset.k] = t.value; };
+IN.npName = (t) => { upperInput(t); NP.name = t.value; };
+const custSearch = debounce(async function (q) {
+  const box = $('custSug'); if (!box) return;
+  if (q.trim().length < 1) { box.innerHTML = ''; return; }
+  const r = await api('/api/clients?q=' + encodeURIComponent(q.trim()));
+  if (!$('custSug') || NP.client) return;
+  const list = r.ok ? r.data.slice(0, 6) : [];
+  let h = list.map(c => '<button data-act="npPick" data-id="' + c.id + '"><b>' + esc(c.name) + '</b><span>' + esc([c.operator, c.country].filter(Boolean).join(' | ')) + '</span></button>').join('');
+  if (!list.length) h += '<button data-act="npNewClient"><b>No saved client matches "' + esc(q.trim()) + '"</b><span>Add it as a new client &rarr;</span></button>';
+  box.innerHTML = '<div class="sugg">' + h + '</div>';
+}, 150);
+IN.npCust = (t) => { NP.name = t.value; custSearch(t.value); };
+ACT.npPick = async (t) => { const r = await api('/api/clients/' + t.dataset.id); if (r.ok) { NP.client = r.data; NP.err = ''; $('custBox').innerHTML = custBoxHtml(); } };
+ACT.npNewClient = () => { const nm = (NP.name || '').toUpperCase(); NP.mode = 'oneoff'; NP.save = true; NP.name = nm; NP.client = null; drawNew(); toast('Add the details below. "' + nm + '" will be saved to your Clients list.'); };
+const imoLookup = debounce(async function (imo) {
+  const r = await api('/api/fleet/' + imo);
+  if (!r.ok || NP.imo !== imo) return;
+  const note = $('imoNote');
+  if (r.data.found) { applyVessel(r.data.vessel); NP.known = true; NP.editV = false; NP.imoNote = 'Found: ' + r.data.vessel.name + '. Details filled in below.'; $('npVname').value = NP.vessel.name; $('vesselBox').innerHTML = vesselBoxHtml(); if (note) note.textContent = NP.imoNote; }
+  else { NP.known = false; NP.imoNote = r.data.checksum_ok ? 'New to Compass. Fill in the vessel details once and they are saved.' : 'This IMO number does not pass the standard check. Please re-check the digits.'; if (note) note.textContent = NP.imoNote; $('vesselBox').innerHTML = vesselBoxHtml(); }
+}, 200);
+IN.npImo = (t) => {
+  t.value = t.value.replace(/\D/g, '').slice(0, 7); NP.imo = t.value;
+  if (NP.known) { NP.known = false; NP.editV = false; $('vesselBox').innerHTML = vesselBoxHtml(); }
+  if (t.value.length === 7) imoLookup(t.value); else { NP.imoNote = ''; $('imoNote').textContent = t.value.length ? 'An IMO number has 7 digits.' : 'Type the IMO and a vessel Compass has seen before fills in by itself.'; }
+};
+const vesSearch = debounce(async function (q) {
+  const box = $('vesSug'); if (!box) return;
+  if (q.trim().length < 2 || NP.known) { box.innerHTML = ''; return; }
+  const r = await api('/api/fleet?q=' + encodeURIComponent(q.trim()));
+  if (!$('vesSug')) return;
+  const list = r.ok ? r.data.slice(0, 5) : [];
+  box.innerHTML = list.length ? '<div class="sugg">' + list.map(x => '<button data-act="npVessel" data-imo="' + esc(x.imo) + '"><b>' + esc(x.name) + '</b><span>IMO ' + esc(x.imo) + (x.vtype ? ' | ' + esc(x.vtype) : '') + '</span></button>').join('') + '</div>' : '';
+}, 150);
+IN.npVname = (t) => { upperInput(t); NP.vessel.name = t.value; vesSearch(t.value); };
+ACT.npVessel = async (t) => {
+  const r = await api('/api/fleet/' + t.dataset.imo); if (!r.ok || !r.data.found) return;
+  NP.imo = t.dataset.imo; applyVessel(r.data.vessel); NP.known = true; NP.editV = false; NP.imoNote = 'Found: ' + r.data.vessel.name + '. Details filled in below.';
+  $('npImo').value = NP.imo; $('npVname').value = NP.vessel.name; $('vesSug').innerHTML = ''; $('imoNote').textContent = NP.imoNote; $('vesselBox').innerHTML = vesselBoxHtml();
+};
+function npFail(msg, focusId) {
+  NP.err = msg; $('npErr').innerHTML = '<div class="alert" role="alert">' + esc(msg) + '</div>';
+  document.querySelectorAll('.bad').forEach(x => x.classList.remove('bad'));
+  const el = focusId && $(focusId); if (el) { el.classList.add('bad'); el.focus(); }
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+ACT.npCreate = async () => {
+  const n = NP, v = n.vessel;
+  const cust = n.mode === 'regular' ? (n.client ? n.client.name : '') : (n.name || '').trim();
+  if (!cust) return npFail(n.mode === 'regular' ? 'Choose a customer first. Type the first letters of a saved client, or switch to One-off customer.' : 'Type the customer\'s name. It is the only thing required here.', n.mode === 'regular' ? 'npCust' : 'npName');
+  if (!(v.name || '').trim()) return npFail('Type the vessel name. It is required.', 'npVname');
+  if (n.imo && n.imo.length !== 7) return npFail('An IMO number has 7 digits. Fix it or leave it empty.', 'npImo');
+  if (!n.port) return npFail('Choose the port of call.', 'npPort');
+  const body = {port: n.port, vessel: v.name.trim(), operation: n.op, eta: n.eta, voyage: n.voyage, principal_ref: n.pref, imo: n.imo, vessel_type: v.vtype, flag: v.flag, built: v.built, call_sign: v.call_sign};
+  ['grt', 'nrt', 'dwt', 'loa', 'beam'].forEach(k => { if (v[k] !== '' && v[k] != null) body[k] = v[k]; });
+  if (n.stay !== '') body.port_stay = n.stay;
+  if (n.mode === 'regular') { body.client_id = n.client.id; body.customer_name = n.client.name; body.customer_address = n.client.address || ''; body.customer_phone = n.client.phone || ''; body.customer_email = n.client.email || ''; }
+  else { body.customer_name = cust; body.customer_address = n.address; body.customer_phone = n.phone; body.customer_email = n.email; body.save_client = !!n.save; }
+  n.busy = true; $('npGo').disabled = true;
+  const r = await api('/api/pda/documents', 'POST', body);
+  n.busy = false; $('npGo') && ($('npGo').disabled = false);
+  if (!r.ok) return npFail(r.data.error || 'Could not create the PDA. Please try again.');
+  toast('PDA ' + r.data.pda_no + ' created for ' + body.vessel.toUpperCase() + '.');
+  location.hash = '#/job/' + r.data.id;
+};
+
+/* ---------------- job file ---------------- */
+const JTABS = ['Overview', 'Charges', 'Husbandry and services', 'Invoices', 'History', 'Documents'];
+const JSLUG = {overview: 'Overview', charges: 'Charges', husbandry: 'Husbandry and services', invoices: 'Invoices', history: 'History', documents: 'Documents'};
+const SVC_SUGGEST = ['Fresh water supply', 'Provisions', 'Garbage disposal', 'Spares delivery', 'Launch hire', 'Crew change assistance', 'Medical visit', 'Bunkering coordination', 'Cash to master', 'Visa and immigration', 'Customs clearance'];
+const STD_INSTR = "Husbandry limit: up to USD 1,000 without written approval.\nStatement of Facts: upload within 24 hours of departure.\nCharterer expenses: invoice within 30 days of departure.\nPort log: update regularly, always include ETB and ETD.";
+async function viewJob(id, slug) {
+  if (!S.job || S.job.job.id !== id) $('view').innerHTML = '<div class="empty">Loading the job file...</div>';
+  if (!Object.keys(PORTS).length) { const s = await api('/api/pda/settings'); if (s.ok) PORTS = s.data.ports || {}; }
+  const r = await api('/api/jobs/' + id);
+  if (!r.ok) { $('view').innerHTML = '<div class="panel empty">' + esc(r.data.error || 'Could not open that job.') + '<br><br><a class="btn" href="#/">&larr; All jobs</a></div>'; S.job = null; return; }
+  S.job = r.data; S.jobTab = JSLUG[slug] || 'Overview';
+  drawJob();
+}
+function drawJob() {
+  const J = S.job, d = J.job, st = J.stage, tb = J.timebar, m = J.money;
+  const next = st < 5 ? J.stages[st + 1] : '';
+  const chipCls = st === 0 ? (d.status === 'draft' ? '0' : '0b') : String(st);
+  const chipTxt = st === 0 ? (d.status === 'draft' ? 'Draft' : 'Quotation sent') : J.stage_name;
+  const dayWord = (n) => Math.abs(n) + ' day' + (Math.abs(n) === 1 ? '' : 's');
+  let tbh;
+  if (tb.state === 'waiting') tbh = '<div class="tb"><div class="k">Time bar</div><div class="t">Starts when the vessel sails</div><div class="d">The principal allows ' + tb.days + ' days after departure to send charterer expenses. Compass starts counting on the day the job is moved to Sailed.</div></div>';
+  else if (tb.state === 'closed') tbh = '<div class="tb closed"><div class="k">Time bar</div><div class="t">Job closed. No time bar pending.</div></div>';
+  else tbh = '<div class="tb ' + (tb.state === 'ok' ? '' : (tb.state === 'warn' ? 'warn' : 'over')) + '"><div class="k">Time bar</div><div class="t">' + (tb.state === 'over' ? 'Time bar passed ' + dayWord(tb.days_left) + ' ago' : dayWord(tb.days_left) + ' left to invoice') + '</div><div class="d">Departure ' + fd(tb.sail_date) + '. Time bar ' + (tb.state === 'over' ? 'ended ' : 'ends ') + fd(tb.deadline) + '.' + (tb.state === 'ok' ? ' Compass will warn you at 14 days.' : '') + '</div></div>';
+  const steps = J.stages.map((n, i) => '<div><div class="bar ' + (i < st ? 'done' : (i === st ? 'cur' : '')) + '"></div><div class="nm" style="color:' + (i <= st ? 'var(--text)' : 'var(--muted)') + '">' + esc(n) + '</div><div class="nt">' + esc(i < st ? 'Done' : (i === st ? 'Current' : J.stage_notes[i])) + '</div></div>').join('');
+  $('view').innerHTML = '<div class="stack">' +
+    '<div class="panel"><a class="btn ghost small" href="#/">&larr; All jobs</a>' +
+    '<div class="spread" style="margin-top:12px"><div><div class="row" style="gap:12px"><span style="font-size:26px;font-weight:700">' + esc(d.vessel) + '</span><span class="chip s' + chipCls + '" style="font-size:12px;padding:5px 14px">' + esc(chipTxt) + '</span></div>' +
+    '<div style="font-size:13px;color:var(--muted);margin-top:4px">Job ' + esc(d.pda_no) + ' &middot; opened ' + esc(fd((d.created_at || '').slice(0, 10))) + ' &middot; handled by ' + esc(d.handler || d.created_by) + '</div></div>' +
+    '<div class="row"><button class="btn ' + (J.pinned ? '' : 'ghost') + '" data-act="jpin" style="' + (J.pinned ? 'background:var(--gold);border-color:var(--gold)' : '') + '">' + (J.pinned ? 'Pinned' : 'Pin to top') + '</button><a class="btn ghost" href="#/report/' + d.id + '">Final job report</a><a class="btn ghost" href="/api/pda/documents/' + d.id + '/pdf" target="_blank" rel="noopener">Download ' + (d.status === 'finalized' ? 'FDA' : 'PDA') + '</a>' +
+    (st < 5 ? '<button class="btn" data-act="advance" title="Moves the job to the next stage and records it in History">Move to: ' + esc(next) + '</button>' : '<button class="btn" disabled>Job closed</button>') + '</div></div>' +
+    '<div class="row" style="gap:6px 22px;margin-top:14px;font-size:13px">' +
+    [['Port', portName(d) || d.dis_port], ['Customer', d.customer_name], ['Voyage', d.voyage], ['ETA', d.eta ? fd(d.eta) : ''], ['Activity', d.operation], ['Principal ref', d.principal_ref]].filter(x => x[1]).map(x => '<span><span style="color:var(--muted)">' + x[0] + ':</span> ' + esc(x[1]) + '</span>').join('') + '</div>' +
+    '<div class="stages">' + steps + '</div>' +
+    (ROLE === 'admin' && st > 0 ? '<div style="margin-top:10px"><button class="btn ghost small" data-act="stageBack">Moved too far? Go back one step (admin)</button></div>' : '') + '</div>' +
+    tbh +
+    '<div class="row">' + JTABS.map(t => '<button class="pill' + (S.jobTab === t ? ' on' : '') + '" data-act="jtab" data-t="' + esc(t) + '">' + esc(t) + (t === 'Invoices' && J.invoices.length ? ' <span class="ct">' + J.invoices.length + '</span>' : '') + (t === 'Husbandry and services' && J.services.length ? ' <span class="ct">' + J.services.length + '</span>' : '') + '</button>').join('') + '</div>' +
+    '<div id="jbody"></div></div>';
+  drawJobTab();
+}
+function drawJobTab() {
+  const f = {Overview: tabOverview, Charges: tabCharges, 'Husbandry and services': tabHusb, Invoices: tabInvoices, History: tabHistory, Documents: tabDocs}[S.jobTab];
+  $('jbody').innerHTML = f();
+  document.querySelectorAll('.pill[data-act="jtab"]').forEach(b => b.classList.toggle('on', b.dataset.t === S.jobTab));
+}
+ACT.jtab = (t) => { S.jobTab = t.dataset.t; drawJobTab(); };
+ACT.jpin = async () => { const r = await api('/api/jobs/' + S.job.job.id + '/pin', 'POST'); if (r.ok) { S.job.pinned = r.data.pinned; drawJob(); } };
+function setJob(data) { S.job = data; const y = window.scrollY; drawJob(); window.scrollTo(0, y); }
+function money4(n) { return fmt(n); }
+
+function tabOverview() {
+  const J = S.job, d = J.job, c = J.client, m = J.money;
+  const cust = '<div class="panel stack" style="gap:12px"><div class="spread" style="align-items:center"><h2>Customer</h2>' + (d.one_off && d.customer_name ? '<button class="btn ghost small" data-act="saveClient">Save to Clients list</button>' : '') + '</div><div style="font-size:15px;font-weight:700">' + esc(d.customer_name || 'No customer on this job') + '</div>' +
+    '<div class="kv"><div><span class="k">Operator</span><br>' + esc((c && c.operator) || '-') + '</div><div><span class="k">Country</span><br>' + esc((c && c.country) || '-') + '</div><div class="full"><span class="k">Address</span><br>' + esc(d.customer_address || (c && c.address) || '-') + '</div><div><span class="k">Phone</span><br>' + esc(d.customer_phone || (c && c.phone) || '-') + '</div><div><span class="k">Email</span><br>' + esc(d.customer_email || (c && c.email) || '-') + '</div></div>' +
+    (c && c.contacts ? '<div style="border-top:1px solid var(--border);padding-top:10px;font-size:13px"><span style="color:var(--muted)">Contacts</span><br>' + esc(c.contacts).replace(/\n/g, '<br>') + '</div>' : '') +
+    '<div class="row">' + (c ? ['cr', 'vat'].map(k => '<span class="chip ' + (c.docs.some(x => x.kind === k) ? 'paid' : 'reqd') + '">' + (k === 'cr' ? 'CR copy' : 'VAT certificate') + (c.docs.some(x => x.kind === k) ? ' on file' : ' missing') + '</span>').join('') + '<a class="btn ghost small" href="#/clients/' + c.id + '">Open client</a>' : '<span class="help">' + (d.one_off ? 'One-off customer: not in the Clients list.' : '') + '</span>') + '</div></div>';
+  const vf = [['Type', d.vessel_type], ['Flag', d.flag], ['Built', d.built], ['GRT', d.grt ? Number(d.grt).toLocaleString() : ''], ['NRT', d.nrt ? Number(d.nrt).toLocaleString() : ''], ['DWT', d.dwt ? Number(d.dwt).toLocaleString() : ''], ['LOA (m)', d.loa || ''], ['Beam (m)', d.beam || ''], ['Call sign', d.call_sign]];
+  const ves = '<div class="panel stack" style="gap:12px"><div class="spread" style="align-items:center"><h2>Vessel</h2>' + (d.imo ? '<span class="noteok">IMO ' + esc(d.imo) + '</span>' : '<span class="help" style="margin:0">No IMO number saved</span>') + '</div><div style="font-size:15px;font-weight:700">' + esc(d.vessel) + '</div>' +
+    '<div class="kv three">' + vf.map(x => '<div><span class="k">' + x[0] + '</span><br>' + esc(x[1] === '' || x[1] == null ? '-' : x[1]) + '</div>').join('') + '</div>' +
+    '<div class="help">Change any detail in <a href="' + editorUrl() + '">the quotation editor</a>. Vessels with an IMO number are remembered for next time.</div></div>';
+  const instr = '<div class="panel stack" style="gap:10px"><h2>Principal\'s instructions</h2><div class="hint" style="margin:0">Saved once on the job, so everyone handling it sees the same rules.</div>' +
+    (d.instructions ? '<div class="stack" style="gap:8px">' + d.instructions.split('\n').filter(x => x.trim()).map(l => '<div class="instr">' + esc(l) + '</div>').join('') + '</div>' : '<div class="help">None saved yet.</div>') +
+    '<div class="row"><button class="btn ghost small" data-act="editInstr">' + (d.instructions ? 'Edit instructions' : 'Add instructions') + '</button></div></div>';
+  const mon = '<div class="panel stack" style="gap:6px"><h2>Money at a glance (SAR)</h2>' + [['Pro forma (estimate)', fmt(m.pro_sar)], ['Final (actual costs)', J.stage >= 3 ? fmt(m.final_sar) : 'Not final yet'], ['Invoiced on this job', fmt(m.invoiced)], ['Paid', fmt(m.paid), 'ok']].map(x => '<div class="spread" style="font-size:14px;padding:8px 0;border-bottom:1px solid var(--border)"><span style="color:var(--muted)">' + x[0] + '</span><b style="font-variant-numeric:tabular-nums;' + (x[2] ? 'color:var(--ok)' : '') + '">' + x[1] + '</b></div>').join('') +
+    '<div class="spread" style="font-size:15px;padding:8px 0"><b>Still to collect</b><b style="font-variant-numeric:tabular-nums;color:var(--danger-text)">' + fmt(m.owed) + '</b></div></div>';
+  return '<div class="grid2">' + cust + ves + instr + mon + '</div>';
+}
+function editorUrl() { return '/pda?job=' + S.job.job.id + '#d' + S.job.job.id; }
+ACT.saveClient = async () => { const r = await api('/api/jobs/' + S.job.job.id + '/save-client', 'POST'); if (!r.ok) return toast(r.data.error || 'Could not save the client.', true); toast('Saved to your Clients list.'); setJob(r.data); };
+ACT.editInstr = () => {
+  modal({title: "Principal's instructions", text: 'One instruction per line. These show on the job for everyone.', body: '<textarea id="mInstr" rows="7">' + esc(S.job.job.instructions || '') + '</textarea><div class="row" style="margin-top:8px"><button class="btn ghost small" data-act="stdInstr">Insert the standard four lines</button></div>', ok: 'Save instructions',
+    onOk: async () => { const r = await api('/api/pda/documents/' + S.job.job.id, 'PUT', {instructions: $('mInstr').value}); if (!r.ok) { toast(r.data.error || 'Could not save.', true); return false; } await reloadJob(); toast('Instructions saved.'); } });
+};
+ACT.stdInstr = () => { const t = $('mInstr'); t.value = (t.value.trim() ? t.value.trim() + '\n' : '') + STD_INSTR; };
+async function reloadJob() { const r = await api('/api/jobs/' + S.job.job.id); if (r.ok) setJob(r.data); }
+
+/* --- stage --- */
+ACT.advance = () => {
+  const J = S.job, to = J.stage + 1, name = J.stages[to];
+  if (to === 3) {
+    const today = new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10);
+    return modal({title: 'Vessel has sailed?', text: 'Compass starts the ' + J.timebar.days + '-day time bar from the sailing date.', body: '<label class="lb" for="mSail">Sailing date</label><input id="mSail" type="date" value="' + today + '">', ok: 'Move to Sailed', onOk: () => doStage(to, {sail_date: $('mSail').value}) });
+  }
+  const txt = {1: 'The appointment was received and the job is opened under ' + J.job.pda_no + '.', 2: 'The vessel is alongside the berth.', 4: 'The final invoices have been issued to the customer.', 5: 'All work is done and the job is filed.'}[to];
+  modal({title: 'Move to ' + name + '?', text: txt + ' This is recorded in History.', ok: 'Move to ' + name, onOk: () => doStage(to, {})});
+};
+async function doStage(to, extra) {
+  const r = await api('/api/jobs/' + S.job.job.id + '/stage', 'POST', Object.assign({to: to}, extra));
+  if (r.status === 409 && r.data.needs_confirm) {
+    closeModal(); modal({title: 'Close with unpaid invoices?', text: r.data.error, ok: 'Close the job anyway', onOk: () => doStage(to, {confirm: true})}); return false;
+  }
+  if (!r.ok) { toast(r.data.error || 'Could not change the stage.', true); return false; }
+  toast('Moved to ' + r.data.stage_name + '.'); setJob(r.data);
+}
+ACT.stageBack = () => modal({title: 'Go back one step?', text: 'The job returns to ' + S.job.stages[S.job.stage - 1] + '. This is recorded in History.', ok: 'Go back', onOk: () => doStage(S.job.stage - 1, {})});
+
+/* --- charges --- */
+function tabCharges() {
+  const J = S.job, d = J.job, m = J.money, fin = J.stage >= 3;
+  const byId = {}; d.items.forEach(i => { byId[i.id] = i; });
+  const editable = fin && J.stage < 5;
+  let rows = '';
+  d.calc.groups.forEach(g => {
+    rows += '<tr class="grp"><td>' + esc(g.name) + '</td><td class="num">Pro forma</td><td class="num">Final' + (editable ? ' (type the actual)' : '') + '</td><td class="num">Difference</td></tr>';
+    g.items.forEach(l => {
+      const it = byId[l.id] || {}, diff = l.act_sar - l.sar;
+      const cell = editable ? '<input type="number" step="any" min="0" class="fin" data-ch="final" data-id="' + l.id + '" value="' + (it.actual_amount == null ? '' : it.actual_amount) + '" placeholder="' + (it.estimated_amount || 0) + '" style="width:130px;text-align:right" aria-label="Final amount for ' + esc(it.name) + '"> <span class="help" style="margin:0">' + esc(it.currency || 'SAR') + '</span>' + (it.currency === 'USD' ? '<div class="help" style="margin:0">= SAR ' + fmt(l.act_sar) + '</div>' : '') : (fin ? fmt(l.act_sar) : '-');
+      rows += '<tr><td>' + esc(it.name) + (it.qty && it.rate ? '<div class="help" style="margin:0">' + esc(fmtQtyJ(it.qty)) + ' x ' + fmt(it.rate) + ' ' + esc(it.currency) + '</div>' : '') + '</td><td class="num">' + fmt(l.sar) + '</td><td class="num">' + cell + '</td><td class="num ' + (fin && Math.abs(diff) > 0.004 ? (diff > 0 ? 'pos' : 'neg') : '') + '" style="font-weight:700">' + (fin && Math.abs(diff) > 0.004 ? (diff > 0 ? '+' : '') + fmt(diff) : '-') + '</td></tr>';
+    });
+    const gd = g.act_sar - g.est_sar;
+    rows += '<tr class="sub"><td>Total ' + esc(g.name.toLowerCase()) + '</td><td class="num">' + fmt(g.est_sar) + '</td><td class="num">' + (fin ? fmt(g.act_sar) : '-') + '</td><td class="num ' + (fin && Math.abs(gd) > 0.004 ? (gd > 0 ? 'pos' : 'neg') : '') + '">' + (fin && Math.abs(gd) > 0.004 ? (gd > 0 ? '+' : '') + fmt(gd) : '-') + '</td></tr>';
+  });
+  if (!d.calc.groups.length) rows = '<tr><td colspan="4" class="empty">No charges yet. Add them in the quotation editor.</td></tr>';
+  const mainAmt = fin ? m.final_sar : m.pro_sar, supp = m.by_kind.supplementary || 0, vend = m.by_kind.vendor || 0;
+  return '<div class="panel"><div class="spread" style="align-items:flex-end;margin-bottom:10px"><div><h2>Consolidated account</h2><div class="hint" style="margin:0">Estimate and actual side by side. ' + (fin ? (editable ? 'Type each actual cost in the Final column; it saves as you leave the box. Grey numbers are the estimate.' : '') : 'The Final column opens once the vessel has sailed.') + '</div></div>' +
+    '<div class="row"><span class="help" style="margin:0">All amounts in SAR</span><a class="btn ghost small" href="' + editorUrl() + '">Edit charges in the quotation editor</a>' +
+    (fin && d.status !== 'finalized' && J.stage < 5 ? '<button class="btn small" data-act="finalize" title="Locks the actual amounts and turns the PDA into the Final Disbursement Account">Prepare final account (FDA)</button>' : '') + '</div></div>' +
+    '<div class="scroll-x"><table class="t" style="min-width:640px"><tbody>' + rows + '</tbody></table></div>' +
+    '<div class="sumrow"><div class="box"><div class="k">Main DA</div><div class="v">' + fmt(mainAmt) + '</div></div><div class="box"><div class="k">Supplementary DA</div><div class="v">' + fmt(supp) + '</div></div><div class="box"><div class="k">Vendor invoices</div><div class="v">' + fmt(vend) + '</div></div><div class="box dark"><div class="k">Total</div><div class="v">' + fmt(mainAmt + supp + vend) + '</div></div></div>' +
+    '<div class="help" style="margin-top:8px">Supplementary and vendor amounts come from the invoices you add in the Invoices tab.</div></div>';
+}
+function fmtQtyJ(n) { return Number(n || 0).toLocaleString('en-US', {maximumFractionDigits: 3}); }
+CH.final = async (t) => {
+  const v = t.value.trim();
+  const r = await api('/api/pda/line-items/' + t.dataset.id, 'PUT', {actual_amount: v === '' ? null : v});
+  if (!r.ok) { toast(r.data.error || 'Could not save that amount.', true); t.classList.add('bad'); return; }
+  await reloadJob(); toast('Final amount saved.');
+};
+ACT.finalize = () => modal({title: 'Prepare the final account?', text: 'The PDA becomes the Final Disbursement Account (FDA). Any charge without an actual amount keeps its estimate. This is recorded in History.', ok: 'Prepare FDA', onOk: async () => { const r = await api('/api/pda/documents/' + S.job.job.id + '/finalize', 'POST'); if (!r.ok) { toast(r.data.error || 'Could not finalize.', true); return false; } await reloadJob(); toast('Final account (FDA) prepared.'); }});
+
+/* --- husbandry --- */
+function tabHusb() {
+  const J = S.job, m = J.money;
+  const rows = J.services.map(s => '<tr><td style="font-weight:600;min-width:170px"><input type="text" data-ch="svc" data-id="' + s.id + '" data-k="name" value="' + esc(s.name) + '" aria-label="Service name"></td>' +
+    '<td><select data-ch="svc" data-id="' + s.id + '" data-k="status" aria-label="Status">' + ['Requested', 'Done', 'Cancelled'].map(o => '<option' + (s.status === o ? ' selected' : '') + '>' + o + '</option>').join('') + '</select></td>' +
+    '<td class="num"><input type="number" step="any" min="0" data-ch="svc" data-id="' + s.id + '" data-k="cost" value="' + s.cost + '" style="width:120px;text-align:right" aria-label="Cost in SAR"></td>' +
+    '<td><input type="text" data-ch="svc" data-id="' + s.id + '" data-k="invoice_no" value="' + esc(s.invoice_no) + '" placeholder="Invoice no." style="width:130px" aria-label="Invoice number"></td>' +
+    '<td><input type="text" data-ch="svc" data-id="' + s.id + '" data-k="note" value="' + esc(s.note) + '" placeholder="Note" aria-label="Note">' + (s.over_limit ? '<div class="pos" style="font-size:12.5px;font-weight:700;margin-top:4px">Over the limit: ask the owner for approval</div>' : '') + '</td>' +
+    '<td class="num"><button class="btn ghost danger small" data-act="svcDel" data-id="' + s.id + '" aria-label="Remove ' + esc(s.name) + '">Remove</button></td></tr>').join('');
+  return '<div class="panel"><div class="spread" style="margin-bottom:12px"><div><h2>Husbandry and services</h2><div class="hint" style="margin:0">Everything provided to the vessel on this job, in one place. The limit is USD ' + fmt(J.limit_usd).replace('.00', '') + ' (SAR ' + fmt(J.limit_sar).replace('.00', '') + ') per service without approval.</div></div><div style="font-size:14px;font-weight:700">Total: SAR ' + fmt(m.services) + '</div></div>' +
+    '<div class="box" style="margin-bottom:14px"><div class="fgrid" style="align-items:end"><div><label class="lb" for="svName">Add a service <span class="req">name required</span></label><input id="svName" type="text" list="svList" placeholder="For example: Fresh water supply" autocomplete="off"><datalist id="svList">' + SVC_SUGGEST.map(x => '<option value="' + esc(x) + '">').join('') + '</datalist></div>' +
+    '<div><label class="lb" for="svCost">Cost (SAR) <span class="opt">can be added later</span></label><input id="svCost" type="number" step="any" min="0" placeholder="0.00"></div><div><button class="btn" data-act="svcAdd" style="width:100%">+ Add service</button></div></div></div>' +
+    (J.services.length ? '<div class="scroll-x"><table class="t" style="min-width:860px"><thead><tr><th>Service</th><th>Status</th><th class="num">Cost (SAR)</th><th>Invoice</th><th>Note</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>' : '<div class="empty">No services recorded yet. Add fresh water, provisions, launch hire and the like above, and they all stay with this job.</div>') + '</div>';
+}
+ACT.svcAdd = async () => {
+  const name = $('svName').value.trim(), cost = $('svCost').value;
+  if (!name) { $('svName').classList.add('bad'); $('svName').focus(); return toast('Name the service first, for example Fresh water supply.', true); }
+  const r = await api('/api/jobs/' + S.job.job.id + '/services', 'POST', {name: name, cost: cost || 0, status: 'Requested'});
+  if (!r.ok) return toast(r.data.error || 'Could not add the service.', true);
+  setJob(r.data); toast('Service added.');
+};
+CH.svc = async (t) => {
+  const id = +t.dataset.id, s = S.job.services.find(x => x.id === id); if (!s) return;
+  const body = {name: s.name, status: s.status, cost: s.cost, invoice_no: s.invoice_no, note: s.note}; body[t.dataset.k] = t.value;
+  const r = await api('/api/jobs/services/' + id, 'PUT', body);
+  if (!r.ok) { toast(r.data.error || 'Could not save that change.', true); t.classList.add('bad'); return; }
+  setJob(r.data);
+};
+ACT.svcDel = (t) => modal({title: 'Remove this service?', text: 'It is taken off the job. The removal is recorded in History.', ok: 'Remove', onOk: async () => { const r = await api('/api/jobs/services/' + t.dataset.id, 'DELETE'); if (!r.ok) { toast(r.data.error || 'Could not remove it.', true); return false; } setJob(r.data); }});
+
+/* --- invoices --- */
+function tabInvoices() {
+  const J = S.job, m = J.money, d = J.job;
+  const rows = J.invoices.map(i => '<tr><td style="font-weight:700;color:var(--navy)">' + esc(i.no) + '</td><td>' + esc(i.description) + '<div class="help" style="margin:0">' + esc(i.kind_label) + '</div></td><td class="num">' + fmt(i.amount) + '</td><td><span class="chip ' + (i.paid ? 'paid' : 'unpaid') + '">' + (i.paid ? 'Paid' : 'Unpaid') + '</span></td>' +
+    '<td class="num"><button class="btn ghost small" data-act="invPaid" data-id="' + i.id + '" data-p="' + (i.paid ? '0' : '1') + '">' + (i.paid ? 'Mark unpaid' : 'Mark paid') + '</button> <button class="btn ghost danger small" data-act="invDel" data-id="' + i.id + '" aria-label="Remove invoice ' + esc(i.no) + '">Remove</button></td></tr>').join('');
+  return '<div class="panel"><div class="spread" style="margin-bottom:12px"><div><h2>Invoices on this job</h2><div class="hint" style="margin:0">Every invoice for this vessel is linked to job ' + esc(d.pda_no) + ' automatically. Official tax invoices are issued from your accounting system; type its number here to link it.</div></div>' +
+    '<button class="btn" data-act="invNew">+ New invoice for this job</button></div>' +
+    '<div class="sumrow" style="margin:0 0 14px"><div class="box"><div class="k">Invoiced</div><div class="v">' + fmt(m.invoiced) + '</div></div><div class="box"><div class="k">Paid</div><div class="v" style="color:var(--ok)">' + fmt(m.paid) + '</div></div><div class="box red"><div class="k">Still to collect</div><div class="v">' + fmt(m.owed) + '</div></div></div>' +
+    (J.invoices.length ? '<div class="scroll-x"><table class="t" style="min-width:700px"><thead><tr><th>Invoice</th><th>For</th><th class="num">Amount (SAR)</th><th>Status</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>' : '<div class="empty">No invoices on this job yet. Press <b>+ New invoice for this job</b>.</div>') + '</div>';
+}
+ACT.invNew = () => {
+  const J = S.job, m = J.money, sug = J.stage >= 3 ? m.final_sar : m.pro_sar;
+  const kinds = Object.keys(J.invoice_kinds).map(k => '<option value="' + k + '">' + esc(J.invoice_kinds[k]) + '</option>').join('');
+  modal({title: 'New invoice for this job', text: 'It is linked to ' + J.job.pda_no + ' and ' + J.job.vessel + ' automatically.', ok: 'Save invoice',
+    body: '<div class="stack" style="gap:12px"><div><label class="lb" for="iKind">What kind of invoice?</label><select id="iKind">' + kinds + '</select></div>' +
+      '<div><label class="lb" for="iDesc">For <span class="req">required</span></label><input id="iDesc" type="text" value="Port disbursements (' + (J.stage >= 3 ? 'final account' : 'pro forma') + ')"></div>' +
+      '<div><label class="lb" for="iAmt">Amount in SAR <span class="req">required</span></label><input id="iAmt" type="number" step="any" min="0" value="' + (sug || '') + '"><div class="help">Filled from the job. Change it if you invoice part of it.</div></div>' +
+      '<div><label class="lb" for="iNo">Invoice number <span class="opt">optional</span></label><input id="iNo" type="text" placeholder="From your accounting system"><div class="help">Leave empty and Compass numbers it for you.</div></div></div>',
+    onOk: async () => {
+      const r = await api('/api/jobs/' + J.job.id + '/invoices', 'POST', {kind: $('iKind').value, description: $('iDesc').value, amount: $('iAmt').value, no: $('iNo').value});
+      if (!r.ok) { toast(r.data.error || 'Could not save the invoice.', true); return false; }
+      setJob(r.data); toast('Invoice added to the job.');
+    }});
+  $('iKind').addEventListener('change', function () { const k = this.value, J2 = S.job; const map = {main: ['Port disbursements (' + (J2.stage >= 3 ? 'final account' : 'pro forma') + ')', J2.stage >= 3 ? J2.money.final_sar : J2.money.pro_sar], supplementary: ['Supplementary disbursements', ''], vendor: ['Vendor invoice passed on', ''], service: ['Husbandry / service', '']}; $('iDesc').value = map[k][0]; $('iAmt').value = map[k][1]; });
+};
+ACT.invPaid = async (t) => { const r = await api('/api/jobs/invoices/' + t.dataset.id, 'POST', {paid: t.dataset.p === '1'}); if (!r.ok) return toast(r.data.error || 'Could not update.', true); setJob(r.data); };
+ACT.invDel = (t) => modal({title: 'Remove this invoice?', text: 'Use this only for an invoice entered by mistake. The removal is recorded in History.', ok: 'Remove invoice', onOk: async () => { const r = await api('/api/jobs/invoices/' + t.dataset.id, 'DELETE'); if (!r.ok) { toast(r.data.error || 'Could not remove it.', true); return false; } setJob(r.data); }});
+
+/* --- history --- */
+function tabHistory() {
+  const J = S.job;
+  return '<div class="panel"><h2>History</h2><div class="hint">Who did what, and when (Riyadh time). Nothing here can be edited, so it is a reliable record.</div><div class="scroll-x"><table class="t" style="min-width:640px"><thead><tr><th>Date and time</th><th>What happened</th><th>Who</th><th>Document</th></tr></thead><tbody>' +
+    (J.history.length ? J.history.map(h => '<tr><td style="color:var(--muted);white-space:nowrap">' + esc(fdt(h.at)) + '</td><td>' + esc(h.text) + '</td><td>' + esc(h.who) + '</td><td style="color:var(--navy-light);font-weight:700">' + esc(h.doc) + '</td></tr>').join('') : '<tr><td colspan="4" class="empty">Nothing recorded yet.</td></tr>') + '</tbody></table></div></div>';
+}
+
+/* --- documents --- */
+function tabDocs() {
+  const J = S.job, d = J.job, c = J.client;
+  const has = (re) => J.files.some(f => re.test(f.title));
+  const slot = (title, sub) => '<div class="doc missing"><b>' + esc(title) + '</b><div class="s">' + esc(sub) + '</div><div><button class="btn ghost small" data-act="docUp" data-title="' + esc(title) + '">Upload</button></div></div>';
+  let h = '<div class="docgrid">' +
+    '<div class="doc"><b>' + (d.status === 'finalized' ? 'Final account (FDA)' : 'PDA letter') + '</b><div class="s">PDF &middot; made from this job</div><div><a class="btn ghost small" href="/api/pda/documents/' + d.id + '/pdf" target="_blank" rel="noopener">Open</a></div></div>' +
+    '<div class="doc"><b>Final job report</b><div class="s">PDF &middot; everything on this job</div><div><a class="btn ghost small" href="/api/jobs/' + d.id + '/report.pdf" target="_blank" rel="noopener">Open</a> <a class="btn ghost small" href="#/report/' + d.id + '">View</a></div></div>';
+  if (c) c.docs.forEach(x => { h += '<div class="doc"><b>' + esc({cr: 'Customer CR copy', vat: 'Customer VAT certificate', profile: 'Customer profile'}[x.kind] || x.filename) + '</b><div class="s">' + esc(x.filename) + ' &middot; from the Clients list</div><div><a class="btn ghost small" href="/api/clients/docs/' + x.id + '" target="_blank" rel="noopener">Open</a></div></div>'; });
+  J.files.forEach(f => { h += '<div class="doc"><b>' + esc(f.title) + '</b><div class="s">' + esc(f.filename) + ' &middot; ' + esc(fdt(f.uploaded_at)) + ' &middot; ' + esc(f.uploaded_by) + '</div><div class="row"><a class="btn ghost small" href="/api/jobs/docs/' + f.id + '" target="_blank" rel="noopener">Open</a><button class="btn ghost danger small" data-act="docDel" data-id="' + f.id + '" aria-label="Remove ' + esc(f.title) + '">Remove</button></div></div>'; });
+  if (!has(/statement of facts|sof/i)) h += slot('Statement of Facts', 'Not uploaded yet. Due 24 hours after departure.');
+  if (!has(/port bill|vendor/i)) h += slot('Port bills and vendor invoices', 'Not uploaded yet.');
+  h += '</div>';
+  return '<div class="panel"><div class="spread" style="align-items:center;margin-bottom:10px"><div><h2>Documents</h2><div class="hint" style="margin:0">Everything for this vessel call in one folder. PDF, pictures, Word, Excel up to 10 MB each.</div></div><button class="btn" data-act="docUp" data-title="">+ Upload a document</button></div>' + h + '</div>';
+}
+ACT.docUp = (t) => {
+  const title = t.dataset.title || '';
+  modal({title: 'Upload a document', text: 'It is saved on this job and shows in History.', ok: 'Upload', body: '<div class="stack" style="gap:12px"><div><label class="lb" for="dTitle">Name <span class="req">required</span></label><input id="dTitle" type="text" value="' + esc(title) + '" placeholder="For example: Fresh water receipt"></div><div><label class="lb" for="dFile">File <span class="req">required</span></label><input id="dFile" type="file" accept=".pdf,.png,.jpg,.jpeg,.doc,.docx,.xls,.xlsx,.csv,.txt"></div></div>',
+    onOk: async () => {
+      const f = $('dFile').files[0], ti = $('dTitle').value.trim();
+      if (!ti) { toast('Give the document a name.', true); $('dTitle').focus(); return false; }
+      if (!f) { toast('Choose a file first.', true); return false; }
+      const fd2 = new FormData(); fd2.append('file', f); fd2.append('title', ti);
+      const r = await api('/api/jobs/' + S.job.job.id + '/docs', 'POST', fd2);
+      if (!r.ok) { toast(r.data.error || 'Could not upload that file.', true); return false; }
+      setJob(r.data); toast('Document saved on the job.');
+    }});
+};
+ACT.docDel = (t) => modal({title: 'Remove this document?', text: 'It is deleted from the job. The removal is recorded in History.', ok: 'Remove', onOk: async () => { const r = await api('/api/jobs/docs/' + t.dataset.id, 'DELETE'); if (!r.ok) { toast(r.data.error || 'Could not remove it.', true); return false; } setJob(r.data); }});
+
+/* ---------------- clients ---------------- */
+const CDOCS = [['cr', 'CR copy', 'Commercial registration'], ['vat', 'VAT certificate', 'Tax registration'], ['profile', 'Company profile', 'Brochure or profile']];
+async function viewClients(id) {
+  $('view').innerHTML = '<div class="empty">Loading clients...</div>';
+  const r = await api('/api/clients'); if (!r.ok) { $('view').innerHTML = '<div class="empty">Could not load the clients. Refresh to try again.</div>'; return; }
+  S.clients = r.data; S.clientSel = null; S.addOpen = !!S.addOpen;
+  if (!S.jobs.length) { const jr = await api('/api/jobs'); if (jr.ok) S.jobs = jr.data.jobs; }
+  if (id) { const c = await api('/api/clients/' + id); if (c.ok) S.clientSel = c.data; }
+  else if (S.clients.length && window.innerWidth > 800) { const c = await api('/api/clients/' + S.clients[0].id); if (c.ok) S.clientSel = c.data; }
+  drawClients();
+}
+function clientListHtml() {
+  const q = S.clientQ.trim().toLowerCase();
+  const list = S.clients.filter(c => !q || [c.name, c.operator, c.country].join(' ').toLowerCase().includes(q));
+  if (!list.length) return '<div class="empty" style="padding:20px 6px">' + (S.clients.length ? 'No client matches.' : 'No clients yet. Press <b>+ Add client</b>.') + '</div>';
+  return list.map(c => '<button class="pill" style="display:flex;justify-content:space-between;gap:8px;width:100%;text-align:left;border-radius:12px;margin-bottom:6px' + (S.clientSel && S.clientSel.id === c.id ? ';border-color:var(--navy);background:var(--bg)' : '') + '" data-act="clientPick" data-id="' + c.id + '"><b>' + esc(c.name) + '</b><span style="color:var(--muted);font-weight:500;font-size:12px">' + esc([c.operator, c.country].filter(Boolean).join(' | ') || (c.jobs + (c.jobs === 1 ? ' job' : ' jobs'))) + '</span></button>').join('');
+}
+function drawClients() {
+  $('view').innerHTML = '<div class="pghead"><div><div class="eyebrow">Compass</div><h1 class="pg">Clients</h1><div class="sub">Add a regular client once. From then on, type the first letters in a new PDA and everything fills in.</div></div><button class="btn" data-act="clientAddToggle">+ Add client</button></div>' +
+    '<div id="clientAdd">' + (S.addOpen ? clientAddHtml() : '') + '</div>' +
+    '<div class="grid2" style="grid-template-columns:minmax(260px,320px) minmax(0,1fr);align-items:start" id="clientGrid"><div class="panel"><input type="search" data-in="clientQ" placeholder="Search clients..." aria-label="Search clients" value="' + esc(S.clientQ) + '" style="margin-bottom:12px"><div id="clientList">' + clientListHtml() + '</div></div><div id="clientDetail">' + clientDetailHtml() + '</div></div>';
+  if (window.innerWidth <= 800) $('clientGrid').style.gridTemplateColumns = '1fr';
+}
+function clientAddHtml() {
+  return '<div class="panel" style="margin-bottom:18px"><h2>Add a client</h2><div class="hint">Only the name is needed. You can add the rest later, from the client\'s page.</div><div id="caErr"></div><div class="fgrid"><div><label class="lb" for="caName">Company name <span class="req">required</span></label><input id="caName" type="text" data-in="upper" placeholder="For example: Hong Glory Shipping" autocomplete="off"><div class="help">Saved in capital letters.</div></div><div><label class="lb" for="caOp">Operator name <span class="opt">optional</span></label><input id="caOp" type="text" placeholder="Contact person at the company"></div></div><div class="row" style="margin-top:14px"><button class="btn" data-act="clientSaveNew">&#10003; Save client</button><button class="btn ghost" data-act="clientAddToggle">Cancel</button></div></div>';
+}
+IN.upper = (t) => upperInput(t);
+IN.clientQ = (t) => { S.clientQ = t.value; $('clientList').innerHTML = clientListHtml(); };
+ACT.clientAddToggle = () => { S.addOpen = !S.addOpen; $('clientAdd').innerHTML = S.addOpen ? clientAddHtml() : ''; if (S.addOpen) $('caName').focus(); };
+ACT.clientSaveNew = async () => {
+  const name = $('caName').value.trim();
+  if (!name) { $('caName').classList.add('bad'); $('caErr').innerHTML = '<div class="alert" role="alert">Type the company name. It is the only thing required.</div>'; $('caName').focus(); return; }
+  const r = await api('/api/clients', 'POST', {name: name, operator: $('caOp').value});
+  if (!r.ok) { $('caErr').innerHTML = '<div class="alert" role="alert">' + esc(r.data.error || 'Could not save the client.') + '</div>'; return; }
+  S.addOpen = false; toast(r.data.client.name + ' saved to your Clients list.'); location.hash = '#/clients/' + r.data.client.id;
+  if ((location.hash || '') === '#/clients/' + r.data.client.id) route();
+};
+ACT.clientPick = async (t) => { const r = await api('/api/clients/' + t.dataset.id); if (!r.ok) return; S.clientSel = r.data; $('clientList').innerHTML = clientListHtml(); $('clientDetail').innerHTML = clientDetailHtml(); try { history.replaceState(null, '', '#/clients/' + t.dataset.id); } catch (e) {} };
+function clientDetailHtml() {
+  const c = S.clientSel; if (!c) return '<div class="panel empty">Pick a client on the left, or add a new one.</div>';
+  const jobsFor = (S.jobs || []).filter(j => j.client_id === c.id).slice(0, 6);
+  const docs = CDOCS.map(k => {
+    const have = c.docs.filter(d => d.kind === k[0]);
+    return '<div class="doc' + (have.length ? '' : ' missing') + '"><b>' + k[1] + '</b><div class="s">' + (have.length ? esc(have[have.length - 1].filename) + ' &middot; ' + esc(fdt(have[have.length - 1].uploaded_at)) : 'Not uploaded yet. ' + k[2]) + '</div><div class="row">' +
+      (have.length ? '<a class="btn ghost small" href="/api/clients/docs/' + have[have.length - 1].id + '" target="_blank" rel="noopener">Open</a><button class="btn ghost danger small" data-act="cdocDel" data-id="' + have[have.length - 1].id + '">Remove</button>' : '') +
+      '<button class="btn ghost small" data-act="cdocUp" data-kind="' + k[0] + '">' + (have.length ? 'Replace' : 'Upload') + '</button></div></div>';
+  }).join('');
+  return '<div class="panel stack" style="gap:16px"><div class="spread" style="align-items:center"><div><div style="font-size:20px;font-weight:700">' + esc(c.name) + '</div><div class="help" style="margin:0">' + (c.jobs != null ? '' : '') + 'Client details</div></div><a class="btn" href="#/new?client=' + c.id + '">New PDA for this client</a></div>' +
+    '<div id="cdErr"></div><div class="fgrid">' + [['name', 'Company name', 'upper'], ['operator', 'Operator name', ''], ['country', 'Country', ''], ['phone', 'Phone', ''], ['email', 'Email', ''], ['address', 'Address', 'full'], ['contacts', 'Other contacts', 'full'], ['notes', 'Notes', 'full']].map(f => '<div' + (f[2] === 'full' ? ' class="full"' : '') + '><label class="lb" for="cd_' + f[0] + '">' + f[1] + '</label>' + (f[2] === 'full' && f[0] !== 'address' ? '<textarea id="cd_' + f[0] + '" rows="2">' + esc(c[f[0]] || '') + '</textarea>' : '<input id="cd_' + f[0] + '" type="text" value="' + esc(c[f[0]] || '') + '"' + (f[2] === 'upper' ? ' data-in="upper"' : '') + '>') + '</div>').join('') + '</div>' +
+    '<div class="row"><button class="btn" data-act="clientSave">Save changes</button>' + (ROLE === 'admin' ? '<button class="btn danger" data-act="clientDel">Delete client</button>' : '') + '</div>' +
+    '<div><h2 style="margin-bottom:8px">Documents</h2><div class="docgrid">' + docs + '</div><div class="help" style="margin-top:8px">These are attached automatically to every job for this client.</div></div>' +
+    '<div><h2 style="margin-bottom:8px">Recent jobs</h2>' + (jobsFor.length ? '<div class="stack" style="gap:6px">' + jobsFor.map(j => '<a href="#/job/' + j.id + '" class="instr" style="display:flex;justify-content:space-between;text-decoration:none;color:var(--text)"><span><b>' + esc(j.vessel) + '</b> &middot; ' + esc(j.pda_no) + '</span><span>' + esc(jobLabel(j)) + '</span></a>').join('') + '</div>' : '<div class="help">No jobs for this client yet.</div>') + '</div></div>';
+}
+ACT.clientSave = async () => {
+  const c = S.clientSel, body = {};
+  ['name', 'operator', 'country', 'phone', 'email', 'address', 'contacts', 'notes'].forEach(k => { body[k] = $('cd_' + k).value; });
+  if (!body.name.trim()) { $('cd_name').classList.add('bad'); $('cdErr').innerHTML = '<div class="alert" role="alert">The client needs a name.</div>'; return; }
+  const r = await api('/api/clients/' + c.id, 'PUT', body);
+  if (!r.ok) { $('cdErr').innerHTML = '<div class="alert" role="alert">' + esc(r.data.error || 'Could not save.') + '</div>'; return; }
+  S.clientSel = r.data.client; const i = S.clients.findIndex(x => x.id === c.id); if (i >= 0) S.clients[i] = Object.assign(S.clients[i], r.data.client);
+  $('clientList').innerHTML = clientListHtml(); $('clientDetail').innerHTML = clientDetailHtml(); toast('Client saved.');
+};
+ACT.clientDel = () => modal({title: 'Delete ' + S.clientSel.name + '?', text: 'The client and its documents are removed. Existing jobs keep the customer name and details written on them.', ok: 'Delete client', onOk: async () => { const r = await api('/api/clients/' + S.clientSel.id, 'DELETE'); if (!r.ok) { toast('Could not delete.', true); return false; } toast('Client deleted.'); S.clientSel = null; location.hash = '#/clients'; route(); }});
+ACT.cdocUp = (t) => {
+  const k = t.dataset.kind, nm = CDOCS.find(x => x[0] === k)[1];
+  modal({title: 'Upload ' + nm, text: 'PDF or a picture, up to 10 MB.', ok: 'Upload', body: '<label class="lb" for="cdFile">File <span class="req">required</span></label><input id="cdFile" type="file" accept=".pdf,.png,.jpg,.jpeg,.doc,.docx">',
+    onOk: async () => {
+      const f = $('cdFile').files[0]; if (!f) { toast('Choose a file first.', true); return false; }
+      const fd2 = new FormData(); fd2.append('file', f); fd2.append('kind', k);
+      const r = await api('/api/clients/' + S.clientSel.id + '/docs', 'POST', fd2);
+      if (!r.ok) { toast(r.data.error || 'Could not upload.', true); return false; }
+      S.clientSel.docs = r.data.docs; $('clientDetail').innerHTML = clientDetailHtml(); toast(nm + ' saved.');
+    }});
+};
+ACT.cdocDel = (t) => modal({title: 'Remove this document?', text: 'It is deleted from the client.', ok: 'Remove', onOk: async () => { const r = await api('/api/clients/docs/' + t.dataset.id, 'DELETE'); if (!r.ok) { toast('Could not remove it.', true); return false; } S.clientSel.docs = r.data.docs; $('clientDetail').innerHTML = clientDetailHtml(); }});
+
+/* ---------------- final job report ---------------- */
+async function viewReport(id) {
+  $('view').innerHTML = '<div class="empty">Preparing the report...</div>';
+  const r = await api('/api/jobs/' + id); if (!r.ok) { $('view').innerHTML = '<div class="panel empty">' + esc(r.data.error || 'Could not open that job.') + '</div>'; return; }
+  const J = r.data, d = J.job, m = J.money, fin = J.stage >= 3;
+  const today = new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10);
+  const grp = d.calc.groups.map(g => { const df = g.act_sar - g.est_sar; return '<tr><td>' + esc(g.name) + '</td><td class="r">' + fmt(g.est_sar) + '</td><td class="r">' + (fin ? fmt(g.act_sar) : '-') + '</td><td class="r"' + (fin && df < -0.004 ? ' style="color:#1c8a5a"' : '') + '>' + (fin && Math.abs(df) > 0.004 ? (df > 0 ? '+' : '') + fmt(df) : '-') + '</td></tr>'; }).join('');
+  const t = d.calc.total, td = t.act_sar - t.est_sar;
+  const svcs = J.services.filter(s => s.status !== 'Cancelled');
+  const invs = J.invoices;
+  const hist = J.history.slice().reverse();
+  $('view').innerHTML = '<div class="row noprint" style="justify-content:space-between;margin-bottom:18px"><a class="btn ghost" href="#/job/' + id + '">&larr; Back to the job file</a><div class="row"><button class="btn ghost" onclick="window.print()">Print</button><a class="btn" href="/api/jobs/' + id + '/report.pdf" target="_blank" rel="noopener">Download PDF</a></div></div>' +
+    '<div class="paper"><div class="spread" style="border-bottom:3px solid #123a56;padding-bottom:16px;align-items:flex-start"><div><div style="font-size:20px;font-weight:700;color:#123a56">SEA POWER MARINE SERVICES CO. LTD</div><div style="font-size:12px;color:#7a8794;margin-top:2px">Ship agency &middot; Saudi Arabia</div></div><div style="text-align:right"><div style="font-size:18px;font-weight:700;letter-spacing:.04em">FINAL JOB REPORT</div><div style="font-size:12px;color:#7a8794;margin-top:2px">Job ' + esc(d.pda_no) + '</div></div></div>' +
+    '<div class="kv" style="font-size:13px">' + [['Vessel', '<b>' + esc(d.vessel) + '</b>' + (d.imo ? ' (IMO ' + esc(d.imo) + ')' : '')], ['Customer', '<b>' + esc(d.customer_name || '-') + '</b>'], ['Port', esc(portName(d) || d.dis_port || '-')], ['Activity', esc(d.operation || '-') + (d.voyage ? ', voyage ' + esc(d.voyage) : '')], ['ETA', esc(d.eta ? fd(d.eta) : '-')], ['Sailed', esc(d.sail_date ? fd(d.sail_date) : '-')], ['Handled by', esc(d.handler || d.sales_exec || d.created_by)], ['Report date', esc(fd(today))], ['Stage', esc(J.stage_name)], ['Principal ref', esc(d.principal_ref || '-')]].map(x => '<div><span style="color:#7a8794">' + x[0] + '</span><br>' + x[1] + '</div>').join('') + '</div>' +
+    '<div><h4>1. PORT COSTS AND AGENCY FEES (SAR)</h4><table><thead><tr><th>Group</th><th class="r">Pro forma</th><th class="r">Final</th><th class="r">Difference</th></tr></thead><tbody>' + (grp || '<tr><td colspan="4">No charges.</td></tr>') + '<tr class="tot"><td>Total</td><td class="r">' + fmt(t.est_sar) + '</td><td class="r">' + (fin ? fmt(t.act_sar) : '-') + '</td><td class="r">' + (fin && Math.abs(td) > 0.004 ? (td > 0 ? '+' : '') + fmt(td) : '-') + '</td></tr></tbody></table></div>' +
+    '<div><h4>2. HUSBANDRY AND SERVICES PROVIDED (SAR)</h4><table><thead><tr><th>Service</th><th>Status</th><th>Invoice</th><th class="r">Amount</th></tr></thead><tbody>' + (svcs.map(s => '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.status) + '</td><td>' + esc(s.invoice_no || '-') + '</td><td class="r">' + fmt(s.cost) + '</td></tr>').join('') || '<tr><td colspan="4">None recorded.</td></tr>') + '<tr class="tot"><td colspan="3">Total services</td><td class="r">' + fmt(m.services) + '</td></tr></tbody></table></div>' +
+    '<div><h4>3. INVOICES ON THIS JOB (SAR)</h4><table><thead><tr><th>Invoice</th><th>For</th><th>Status</th><th class="r">Amount</th></tr></thead><tbody>' + (invs.map(i => '<tr><td>' + esc(i.no) + '</td><td>' + esc(i.description) + '</td><td style="font-weight:700;color:' + (i.paid ? '#1c8a5a' : '#a3322b') + '">' + (i.paid ? 'Paid' : 'Unpaid') + '</td><td class="r">' + fmt(i.amount) + '</td></tr>').join('') || '<tr><td colspan="4">No invoices yet.</td></tr>') +
+    '<tr class="tot"><td colspan="3">Total invoiced</td><td class="r">' + fmt(m.invoiced) + '</td></tr><tr><td colspan="3" style="font-weight:700">Paid so far</td><td class="r" style="color:#1c8a5a;font-weight:700">' + fmt(m.paid) + '</td></tr><tr><td colspan="3" style="font-weight:700">Still to collect</td><td class="r" style="color:#a3322b;font-weight:700">' + fmt(m.owed) + '</td></tr></tbody></table></div>' +
+    '<div><h4>4. TIMELINE</h4><div style="display:flex;flex-direction:column;gap:6px;font-size:12.5px">' + hist.map(h => '<div style="display:flex;gap:14px"><span style="width:130px;flex:none;color:#7a8794">' + esc(fdt(h.at)) + '</span><span>' + esc(h.text) + ' <span style="color:#7a8794">(' + esc(h.who) + ')</span></span></div>').join('') + '</div>' + (J.timebar.deadline ? '<div style="margin-top:10px;font-size:12.5px;font-weight:700;color:#123a56">Time bar: ' + J.timebar.days + ' days from departure, ends ' + esc(fd(J.timebar.deadline)) + '.</div>' : '') + '</div>' +
+    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:40px;margin-top:16px"><div style="border-top:1px solid #1c2b3a;padding-top:6px;font-size:12px;color:#7a8794">Prepared by: ' + esc(J.job.handler || J.job.created_by) + '</div><div style="border-top:1px solid #1c2b3a;padding-top:6px;font-size:12px;color:#7a8794">Approved by:</div></div></div>';
+}
+
+route();
+</script>
+</body></html>
+"""
+
+
 PDA_HTML = """
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Compass - Disbursement Accounts</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + """">
@@ -10070,6 +11782,8 @@ function applyPayload(d) {
 }
 
 function closeDocument() {
+  const jm = /[?&]job=(\\d+)/.exec(location.search);
+  if (jm) { location.href = '/jobs#/job/' + jm[1]; return; }
   currentDocId = null;
   document.getElementById('docDetail').style.display = 'none';
   document.getElementById('listView').style.display = '';
@@ -10146,10 +11860,10 @@ function renderDetailHead() {
   b.textContent = fda ? 'Finalized' : (doc.status === 'sent' ? 'Sent' : 'Draft');
   document.getElementById('detailSub').textContent = (doc.vessel || '-') + ' - ' + (doc.customer_name || 'no customer yet') + ' - prepared by ' + (doc.created_by || '-') + (doc.created_at ? ' on ' + doc.created_at.slice(0, 10) : '');
   const acts = [];
-  if (doc.status === 'draft') acts.push('<button class="btn ghost small" onclick="markSent()">Mark as sent</button>');
+  if (doc.status === 'draft') acts.push('<button class="btn ghost small" onclick="markSent()">Mark as sent to client</button>');
   acts.push('<button class="btn ghost small" onclick="duplicateDocument(' + doc.id + ')">Duplicate</button>');
-  acts.push('<button class="btn ghost small" onclick="openMail()">Email</button>');
-  acts.push('<a class="btn ghost small" href="/api/pda/documents/' + doc.id + '/pdf" target="_blank">Export PDF</a>');
+  acts.push('<button class="btn ghost small" onclick="openMail()">Email to client</button>');
+  acts.push('<a class="btn ghost small" href="/api/pda/documents/' + doc.id + '/pdf" target="_blank">Download PDF</a>');
   if (!fda) acts.push('<button class="btn small" onclick="finalizeDoc()">Finalize as FDA</button>');
   document.getElementById('detailActions').innerHTML = acts.join('');
 }
@@ -10447,7 +12161,7 @@ async function markSent() {
   if (!r.ok) { showToast(r.data.error || 'Could not update status.', {error: true}); return; }
   currentDoc.status = 'sent';
   renderDetailHead();
-  showToast('Marked as sent.');
+  showToast('Marked as sent to client.');
 }
 
 async function finalizeDoc() {
