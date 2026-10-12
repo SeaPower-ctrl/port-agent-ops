@@ -176,6 +176,16 @@ const I18N = {
     complete_badge: "Complete",
     // Vessel group header
     eta_label: "ETA",
+    vs_label: "Status",
+    vs_anch: "At anchorage",
+    vs_berth: "At berth",
+    vs_title: "Where the vessel is. Shown to customers on the QR page.",
+    etb_label: "ETB",
+    etb_title: "Expected berthing date, as per the terminal",
+    berth_label: "Berth no.",
+    berth_ph: "No.",
+    etcd_label: "ETC/D",
+    etcd_title: "Expected completion / departure date",
     not_set: "Not set",
     expected_arrival_title: "Expected arrival",
     export: "Export",
@@ -426,6 +436,16 @@ const I18N = {
     unassigned_port_ph: "ميناء غير محدد",
     complete_badge: "مكتمل",
     eta_label: "الوصول المتوقع",
+    vs_label: "الحالة",
+    vs_anch: "في منطقة الانتظار",
+    vs_berth: "على الرصيف",
+    vs_title: "موقع السفينة. يظهر للعملاء في صفحة رمز QR.",
+    etb_label: "الرسو المتوقع (ETB)",
+    etb_title: "موعد الرسو المتوقع حسب المحطة",
+    berth_label: "رقم الرصيف",
+    berth_ph: "الرقم",
+    etcd_label: "ETC/D",
+    etcd_title: "موعد الانتهاء / المغادرة المتوقع",
     not_set: "غير محدد",
     expected_arrival_title: "تاريخ الوصول المتوقع",
     export: "تصدير",
@@ -790,6 +810,12 @@ def init_db():
     # per-BL - lets the board sort "arriving soonest first" instead of
     # alphabetically, and surfaces an ETA without a separate vessels table.
     cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS eta TEXT DEFAULT ''")
+    # Where the vessel is in its call, set once per vessel group like the ETA:
+    # vessel_status '' / 'anch' (waiting at anchorage, with an ETB date) /
+    # 'berth' (alongside, with a berth number and an ETC/D date). Shown to
+    # the customer on the QR / tracking page.
+    for _col in ("vessel_status", "etb", "berth_no", "etcd"):
+        cur.execute(f"ALTER TABLE records ADD COLUMN IF NOT EXISTS {_col} TEXT DEFAULT ''")
     # A vessel group that's fully complete and old can be archived off the
     # main board (manually, from the UI) without deleting its data - it's
     # still searchable/exportable, just out of the day-to-day view.
@@ -5115,8 +5141,9 @@ def _restore_one_record(db, data):
            (bl_number, consignee, port, vessel, invoice_issued, invoice_by, invoice_at,
             approval_received, approval_by, approval_at, do_issued, do_by, do_at,
             remarks, created_at, created_by, eta, archived,
-            consignee_email, consignee_phone, broker_email, broker_phone, track_token)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            consignee_email, consignee_phone, broker_email, broker_phone, track_token,
+            vessel_status, etb, berth_no, etcd)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             bl_number,
             data.get("consignee", ""),
@@ -5141,6 +5168,10 @@ def _restore_one_record(db, data):
             _clean_email(data.get("broker_email")),
             _normalize_phone(data.get("broker_phone")),
             token,
+            data.get("vessel_status") if data.get("vessel_status") in ("anch", "berth") else "",
+            str(data.get("etb") or ""),
+            str(data.get("berth_no") or ""),
+            str(data.get("etcd") or ""),
         ),
     )
     _unstash_attachments(db, bl_number)
@@ -5339,6 +5370,63 @@ def set_vessel_eta():
         if not _owns_record(bl_number):
             continue
         db.execute("UPDATE records SET eta = ? WHERE bl_number = ?", (eta, bl_number))
+        updated += 1
+    db.commit()
+    return jsonify({"updated": updated})
+
+
+def _clean_ymd(v):
+    """'' or a real 'YYYY-MM-DD' date; None when it is neither."""
+    v = str(v or "").strip()
+    if not v:
+        return ""
+    try:
+        datetime.strptime(v, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return v
+
+
+@app.route("/api/vessel/status", methods=["POST"])
+@login_required
+def set_vessel_status():
+    """Where the vessel is in its call - set once for the whole vessel group
+    (same as the ETA) and shown on the customer's QR / tracking page.
+    Only the fields sent are changed:
+      vessel_status  '' | 'anch' (waiting at anchorage) | 'berth' (alongside)
+      etb            expected berthing date (while at anchorage)
+      berth_no       berth number (while at berth)
+      etcd           expected completion / departure date (while at berth)"""
+    data = request.get_json(force=True)
+    bl_numbers = [str(b).strip().upper() for b in data.get("bl_numbers", []) if str(b).strip()]
+    if not bl_numbers:
+        return jsonify({"error": "No BL numbers given"}), 400
+    sets = {}
+    if "vessel_status" in data:
+        st = str(data.get("vessel_status") or "").strip().lower()
+        if st not in ("", "anch", "berth"):
+            return jsonify({"error": "Status must be At anchorage, At berth or not set."}), 400
+        sets["vessel_status"] = st
+    for key, label in (("etb", "ETB"), ("etcd", "ETC/D")):
+        if key in data:
+            v = _clean_ymd(data.get(key))
+            if v is None:
+                return jsonify({"error": f"{label} must be a valid date."}), 400
+            sets[key] = v
+    if "berth_no" in data:
+        v = re.sub(r"\s+", " ", str(data.get("berth_no") or "")).strip().upper()
+        if len(v) > 12:
+            return jsonify({"error": "Berth number is too long (12 characters at most)."}), 400
+        sets["berth_no"] = v
+    if not sets:
+        return jsonify({"error": "Nothing to update"}), 400
+    clause = ", ".join(f"{k} = ?" for k in sets)  # keys are the fixed names above
+    db = get_db()
+    updated = 0
+    for bl_number in bl_numbers:
+        if not _owns_record(bl_number):
+            continue
+        db.execute(f"UPDATE records SET {clause} WHERE bl_number = ?", (*sets.values(), bl_number))
         updated += 1
     db.commit()
     return jsonify({"updated": updated})
@@ -5737,10 +5825,15 @@ def share_link(bl_number):
 
 
 @app.route("/api/records/<path:bl_number>/qr", methods=["GET"])
+@app.route("/api/records/<path:bl_number>/qr/<fname>", methods=["GET"])
 @login_required
-def share_qr(bl_number):
+def share_qr(bl_number, fname=None):
     """QR code of the tracking link - SVG to show on screen, ?format=png
-    (and &download=1) for pasting into a message or printing."""
+    (and &download=1) for pasting into a message or printing.
+    The second URL form ends in the file name (QR_<BL>.png); fname itself is
+    ignored, it is there so that "Save image as..." on the on-screen QR, or
+    any other way of saving it, also names the file after the BL - and the
+    Download button's Content-Disposition does the same."""
     import segno
     bl_number = bl_number.upper()
     if not _owns_record(bl_number):
@@ -5876,6 +5969,11 @@ TRACK_TEXT = {
         "contact": "Questions about this shipment?", "lang_switch": "العربية",
         "company": COMPANY_NAME_EN,
         "months": ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+        "anch_title": "Awaiting at anchorage", "anch_expect": "Expected berthing",
+        "berth_title": "Vessel is at berth", "berth_no": "Berth no.", "etcd": "ETC/D",
+        "anch_pre": "As per the terminal, the vessel will berth ", "anch_post": ".",
+        "anch_today": "today", "anch_tomorrow": "tomorrow", "anch_in": "in {n} days",
+        "anch_wait": "As per the terminal, the vessel is awaiting its berth.",
     },
     "ar": {
         "title": "حالة الشحنة", "bl": "رقم البوليصة", "vessel": "السفينة", "port": "ميناء التفريغ", "eta": "الوصول المتوقع",
@@ -5890,6 +5988,11 @@ TRACK_TEXT = {
         "contact": "هل لديكم استفسار حول هذه الشحنة؟", "lang_switch": "English",
         "company": COMPANY_NAME_AR,
         "months": ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"],
+        "anch_title": "بانتظار الرصيف في منطقة الانتظار", "anch_expect": "موعد الرسو المتوقع",
+        "berth_title": "السفينة على الرصيف", "berth_no": "رقم الرصيف", "etcd": "الانتهاء/المغادرة المتوقعة (ETC/D)",
+        "anch_pre": "وفقًا للمحطة، ستُرسو السفينة ", "anch_post": ".",
+        "anch_today": "اليوم", "anch_tomorrow": "غدًا", "anch_in": "خلال {n} أيام",
+        "anch_wait": "وفقًا للمحطة، السفينة بانتظار الرصيف.",
     },
 }
 
@@ -5910,6 +6013,40 @@ def _track_date(raw, lang):
     return ""
 
 
+def _track_vessel_status(rec, lang, tx):
+    """What the customer sees about the vessel's position: waiting at
+    anchorage (with 'will berth in N days', counted in Saudi time from the
+    ETB the agent entered) or alongside (berth number + ETC/D). None when the
+    agent hasn't set a status, so the page looks exactly as before."""
+    st = rec["vessel_status"] or ""
+    if st == "anch":
+        etb = rec["etb"] or ""
+        n = None
+        if etb:
+            try:
+                n = (datetime.strptime(etb, "%Y-%m-%d").date() - _riyadh_today()).days
+            except ValueError:
+                n = None
+        if n is None or n < 0:
+            return {"kind": "anch", "title": tx["anch_title"], "pre": tx["anch_wait"], "strong": "", "post": "", "sub": ""}
+        if n == 0:
+            strong = tx["anch_today"]
+        elif n == 1:
+            strong = tx["anch_tomorrow"]
+        elif lang == "ar" and n == 2:
+            strong = "خلال يومين"
+        elif lang == "ar" and n >= 11:
+            strong = f"خلال {n} يومًا"
+        else:
+            strong = tx["anch_in"].format(n=n)
+        return {"kind": "anch", "title": tx["anch_title"], "pre": tx["anch_pre"], "strong": strong,
+                "post": tx["anch_post"], "sub": f"{tx['anch_expect']}: {_track_date(etb, lang)}"}
+    if st == "berth":
+        return {"kind": "berth", "title": tx["berth_title"], "berth": (rec["berth_no"] or "").strip(),
+                "etcd": _track_date(rec["etcd"], lang), "l_berth": tx["berth_no"], "l_etcd": tx["etcd"]}
+    return None
+
+
 @app.route("/t/<token>")
 def public_tracking(token):
     """The page a consignee/broker opens from a shared link or QR code.
@@ -5924,7 +6061,8 @@ def public_tracking(token):
     if re.fullmatch(r"[A-Za-z0-9_-]{16,64}", token or ""):
         rec = get_db().execute(
             """SELECT bl_number, vessel, port, eta, invoice_issued, invoice_at, approval_received, approval_at,
-                      do_issued, do_at, created_at FROM records WHERE track_token = ?""",
+                      do_issued, do_at, created_at, vessel_status, etb, berth_no, etcd
+               FROM records WHERE track_token = ?""",
             (token,),
         ).fetchone()
     ctx = {"lang": lang, "tx": tx, "logo": LOGO_B64, "found": bool(rec),
@@ -5939,6 +6077,7 @@ def public_tracking(token):
             "bl": rec["bl_number"], "vessel": rec["vessel"] or "-",
             "port": (PORT_NAMES_AR.get(port.upper(), port) if lang == "ar" else port.title()) or "-",
             "eta": _track_date(rec["eta"], lang),
+            "vs": _track_vessel_status(rec, lang, tx),
             "steps": [{"label": tx["steps"][i], "done": done[i], "date": dates[i]} for i in range(3)],
             "stage": stage, "status": tx["status"][stage],
             "updated": _track_date(max(stamps), lang) if stamps else "",
@@ -12897,6 +13036,17 @@ TRACK_HTML = """<!DOCTYPE html>
   .step.current .mark { border-color: var(--gold); box-shadow: 0 0 0 4px color-mix(in srgb, var(--gold) 22%, transparent); }
   .step-text b { display: block; font-size: 15px; padding-top: 3px; }
   .step-text span { font-size: 13px; color: var(--muted); }
+  .vs { margin-top: 14px; border-radius: 14px; padding: 13px 14px; }
+  .vs.anch { background: color-mix(in srgb, var(--navy) 9%, transparent); border: 1px solid color-mix(in srgb, var(--navy) 25%, transparent); }
+  .vs.berth { background: var(--ok-bg); border: 1px solid color-mix(in srgb, var(--ok) 35%, transparent); }
+  .vs h3 { margin: 0; display: flex; align-items: center; gap: 9px; font-size: 15px; font-weight: 800; }
+  .vs h3 svg { width: 19px; height: 19px; flex-shrink: 0; }
+  .vs.anch h3 { color: var(--navy); } .vs.berth h3 { color: var(--ok); }
+  .vs p { margin: 6px 0 0; font-size: 14px; line-height: 1.6; }
+  .vs small { display: block; margin-top: 3px; font-size: 12px; color: var(--muted); }
+  .vgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; margin-top: 9px; }
+  .vgrid span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 1px; }
+  .vgrid b { font-size: 15px; } .vgrid .big { font-size: 22px; line-height: 1.2; }
   .updated { margin-top: 18px; font-size: 12px; color: var(--muted); }
   .dl { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 22px;
         padding: 13px 16px; border-radius: 12px; background: var(--navy); color: #fff;
@@ -12930,6 +13080,21 @@ TRACK_HTML = """<!DOCTYPE html>
       <div><span>{{ tx.eta }}</span><b>{{ eta or '-' }}</b></div>
       <div class="full"><span>{{ tx.port }}</span><b>{{ port }}</b></div>
     </div>
+
+    {% if vs %}
+    <div class="vs {{ vs.kind }}">
+      <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="5" r="3"/><path d="M12 22V8M5 12H2a10 10 0 0 0 20 0h-3"/></svg>{{ vs.title }}</h3>
+      {% if vs.kind == 'anch' %}
+      <p>{{ vs.pre }}{% if vs.strong %}<b>{{ vs.strong }}</b>{% endif %}{{ vs.post }}</p>
+      {% if vs.sub %}<small>{{ vs.sub }}</small>{% endif %}
+      {% else %}
+      <div class="vgrid">
+        {% if vs.berth %}<div><span>{{ vs.l_berth }}</span><b class="big" dir="auto">{{ vs.berth }}</b></div>{% endif %}
+        {% if vs.etcd %}<div><span>{{ vs.l_etcd }}</span><b>{{ vs.etcd }}</b></div>{% endif %}
+      </div>
+      {% endif %}
+    </div>
+    {% endif %}
 
     <ol class="steps">
       {% for s in steps %}
@@ -13424,6 +13589,12 @@ PAGE_HTML = """
   }
   .eta-input.eta-unset { border-style: dashed; border-color: var(--muted); }
   .eta-unset-hint { font-size: 10px; color: var(--muted); font-style: italic; }
+  .vs-select { cursor: pointer; font-weight: 600; max-width: 150px; }
+  .eta-input.vs-berth { width: 70px; flex: 0 0 auto; }
+  .vs-new .eta-label, .eta-wrap .eta-label { white-space: nowrap; }
+  .vs-new { animation: vsPop .28s ease-out; }
+  @keyframes vsPop { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { .vs-new { animation: none; } }
   .port-body { border: 1px solid var(--border); border-top: none; border-radius: 0 0 14px 14px; overflow: hidden; background: var(--card); }
   .port-body.collapsed { display: none; }
 
@@ -14691,9 +14862,12 @@ function toggleQr(bl) {
   const panel = document.getElementById('qrPanel');
   if (!panel) return;
   if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
-  const base = `/api/records/${encodeURIComponent(bl)}/qr`;
-  panel.innerHTML = `<img src="${base}?v=${Date.now()}" alt="QR">
-    <a href="${base}?format=png&download=1">${t('download_qr')}</a>`;
+  // The file name ends the URL (QR_<BL>.png) so every way of saving the QR,
+  // the button or right-click "Save image as", names it after the BL.
+  const fname = 'QR_' + String(bl).replace(/[^A-Za-z0-9._-]+/g, '_') + '.png';
+  const base = `/api/records/${encodeURIComponent(bl)}/qr/${fname}`;
+  panel.innerHTML = `<img src="${base}?format=png&v=${Date.now()}" alt="QR ${esc(bl)}">
+    <a href="${base}?format=png&download=1" download="${fname}">${t('download_qr')}</a>`;
   panel.style.display = '';
 }
 
@@ -15346,6 +15520,7 @@ function vesselGroupHtml(portName, vesselName, list, archivedView) {
             onchange="this.classList.toggle('eta-unset', !this.value); setVesselEta(JSON.parse(this.dataset.bls), this.value)" data-bls="${blsJson}">
           ${eta ? '' : `<span class="eta-unset-hint">${t('not_set')}</span>`}
         </span>`}
+        ${archivedView ? '' : vesselStatusHtml(sortedList[0], blsJson)}
         <span class="group-count">${t('bl_count', {n: sortedList.length, p: sortedList.length === 1 ? '' : 's'})}${left ? t('left_suffix', {n: left}) : t('done_suffix')}</span>
         <span class="vessel-progress ${pct >= 100 ? 'done' : ''}" title="${t('pct_complete', {pct})}"><span class="vessel-progress-fill" style="width:${pct}%"></span></span>
         <span class="group-actions">
@@ -15554,6 +15729,58 @@ function render() {
   restoreListScroll(savedListScroll);
   updateSummaryOnly();
   updateBulkBars();
+}
+
+// Where the vessel is (anchorage / berth) plus ETB, berth number and ETC/D.
+// Set once per vessel group, like the ETA, and shown on the customer's QR page.
+function vesselStatusHtml(rec, blsJson) {
+  const st = (rec && rec.vessel_status) || '';
+  const v = k => esc((rec && rec[k]) || '');
+  const wrap = (cls, inner) => `<span class="eta-wrap ${cls}" onclick="event.stopPropagation()">${inner}</span>`;
+  let html = wrap('', `<span class="eta-label">${t('vs_label')}</span>
+    <select class="eta-input vs-select${st ? '' : ' eta-unset'}" title="${t('vs_title')}" data-bls="${blsJson}"
+      onchange="setVesselStatus(JSON.parse(this.dataset.bls), {vessel_status: this.value}, true)">
+      <option value=""${st === '' ? ' selected' : ''}>${t('not_set')}</option>
+      <option value="anch"${st === 'anch' ? ' selected' : ''}>${t('vs_anch')}</option>
+      <option value="berth"${st === 'berth' ? ' selected' : ''}>${t('vs_berth')}</option>
+    </select>`);
+  if (st === 'anch') {
+    html += wrap('vs-new', `<span class="eta-label">${t('etb_label')}</span>
+      <input type="date" class="eta-input vs-etb${v('etb') ? '' : ' eta-unset'}" value="${v('etb')}" title="${t('etb_title')}" data-bls="${blsJson}"
+        onchange="this.classList.toggle('eta-unset', !this.value); setVesselStatus(JSON.parse(this.dataset.bls), {etb: this.value})">`);
+  } else if (st === 'berth') {
+    html += wrap('vs-new', `<span class="eta-label">${t('berth_label')}</span>
+      <input type="text" class="eta-input vs-berth${v('berth_no') ? '' : ' eta-unset'}" maxlength="12" value="${v('berth_no')}" placeholder="${t('berth_ph')}" data-bls="${blsJson}"
+        onkeydown="if(event.key==='Enter') this.blur()"
+        onchange="this.classList.toggle('eta-unset', !this.value.trim()); setVesselStatus(JSON.parse(this.dataset.bls), {berth_no: this.value})">`);
+    html += wrap('vs-new', `<span class="eta-label">${t('etcd_label')}</span>
+      <input type="date" class="eta-input vs-etcd${v('etcd') ? '' : ' eta-unset'}" value="${v('etcd')}" title="${t('etcd_title')}" data-bls="${blsJson}"
+        onchange="this.classList.toggle('eta-unset', !this.value); setVesselStatus(JSON.parse(this.dataset.bls), {etcd: this.value})">`);
+  }
+  return html;
+}
+
+async function setVesselStatus(blNumbers, patch, focusNew) {
+  // Show the change straight away (the new fields appear without waiting for
+  // the server), then save it and quietly re-sync.
+  blNumbers.forEach(bl => {
+    const rec = records.find(r => r.bl_number === bl);
+    if (rec) Object.assign(rec, patch);
+  });
+  suppressPollUntil = Date.now() + 1500;
+  render();
+  if (focusNew && patch.vessel_status) {
+    const cls = patch.vessel_status === 'berth' ? '.vs-berth' : '.vs-etb';
+    const el = Array.from(document.querySelectorAll(cls)).find(e => {
+      try { return JSON.parse(e.dataset.bls)[0] === blNumbers[0]; } catch (x) { return false; }
+    });
+    if (el) el.focus();
+  }
+  await apiWrite('/api/vessel/status', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(Object.assign({bl_numbers: blNumbers}, patch))
+  });
+  await fetchRecords(true);
 }
 
 async function setVesselEta(blNumbers, eta) {
