@@ -1042,6 +1042,26 @@ def init_db():
             paid INTEGER DEFAULT 0, paid_at TEXT DEFAULT '', created_by TEXT DEFAULT '', created_at TEXT DEFAULT ''
         )""")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pda_invoices_pda ON pda_invoices (pda_id)")
+    for _c, _t in (("bill_to", "TEXT DEFAULT ''"), ("bill_address", "TEXT DEFAULT ''"), ("bill_vat_no", "TEXT DEFAULT ''"),
+                   ("attention", "TEXT DEFAULT ''"), ("issue_date", "TEXT DEFAULT ''"), ("remarks", "TEXT DEFAULT ''"),
+                   ("currency", "TEXT DEFAULT 'SAR'"), ("fx_rate", "NUMERIC DEFAULT 3.75"), ("prepared_by", "TEXT DEFAULT ''"),
+                   ("finance_mgr", "TEXT DEFAULT ''"), ("acct_job_no", "TEXT DEFAULT ''"), ("is_draft", "INTEGER DEFAULT 0")):
+        cur.execute(f"ALTER TABLE pda_invoices ADD COLUMN IF NOT EXISTS {_c} {_t}")
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS pda_invoice_lines (
+            id SERIAL PRIMARY KEY, invoice_id INTEGER NOT NULL REFERENCES pda_invoices(id) ON DELETE CASCADE,
+            pos INTEGER DEFAULT 0, description TEXT DEFAULT '', unit TEXT DEFAULT '', qty NUMERIC DEFAULT 1,
+            rate NUMERIC DEFAULT 0, vat_pct NUMERIC DEFAULT 0
+        )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pda_invoice_lines_inv ON pda_invoice_lines (invoice_id)")
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS pda_costs (
+            id SERIAL PRIMARY KEY, pda_id INTEGER NOT NULL REFERENCES pda_documents(id) ON DELETE CASCADE,
+            supplier TEXT DEFAULT '', supplier_inv_no TEXT DEFAULT '', inv_date TEXT DEFAULT '', description TEXT DEFAULT '',
+            unit TEXT DEFAULT '', qty NUMERIC DEFAULT 1, rate NUMERIC DEFAULT 0, vat_pct NUMERIC DEFAULT 0,
+            paid INTEGER DEFAULT 0, paid_at TEXT DEFAULT '', created_by TEXT DEFAULT '', created_at TEXT DEFAULT ''
+        )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pda_costs_pda ON pda_costs (pda_id)")
     cur.execute(
         """CREATE TABLE IF NOT EXISTS pda_job_docs (
             id SERIAL PRIMARY KEY, pda_id INTEGER NOT NULL REFERENCES pda_documents(id) ON DELETE CASCADE,
@@ -7055,8 +7075,15 @@ def finalize_pda_document(pda_id):
 @login_required
 def delete_pda_document(pda_id):
     db = get_db()
-    if not _pda_get(db, pda_id):
+    doc = _pda_get(db, pda_id)
+    if not doc:
         return jsonify({"error": "Not found."}), 404
+    # A job that already has invoices is only deleted when the job number is typed back (the screen asks for it).
+    n_inv = db.execute("SELECT COUNT(*) AS n FROM pda_invoices WHERE pda_id = ?", (pda_id,)).fetchone()["n"]
+    if n_inv:
+        typed = ((request.get_json(silent=True) or {}).get("confirm") or "").strip().upper()
+        if typed != str(doc["pda_no"] or "").strip().upper():
+            return jsonify({"error": "This job has invoices. Type the job number to confirm the delete."}), 400
     db.execute("DELETE FROM pda_documents WHERE id = ?", (pda_id,))
     db.commit()
     return jsonify({"ok": True})
@@ -7673,12 +7700,17 @@ def _job_full(db, doc):
         x["amount"] = float(x["amount"] or 0)
         x["paid"] = bool(x["paid"])
         x["kind_label"] = JOB_INVOICE_KINDS.get(x["kind"], "Invoice")
+        x["is_draft"] = bool(x.get("is_draft"))
+        x["fx_rate"] = float(x.get("fx_rate") or PDA_DEFAULT_FX)
+        if x["is_draft"]:
+            x["lines"] = _inv_lines(db, x["id"])
+            x["totals"] = _inv_totals(x["lines"], x["currency"], x["fx_rate"])
         invs.append(x)
     return {
         "job": d, "stage": stage, "stage_name": JOB_STAGES[min(stage, 5)], "stages": JOB_STAGES, "stage_notes": JOB_STAGE_NOTES,
         "timebar": _job_timebar(doc), "client": client, "money": _job_money(db, doc, d),
         "services": [_job_service_view(s, limit_sar) for s in db.execute("SELECT * FROM pda_services WHERE pda_id = ? ORDER BY id", (doc["id"],)).fetchall()],
-        "invoices": invs, "invoice_kinds": JOB_INVOICE_KINDS,
+        "invoices": invs, "invoice_kinds": JOB_INVOICE_KINDS, "costs": _job_costs(db, doc["id"]), "profit": _job_profit(db, doc["id"], invs),
         "history": [dict(h) for h in db.execute("SELECT at, who, text, doc FROM pda_history WHERE pda_id = ? ORDER BY id DESC", (doc["id"],)).fetchall()],
         "files": [dict(f) for f in db.execute("SELECT id, title, filename, mime, uploaded_by, uploaded_at FROM pda_job_docs WHERE pda_id = ? ORDER BY id", (doc["id"],)).fetchall()],
         "pinned": bool(db.execute("SELECT 1 FROM pda_pins WHERE username = ? AND pda_id = ?", (session.get("username"), doc["id"])).fetchone()),
@@ -7937,6 +7969,440 @@ def edit_job_invoice(iid):
         paid = 1 if (request.get_json(force=True) or {}).get("paid") else 0
         db.execute("UPDATE pda_invoices SET paid = ?, paid_at = ? WHERE id = ?", (paid, _now_stamp() if paid else "", iid))
         _job_log(db, doc["id"], f"Invoice {inv['no']} marked {'paid' if paid else 'unpaid'}.", inv["no"])
+    db.commit()
+    return jsonify({"ok": True, **_job_full(db, doc)})
+
+
+# ----- draft invoices (services billed to a party; never part of the PDA/FDA totals) -----
+
+INVOICE_UNITS = ["PER SHIPMENT", "PER DAY", "PER GRT", "PER MT", "PER TRIP", "PER HOUR", "PER PERSON", "LUMPSUM"]
+
+
+def _inv_lines(db, iid):
+    out = []
+    for l in db.execute("SELECT * FROM pda_invoice_lines WHERE invoice_id = ? ORDER BY pos, id", (iid,)).fetchall():
+        out.append({"id": l["id"], "description": l["description"] or "", "unit": l["unit"] or "", "qty": float(l["qty"] or 0),
+                    "rate": float(l["rate"] or 0), "vat_pct": float(l["vat_pct"] or 0)})
+    return out
+
+
+def _inv_totals(lines, currency, fx):
+    """Per-line and total figures the way the company's Draft Invoice shows them: amount in the invoice currency,
+    its SAR equivalent, VAT, and the total payable."""
+    fx = fx or PDA_DEFAULT_FX
+    usd = (currency or "SAR").upper() == "USD"
+    rows, net, vat = [], 0.0, 0.0
+    for l in lines:
+        fc = round(l["qty"] * l["rate"], 2)
+        v = round(fc * l["vat_pct"] / 100.0, 2)
+        rows.append({"fc": fc, "usd": fc if usd else round(fc / fx, 2), "sar": round(fc * fx, 2) if usd else fc, "vat": v, "total": round(fc + v, 2)})
+        net += fc
+        vat += v
+    net, vat = round(net, 2), round(vat, 2)
+    total = round(net + vat, 2)
+    return {"rows": rows, "net": net, "vat": vat, "total": total, "total_sar": round(total * fx, 2) if usd else total}
+
+
+_ONES = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen",
+         "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"]
+_TENS = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
+
+
+def _words_below_1000(n):
+    out = []
+    if n >= 100:
+        out.append(_ONES[n // 100] + " Hundred")
+        n %= 100
+    if n >= 20:
+        out.append(_TENS[n // 10] + ("-" + _ONES[n % 10] if n % 10 else ""))
+    elif n:
+        out.append(_ONES[n])
+    return " ".join(out)
+
+
+def _amount_in_words(amount, cur):
+    amount = round(float(amount or 0), 2)
+    whole, frac = int(amount), int(round((amount - int(amount)) * 100))
+    if whole == 0:
+        w = "Zero"
+    else:
+        parts = []
+        for size, name in ((10 ** 9, "Billion"), (10 ** 6, "Million"), (1000, "Thousand"), (1, "")):
+            q, whole = divmod(whole, size)
+            if q:
+                parts.append((_words_below_1000(q) + " " + name).strip())
+        w = " ".join(parts)
+    return f"{cur} {w} {frac}/100 Only"
+
+
+def _inv_clean_lines(raw):
+    lines = []
+    for l in (raw or [])[:60]:
+        desc = _pda_clean_text((l or {}).get("description"), 200)
+        if not desc:
+            continue
+        qty, rate = _pf((l or {}).get("qty"), 1.0), _pf((l or {}).get("rate"), 0.0)
+        vat = _pf((l or {}).get("vat_pct"), 0.0)
+        if qty <= 0 or qty > 1e9 or rate < 0 or rate > 1e10 or vat < 0 or vat > 100:
+            return None, f"Check the line '{desc[:40]}': quantity must be above zero and VAT between 0 and 100."
+        unit = _pda_clean_text((l or {}).get("unit"), 30).upper()
+        lines.append({"description": desc, "unit": unit, "qty": qty, "rate": rate, "vat_pct": vat})
+    if not lines:
+        return None, "Add at least one line (what was provided, the quantity and the rate)."
+    return lines, ""
+
+
+def _inv_header(data, who):
+    cur = "USD" if str(data.get("currency") or "").upper() == "USD" else "SAR"
+    fx = _pf(data.get("fx_rate"), PDA_DEFAULT_FX) or PDA_DEFAULT_FX
+    issue = _pda_clean_text(data.get("issue_date"), 10)
+    if issue and not re.match(r"^\d{4}-\d{2}-\d{2}$", issue):
+        issue = ""
+    return {"bill_to": _pda_clean_text(data.get("bill_to"), 160), "bill_address": _pda_clean_text(data.get("bill_address"), 300),
+            "bill_vat_no": _pda_clean_text(data.get("bill_vat_no"), 40), "attention": _pda_clean_text(data.get("attention"), 200),
+            "issue_date": issue or str(_riyadh_today())[:10],
+            "remarks": _pda_clean_text(data.get("remarks"), 400), "currency": cur, "fx_rate": fx,
+            "prepared_by": _pda_clean_text(data.get("prepared_by"), 80) or who,
+            "finance_mgr": _pda_clean_text(data.get("finance_mgr"), 80), "acct_job_no": _pda_clean_text(data.get("acct_job_no"), 60)}
+
+
+@app.route("/api/jobs/<int:pda_id>/draft-invoices", methods=["POST"])
+@login_required
+def add_draft_invoice(pda_id):
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    doc = _pda_get(db, pda_id)
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    h = _inv_header(data, _who())
+    if not h["bill_to"]:
+        return jsonify({"error": "Say who the invoice is billed to."}), 400
+    lines, err = _inv_clean_lines(data.get("lines"))
+    if err:
+        return jsonify({"error": err}), 400
+    tot = _inv_totals(lines, h["currency"], h["fx_rate"])
+    no = _pda_clean_text(data.get("no"), 60)
+    if not no:
+        n = db.execute("SELECT COUNT(*) AS n FROM pda_invoices WHERE pda_id = ?", (pda_id,)).fetchone()["n"] + 1
+        no = f"{doc['pda_no']}-D{n}"
+    desc = _pda_clean_text(data.get("description"), 200) or (lines[0]["description"] + (f" +{len(lines) - 1} more" if len(lines) > 1 else ""))
+    row = db.execute(
+        "INSERT INTO pda_invoices (pda_id, no, kind, description, amount, paid, created_by, created_at, bill_to, bill_address, bill_vat_no, attention, "
+        "issue_date, remarks, currency, fx_rate, prepared_by, finance_mgr, acct_job_no, is_draft) VALUES (?, ?, 'service', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1) RETURNING id",
+        (pda_id, no, desc, tot["total_sar"], _who(), _now_stamp(), h["bill_to"], h["bill_address"], h["bill_vat_no"], h["attention"], h["issue_date"],
+         h["remarks"], h["currency"], h["fx_rate"], h["prepared_by"], h["finance_mgr"], h["acct_job_no"])).fetchone()
+    for i, l in enumerate(lines):
+        db.execute("INSERT INTO pda_invoice_lines (invoice_id, pos, description, unit, qty, rate, vat_pct) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                   (row["id"], i, l["description"], l["unit"], l["qty"], l["rate"], l["vat_pct"]))
+    if h["finance_mgr"]:
+        set_setting("inv_finance_mgr", h["finance_mgr"])
+    _job_log(db, pda_id, f"Draft invoice {no} to {h['bill_to']} created, {h['currency']} {fmt_money(tot['total'])} (outside the PDA/FDA).", no)
+    db.commit()
+    return jsonify({"ok": True, "invoice_id": row["id"], **_job_full(db, doc)})
+
+
+@app.route("/api/jobs/draft-invoices/<int:iid>", methods=["PUT"])
+@login_required
+def edit_draft_invoice(iid):
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    inv = db.execute("SELECT * FROM pda_invoices WHERE id = ? AND is_draft = 1", (iid,)).fetchone()
+    doc = _pda_get(db, inv["pda_id"]) if inv else None
+    if not inv or not doc:
+        return jsonify({"error": "Not found."}), 404
+    h = _inv_header(data, inv["prepared_by"] or _who())
+    if not h["bill_to"]:
+        return jsonify({"error": "Say who the invoice is billed to."}), 400
+    lines, err = _inv_clean_lines(data.get("lines"))
+    if err:
+        return jsonify({"error": err}), 400
+    tot = _inv_totals(lines, h["currency"], h["fx_rate"])
+    no = _pda_clean_text(data.get("no"), 60) or inv["no"]
+    desc = _pda_clean_text(data.get("description"), 200) or (lines[0]["description"] + (f" +{len(lines) - 1} more" if len(lines) > 1 else ""))
+    db.execute(
+        "UPDATE pda_invoices SET no = ?, description = ?, amount = ?, bill_to = ?, bill_address = ?, bill_vat_no = ?, attention = ?, issue_date = ?, remarks = ?, "
+        "currency = ?, fx_rate = ?, prepared_by = ?, finance_mgr = ?, acct_job_no = ? WHERE id = ?",
+        (no, desc, tot["total_sar"], h["bill_to"], h["bill_address"], h["bill_vat_no"], h["attention"], h["issue_date"], h["remarks"], h["currency"],
+         h["fx_rate"], h["prepared_by"], h["finance_mgr"], h["acct_job_no"], iid))
+    db.execute("DELETE FROM pda_invoice_lines WHERE invoice_id = ?", (iid,))
+    for i, l in enumerate(lines):
+        db.execute("INSERT INTO pda_invoice_lines (invoice_id, pos, description, unit, qty, rate, vat_pct) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                   (iid, i, l["description"], l["unit"], l["qty"], l["rate"], l["vat_pct"]))
+    if h["finance_mgr"]:
+        set_setting("inv_finance_mgr", h["finance_mgr"])
+    _job_log(db, doc["id"], f"Draft invoice {no} edited, {h['currency']} {fmt_money(tot['total'])}.", no)
+    db.commit()
+    return jsonify({"ok": True, **_job_full(db, doc)})
+
+
+@app.route("/api/jobs/invoice-defaults/<int:pda_id>")
+@login_required
+def invoice_defaults(pda_id):
+    db = get_db()
+    doc = _pda_get(db, pda_id)
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    client = db.execute("SELECT * FROM pda_clients WHERE id = ?", (doc["client_id"],)).fetchone() if doc["client_id"] else None
+    return jsonify({
+        "bill_to": doc["customer_name"] or "", "bill_address": (doc["customer_address"] or (client["address"] if client else "") or ""),
+        "attention": (doc["customer_email"] or (client["email"] if client else "") or ""),
+        "prepared_by": _who(), "finance_mgr": get_setting("inv_finance_mgr", ""), "units": INVOICE_UNITS,
+    })
+
+
+def build_invoice_pdf(doc, inv, lines, banks=""):
+    """The company's own 'Draft Invoice' layout: billed-to block, invoice/job block, route + vessel block, remarks, a lines table with
+    FC / USD / SAR / VAT columns, totals, amount in words, bank details, prepared-by / finance manager and the terms."""
+    NAVY, GREY = (18, 58, 86), (110, 120, 130)
+    cur = inv["currency"] or "SAR"
+    fx = float(inv["fx_rate"] or PDA_DEFAULT_FX)
+    tot = _inv_totals(lines, cur, fx)
+    pdf = PdaPDF(format="A4")
+    pdf.alias_nb_pages()
+    pdf.set_auto_page_break(False)
+    L, W = 10, 190
+    pdf.set_margins(L, 10, L)
+    pdf.add_page()
+
+    def txt(x, y, w, h, s, size=8, style="", color=(0, 0, 0), align="L"):
+        pdf.set_xy(x, y)
+        pdf.set_font("Helvetica", style, size)
+        pdf.set_text_color(*color)
+        pdf.cell(w, h, str(s), align=align)
+
+    def rect(x, y, w, h):
+        pdf.set_draw_color(120, 135, 150)
+        pdf.set_line_width(0.25)
+        pdf.rect(x, y, w, h)
+
+    try:
+        pdf.image(io.BytesIO(base64.b64decode(LOGO_B64)), x=L, y=8, w=24)
+    except Exception:
+        pass
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(*NAVY)
+    pdf.set_xy(L + 90, 10)
+    pdf.cell(W - 90, 5, COMPANY_NAME_EN.upper(), align="R")
+    txt(L, 33, W, 10, "Draft Invoice", 20, "B", NAVY, "C")
+
+    y = 46
+    half = W / 2
+    rect(L, y, half, 62)
+    rect(L + half, y, half, 62)
+
+    def pair(x, yy, label, val, lw=26, vw=60, bold=False):
+        txt(x, yy, lw, 5, label, 7.5, "B")
+        pdf.set_font("Helvetica", "B" if bold else "", 8)
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_xy(x + lw, yy)
+        pdf.cell(vw, 5, str(val or "")[:46])
+
+    addr = [ln.strip() for ln in str(inv["bill_address"] or "").replace("\r", "").split("\n") if ln.strip()][:3]
+    left = [("Billed To:", inv["bill_to"]), ("VAT Reg #:", inv["bill_vat_no"]), ("Address:", addr[0] if addr else ""),
+            ("", addr[1] if len(addr) > 1 else ""), ("", addr[2] if len(addr) > 2 else ""), ("Attention To:", inv["attention"]),
+            ("POL:", doc.get("load_port") or ""), ("POD:", doc.get("dis_port") or doc.get("port") or ""), ("Shipper:", ""), ("Phone:", doc.get("customer_phone") or "")]
+    for i, (a, b) in enumerate(left):
+        pair(L + 2, y + 2 + i * 5.8, a, b, 24, 62, bold=(i == 0))
+    eta = doc.get("eta") or ""
+    right = [("Invoice #:", inv["no"]), ("Invoice Date:", inv["issue_date"]), ("Our VAT Reg #:", get_setting("company_vat_no", "300357262200003")),
+             ("Job #:", inv["acct_job_no"] or doc.get("pda_no")), ("Compass Job:", doc.get("pda_no")), ("Vessel Name:", doc.get("vessel") or ""),
+             ("Voyage #:", doc.get("voyage") or ""), ("ETA:", eta), ("GRT / NRT / DWT:", " / ".join(str(int(float(doc.get(k) or 0))) if doc.get(k) else "-" for k in ("grt", "nrt", "dwt"))),
+             ("Order Ref #:", doc.get("principal_ref") or "")]
+    for i, (a, b) in enumerate(right):
+        pair(L + half + 2, y + 2 + i * 5.8, a, b, 30, 58)
+
+    y += 62
+    rect(L, y, W, 8)
+    txt(L + 2, y + 1.5, 20, 5, "Remarks:", 7.5, "B")
+    txt(L + 24, y + 1.5, W - 26, 5, str(inv["remarks"] or "")[:120], 8)
+    y += 12
+
+    cols = [("Billing", 50, "L"), ("Cur", 10, "C"), ("Qty", 13, "R"), ("Rate", 17, "R"), ("FC Amount", 19, "R"), ("Amount USD", 19, "R"),
+            ("Amount SAR", 19, "R"), ("VAT %", 11, "R"), ("VAT Amt", 15, "R"), ("Total", 0, "R")]
+    used = sum(c[1] for c in cols)
+    cols[-1] = ("Total", W - used, "R")
+    pdf.set_fill_color(*NAVY)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 7)
+    pdf.set_xy(L, y)
+    for name, w, al in cols:
+        pdf.cell(w, 7, name, border=0, align="C", fill=True)
+    y += 7
+    rect_top = y
+    for i, (l, r) in enumerate(zip(lines, tot["rows"])):
+        label = f"{i + 1}. {l['description']}"
+        _u = f" ({l['unit'].title()})" if l["unit"] and l["unit"] != "LUMPSUM" else ""
+        if len(label + _u) <= 31:
+            label += _u
+        vals = [label[:31], cur, f"{l['qty']:,.3f}", f"{l['rate']:,.4f}", _pda_num(r["fc"]), _pda_num(r["usd"]), _pda_num(r["sar"]),
+                f"{l['vat_pct']:g}%", _pda_num(r["vat"]), _pda_num(r["total"])]
+        pdf.set_xy(L, y)
+        pdf.set_font("Helvetica", "", 8)
+        pdf.set_text_color(0, 0, 0)
+        for (name, w, al), v in zip(cols, vals):
+            pdf.cell(w, 6.5, v, align=al)
+        y += 6.5
+        if y > 235:
+            break
+    rect(L, rect_top, W, max(y - rect_top, 6.5))
+    y += 2
+    txt(L + 100, y, 60, 5, "Amount without VAT", 8, "B", align="R")
+    txt(L + W - 28, y, 28, 5, f"{cur} {_pda_num(tot['net'])}", 8, "B", align="R")
+    txt(L + 100, y + 5.5, 60, 5, "VAT Amount", 8, "B", align="R")
+    txt(L + W - 28, y + 5.5, 28, 5, f"{cur} {_pda_num(tot['vat'])}", 8, "B", align="R")
+    y += 12
+    rect(L, y, W, 8)
+    txt(L + 2, y + 1.8, 120, 5, _amount_in_words(tot["total"], cur), 8, "B")
+    txt(L + 100, y + 1.8, 60, 5, "Total Payable Amount", 8.5, "B", align="R")
+    txt(L + W - 28, y + 1.8, 28, 5, f"{cur} {_pda_num(tot['total'])}", 8.5, "B", align="R")
+    if cur == "USD":
+        txt(L + 2, y + 9, 120, 4, f"SAR equivalent {_pda_num(tot['total_sar'])} at {fx:g}", 7, "", GREY)
+    y += 13
+    if str(banks or "").strip():
+        txt(L, y, W, 5, "Bank Details:", 8, "")
+        txt(L, y + 4.5, W, 5, f"Please arrange payment in favour of {COMPANY_NAME_EN.upper()}", 8, "B")
+        y += 10
+        bl = [ln.strip() for ln in str(banks).replace("\r", "").split("\n") if ln.strip()][:12]
+        rect(L, y, W, 4 * len(bl) + 3)
+        for i, ln in enumerate(bl):
+            txt(L + 2, y + 1.5 + i * 4, W - 4, 4, ln[:120], 7.5)
+    y = max(y + 4 * (len(bl) if str(banks or "").strip() else 0) + 12, 238)
+    pdf.set_draw_color(0, 0, 0)
+    txt(L, y, 24, 5, "Prepared By:", 8, "B")
+    txt(L + 26, y, 60, 5, str(inv["prepared_by"] or "").upper(), 8, "B")
+    pdf.line(L, y + 6, L + 80, y + 6)
+    txt(L + 100, y, 30, 5, "Finance Manager:", 8, "B")
+    txt(L + 132, y, 58, 5, str(inv["finance_mgr"] or "").upper(), 8, "B")
+    pdf.line(L + 100, y + 6, L + W, y + 6)
+    txt(L, y + 11, W, 4, "Terms: 1. The company is not responsible for any cash settlement without an official receipt.", 6.5)
+    txt(L + 8, y + 14.5, W, 4, "2. Any discrepancy should be notified to us in writing within 7 days from the invoice date after which NONE will be accepted.", 6.5)
+    txt(L, y + 22, W, 4, "DRAFT - NOT POSTED TO ZATCA. The official tax invoice is issued from the accounting system.", 7, "B", (150, 40, 40), "R")
+    return bytes(pdf.output(dest="S"))
+
+
+@app.route("/api/jobs/draft-invoices/<int:iid>/pdf")
+@login_required
+def draft_invoice_pdf(iid):
+    db = get_db()
+    inv = db.execute("SELECT * FROM pda_invoices WHERE id = ? AND is_draft = 1", (iid,)).fetchone()
+    doc = _pda_get(db, inv["pda_id"]) if inv else None
+    if not inv or not doc:
+        return jsonify({"error": "Not found."}), 404
+    pdf = build_invoice_pdf(dict(doc), dict(inv), _inv_lines(db, iid), banks=get_setting("pda_banks", ""))
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(inv["no"] or "draft-invoice"))
+    return Response(pdf, mimetype="application/pdf", headers={"Content-Disposition": f'inline; filename="Draft-Invoice-{safe}.pdf"'})
+
+
+# ----- costs paid to suppliers on behalf of the job, and profit -----
+
+def _job_costs(db, pda_id):
+    out = []
+    for c in db.execute("SELECT * FROM pda_costs WHERE pda_id = ? ORDER BY supplier, supplier_inv_no, id", (pda_id,)).fetchall():
+        qty, rate, vp = float(c["qty"] or 0), float(c["rate"] or 0), float(c["vat_pct"] or 0)
+        net = round(qty * rate, 2)
+        vat = round(net * vp / 100.0, 2)
+        out.append({"id": c["id"], "supplier": c["supplier"] or "", "inv_no": c["supplier_inv_no"] or "", "inv_date": c["inv_date"] or "",
+                    "description": c["description"] or "", "unit": c["unit"] or "", "qty": qty, "rate": rate, "vat_pct": vp,
+                    "net": net, "vat": vat, "total": round(net + vat, 2), "paid": bool(c["paid"]), "paid_at": c["paid_at"] or ""})
+    return out
+
+
+def _job_profit(db, pda_id, invs):
+    """Billed to parties (net of VAT, in SAR) minus what the suppliers charged (net of VAT, in SAR)."""
+    billed = 0.0
+    for i in invs:
+        if i.get("is_draft") and i.get("totals"):
+            fx = i["fx_rate"] if (i.get("currency") or "SAR") == "USD" else 1.0
+            billed += i["totals"]["net"] * fx
+        else:
+            billed += float(i["amount"] or 0)
+    costs = _job_costs(db, pda_id)
+    cost_net = sum(c["net"] for c in costs)
+    cost_total = sum(c["total"] for c in costs)
+    unpaid = sum(c["total"] for c in costs if not c["paid"])
+    profit = billed - cost_net
+    return {"billed": round(billed, 2), "cost_net": round(cost_net, 2), "cost_total": round(cost_total, 2), "cost_unpaid": round(unpaid, 2),
+            "profit": round(profit, 2), "margin": round(profit / billed * 100, 1) if billed else None}
+
+
+def _cost_lines_clean(raw):
+    out = []
+    for l in (raw or [])[:60]:
+        desc = _pda_clean_text((l or {}).get("description"), 200)
+        if not desc:
+            continue
+        qty, rate, vat = _pf((l or {}).get("qty"), 1.0), _pf((l or {}).get("rate"), 0.0), _pf((l or {}).get("vat_pct"), 0.0)
+        if qty <= 0 or qty > 1e9 or rate < 0 or rate > 1e10 or vat < 0 or vat > 100:
+            return None, f"Check the line '{desc[:40]}': quantity must be above zero and VAT between 0 and 100."
+        out.append({"description": desc, "unit": _pda_clean_text((l or {}).get("unit"), 30).upper(), "qty": qty, "rate": rate, "vat_pct": vat})
+    if not out:
+        return None, "Add at least one cost line (what the supplier charged, the quantity and the rate)."
+    return out, ""
+
+
+@app.route("/api/jobs/<int:pda_id>/costs", methods=["POST"])
+@login_required
+def add_job_costs(pda_id):
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    doc = _pda_get(db, pda_id)
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    supplier = _pda_clean_text(data.get("supplier"), 160).upper()
+    if not supplier:
+        return jsonify({"error": "Say which supplier charged this (port, tug company, stevedore...)."}), 400
+    lines, err = _cost_lines_clean(data.get("lines"))
+    if err:
+        return jsonify({"error": err}), 400
+    inv_no, inv_date = _pda_clean_text(data.get("inv_no"), 60), _pda_clean_text(data.get("inv_date"), 10)
+    paid = 1 if data.get("paid") else 0
+    tot = 0.0
+    for l in lines:
+        db.execute("INSERT INTO pda_costs (pda_id, supplier, supplier_inv_no, inv_date, description, unit, qty, rate, vat_pct, paid, paid_at, created_by, created_at) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   (pda_id, supplier, inv_no, inv_date, l["description"], l["unit"], l["qty"], l["rate"], l["vat_pct"], paid, _now_stamp() if paid else "", _who(), _now_stamp()))
+        tot += l["qty"] * l["rate"] * (1 + l["vat_pct"] / 100.0)
+    _job_log(db, pda_id, f"Cost added from {supplier}{' (' + inv_no + ')' if inv_no else ''}: {len(lines)} line{'s' if len(lines) != 1 else ''}, SAR {fmt_money(tot)}.", inv_no)
+    db.commit()
+    return jsonify({"ok": True, **_job_full(db, doc)})
+
+
+@app.route("/api/jobs/costs/<int:cid>", methods=["PUT", "DELETE"])
+@login_required
+def edit_job_cost(cid):
+    db = get_db()
+    c = db.execute("SELECT * FROM pda_costs WHERE id = ?", (cid,)).fetchone()
+    doc = _pda_get(db, c["pda_id"]) if c else None
+    if not c or not doc:
+        return jsonify({"error": "Not found."}), 404
+    if request.method == "DELETE":
+        db.execute("DELETE FROM pda_costs WHERE id = ?", (cid,))
+        _job_log(db, doc["id"], f"Cost line removed: {c['supplier']} - {c['description']}.", c["supplier_inv_no"])
+    else:
+        data = request.get_json(force=True) or {}
+        lines, err = _cost_lines_clean([data])
+        if err:
+            return jsonify({"error": err}), 400
+        l = lines[0]
+        db.execute("UPDATE pda_costs SET description = ?, unit = ?, qty = ?, rate = ?, vat_pct = ? WHERE id = ?", (l["description"], l["unit"], l["qty"], l["rate"], l["vat_pct"], cid))
+        _job_log(db, doc["id"], f"Cost line edited: {c['supplier']} - {l['description']}.", c["supplier_inv_no"])
+    db.commit()
+    return jsonify({"ok": True, **_job_full(db, doc)})
+
+
+@app.route("/api/jobs/<int:pda_id>/costs/paid", methods=["POST"])
+@login_required
+def job_costs_paid(pda_id):
+    """Mark every line of one supplier invoice paid / unpaid in one go."""
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    doc = _pda_get(db, pda_id)
+    if not doc:
+        return jsonify({"error": "Not found."}), 404
+    paid = 1 if data.get("paid") else 0
+    sup, no = _pda_clean_text(data.get("supplier"), 160).upper(), _pda_clean_text(data.get("inv_no"), 60)
+    db.execute("UPDATE pda_costs SET paid = ?, paid_at = ? WHERE pda_id = ? AND supplier = ? AND supplier_inv_no = ?", (paid, _now_stamp() if paid else "", pda_id, sup, no))
+    _job_log(db, pda_id, f"{sup}{' ' + no if no else ''} marked {'paid' if paid else 'unpaid'}.", no)
     db.commit()
     return jsonify({"ok": True, **_job_full(db, doc)})
 
@@ -10614,7 +11080,7 @@ async function api(url, method, body) {
 }
 function modal(opts) { // {title, text, body, ok, cancel, onOk}
   const h = $('modalHost');
-  h.innerHTML = '<div class="modal"><h3>' + esc(opts.title) + '</h3>' + (opts.text ? '<p>' + esc(opts.text) + '</p>' : '') + (opts.body || '') +
+  h.innerHTML = '<div class="modal"' + (opts.wide ? ' style="max-width:860px;width:94vw"' : '') + '><h3>' + esc(opts.title) + '</h3>' + (opts.text ? '<p>' + esc(opts.text) + '</p>' : '') + (opts.body || '') +
     '<div class="row" style="justify-content:flex-end;margin-top:16px"><button class="btn ghost" data-act="modalCancel">' + esc(opts.cancel || 'Cancel') + '</button><button class="btn" id="modalOk">' + esc(opts.ok || 'OK') + '</button></div></div>';
   h.classList.add('open'); h._ok = opts.onOk;
   const first = h.querySelector('input,select,textarea'); if (first) first.focus(); else $('modalOk').focus();
@@ -10863,8 +11329,8 @@ ACT.npCreate = async () => {
 };
 
 /* ---------------- job file ---------------- */
-const JTABS = ['Overview', 'Charges', 'Husbandry and services', 'Invoices', 'History', 'Documents'];
-const JSLUG = {overview: 'Overview', charges: 'Charges', husbandry: 'Husbandry and services', invoices: 'Invoices', history: 'History', documents: 'Documents'};
+const JTABS = ['Overview', 'Charges', 'Husbandry and services', 'Invoices', 'Costs and profit', 'History', 'Documents'];
+const JSLUG = {overview: 'Overview', charges: 'Charges', husbandry: 'Husbandry and services', invoices: 'Invoices', costs: 'Costs and profit', history: 'History', documents: 'Documents'};
 const SVC_SUGGEST = ['Fresh water supply', 'Provisions', 'Garbage disposal', 'Spares delivery', 'Launch hire', 'Crew change assistance', 'Medical visit', 'Bunkering coordination', 'Cash to master', 'Visa and immigration', 'Customs clearance'];
 const STD_INSTR = "Husbandry limit: up to USD 1,000 without written approval.\nStatement of Facts: upload within 24 hours of departure.\nCharterer expenses: invoice within 30 days of departure.\nPort log: update regularly, always include ETB and ETD.";
 async function viewJob(id, slug) {
@@ -10890,7 +11356,7 @@ function drawJob() {
     '<div class="panel"><a class="btn ghost small" href="#/">&larr; All jobs</a>' +
     '<div class="spread" style="margin-top:12px"><div><div class="row" style="gap:12px"><span style="font-size:26px;font-weight:700">' + esc(d.vessel || 'VESSEL TO BE ADVISED') + '</span><span class="chip s' + chipCls + '" style="font-size:12px;padding:5px 14px">' + esc(chipTxt) + '</span></div>' +
     '<div style="font-size:13px;color:var(--muted);margin-top:4px">Job ' + esc(d.pda_no) + ' &middot; opened ' + esc(fd((d.created_at || '').slice(0, 10))) + ' &middot; handled by ' + esc(d.handler || d.created_by) + '</div></div>' +
-    '<div class="row"><button class="btn ' + (J.pinned ? '' : 'ghost') + '" data-act="jpin" style="' + (J.pinned ? 'background:var(--gold);border-color:var(--gold)' : '') + '">' + (J.pinned ? 'Pinned' : 'Pin to top') + '</button><a class="btn ghost" href="#/report/' + d.id + '">Final job report</a><a class="btn ghost" href="/api/pda/documents/' + d.id + '/pdf" target="_blank" rel="noopener">Download ' + (d.status === 'finalized' ? 'FDA' : 'PDA') + '</a>' +
+    '<div class="row"><button class="btn ' + (J.pinned ? '' : 'ghost') + '" data-act="jpin" style="' + (J.pinned ? 'background:var(--gold);border-color:var(--gold)' : '') + '">' + (J.pinned ? 'Pinned' : 'Pin to top') + '</button><a class="btn ghost" href="#/report/' + d.id + '">Final job report</a><button class="btn danger" data-act="jdelete">Delete job</button><a class="btn ghost" href="/api/pda/documents/' + d.id + '/pdf" target="_blank" rel="noopener">Download ' + (d.status === 'finalized' ? 'FDA' : 'PDA') + '</a>' +
     (st < 5 ? '<button class="btn" data-act="advance" title="Moves the job to the next stage and records it in History">Move to: ' + esc(next) + '</button>' : '<button class="btn" disabled>Job closed</button>') + '</div></div>' +
     '<div class="row" style="gap:6px 22px;margin-top:14px;font-size:13px">' +
     [['Port', portName(d) || d.dis_port], ['Customer', d.customer_name], ['Voyage', d.voyage], ['ETA', d.eta ? fd(d.eta) : ''], ['Activity', d.operation], ['Principal ref', d.principal_ref]].filter(x => x[1]).map(x => '<span><span style="color:var(--muted)">' + x[0] + ':</span> ' + esc(x[1]) + '</span>').join('') + '</div>' +
@@ -10902,11 +11368,23 @@ function drawJob() {
   drawJobTab();
 }
 function drawJobTab() {
-  const f = {Overview: tabOverview, Charges: tabCharges, 'Husbandry and services': tabHusb, Invoices: tabInvoices, History: tabHistory, Documents: tabDocs}[S.jobTab];
+  const f = {Overview: tabOverview, Charges: tabCharges, 'Husbandry and services': tabHusb, Invoices: tabInvoices, 'Costs and profit': tabCosts, History: tabHistory, Documents: tabDocs}[S.jobTab];
   $('jbody').innerHTML = f();
   document.querySelectorAll('.pill[data-act="jtab"]').forEach(b => b.classList.toggle('on', b.dataset.t === S.jobTab));
 }
 ACT.jtab = (t) => { S.jobTab = t.dataset.t; drawJobTab(); };
+ACT.jdelete = () => {
+  const J = S.job, d = J.job, nI = J.invoices.length, nS = J.services.length, nF = J.files.length, nH = J.history.length;
+  const items = ['the PDA / FDA and all its charge lines', nI + ' invoice' + (nI === 1 ? '' : 's'), nS + ' service' + (nS === 1 ? '' : 's'), nF + ' uploaded document' + (nF === 1 ? '' : 's'), 'the full history (' + nH + ' entr' + (nH === 1 ? 'y' : 'ies') + ')'];
+  const body = '<p style="margin:10px 0 6px">Deleting <b>' + esc(d.pda_no) + '</b> (' + esc(d.vessel || 'vessel TBA') + ') permanently erases:</p><ul style="margin:0 0 10px 18px;font-size:14px;line-height:1.6">' + items.map(x => '<li>' + esc(x) + '</li>').join('') + '</ul><p style="margin:0;color:var(--muted);font-size:13px">This cannot be undone. If you only want it out of the way, move it to Closed instead.</p>' +
+    (nI ? '<label class="lb" for="mDelNo" style="margin-top:12px;display:block">This job has invoices. Type <b>' + esc(d.pda_no) + '</b> to confirm</label><input id="mDelNo" autocomplete="off">' : '');
+  modal({title: 'Delete this job?', body: body, ok: 'Delete job permanently', onOk: async () => {
+    const typed = nI ? ($('mDelNo').value || '').trim() : '';
+    if (nI && typed.toUpperCase() !== String(d.pda_no).toUpperCase()) { toast('Type the job number exactly to confirm.', true); return false; }
+    const r = await api('/api/pda/documents/' + d.id, 'DELETE', {confirm: typed});
+    if (!r.ok) { toast(r.data.error || 'Could not delete that job.', true); return false; }
+    S.job = null; toast('Job ' + d.pda_no + ' deleted.'); location.hash = '#/'; }});
+};
 ACT.jpin = async () => { const r = await api('/api/jobs/' + S.job.job.id + '/pin', 'POST'); if (r.ok) { S.job.pinned = r.data.pinned; drawJob(); } };
 function setJob(data) { S.job = data; const y = window.scrollY; drawJob(); window.scrollTo(0, y); }
 function money4(n) { return fmt(n); }
@@ -10926,7 +11404,34 @@ function tabOverview() {
     '<div class="row"><button class="btn ghost small" data-act="editInstr">' + (d.instructions ? 'Edit instructions' : 'Add instructions') + '</button></div></div>';
   const mon = '<div class="panel stack" style="gap:6px"><h2>Money at a glance (SAR)</h2>' + [['Pro forma (estimate)', fmt(m.pro_sar)], ['Final (actual costs)', J.stage >= 3 ? fmt(m.final_sar) : 'Not final yet'], ['Invoiced on this job', fmt(m.invoiced)], ['Paid', fmt(m.paid), 'ok']].map(x => '<div class="spread" style="font-size:14px;padding:8px 0;border-bottom:1px solid var(--border)"><span style="color:var(--muted)">' + x[0] + '</span><b style="font-variant-numeric:tabular-nums;' + (x[2] ? 'color:var(--ok)' : '') + '">' + x[1] + '</b></div>').join('') +
     '<div class="spread" style="font-size:15px;padding:8px 0"><b>Still to collect</b><b style="font-variant-numeric:tabular-nums;color:var(--danger-text)">' + fmt(m.owed) + '</b></div></div>';
-  return '<div class="grid2">' + cust + ves + instr + mon + '</div>';
+  return jobAtAGlance() + '<div class="grid2" style="margin-top:14px">' + cust + ves + instr + mon + '</div>';
+}
+
+function jobAtAGlance() {
+  const J = S.job, d = J.job, m = J.money;
+  const svc = J.services.filter(x => x.status !== 'Cancelled'), done = svc.filter(x => x.status === 'Done').length;
+  const unpaid = J.invoices.filter(i => !i.paid), pdaInv = J.invoices.filter(i => !i.is_draft), svcInv = J.invoices.filter(i => i.is_draft);
+  const tile = (k, v, sub, cls) => '<div class="box ' + (cls || '') + '"><div class="k">' + k + '</div><div class="v">' + v + '</div><div class="help" style="margin:2px 0 0">' + sub + '</div></div>';
+  const tiles = '<div class="sumrow" style="margin:0 0 14px">' +
+    tile('Services', svc.length, done + ' done, ' + (svc.length - done) + ' open') +
+    tile('Pro forma / final (SAR)', fmt(J.stage >= 3 ? m.final_sar : m.pro_sar), J.stage >= 3 ? 'Final account' : 'Estimate') +
+    tile('Invoices', J.invoices.length, svcInv.length + ' billed separately, ' + pdaInv.length + ' disbursement') +
+    tile('Still to collect (SAR)', fmt(m.owed), unpaid.length + ' unpaid', m.owed > 0 ? 'red' : '') +
+    tile('Profit so far (SAR)', fmt(J.profit.profit), J.profit.margin == null ? 'nothing billed yet' : J.profit.margin + '% of billed', J.profit.profit < 0 ? 'red' : '') +
+    '</div>';
+  const sv = svc.length ? '<div class="scroll-x"><table class="t" style="min-width:480px"><thead><tr><th>Service provided</th><th>Status</th><th class="num">Cost (SAR)</th></tr></thead><tbody>' +
+    J.services.map(x => '<tr><td>' + esc(x.name) + (x.over_limit ? ' <span class="chip reqd">over limit</span>' : '') + '</td><td><span class="chip ' + (x.status === 'Done' ? 'paid' : (x.status === 'Cancelled' ? '' : 'unpaid')) + '">' + esc(x.status) + '</span></td><td class="num">' + fmt(x.cost) + '</td></tr>').join('') + '</tbody></table></div>' :
+    '<div class="empty" style="padding:14px">No services recorded yet. Add them under Husbandry and services.</div>';
+  const iv = J.invoices.length ? '<div class="scroll-x"><table class="t" style="min-width:520px"><thead><tr><th>Invoice</th><th>Billed to / for</th><th class="num">SAR</th><th>Status</th><th></th></tr></thead><tbody>' +
+    J.invoices.map(i => '<tr><td style="font-weight:700;color:var(--navy)">' + esc(i.no) + '</td><td>' + (i.is_draft ? '<b>' + esc(i.bill_to) + '</b> <span class="help" style="margin:0">draft, services</span>' : esc(i.description) + ' <span class="help" style="margin:0">' + esc(i.kind_label) + '</span>') + '</td><td class="num">' + fmt(i.amount) + '</td><td><span class="chip ' + (i.paid ? 'paid' : 'unpaid') + '">' + (i.paid ? 'Paid' : 'Unpaid') + '</span></td><td>' + (i.is_draft ? '<a class="btn ghost small" href="/api/jobs/draft-invoices/' + i.id + '/pdf" target="_blank" rel="noopener">PDF</a>' : '') + '</td></tr>').join('') + '</tbody></table></div>' :
+    '<div class="empty" style="padding:14px">No invoices yet.</div>';
+  const docs = '<div class="row" style="gap:8px">' + ['<a class="btn ghost small" href="/api/pda/documents/' + d.id + '/pdf" target="_blank" rel="noopener">' + (d.status === 'finalized' ? 'FDA (PDF)' : 'PDA (PDF)') + '</a>'].concat(J.files.map(f => '<a class="btn ghost small" href="/api/jobs/docs/' + f.id + '" target="_blank" rel="noopener">' + esc(f.title) + '</a>')).join('') + '</div>';
+  const hist = J.history.slice(0, 5).map(h => '<div class="spread" style="font-size:13px;padding:5px 0;border-bottom:1px solid var(--border)"><span>' + esc(h.text) + '</span><span style="color:var(--muted);white-space:nowrap;margin-left:12px">' + esc(fdt(h.at)) + ' &middot; ' + esc(h.who) + '</span></div>').join('');
+  return '<div class="panel stack" style="gap:14px"><div class="spread"><h2>Everything on this job</h2><span class="help" style="margin:0">' + esc(d.vessel || 'Vessel TBA') + ' &middot; ' + esc(portName(d) || d.dis_port || '') + '</span></div>' + tiles +
+    '<div class="grid2"><div class="stack" style="gap:8px"><h3 style="margin:0">Services provided</h3>' + sv + '</div><div class="stack" style="gap:8px"><h3 style="margin:0">Invoices</h3>' + iv +
+    '<div class="row"><button class="btn small" data-act="dinvNew">+ Draft invoice</button></div></div></div>' +
+    '<div class="stack" style="gap:6px"><h3 style="margin:0">Documents</h3>' + docs + '</div>' +
+    '<div class="stack" style="gap:2px"><h3 style="margin:0 0 4px">Latest activity</h3>' + (hist || '<div class="help">Nothing recorded yet.</div>') + '<div><button class="btn ghost small" data-act="jtab" data-t="History">Full history</button></div></div></div>';
 }
 function editorUrl() { return '/pda?job=' + S.job.job.id + '#d' + S.job.job.id; }
 ACT.saveClient = async () => { const r = await api('/api/jobs/' + S.job.job.id + '/save-client', 'POST'); if (!r.ok) return toast(r.data.error || 'Could not save the client.', true); toast('Saved to your Clients list.'); setJob(r.data); };
@@ -11044,10 +11549,10 @@ ACT.svcDel = (t) => modal({title: 'Remove this service?', text: 'It is taken off
 /* --- invoices --- */
 function tabInvoices() {
   const J = S.job, m = J.money, d = J.job;
-  const rows = J.invoices.map(i => '<tr><td style="font-weight:700;color:var(--navy)">' + esc(i.no) + '</td><td>' + esc(i.description) + '<div class="help" style="margin:0">' + esc(i.kind_label) + '</div></td><td class="num">' + fmt(i.amount) + '</td><td><span class="chip ' + (i.paid ? 'paid' : 'unpaid') + '">' + (i.paid ? 'Paid' : 'Unpaid') + '</span></td>' +
-    '<td class="num"><button class="btn ghost small" data-act="invPaid" data-id="' + i.id + '" data-p="' + (i.paid ? '0' : '1') + '">' + (i.paid ? 'Mark unpaid' : 'Mark paid') + '</button> <button class="btn ghost danger small" data-act="invDel" data-id="' + i.id + '" aria-label="Remove invoice ' + esc(i.no) + '">Remove</button></td></tr>').join('');
+  const rows = J.invoices.map(i => '<tr><td style="font-weight:700;color:var(--navy)">' + esc(i.no) + '</td><td>' + (i.is_draft ? '<b>' + esc(i.bill_to) + '</b><div class="help" style="margin:0">' + esc(i.description) + ' &middot; Draft invoice, ' + esc(i.currency) + ' ' + fmt(i.totals.total) + (i.currency === 'USD' ? ' (SAR ' + fmt(i.totals.total_sar) + ')' : '') + '</div>' : esc(i.description) + '<div class="help" style="margin:0">' + esc(i.kind_label) + '</div>') + '</td><td class="num">' + fmt(i.amount) + '</td><td><span class="chip ' + (i.paid ? 'paid' : 'unpaid') + '">' + (i.paid ? 'Paid' : 'Unpaid') + '</span></td>' +
+    '<td class="num">' + (i.is_draft ? '<a class="btn ghost small" href="/api/jobs/draft-invoices/' + i.id + '/pdf" target="_blank" rel="noopener">PDF</a> <button class="btn ghost small" data-act="dinvEdit" data-id="' + i.id + '">Edit</button> ' : '') + '<button class="btn ghost small" data-act="invPaid" data-id="' + i.id + '" data-p="' + (i.paid ? '0' : '1') + '">' + (i.paid ? 'Mark unpaid' : 'Mark paid') + '</button> <button class="btn ghost danger small" data-act="invDel" data-id="' + i.id + '" aria-label="Remove invoice ' + esc(i.no) + '">Remove</button></td></tr>').join('');
   return '<div class="panel"><div class="spread" style="margin-bottom:12px"><div><h2>Invoices on this job</h2><div class="hint" style="margin:0">Every invoice for this vessel is linked to job ' + esc(d.pda_no) + ' automatically. Official tax invoices are issued from your accounting system; type its number here to link it.</div></div>' +
-    '<button class="btn" data-act="invNew">+ New invoice for this job</button></div>' +
+    '<div class="row"><button class="btn" data-act="dinvNew">+ Draft invoice (services)</button><button class="btn ghost" data-act="invNew">+ Simple invoice</button></div></div>' +
     '<div class="sumrow" style="margin:0 0 14px"><div class="box"><div class="k">Invoiced</div><div class="v">' + fmt(m.invoiced) + '</div></div><div class="box"><div class="k">Paid</div><div class="v" style="color:var(--ok)">' + fmt(m.paid) + '</div></div><div class="box red"><div class="k">Still to collect</div><div class="v">' + fmt(m.owed) + '</div></div></div>' +
     (J.invoices.length ? '<div class="scroll-x"><table class="t" style="min-width:700px"><thead><tr><th>Invoice</th><th>For</th><th class="num">Amount (SAR)</th><th>Status</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>' : '<div class="empty">No invoices on this job yet. Press <b>+ New invoice for this job</b>.</div>') + '</div>';
 }
@@ -11066,6 +11571,113 @@ ACT.invNew = () => {
     }});
   $('iKind').addEventListener('change', function () { const k = this.value, J2 = S.job; const map = {main: ['Port disbursements (' + (J2.stage >= 3 ? 'final account' : 'pro forma') + ')', J2.stage >= 3 ? J2.money.final_sar : J2.money.pro_sar], supplementary: ['Supplementary disbursements', ''], vendor: ['Vendor invoice passed on', ''], service: ['Husbandry / service', '']}; $('iDesc').value = map[k][0]; $('iAmt').value = map[k][1]; });
 };
+
+/* --- draft invoice editor (services billed to a party, outside the PDA/FDA) --- */
+let DINV = null;
+function dinvLineRow(l, i) {
+  const units = DINV.units.map(u => '<option' + (u === l.unit ? ' selected' : '') + '>' + esc(u) + '</option>').join('');
+  return '<tr data-i="' + i + '"><td><input type="text" data-f="description" value="' + esc(l.description) + '" placeholder="e.g. Port pass charges" style="min-width:190px"></td><td><select data-f="unit">' + units + '</select></td>' +
+    '<td><input data-f="qty" type="number" step="any" min="0" value="' + l.qty + '" style="width:72px"></td><td><input data-f="rate" type="number" step="any" min="0" value="' + (l.rate === 0 ? '' : l.rate) + '" style="width:92px"></td>' +
+    '<td><select data-f="vat_pct"><option value="0"' + (+l.vat_pct === 0 ? ' selected' : '') + '>0%</option><option value="15"' + (+l.vat_pct === 15 ? ' selected' : '') + '>15%</option></select></td>' +
+    '<td class="num" data-tot style="white-space:nowrap">-</td><td><button class="btn ghost danger small" data-act="dinvDelLine" data-i="' + i + '" aria-label="Remove line">&times;</button></td></tr>';
+}
+function dinvReadLines() {
+  return Array.from(document.querySelectorAll('#dinvLines tr[data-i]')).map(tr => { const o = {}; tr.querySelectorAll('[data-f]').forEach(e => { o[e.dataset.f] = e.value; }); return {description: o.description, unit: o.unit, qty: parseFloat(o.qty) || 0, rate: parseFloat(o.rate) || 0, vat_pct: parseFloat(o.vat_pct) || 0}; });
+}
+function dinvDraw() {
+  $('dinvLines').innerHTML = DINV.lines.map(dinvLineRow).join('');
+  dinvTotals();
+}
+function dinvTotals() {
+  const cur = $('dInvCur') ? $('dInvCur').value : 'SAR', fx = $('dInvFx') ? (parseFloat($('dInvFx').value) || 3.75) : 1, lines = dinvReadLines();
+  let net = 0, vat = 0;
+  document.querySelectorAll('#dinvLines tr[data-i]').forEach((tr, k) => { const l = lines[k], fc = l.qty * l.rate, v = fc * l.vat_pct / 100; net += fc; vat += v; tr.querySelector('[data-tot]').textContent = fmt(fc + v); });
+  const total = net + vat;
+  $('dinvSum').innerHTML = '<div class="spread" style="font-size:13px"><span>Amount without VAT</span><b>' + cur + ' ' + fmt(net) + '</b></div><div class="spread" style="font-size:13px"><span>VAT</span><b>' + cur + ' ' + fmt(vat) + '</b></div><div class="spread" style="font-size:16px;margin-top:4px"><b>Total payable</b><b>' + cur + ' ' + fmt(total) + '</b></div>' + (cur === 'USD' ? '<div class="help" style="text-align:right">= SAR ' + fmt(total * fx) + ' at ' + fx + '</div>' : '');
+}
+IN.dinv = () => dinvTotals();
+CH.dinv = () => dinvTotals();
+ACT.dinvDelLine = (t) => { DINV.lines = dinvReadLines(); DINV.lines.splice(+t.dataset.i, 1); if (!DINV.lines.length) DINV.lines.push({description: '', unit: 'PER SHIPMENT', qty: 1, rate: 0, vat_pct: 0}); dinvDraw(); };
+ACT.dinvAddLine = () => { DINV.lines = dinvReadLines(); DINV.lines.push({description: '', unit: 'PER SHIPMENT', qty: 1, rate: 0, vat_pct: 0}); dinvDraw(); };
+ACT.dinvFromSvc = () => {
+  DINV.lines = dinvReadLines().filter(l => l.description);
+  const have = new Set(DINV.lines.map(l => l.description.toLowerCase()));
+  let n = 0;
+  S.job.services.filter(x => x.status !== 'Cancelled').forEach(x => { if (!have.has(String(x.name).toLowerCase())) { DINV.lines.push({description: x.name, unit: 'PER SHIPMENT', qty: 1, rate: +x.cost || 0, vat_pct: 0}); n++; } });
+  if (!DINV.lines.length) DINV.lines.push({description: '', unit: 'PER SHIPMENT', qty: 1, rate: 0, vat_pct: 0});
+  dinvDraw(); toast(n ? n + ' service' + (n === 1 ? '' : 's') + ' from this job added as lines.' : 'No more services on this job to add.');
+};
+async function dinvOpen(inv) {
+  const J = S.job, r = await api('/api/jobs/invoice-defaults/' + J.job.id);
+  if (!r.ok) return toast(r.data.error || 'Could not open the invoice form.', true);
+  const df = r.data;
+  DINV = {id: inv ? inv.id : null, units: df.units, lines: inv ? inv.lines.map(l => Object.assign({}, l)) : [{description: '', unit: 'PER SHIPMENT', qty: 1, rate: 0, vat_pct: 0}]};
+  const v = (k) => esc(inv ? (inv[k] || '') : (df[k] || ''));
+  const today = new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10);
+  const f = (id, label, val, extra) => '<div><label class="lb" for="' + id + '">' + label + '</label><input id="' + id + '" type="text" value="' + val + '" ' + (extra || '') + '></div>';
+  modal({title: inv ? 'Edit draft invoice ' + inv.no : 'New draft invoice for ' + J.job.pda_no, text: 'Billed to a party you choose, separate from the PDA/FDA. Compass makes the draft; your accounting system issues the official tax invoice.', wide: true, ok: inv ? 'Save changes' : 'Create draft invoice',
+    body: '<div class="stack" style="gap:12px;max-height:66vh;overflow:auto;padding-right:4px">' +
+      '<div class="grid2">' + f('dInvTo', 'Billed to <span class="req">required</span>', inv ? esc(inv.bill_to) : esc(df.bill_to)) + f('dInvVat', 'Customer VAT Reg #', v('bill_vat_no')) + '</div>' +
+      '<div class="grid2"><div><label class="lb" for="dInvCur">Currency</label><select id="dInvCur" data-in="dinv" data-ch="dinv"><option' + (inv && inv.currency === 'SAR' ? ' selected' : '') + '>SAR</option><option' + (!inv || inv.currency === 'USD' ? ' selected' : '') + '>USD</option></select></div>' +
+      '<div><label class="lb" for="dInvFx">Rate to SAR</label><input id="dInvFx" type="number" step="any" value="' + (inv ? inv.fx_rate : 3.75) + '" data-in="dinv"></div></div>' +
+      '<div><div class="spread" style="margin-bottom:6px"><b>Services billed</b><button class="btn ghost small" data-act="dinvFromSvc">Add from this job\'s services</button></div>' +
+      '<div class="scroll-x"><table class="t" style="min-width:640px"><thead><tr><th>Service</th><th>Charged</th><th>Qty</th><th>Rate</th><th>VAT</th><th class="num">Total</th><th></th></tr></thead><tbody id="dinvLines" data-in="dinv" data-ch="dinv"></tbody></table></div>' +
+      '<div class="row" style="margin-top:8px"><button class="btn ghost small" data-act="dinvAddLine">+ Add a line</button></div></div>' +
+      '<div class="panel" id="dinvSum"></div>' +
+      '<div class="grid2"><div><label class="lb" for="dInvAddr">Address</label><textarea id="dInvAddr" rows="2">' + v('bill_address') + '</textarea></div>' + f('dInvAtt', 'Attention to', v('attention')) + '</div>' +
+      '<div class="grid2"><div><label class="lb" for="dInvDate">Invoice date</label><input id="dInvDate" type="date" value="' + (inv ? esc(inv.issue_date) : today) + '"></div>' + f('dInvNo', 'Invoice number <span class="opt">from your accounting system, or leave blank</span>', inv ? esc(inv.no) : '') + '</div>' +
+      f('dInvJob', 'Accounting system job # <span class="opt">optional</span>', v('acct_job_no')) +
+      f('dInvRem', 'Remarks', v('remarks'), 'placeholder="e.g. Port pass and material pass charges for MV ' + esc(J.job.vessel || '') + '"') +
+      '<div class="grid2">' + f('dInvPrep', 'Prepared by', v('prepared_by')) + f('dInvFin', 'Finance manager', v('finance_mgr')) + '</div></div>',
+    onOk: async () => {
+      const body = {bill_to: $('dInvTo').value, bill_vat_no: $('dInvVat').value, bill_address: $('dInvAddr').value, attention: $('dInvAtt').value, currency: $('dInvCur').value, fx_rate: $('dInvFx').value,
+        issue_date: $('dInvDate').value, no: $('dInvNo').value, acct_job_no: $('dInvJob').value, remarks: $('dInvRem').value, prepared_by: $('dInvPrep').value, finance_mgr: $('dInvFin').value, lines: dinvReadLines()};
+      const r = DINV.id ? await api('/api/jobs/draft-invoices/' + DINV.id, 'PUT', body) : await api('/api/jobs/' + J.job.id + '/draft-invoices', 'POST', body);
+      if (!r.ok) { toast(r.data.error || 'Could not save the invoice.', true); return false; }
+      setJob(r.data); toast(DINV.id ? 'Draft invoice updated.' : 'Draft invoice added to the job.');
+      if (!DINV.id && r.data.invoice_id) window.open('/api/jobs/draft-invoices/' + r.data.invoice_id + '/pdf', '_blank');
+    }});
+  dinvDraw();
+}
+ACT.dinvNew = () => dinvOpen(null);
+ACT.dinvEdit = (t) => dinvOpen(S.job.invoices.find(i => String(i.id) === t.dataset.id));
+
+/* --- costs paid to suppliers, and profit --- */
+function tabCosts() {
+  const J = S.job, P = J.profit, groups = {};
+  J.costs.forEach(c => { const k = c.supplier + '||' + c.inv_no; (groups[k] = groups[k] || {supplier: c.supplier, inv_no: c.inv_no, inv_date: c.inv_date, rows: []}).rows.push(c); });
+  const gh = Object.values(groups).map(g => {
+    const tot = g.rows.reduce((a, c) => a + c.total, 0), allPaid = g.rows.every(c => c.paid);
+    return '<div class="panel" style="padding:14px"><div class="spread" style="margin-bottom:8px"><div><b style="font-size:15px">' + esc(g.supplier) + '</b> <span class="help" style="margin:0">' + (g.inv_no ? 'Invoice ' + esc(g.inv_no) : 'no invoice number') + (g.inv_date ? ' &middot; ' + esc(fd(g.inv_date)) : '') + '</span></div>' +
+      '<div class="row"><span class="chip ' + (allPaid ? 'paid' : 'unpaid') + '">' + (allPaid ? 'Paid' : 'Unpaid') + '</span><b>SAR ' + fmt(tot) + '</b><button class="btn ghost small" data-act="costPaid" data-s="' + esc(g.supplier) + '" data-n="' + esc(g.inv_no) + '" data-p="' + (allPaid ? '0' : '1') + '">' + (allPaid ? 'Mark unpaid' : 'Mark paid') + '</button></div></div>' +
+      '<div class="scroll-x"><table class="t" style="min-width:560px"><thead><tr><th>Charge</th><th>Charged</th><th class="num">Qty</th><th class="num">Rate</th><th>VAT</th><th class="num">Total</th><th></th></tr></thead><tbody>' +
+      g.rows.map(c => '<tr><td>' + esc(c.description) + '</td><td>' + esc(c.unit.toLowerCase()) + '</td><td class="num">' + c.qty + '</td><td class="num">' + fmt(c.rate) + '</td><td>' + c.vat_pct + '%</td><td class="num">' + fmt(c.total) + '</td><td class="num"><button class="btn ghost danger small" data-act="costDel" data-id="' + c.id + '" aria-label="Remove line">Remove</button></td></tr>').join('') + '</tbody></table></div></div>';
+  }).join('');
+  return '<div class="stack" style="gap:14px"><div class="panel"><div class="spread" style="margin-bottom:12px"><div><h2>Costs and profit</h2><div class="hint" style="margin:0">What suppliers charged for this vessel (port, tug, stevedore...) against what you billed. Amounts in SAR, VAT left out of profit. Costs you pass on to the principal only balance out once their invoice is added under Invoices.</div></div><button class="btn" data-act="costNew">+ Add supplier invoice</button></div>' +
+    '<div class="sumrow" style="margin:0"><div class="box"><div class="k">Billed to parties</div><div class="v">' + fmt(P.billed) + '</div></div><div class="box"><div class="k">Supplier costs</div><div class="v">' + fmt(P.cost_net) + '</div></div>' +
+    '<div class="box ' + (P.profit < 0 ? 'red' : '') + '"><div class="k">Profit</div><div class="v" style="color:' + (P.profit < 0 ? 'var(--danger-text)' : 'var(--ok)') + '">' + fmt(P.profit) + '</div><div class="help" style="margin:2px 0 0">' + (P.margin == null ? 'nothing billed yet' : P.margin + '% margin') + '</div></div>' +
+    '<div class="box ' + (P.cost_unpaid > 0 ? 'red' : '') + '"><div class="k">Still to pay suppliers</div><div class="v">' + fmt(P.cost_unpaid) + '</div></div></div></div>' +
+    (gh || '<div class="panel empty">No supplier costs recorded yet. Press <b>+ Add supplier invoice</b> and type what the port, tug company or stevedore charged.</div>') + '</div>';
+}
+ACT.costNew = async () => {
+  const J = S.job, r = await api('/api/jobs/invoice-defaults/' + J.job.id);
+  if (!r.ok) return toast(r.data.error || 'Could not open the form.', true);
+  DINV = {id: null, units: r.data.units, lines: [{description: '', unit: 'PER SHIPMENT', qty: 1, rate: 0, vat_pct: 0}]};
+  modal({title: 'Add a supplier invoice', text: 'What a supplier charged for ' + (J.job.vessel || 'this vessel') + '. It stays inside this job.', wide: true, ok: 'Save costs',
+    body: '<div class="stack" style="gap:12px;max-height:64vh;overflow:auto;padding-right:4px"><div class="grid2"><div><label class="lb" for="cSup">Supplier <span class="req">required</span></label><input id="cSup" type="text" list="cSupList" placeholder="e.g. Yanbu Industrial Port"><datalist id="cSupList">' + [...new Set(J.costs.map(c => c.supplier))].map(x => '<option value="' + esc(x) + '">').join('') + '</datalist></div>' +
+      '<div><label class="lb" for="cNo">Their invoice number</label><input id="cNo" type="text"></div></div>' +
+      '<div class="grid2"><div><label class="lb" for="cDate">Invoice date</label><input id="cDate" type="date"></div><div><label class="lb" for="cPaid">Already paid?</label><select id="cPaid"><option value="0">Not yet</option><option value="1">Yes, paid</option></select></div></div>' +
+      '<div><div class="spread" style="margin-bottom:6px"><b>Charges on their invoice</b></div><div class="scroll-x"><table class="t" style="min-width:640px"><thead><tr><th>Charge</th><th>Charged</th><th>Qty</th><th>Rate (SAR)</th><th>VAT</th><th class="num">Total</th><th></th></tr></thead><tbody id="dinvLines" data-in="dinv" data-ch="dinv"></tbody></table></div>' +
+      '<div class="row" style="margin-top:8px"><button class="btn ghost small" data-act="dinvAddLine">+ Add a line</button></div></div><div class="panel" id="dinvSum"></div></div>',
+    onOk: async () => {
+      const r2 = await api('/api/jobs/' + J.job.id + '/costs', 'POST', {supplier: $('cSup').value, inv_no: $('cNo').value, inv_date: $('cDate').value, paid: $('cPaid').value === '1', lines: dinvReadLines()});
+      if (!r2.ok) { toast(r2.data.error || 'Could not save the costs.', true); return false; }
+      setJob(r2.data); toast('Supplier costs added to the job.');
+    }});
+  dinvDraw();
+};
+ACT.costPaid = async (t) => { const r = await api('/api/jobs/' + S.job.job.id + '/costs/paid', 'POST', {supplier: t.dataset.s, inv_no: t.dataset.n, paid: t.dataset.p === '1'}); if (!r.ok) return toast(r.data.error || 'Could not update.', true); setJob(r.data); };
+ACT.costDel = (t) => modal({title: 'Remove this cost line?', text: 'Use this for a line entered by mistake. The removal is recorded in History.', ok: 'Remove line', onOk: async () => { const r = await api('/api/jobs/costs/' + t.dataset.id, 'DELETE'); if (!r.ok) { toast(r.data.error || 'Could not remove it.', true); return false; } setJob(r.data); toast('Cost line removed.'); }});
 ACT.invPaid = async (t) => { const r = await api('/api/jobs/invoices/' + t.dataset.id, 'POST', {paid: t.dataset.p === '1'}); if (!r.ok) return toast(r.data.error || 'Could not update.', true); setJob(r.data); };
 ACT.invDel = (t) => modal({title: 'Remove this invoice?', text: 'Use this only for an invoice entered by mistake. The removal is recorded in History.', ok: 'Remove invoice', onOk: async () => { const r = await api('/api/jobs/invoices/' + t.dataset.id, 'DELETE'); if (!r.ok) { toast(r.data.error || 'Could not remove it.', true); return false; } setJob(r.data); }});
 
@@ -11496,7 +12108,6 @@ PDA_HTML = """
           <span class="theme-knob"></span>
         </span>
       </label>
-      <a href="/do-tracker">DO Tracker</a>
       {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
       <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
@@ -12659,7 +13270,6 @@ SOF_HTML = """
         </span>
       </label>
       <a href="/pda">Disbursement Accounts</a>
-      <a href="/do-tracker">DO Tracker</a>
       {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
       <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
