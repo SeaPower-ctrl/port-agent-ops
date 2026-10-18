@@ -795,6 +795,16 @@ def init_db():
         )"""
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions (user_id)")
+    # Failed sign-ins, for the 15-minute lockout (in the database so restarts don't reset it).
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS login_failures (
+            id SERIAL PRIMARY KEY,
+            kind TEXT NOT NULL,
+            key TEXT NOT NULL,
+            at BIGINT NOT NULL
+        )"""
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_login_failures_key ON login_failures (kind, key, at)")
     cur.execute(
         """CREATE TABLE IF NOT EXISTS records (
             bl_number TEXT PRIMARY KEY,
@@ -2220,8 +2230,6 @@ def setup():
 _LOGIN_MAX_ATTEMPTS = 8
 _LOGIN_MAX_ATTEMPTS_PER_USER = 20
 _LOGIN_WINDOW_SECONDS = 900  # 15 minutes
-_login_failures = {}  # ip -> [timestamp, ...] of recent failed attempts
-_login_failures_user = {}  # lowercased username -> [timestamp, ...]
 
 
 def _client_ip():
@@ -2234,28 +2242,31 @@ def _client_ip():
     return request.remote_addr or "unknown"
 
 
-def _recent(store, key):
-    now = time.time()
-    recent = [t for t in store.get(key, []) if now - t < _LOGIN_WINDOW_SECONDS]
-    if recent:
-        store[key] = recent
-    else:
-        store.pop(key, None)  # don't let the dict grow forever with stale keys
-    return recent
+def _failures_since(kind, key):
+    """How many failed sign-ins this IP / username has had in the last 15 minutes.
+    Kept in the database, so a restart or a new deploy doesn't wipe the count."""
+    if not key:
+        return 0
+    db = get_db()
+    cutoff = int(time.time()) - _LOGIN_WINDOW_SECONDS
+    return db.execute("SELECT COUNT(*) AS n FROM login_failures WHERE kind = ? AND key = ? AND at > ?", (kind, key, cutoff)).fetchone()["n"]
 
 
 def _login_locked_out(ip, username=""):
-    if len(_recent(_login_failures, ip)) >= _LOGIN_MAX_ATTEMPTS:
+    if _failures_since("ip", ip) >= _LOGIN_MAX_ATTEMPTS:
         return True
-    user_key = (username or "").strip().lower()
-    return bool(user_key) and len(_recent(_login_failures_user, user_key)) >= _LOGIN_MAX_ATTEMPTS_PER_USER
+    return _failures_since("user", (username or "").strip().lower()) >= _LOGIN_MAX_ATTEMPTS_PER_USER
 
 
 def _record_login_failure(ip, username=""):
-    _login_failures.setdefault(ip, []).append(time.time())
-    user_key = (username or "").strip().lower()
+    db = get_db()
+    now = int(time.time())
+    db.execute("DELETE FROM login_failures WHERE at < ?", (now - 86400,))   # keep the table small
+    db.execute("INSERT INTO login_failures (kind, key, at) VALUES ('ip', ?, ?)", ((ip or "")[:64], now))
+    user_key = (username or "").strip().lower()[:120]
     if user_key:
-        _login_failures_user.setdefault(user_key, []).append(time.time())
+        db.execute("INSERT INTO login_failures (kind, key, at) VALUES ('user', ?, ?)", (user_key, now))
+    db.commit()
 
 
 _DUMMY_HASH = generate_password_hash("not-a-real-password")
@@ -9054,6 +9065,11 @@ AUTH_STYLE = """
   [dir="rtl"] .pw-wrap input { padding-right: 13px; padding-left: 42px; }
   [dir="rtl"] .pw-toggle { right: auto; left: 5px; }
   @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+  /* dark mode: Sign In button a shade deeper so the white text is easy to read */
+  :root[data-theme="dark"] button[type="submit"], :root[data-theme="dark"] a.btn-link { background: #2f74a6; }
+  :root[data-theme="dark"] button[type="submit"]:hover, :root[data-theme="dark"] a.btn-link:hover { background: #3a82b5; }
+  /* background shapes stay where they are instead of drifting (saves battery on older phones) */
+  .blob1, .blob2 { animation: none; }
 </style>
 <script>
 try { if (sessionStorage.getItem('logoSeen')) document.documentElement.classList.add('seen'); sessionStorage.setItem('logoSeen', '1'); } catch (e) {}
