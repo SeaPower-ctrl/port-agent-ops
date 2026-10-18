@@ -8966,7 +8966,7 @@ AUTH_STYLE = """
   input.code { text-align: center; font-size: 24px; font-weight: 700; letter-spacing: .32em; padding: 13px 10px; font-variant-numeric: tabular-nums; }
   input.code.recovery { font-size: 18px; letter-spacing: .12em; }
   .auth-link { display: block; text-align: center; margin-top: 16px; font-size: 13px; font-weight: 600; color: var(--muted); text-decoration: none; background: none; border: 0; width: 100%; padding: 6px; cursor: pointer; }
-  .auth-link:hover { color: var(--text); }
+  .auth-link:hover { color: var(--text); background: none; }
   .step { display: flex; gap: 12px; align-items: flex-start; margin-top: 18px; font-size: 13.5px; line-height: 1.5; }
   .step b.n { flex: none; width: 24px; height: 24px; border-radius: 50%; background: var(--navy); color: #fff; font-size: 12px; display: inline-flex; align-items: center; justify-content: center; margin-top: 1px; }
   .qr-wrap { margin: 14px auto 0; width: 190px; height: 190px; padding: 8px; background: #fff; border-radius: 14px; border: 1px solid var(--border); }
@@ -9221,7 +9221,7 @@ AUTH_I18N_JS = r"""<script>
     en: {co: 'Sea Power Marine Services Co. Ltd', h1: 'Sign in to Compass', sub: 'Your shared workspace.', expired: 'You were signed out. Please sign in again.',
       eBoth: 'Wrong username or password.', eLock: 'Too many failed attempts. Please wait 15 minutes and try again.', user: 'Username', eUser: 'Enter your username.', pw: 'Password',
       caps: 'Caps Lock is on', ePw: 'Enter your password.', keep: 'Keep me signed in', keep2: 'For 7 days on this device', signin: 'Sign In', hello: 'Hello, ', vsub: 'Enter the 6-digit code from your authenticator app.',
-      as: 'Signing in as', vlabel: 'Verification code', verify: 'Verify', rec: 'Lost your phone? Use a recovery code', notyou: 'Not you? Back to sign in',
+      vlabel: 'Verification code', verify: 'Verify', rec: 'Lost your phone? Use a recovery code', notyou: 'Not you? Back to sign in',
       eCode: "That code isn't right. Use the code showing in your app now.", eCode6: 'Enter all 6 digits.', recLbl: 'Recovery code', recSub: 'Enter one of the recovery codes you saved. Each one works once.',
       useApp: 'Use my authenticator app instead', show: 'Show password', hide: 'Hide password', eRec: "That recovery code isn't right, or it has already been used."},
     ar: {co: 'شركة سي باور للخدمات البحرية المحدودة', h1: 'تسجيل الدخول إلى كومباس', sub: 'مساحة العمل المشتركة.',
@@ -9231,7 +9231,7 @@ AUTH_I18N_JS = r"""<script>
       user: 'اسم المستخدم', eUser: 'أدخل اسم المستخدم.', pw: 'كلمة المرور',
       caps: 'مفتاح الأحرف الكبيرة مفعّل', ePw: 'أدخل كلمة المرور.', keep: 'إبقائي مسجلاً',
       keep2: 'لمدة 7 أيام على هذا الجهاز', signin: 'تسجيل الدخول', hello: 'مرحباً، ',
-      vsub: 'أدخل الرمز المكوّن من 6 أرقام من تطبيق المصادقة.', as: 'تسجيل الدخول باسم',
+      vsub: 'أدخل الرمز المكوّن من 6 أرقام من تطبيق المصادقة.',
       vlabel: 'رمز التحقق', verify: 'تحقّق', rec: 'فقدت هاتفك؟ استخدم رمز استرداد',
       notyou: 'لست أنت؟ العودة لتسجيل الدخول',
       eCode: 'الرمز غير صحيح. استخدم الرمز الظاهر في التطبيق الآن.', eCode6: 'أدخل الأرقام الستة كاملة.',
@@ -9337,7 +9337,6 @@ VERIFY_HTML = """
   </div>
   <h1><span data-t="hello">Hello, </span>{{ name }}</h1>
   <div class="sub" id="vsub" data-t="vsub">Enter the 6-digit code from your authenticator app.</div>
-  <div class="who"><span data-t="as">Signing in as</span> <b>{{ username }}</b></div>
   {% if error and error_key == 'eLock' %}<div class="error" role="alert">""" + AUTH_ERR_ICON + """<span data-t="eLock">{{ error }}</span></div>{% endif %}
   <form method="post" id="vform" novalidate>
     <label for="vcode" id="vlabel" data-t="vlabel">Verification code</label>
