@@ -9344,6 +9344,9 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
     today = now.date().isoformat()
     if snap["lineup_date"] < today:
         out["alerts"].append({"tone": "warn", "title": f"Today's {short} line-up is not in yet", "text": f"Showing the line-up of {_lu_fmt_day(snap['lineup_date'])}. Upload today's to refresh the plan."})
+    if prev_snap_had_expected(db, port, snap) and not any(v["status"] == "expected" for v in vessels):
+        out["alerts"].append({"tone": "info", "title": "No expected vessels on this line-up",
+                              "text": "The previous line-up had some. If the expected-vessels list came as a separate file, upload it too; it is added to the same day."})
     if not berths:
         out["alerts"].append({"tone": "warn", "title": f"Add the {short} berths", "text": "Enter each general cargo berth with its maximum draft, so Compass can tell which berths a vessel fits."})
     elif any(not b.get("max_draft") for b in berths):
@@ -9372,6 +9375,11 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
     rank = {"bad": 0, "warn": 1, "info": 2}
     out["alerts"].sort(key=lambda a: rank[a["tone"]])
     return out
+
+
+def prev_snap_had_expected(db, port, snap):
+    prev = _lu_latest(db, port, before_id=snap["id"])
+    return bool(prev) and bool(db.execute("SELECT 1 FROM lu_vessels WHERE snapshot_id = ? AND status = 'expected' LIMIT 1", (prev["id"],)).fetchone())
 
 
 def _ord(n):
@@ -9504,16 +9512,35 @@ def lineups_overview():
     })
 
 
+_LU_STATUS_RANK = {"alongside": 3, "anchor": 2, "expected": 1}
+_LU_FIELDS = ("vessel", "agent", "cargo", "qty", "loa", "draft", "arrived", "eta", "etb", "berth", "berthed", "etd", "status", "remarks")
+
+
+def _lu_merge(a, b):
+    """One vessel listed in two files (e.g. Dammam's berthing line-up and its
+    expected-vessels list): keep the most advanced status (alongside > at anchor >
+    expected) with its berth and dates, and fill any blank detail from the other."""
+    hi, lo = (a, b) if _LU_STATUS_RANK.get(a["status"], 0) >= _LU_STATUS_RANK.get(b["status"], 0) else (b, a)
+    out = dict(hi)
+    for k in _LU_FIELDS:
+        if out.get(k) in (None, "") and lo.get(k) not in (None, ""):
+            out[k] = lo[k]
+    return out
+
+
 @app.route("/api/lineups/import", methods=["POST"])
 @login_required
 def lineups_import():
+    """Reads one or more line-up files. Files for the same port and date are
+    combined into that day's line-up (Dammam sends a berthing line-up and a
+    separate expected-vessels list); uploading again the same day adds to it
+    and updates vessels already on it, and never drops the others."""
     port = (request.form.get("port") or "").upper()
     day = (request.form.get("date") or "").strip() or _riyadh_today().isoformat()
     try:
         ref = datetime.strptime(day, "%Y-%m-%d").date()
     except ValueError:
         return jsonify({"error": "Choose the line-up date."}), 400
-    results = []
     sources = []
     for f in request.files.getlist("files"):
         raw = f.read()
@@ -9527,7 +9554,8 @@ def lineups_import():
         sources.append(("pasted text", text.encode("utf-8")))
     if not sources:
         return jsonify({"error": "Add a line-up file or paste the line-up text."}), 400
-    db = get_db()
+
+    results, by_port = [], {}
     for fname, raw in sources:
         try:
             tables = _lu_tables_from_upload(raw, fname if fname != "pasted text" else "")
@@ -9542,27 +9570,67 @@ def lineups_import():
         if not rows:
             results.append({"source": fname, "error": "No vessel table found. The line-up needs a header row with at least the vessel name and two of: agent, cargo, quantity, draft, arrival, berth."})
             continue
+        results.append({"source": fname, "port": p, "port_name": _LU_PORT[p][0], "vessels": len(rows)})
+        by_port.setdefault(p, []).append((fname, rows))
+
+    db = get_db()
+    for p, files in by_port.items():
+        # combine this upload's files, one entry per vessel
+        merged, order = {}, []
+        for fname, rows in files:
+            for r in rows:
+                if r["vessel"] in merged:
+                    merged[r["vessel"]] = _lu_merge(merged[r["vessel"]], r)
+                else:
+                    merged[r["vessel"]] = r
+                    order.append(r["vessel"])
         now_txt = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-        snap_id = db.execute("INSERT INTO lu_snapshots (port, lineup_date, source, created_by, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
-                             (p, day, fname[:120], _who(), now_txt)).fetchone()["id"]
-        known = {_lu_norm_berth(b["name"]) for b in db.execute("SELECT name FROM lu_berths WHERE port = ?", (p,)).fetchall()}
+        names = ", ".join(f for f, _ in files)
+        existing = db.execute("SELECT * FROM lu_snapshots WHERE port = ? AND lineup_date = ? ORDER BY id DESC LIMIT 1", (p, day)).fetchone()
+        if existing:
+            snap_id = existing["id"]
+            src = existing["source"] or ""
+            add = [f for f, _ in files if f not in src]
+            if add:
+                db.execute("UPDATE lu_snapshots SET source = ? WHERE id = ?", ((src + ", " + ", ".join(add)).strip(", ")[:300], snap_id))
+            have = {v["vessel"]: v for v in _lu_vessels(db, snap_id)}
+        else:
+            snap_id = db.execute("INSERT INTO lu_snapshots (port, lineup_date, source, created_by, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
+                                 (p, day, names[:300], _who(), now_txt)).fetchone()["id"]
+            have = {}
         prev = _lu_latest(db, p, before_id=snap_id)
         prev_rows = {v["vessel"]: v for v in _lu_vessels(db, prev["id"])} if prev else {}
-        for i, r in enumerate(rows):
-            pv = prev_rows.get(r["vessel"], {})
-            ours = 1 if (_lu_is_ours(r["agent"]) or pv.get("ours")) else 0
-            db.execute(
-                "INSERT INTO lu_vessels (snapshot_id, seq, vessel, agent, cargo, qty, loa, draft, arrived, eta, etb, berth, berthed, etd, status, ours, principal, remarks) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (snap_id, i, r["vessel"], r["agent"], r["cargo"], r["qty"], r["loa"], r["draft"], r["arrived"], r["eta"], r["etb"], r["berth"],
-                 r["berthed"], r["etd"], r["status"], ours, pv.get("principal") or "", r["remarks"]))
+        known = {_lu_norm_berth(b["name"]) for b in db.execute("SELECT name FROM lu_berths WHERE port = ?", (p,)).fetchall()}
+        seq = (db.execute("SELECT MAX(seq) AS m FROM lu_vessels WHERE snapshot_id = ?", (snap_id,)).fetchone()["m"] or 0) + 1 if have else 0
+        for name in order:
+            r = merged[name]
+            old = have.get(name)
+            if old:
+                m = _lu_merge({k: old.get(k) for k in _LU_FIELDS}, r) if _LU_STATUS_RANK.get(old["status"], 0) > _LU_STATUS_RANK.get(r["status"], 0) else _lu_merge(r, {k: old.get(k) for k in _LU_FIELDS})
+                ours = 1 if (old["ours"] or _lu_is_ours(m["agent"])) else 0
+                db.execute(f"UPDATE lu_vessels SET {', '.join(k + ' = ?' for k in _LU_FIELDS)}, ours = ? WHERE id = ?",
+                           (*[m[k] for k in _LU_FIELDS], ours, old["id"]))
+            else:
+                pv = prev_rows.get(name, {})
+                ours = 1 if (_lu_is_ours(r["agent"]) or pv.get("ours")) else 0
+                db.execute(
+                    "INSERT INTO lu_vessels (snapshot_id, seq, vessel, agent, cargo, qty, loa, draft, arrived, eta, etb, berth, berthed, etd, status, ours, principal, remarks) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (snap_id, seq, r["vessel"], r["agent"], r["cargo"], r["qty"], r["loa"], r["draft"], r["arrived"], r["eta"], r["etb"], r["berth"],
+                     r["berthed"], r["etd"], r["status"], ours, pv.get("principal") or "", r["remarks"]))
+                seq += 1
             k = _lu_norm_berth(r["berth"])
             if r["berth"] and k not in known:
                 known.add(k)
                 db.execute("INSERT INTO lu_berths (port, name, max_draft, active, sort) VALUES (?, ?, NULL, 1, 999)",
                            (p, ("Berth " + k) if re.match(r"^\d+[A-Z]?$", k) else r["berth"].title()))
         db.commit()
-        results.append({"source": fname, "port": p, "port_name": _LU_PORT[p][0], "vessels": len(rows), "snapshot": snap_id})
+        total = db.execute("SELECT COUNT(*) AS n FROM lu_vessels WHERE snapshot_id = ?", (snap_id,)).fetchone()["n"]
+        for res in results:
+            if res.get("port") == p and "error" not in res:
+                res["snapshot"] = snap_id
+                res["total"] = total
+                res["combined"] = bool(existing) or len(files) > 1
     return jsonify({"results": results})
 
 
@@ -14472,7 +14540,7 @@ tr.mine td:first-child{box-shadow:inset 3px 0 0 var(--gold)}
 
   <section class="panel" id="upPanel" hidden>
     <h2>Upload line-ups</h2>
-    <p class="sub">Excel, CSV, Word or PDF, or paste the table straight from the email. Each upload is kept as that day's line-up, and Compass compares it with the day before.</p>
+    <p class="sub">Excel, CSV, Word or PDF, or paste the table straight from the email. Files for the same port and day are combined into one line-up, so for Dammam upload the berthing line-up and the expected-vessels list together. Uploading again the same day adds to that day's line-up. Compass compares each day with the day before.</p>
     <div class="frow">
       <label>Port<select id="upPort"><option value="">Recognise from the file</option><option value="JED">Jeddah Islamic Port</option><option value="YNB">Yanbu Commercial Port</option><option value="DMM">King Abdulaziz Port Dammam</option></select></label>
       <label>Line-up date<input type="date" id="upDate"></label>
@@ -14727,7 +14795,7 @@ document.addEventListener('click',function(e){var b=e.target.closest('button,[da
   if(b.id==='upGo'){var fd=new FormData();fd.append('port',$('upPort').value);fd.append('date',$('upDate').value);[].forEach.call($('upFiles').files,function(f){fd.append('files',f)});fd.append('text',$('upText').value);
     b.disabled=true;b.textContent='Reading…';
     fetch('/api/lineups/import',{method:'POST',body:fd}).then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||'Upload failed');return j})}).then(function(j){
-      $('upRes').innerHTML=j.results.map(function(r){return r.error?'<div class="result bad"><b>'+esc(r.source)+':</b> '+esc(r.error)+'</div>':'<div class="result ok"><b>'+esc(r.source)+':</b> '+r.vessels+' vessels read for '+esc(r.port_name)+'</div>'}).join('');
+      $('upRes').innerHTML=j.results.map(function(r){return r.error?'<div class="result bad"><b>'+esc(r.source)+':</b> '+esc(r.error)+'</div>':'<div class="result ok"><b>'+esc(r.source)+':</b> '+r.vessels+' vessels read for '+esc(r.port_name)+(r.combined?' · combined into the '+esc(r.port_name)+' line-up of '+day($('upDate').value+' 12:00')+', '+r.total+' vessels in all':'')+'</div>'}).join('');
       var okr=j.results.filter(function(r){return !r.error});if(okr.length){cur=okr[0].port;$('upFiles').value='';$('upText').value='';load()}}).catch(function(err){$('upRes').innerHTML='<div class="result bad">'+esc(err.message)+'</div>'}).then(function(){b.disabled=false;b.textContent='Import'});return}
 });
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){var m=document.querySelectorAll('.modal');if(m.length)m[m.length-1].remove()}});
