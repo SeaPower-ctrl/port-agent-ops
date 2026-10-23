@@ -805,6 +805,52 @@ def init_db():
         )"""
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_login_failures_key ON login_failures (kind, key, at)")
+    # Port line-ups: berths per port, each day's line-up, and the vessels on it.
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS lu_berths (
+            id SERIAL PRIMARY KEY,
+            port TEXT NOT NULL,
+            name TEXT NOT NULL,
+            max_draft REAL,
+            active INTEGER DEFAULT 1,
+            sort INTEGER DEFAULT 0
+        )"""
+    )
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS lu_snapshots (
+            id SERIAL PRIMARY KEY,
+            port TEXT NOT NULL,
+            lineup_date TEXT NOT NULL,
+            source TEXT DEFAULT '',
+            created_by TEXT DEFAULT '',
+            created_at TEXT DEFAULT ''
+        )"""
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_lu_snapshots_port ON lu_snapshots (port, lineup_date)")
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS lu_vessels (
+            id SERIAL PRIMARY KEY,
+            snapshot_id INTEGER NOT NULL REFERENCES lu_snapshots(id) ON DELETE CASCADE,
+            seq INTEGER DEFAULT 0,
+            vessel TEXT NOT NULL,
+            agent TEXT DEFAULT '',
+            cargo TEXT DEFAULT '',
+            qty DOUBLE PRECISION,
+            loa REAL,
+            draft REAL,
+            arrived TEXT DEFAULT '',
+            eta TEXT DEFAULT '',
+            etb TEXT DEFAULT '',
+            berth TEXT DEFAULT '',
+            berthed TEXT DEFAULT '',
+            etd TEXT DEFAULT '',
+            status TEXT DEFAULT 'anchor',
+            ours INTEGER DEFAULT 0,
+            principal TEXT DEFAULT '',
+            remarks TEXT DEFAULT ''
+        )"""
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_lu_vessels_snap ON lu_vessels (snapshot_id)")
     cur.execute(
         """CREATE TABLE IF NOT EXISTS records (
             bl_number TEXT PRIMARY KEY,
@@ -8806,6 +8852,868 @@ def export_sof_pdf(doc_id):
     )
 
 
+# ---------- Port line-ups: daily line-ups, berth plan by draft, port comparison ----------
+# The three ports whose line-ups Sea Power receives. Each line-up upload is kept as a
+# dated snapshot, so Compass can show what changed since the day before and learn the
+# real waiting times. The berth plan is worked out by "simulating" the queue: vessels
+# alongside keep their berth until they sail, then waiting vessels take the first free
+# berth that accepts their draft, in arrival order.
+
+LINEUP_PORTS = [
+    ("JED", "Jeddah", "Jeddah Islamic Port"),
+    ("YNB", "Yanbu", "Yanbu Commercial Port"),
+    ("DMM", "Dammam", "King Abdulaziz Port Dammam"),
+]
+_LU_PORT = {k: (short, full) for k, short, full in LINEUP_PORTS}
+# Sailing time between the ports in days at about 12 knots (Jeddah-Yanbu ~190 nm;
+# the Red Sea ports to Dammam go round the Arabian Peninsula, ~2,500-2,650 nm).
+_LU_TRANSIT_DAYS = {("JED", "YNB"): 0.7, ("JED", "DMM"): 8.7, ("YNB", "DMM"): 9.2}
+# Discharge rates used to estimate days alongside (MT per day), by cargo family.
+_LU_RATES = {"steel": 4000, "bagged": 3500, "bulk": 6000, "project": 1200, "general": 2500}
+_LU_RATE_LABEL = {"steel": "Steel", "bagged": "Bagged cargo", "bulk": "Bulk", "project": "Project cargo", "general": "General cargo"}
+_LU_DRAFT_TIGHT = 0.3   # metres of margin under the berth limit that we call "tight"
+
+
+def _lu_transit(a, b):
+    if a == b:
+        return 0.0
+    return _LU_TRANSIT_DAYS.get((a, b)) or _LU_TRANSIT_DAYS.get((b, a)) or 0.0
+
+
+def _lu_now():
+    return datetime.utcnow() + timedelta(hours=3)
+
+
+def _lu_cargo_family(text):
+    t = (text or "").upper()
+    if re.search(r"STEEL|COIL|PIPE|BILLET|PLATE|REBAR|BEAM|WIRE ROD|H-?BEAM|SLAB|TUBE|ANGLE|CHANNEL|IRON", t):
+        return "steel"
+    if re.search(r"BAG|RICE|SUGAR|FLOUR|FERTILI[SZ]ER|CEMENT IN|SACK", t):
+        return "bagged"
+    if re.search(r"PROJECT|HEAVY|MACHIN|EQUIPMENT|TRANSFORMER|VEHICLE|RO-?RO|UNIT", t):
+        return "project"
+    if re.search(r"\bBULK\b|CLINKER|GRAIN|WHEAT|BARLEY|CORN|MAIZE|SOYA|SULPHUR|UREA|COAL", t):
+        return "bulk"
+    return "general"
+
+
+def _lu_days_alongside(cargo, qty):
+    fam = _lu_cargo_family(cargo)
+    try:
+        q = float(qty or 0)
+    except (TypeError, ValueError):
+        q = 0
+    if q <= 0:
+        return 2.0
+    return max(0.5, round(q / _LU_RATES[fam], 1))
+
+
+_LU_MONTHS = {m: i for i, m in enumerate(["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1)}
+
+
+def _lu_parse_dt(s, ref):
+    """A date/time from a line-up cell, read day-first (Saudi style). Returns a datetime or None.
+    ref (a date) supplies the year when the cell leaves it out."""
+    s = (str(s or "")).strip().upper().replace(".", "/")
+    if not s or s in ("-", "--", "N/A", "NA", "TBA", "TBC", "NIL"):
+        return None
+    m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T ](\d{1,2}):(\d{2}))?", s)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        hh, mm = int(m.group(4) or 12), int(m.group(5) or 0)
+        try:
+            return datetime(y, mo, d, hh, mm)
+        except ValueError:
+            return None
+    t = re.search(r"(\d{1,2})[:H](\d{2})", s)
+    hh, mm = (int(t.group(1)), int(t.group(2))) if t and int(t.group(1)) < 24 else (12, 0)
+    s_dates = re.sub(r"(\d{1,2})[:H](\d{2})(?:\s*(?:HRS|HR|LT))?", " ", s)
+    m = re.search(r"(\d{1,2})[/\-\s]?([A-Z]{3})[A-Z]*[/\-\s,]*(\d{2,4})?", s_dates)
+    if m and m.group(2) in _LU_MONTHS:
+        d, mo = int(m.group(1)), _LU_MONTHS[m.group(2)]
+        y = int(m.group(3)) if m.group(3) else ref.year
+    else:
+        m = re.search(r"(\d{1,2})[/\-](\d{1,2})(?:[/\-](\d{2,4}))?", s_dates)
+        if not m:
+            return None
+        d, mo = int(m.group(1)), int(m.group(2))
+        y = int(m.group(3)) if m.group(3) else ref.year
+        if mo > 12 and d <= 12:
+            d, mo = mo, d
+    if y < 100:
+        y += 2000
+    try:
+        out = datetime(y, mo, d, hh, mm)
+    except ValueError:
+        return None
+    if not (m and m.groups()[-1]):   # no year given: pick the one closest to the line-up date
+        if (out.date() - ref).days > 180:
+            out = out.replace(year=out.year - 1)
+        elif (ref - out.date()).days > 180:
+            out = out.replace(year=out.year + 1)
+    return out
+
+
+def _lu_num(s):
+    m = re.search(r"-?\d[\d,]*(?:\.\d+)?", str(s or "").replace(" ", ""))
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+_LU_HEADERS = [
+    ("vessel", r"^(?:M\.?V\.?\s*)?(?:VESSEL|VSL|SHIP)(?:'?S)?(?:\s*NAME)?$|^NAME\s+OF\s+(?:THE\s+)?(?:VESSEL|SHIP)$|^VESSEL\s*/\s*VOY"),
+    ("agent", r"^(?:SHIPPING\s+)?AGEN(?:T|TS|CY)(?:\s*NAME)?$|^LOCAL\s+AGENT$"),
+    ("cargo", r"^(?:CARGO|COMMODITY|CARGO\s*TYPE|TYPE\s+OF\s+CARGO|CARGO\s*DESC(?:RIPTION)?|DESCRIPTION)$"),
+    ("qty", r"^(?:QTY|QUANTITY|TONNAGE|TONS|MT|WEIGHT|CARGO\s*QTY|QTY\s*\(?MT\)?|QUANTITY\s*\(?(?:MT|TONS)\)?|DISCH(?:ARGE)?\s*QTY|TOTAL\s*QTY)$"),
+    ("loa", r"^L\.?O\.?A\.?(?:\s*\(?M\)?)?$|^LENGTH"),
+    ("draft", r"DRAFT|DRAUGHT"),
+    ("arrived", r"^E\.?T\.?A\.?\s*/\s*A\.?T\.?A\.?$|^A\.?T\.?A\.?\s*/\s*E\.?T\.?A\.?$|^(?:ARRIVED|ARRIVAL|A\.?T\.?A\.?|ARRIVAL\s+DATE|DATE\s+OF\s+ARRIVAL|ANCHORED|ARR(?:IVAL)?\s*(?:DATE|TIME)?|N\.?O\.?R\.?(?:\s+TENDERED)?)$"),
+    ("eta", r"^E\.?T\.?A\.?(?:\s*DATE)?$|^EXPECTED(?:\s+ARRIVAL)?$"),
+    ("etb", r"^E\.?T\.?B\.?$|EXPECTED\s+BERTH"),
+    ("berth", r"^(?:BERTH|BERTH\s*NO\.?|B\.?\s*NO\.?|QUAY|JETTY)$"),
+    ("berthed", r"^(?:BERTHED|BERTHING(?:\s+DATE)?|A\.?T\.?B\.?|ALONGSIDE(?:\s+DATE)?)$"),
+    ("etd", r"^(?:E\.?T\.?D\.?|E\.?T\.?S\.?|EXPECTED\s+(?:SAILING|DEPARTURE)|SAILING)$"),
+    ("status", r"^(?:STATUS|POSITION|VESSEL\s+STATUS)$"),
+    ("remarks", r"^(?:REMARKS?|NOTES?|COMMENTS?)$"),
+]
+
+
+def _lu_header_map(row):
+    found = {}
+    for i, cell in enumerate(row):
+        c = re.sub(r"\s+", " ", str(cell or "")).strip().upper().rstrip(":")
+        if not c:
+            continue
+        for key, pat in _LU_HEADERS:
+            if key not in found and re.search(pat, c):
+                found[key] = i
+                break
+    return found
+
+
+def _lu_section_status(row):
+    cells = [str(c or "").strip() for c in row if str(c or "").strip()]
+    if len(cells) != 1 or len(cells[0]) > 60:
+        return None
+    t = cells[0].upper()
+    if re.search(r"ALONGSIDE|AT\s+BERTH|BERTHED|WORKING", t):
+        return "alongside"
+    if re.search(r"ANCHOR|WAITING|AWAITING|OUTER", t):
+        return "anchor"
+    if re.search(r"EXPECT|ARRIVING|E\.?T\.?A", t):
+        return "expected"
+    return None
+
+
+def _lu_rows_from_tables(tables, ref):
+    """Finds the line-up table(s) and turns each vessel row into a dict."""
+    out = []
+    for t in tables:
+        rows = t["rows"]
+        hdr_i, hmap = None, {}
+        for i, r in enumerate(rows[:40]):
+            m = _lu_header_map(r)
+            if "vessel" in m and len(m) >= 3:
+                hdr_i, hmap = i, m
+                break
+        if hdr_i is None:
+            continue
+        section = None
+        for r in rows[hdr_i + 1:]:
+            sec = _lu_section_status(r)
+            if sec:
+                section = sec
+                continue
+            hm2 = _lu_header_map(r)
+            if "vessel" in hm2 and len(hm2) >= 3:     # a repeated header row starts another block
+                hmap = hm2
+                continue
+            g = lambda k: (r[hmap[k]] if k in hmap and hmap[k] < len(r) else "")
+            name = re.sub(r"\s+", " ", str(g("vessel") or "")).strip()
+            if not name or len(name) < 3 or not re.search(r"[A-Za-z]", name) or re.match(r"(?i)^(total|nil|none)\b", name):
+                continue
+            name = "MV " + re.sub(r"^M\s*[./]?\s*[VT]\b[./]?\s*", "", name.upper()).strip()
+            arrived = _lu_parse_dt(g("arrived"), ref)
+            eta = _lu_parse_dt(g("eta"), ref)
+            berthed = _lu_parse_dt(g("berthed"), ref)
+            etd = _lu_parse_dt(g("etd"), ref)
+            etb = _lu_parse_dt(g("etb"), ref)
+            status_txt = str(g("status") or "").upper()
+            berth = re.sub(r"\s+", " ", str(g("berth") or "")).strip().upper()
+            if re.search(r"ALONGSIDE|BERTHED|WORKING|AT BERTH", status_txt):
+                st = "alongside"
+            elif re.search(r"ANCHOR|WAIT|AWAIT|OUTER", status_txt):
+                st = "anchor"
+            elif re.search(r"EXPECT|ETA|ARRIVING", status_txt):
+                st = "expected"
+            elif section:
+                st = section
+            elif berthed or (berth and not etb and berth not in ("-", "TBA")):
+                st = "alongside"
+            elif arrived:
+                st = "anchor"
+            elif eta:
+                st = "expected"
+            else:
+                st = "anchor"
+            if st == "expected" and arrived and not eta:
+                eta, arrived = arrived, None
+            out.append({
+                "vessel": name[:80], "agent": str(g("agent") or "").strip()[:80], "cargo": str(g("cargo") or "").strip()[:80],
+                "qty": _lu_num(g("qty")), "loa": _lu_num(g("loa")), "draft": _lu_num(g("draft")),
+                "arrived": arrived.strftime("%Y-%m-%d %H:%M") if arrived else "",
+                "eta": eta.strftime("%Y-%m-%d %H:%M") if eta else "",
+                "etb": etb.strftime("%Y-%m-%d %H:%M") if etb else "",
+                "berth": berth[:30] if berth not in ("-", "--", "TBA", "TBC", "NIL") else "",
+                "berthed": berthed.strftime("%Y-%m-%d %H:%M") if berthed else "",
+                "etd": etd.strftime("%Y-%m-%d %H:%M") if etd else "",
+                "status": st, "remarks": str(g("remarks") or "").strip()[:200],
+            })
+    for r in out:   # a draft above 25 m is a typo or the column was mis-read (e.g. it held LOA)
+        if r["draft"] and not (2 <= r["draft"] <= 25):
+            r["draft"] = None
+    return out
+
+
+def _lu_tables_from_upload(raw, filename):
+    name = (filename or "").lower()
+    if name.endswith((".csv", ".txt", ".tsv")) or not name:
+        text = _mf_decode_csv(raw)
+        return [_mf_plain_table("Text", list(csv.reader(io.StringIO(text), delimiter=_mf_sniff_delimiter(text))))]
+    if name.endswith(".docx"):
+        import docx
+        document = docx.Document(io.BytesIO(raw))
+        return [_mf_plain_table(f"Table {n + 1}", [[c.text for c in r.cells] for r in tb.rows]) for n, tb in enumerate(document.tables)]
+    if name.endswith(".pdf"):
+        import pdfplumber
+        tables = []
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
+            for page in pdf.pages:
+                for tb in (page.extract_tables() or []):
+                    if tb:
+                        tables.append(_mf_plain_table(f"Page {page.page_number}", [[c or "" for c in r] for r in tb]))
+        return tables
+    if name.endswith((".xlsx", ".xlsm", ".xls")):
+        if raw[:4] == _ZIP_MAGIC or raw[:8] == _OLE_MAGIC:
+            return _mf_tables_from_excel(raw, name)
+        return _mf_tables_from_markup_or_text(raw)
+    raise ValueError("unsupported file type")
+
+
+def _lu_guess_port(text):
+    t = (text or "").upper()
+    if "YANBU" in t:
+        return "YNB"
+    if "DAMMAM" in t or "ABDULAZIZ" in t or "DMM" in t:
+        return "DMM"
+    if "JEDDAH" in t or "JEDDA" in t or "JIP" in t:
+        return "JED"
+    return ""
+
+
+def _lu_norm_berth(name):
+    """'BERTH NO. 5', 'B-5', 'B5', '5' -> '5'; anything else upper-cased as is."""
+    t = re.sub(r"\s+", " ", str(name or "")).strip().upper()
+    m = re.match(r"^(?:BERTH|BERTH NO\.?|B\.?|NO\.?)?\s*[-#]?\s*(\d+[A-Z]?)$", t)
+    return m.group(1) if m else t
+
+
+def _lu_our_names():
+    raw = get_setting("lineup_our_names", "SEA POWER")
+    return [x.strip().upper() for x in raw.split(",") if x.strip()] or ["SEA POWER"]
+
+
+def _lu_is_ours(agent):
+    a = (agent or "").upper()
+    return any(n in a for n in _lu_our_names())
+
+
+def _lu_berths(db, port):
+    return [dict(r) for r in db.execute(
+        "SELECT * FROM lu_berths WHERE port = ? AND active = 1 ORDER BY sort, id", (port,)).fetchall()]
+
+
+def _lu_latest(db, port, before_id=None):
+    if before_id:
+        return db.execute("SELECT * FROM lu_snapshots WHERE port = ? AND id < ? ORDER BY lineup_date DESC, id DESC LIMIT 1",
+                          (port, before_id)).fetchone()
+    return db.execute("SELECT * FROM lu_snapshots WHERE port = ? ORDER BY lineup_date DESC, id DESC LIMIT 1", (port,)).fetchone()
+
+
+def _lu_vessels(db, snap_id):
+    return [dict(r) for r in db.execute("SELECT * FROM lu_vessels WHERE snapshot_id = ? ORDER BY seq, id", (snap_id,)).fetchall()]
+
+
+def _lu_dt(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M") if s else None
+    except ValueError:
+        return None
+
+
+def _lu_simulate(berths, vessels, now, extra=None):
+    """Works out the berth plan. Returns {vessel_id: {...}} plus the extra
+    (hypothetical) vessel's result under key '__extra__'.
+    Times are datetimes. Berths without a max draft accept any draft."""
+    bmap = {_lu_norm_berth(b["name"]): b for b in berths}
+    free = {k: now for k in bmap}
+    res = {}
+    # 1) vessels alongside hold their berth until they sail
+    for v in vessels:
+        if v["status"] != "alongside":
+            continue
+        k = _lu_norm_berth(v["berth"])
+        start = _lu_dt(v["berthed"]) or now
+        end = _lu_dt(v["etd"])
+        if not end or end <= now:
+            end = max(now + timedelta(hours=6), start + timedelta(days=_lu_days_alongside(v["cargo"], v["qty"])))
+        res[v["id"]] = {"berth": bmap[k]["name"] if k in bmap else (v["berth"] or ""), "start": start, "end": end, "ready": _lu_dt(v["arrived"]) or start}
+        if k in free:
+            free[k] = max(free[k], end)
+    # 2) waiting and expected vessels, first come first served by readiness
+    queue = []
+    for v in vessels:
+        if v["status"] == "alongside":
+            continue
+        ready = _lu_dt(v["arrived"]) if v["status"] == "anchor" else _lu_dt(v["eta"])
+        ready = ready or (now if v["status"] == "anchor" else now + timedelta(days=1))
+        queue.append((ready, v.get("seq") or 0, v))
+    if extra:
+        queue.append((extra["ready"], 10 ** 6, extra))
+    queue.sort(key=lambda x: (x[0], x[1]))
+    for ready, _, v in queue:
+        draft = v.get("draft")
+        fits = [k for k, b in bmap.items() if not draft or not b.get("max_draft") or draft <= b["max_draft"]]
+        if not fits:
+            res[v["id"]] = {"berth": "", "start": None, "end": None, "ready": ready, "nofit": True}
+            continue
+        etb = _lu_dt(v.get("etb") or "")
+        want = _lu_norm_berth(v.get("berth") or "")
+        best = None
+        for k in fits:
+            start = max(free[k], ready, now if v["status"] != "expected" else ready)
+            if etb and want == k:
+                start = max(start, etb)
+            score = (start, bmap[k].get("max_draft") or 99)       # earliest; on a tie keep deep berths for deep vessels
+            if want == k and etb:
+                score = (start - timedelta(hours=1), 0)
+            if best is None or score < best[0]:
+                best = (score, k, start)
+        _, k, start = best
+        end = start + timedelta(days=_lu_days_alongside(v.get("cargo"), v.get("qty")))
+        free[k] = end
+        b = bmap[k]
+        margin = (b["max_draft"] - draft) if (draft and b.get("max_draft")) else None
+        res[v["id"]] = {"berth": b["name"], "start": start, "end": end, "ready": ready, "margin": margin,
+                        "fits": [bmap[x]["name"] for x in fits]}
+    return res
+
+
+def _lu_days(a, b):
+    return (a - b).total_seconds() / 86400.0
+
+
+def _lu_port_state(db, port, now=None, plan_extra=None):
+    """Everything the page needs for one port, worked out from its latest line-up."""
+    now = now or _lu_now()
+    short, full = _LU_PORT[port]
+    berths = _lu_berths(db, port)
+    snap = _lu_latest(db, port)
+    out = {"port": port, "name": short, "full": full, "berths": berths, "snapshot": None, "vessels": [],
+           "changes": [], "alerts": [], "history": [], "outlook": [], "avg_wait": None, "avg_wait_prev": None}
+    if not snap:
+        return out
+    vessels = _lu_vessels(db, snap["id"])
+    sim = _lu_simulate(berths, vessels, now)
+    out["snapshot"] = {"id": snap["id"], "date": snap["lineup_date"], "source": snap["source"], "by": snap["created_by"], "at": snap["created_at"]}
+    waiting = [v for v in vessels if v["status"] == "anchor"]
+    waiting_sorted = sorted(waiting, key=lambda v: (sim.get(v["id"], {}).get("start") or now + timedelta(days=99), _lu_dt(v["arrived"]) or now))
+    pos = {v["id"]: i + 1 for i, v in enumerate(waiting_sorted)}
+    for v in vessels:
+        s = sim.get(v["id"], {})
+        fits = [b["name"] for b in berths if not v["draft"] or not b.get("max_draft") or v["draft"] <= b["max_draft"]]
+        ready = s.get("ready")
+        item = dict(v)
+        item.update({
+            "est_berth": s.get("berth", ""), "nofit": bool(s.get("nofit")),
+            "est_start": s["start"].strftime("%Y-%m-%d %H:%M") if s.get("start") else "",
+            "est_end": s["end"].strftime("%Y-%m-%d %H:%M") if s.get("end") else "",
+            "start_off": round(_lu_days(s["start"], now), 2) if s.get("start") else None,
+            "end_off": round(_lu_days(s["end"], now), 2) if s.get("end") else None,
+            "ready_off": round(_lu_days(ready, now), 2) if ready else None,
+            "waited": round(max(0, _lu_days(now, _lu_dt(v["arrived"]))), 1) if v["status"] == "anchor" and _lu_dt(v["arrived"]) else None,
+            "total_wait": round(max(0, _lu_days(s["start"], ready)), 1) if s.get("start") and ready and v["status"] != "alongside" else None,
+            "margin": round(s["margin"], 2) if s.get("margin") is not None else None,
+            "fits": fits, "position": pos.get(v["id"]),
+        })
+        out["vessels"].append(item)
+
+    # waiting time a new arrival can expect today, for a normal and a deep draft
+    def probe(draft):
+        r = _lu_simulate(berths, vessels, now, extra={"id": "__x__", "status": "anchor", "draft": draft, "cargo": "general", "qty": 8000, "ready": now})
+        x = r.get("__x__") or {}
+        return None if x.get("nofit") or not x.get("start") else round(max(0, _lu_days(x["start"], now)), 1)
+    out["probe"] = {"normal": probe(10.0), "deep": probe(11.5) if any((b.get("max_draft") or 0) >= 11.5 for b in berths) else None}
+
+    # outlook: vessels waiting at noon of each of the next 7 days (from today's line-up)
+    for d in range(7):
+        t = (now.replace(hour=12, minute=0) + timedelta(days=d)) if d else now
+        n = 0
+        for v in out["vessels"]:
+            if v["status"] == "alongside":
+                continue
+            rd, st = v["ready_off"], v["start_off"]
+            to = _lu_days(t, now)
+            if rd is not None and rd <= to and (st is None or st > to):
+                n += 1
+        out["outlook"].append(n)
+
+    # history (last 30 days of line-ups): waiting count per day, and real waiting times
+    since = (now.date() - timedelta(days=30)).isoformat()
+    snaps = db.execute("SELECT id, lineup_date FROM lu_snapshots WHERE port = ? AND lineup_date >= ? ORDER BY lineup_date, id", (port, since)).fetchall()
+    per_day = {}
+    for sn in snaps:
+        per_day[sn["lineup_date"]] = sn["id"]
+    for day, sid in sorted(per_day.items())[-14:]:
+        n = db.execute("SELECT COUNT(*) AS n FROM lu_vessels WHERE snapshot_id = ? AND status = 'anchor'", (sid,)).fetchone()["n"]
+        out["history"].append({"date": day, "waiting": n})
+    waits, waits_prev, seen = [], [], set()
+    if per_day:
+        rows = db.execute(
+            "SELECT v.vessel, v.arrived, v.berthed, s.lineup_date FROM lu_vessels v JOIN lu_snapshots s ON s.id = v.snapshot_id "
+            "WHERE s.port = ? AND s.lineup_date >= ? AND v.status = 'alongside' AND v.arrived <> '' AND v.berthed <> ''",
+            (port, since)).fetchall()
+        for r in rows:
+            key = (r["vessel"], r["arrived"][:10])
+            if key in seen:
+                continue
+            seen.add(key)
+            a, b = _lu_dt(r["arrived"]), _lu_dt(r["berthed"])
+            if a and b and b >= a:
+                w = _lu_days(b, a)
+                (waits if (now - b).days < 14 else waits_prev).append(w)
+    if len(waits) >= 2:
+        out["avg_wait"] = round(sum(waits) / len(waits), 1)
+    out["wait_today"] = out["probe"]["normal"]
+    if len(waits_prev) >= 2:
+        out["avg_wait_prev"] = round(sum(waits_prev) / len(waits_prev), 1)
+
+    # changes since the previous line-up
+    prev = _lu_latest(db, port, before_id=snap["id"])
+    if prev:
+        old_list = _lu_vessels(db, prev["id"])
+        old = {v["vessel"]: v for v in old_list}
+        new = {v["vessel"]: v for v in vessels}
+        old_sim = _lu_simulate(berths, old_list, now)    # yesterday's queue worked out the same way, so places compare like with like
+        old_wait = [v["vessel"] for v in sorted([v for v in old_list if v["status"] == "anchor"],
+                    key=lambda v: (old_sim.get(v["id"], {}).get("start") or now + timedelta(days=99), _lu_dt(v["arrived"]) or now))]
+        new_pos = {v["vessel"]: v["position"] for v in out["vessels"] if v["position"]}
+        for n, v in new.items():
+            o = old.get(n)
+            ours = " (ours)" if v["ours"] else ""
+            if not o:
+                kind = "Arrived" if v["status"] == "anchor" else ("Berthed" if v["status"] == "alongside" else "New")
+                what = f"{n}{ours}" + (f", {v['cargo'].lower()}" if v["cargo"] else "") + (f" {int(v['qty']):,} MT" if v["qty"] else "")
+                out["changes"].append({"kind": kind, "tone": "", "text": what})
+            elif o["status"] != "alongside" and v["status"] == "alongside":
+                out["changes"].append({"kind": "Berthed", "tone": "g", "text": f"{n}{ours}" + (f" at {v['berth'].title()}" if v["berth"] else "")})
+            elif o["status"] == "expected" and v["status"] == "anchor":
+                out["changes"].append({"kind": "Arrived", "tone": "", "text": f"{n}{ours} now at anchorage"})
+            if v["ours"] and v["status"] == "anchor" and o and o["status"] == "anchor" and n in old_wait and n in new_pos:
+                before, after = old_wait.index(n) + 1, new_pos[n]
+                if after > before:
+                    out["changes"].append({"kind": "Slipped", "tone": "r", "text": f"{n} (ours) from {_ord(before)} to {_ord(after)} in line"})
+                    for item in out["vessels"]:
+                        if item["vessel"] == n:
+                            item["slipped_from"] = before
+                elif after < before:
+                    out["changes"].append({"kind": "Moved up", "tone": "g", "text": f"{n} (ours) from {_ord(before)} to {_ord(after)} in line"})
+        for n, o in old.items():
+            if n not in new:
+                out["changes"].append({"kind": "Sailed" if o["status"] == "alongside" else "Left", "tone": "",
+                                       "text": n + (f" from {o['berth'].title()}" if o["status"] == "alongside" and o["berth"] else " (no longer on the line-up)")})
+        order = {"Slipped": 0, "Berthed": 1, "Moved up": 2, "Arrived": 3, "New": 4, "Sailed": 5, "Left": 6}
+        out["changes"].sort(key=lambda c: order.get(c["kind"], 9))
+
+    # alerts about our vessels and the line-up itself
+    limit = float(get_setting("lineup_wait_limit", "4") or 4)
+    today = now.date().isoformat()
+    if snap["lineup_date"] < today:
+        out["alerts"].append({"tone": "warn", "title": f"Today's {short} line-up is not in yet", "text": f"Showing the line-up of {_lu_fmt_day(snap['lineup_date'])}. Upload today's to refresh the plan."})
+    if not berths:
+        out["alerts"].append({"tone": "warn", "title": f"Add the {short} berths", "text": "Enter each general cargo berth with its maximum draft, so Compass can tell which berths a vessel fits."})
+    elif any(not b.get("max_draft") for b in berths):
+        missing = ", ".join(b["name"] for b in berths if not b.get("max_draft"))
+        out["alerts"].append({"tone": "info", "title": "Max draft missing for " + missing, "text": "Until it is set, Compass assumes any draft fits there."})
+    for v in out["vessels"]:
+        if not v["ours"]:
+            continue
+        if v["nofit"]:
+            out["alerts"].append({"tone": "bad", "title": f"{v['vessel']} fits no berth here", "text": f"Her draft of {v['draft']:.1f} m is deeper than every {short} berth on record.", "vessel": v["id"], "msg": True})
+        if v.get("slipped_from"):
+            out["alerts"].append({"tone": "bad", "title": f"{v['vessel']} slipped from {_ord(v['slipped_from'])} to {_ord(v['position'])}",
+                                  "text": "Estimated berthing now " + (_lu_fmt_day(v["est_start"]) if v["est_start"] else "unknown") + (f" at {v['est_berth']}" if v["est_berth"] else "") + ".",
+                                  "vessel": v["id"], "msg": True})
+        if v["status"] == "anchor" and (v["waited"] or 0) > limit:
+            out["alerts"].append({"tone": "warn", "title": f"{v['vessel']} is past your {limit:g}-day limit",
+                                  "text": f"{v['waited']:.0f} days at anchor so far" + (f", about {v['total_wait']:.0f} in total" if v["total_wait"] else "") + ". Tell the principal about the waiting time now.",
+                                  "vessel": v["id"], "msg": True})
+        if v["status"] != "alongside" and v["margin"] is not None and v["margin"] < _LU_DRAFT_TIGHT:
+            out["alerts"].append({"tone": "warn", "title": f"{v['vessel']}: tight draft at {v['est_berth']}",
+                                  "text": f"Only {v['margin']:.2f} m under the berth limit. Confirm with the harbour master before she shifts in.", "vessel": v["id"], "msg": True})
+        if v["status"] == "alongside" and v["end_off"] is not None and v["end_off"] <= 1.5:
+            out["alerts"].append({"tone": "info", "title": f"{v['vessel']} sails ~{_lu_fmt_day(v['est_end'])}", "text": "Prepare the remaining DOs before she sails."})
+        if v["status"] != "alongside" and v["start_off"] is not None and 0 <= v["start_off"] <= 1.5:
+            out["alerts"].append({"tone": "info", "title": f"{v['vessel']} berths ~{_lu_fmt_day(v['est_start'])}", "text": "Book the surveyor and gangs."})
+    rank = {"bad": 0, "warn": 1, "info": 2}
+    out["alerts"].sort(key=lambda a: rank[a["tone"]])
+    return out
+
+
+def _ord(n):
+    n = int(n)
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+def _lu_fmt_day(s):
+    d = _lu_dt(s) if s and len(s) > 10 else (datetime.strptime(s, "%Y-%m-%d") if s else None)
+    return f"{d.day} {d.strftime('%b')}" if d else ""
+
+
+def _lu_plan(db, draft, cargo, qty, eta, at_port="", vessel_name=""):
+    """Compares the three ports for one vessel. eta: datetime she can arrive at the
+    nearest port (or now, if she is already lying at at_port)."""
+    now = _lu_now()
+    res = []
+    for port, short, full in LINEUP_PORTS:
+        berths = _lu_berths(db, port)
+        snap = _lu_latest(db, port)
+        vessels = _lu_vessels(db, snap["id"]) if snap else []
+        arrive = (max(now, eta) + timedelta(days=_lu_transit(at_port, port))) if at_port else eta
+        item = {"port": port, "name": short, "full": full, "arrive": arrive.strftime("%Y-%m-%d %H:%M"),
+                "transit": _lu_transit(at_port, port) if at_port else 0, "has_lineup": bool(snap),
+                "lineup_date": snap["lineup_date"] if snap else "", "berths": len(berths)}
+        if not berths:
+            item.update({"ok": False, "reason": "No berths set up yet"})
+            res.append(item)
+            continue
+        fits = [b for b in berths if not b.get("max_draft") or draft <= b["max_draft"]]
+        item["fit_count"] = len(fits)
+        if not fits:
+            deepest = max((b.get("max_draft") or 0) for b in berths)
+            item.update({"ok": False, "reason": f"No berth takes {draft:.1f} m (deepest {deepest:.1f} m)"})
+            res.append(item)
+            continue
+        mine = next((v for v in vessels if vessel_name and v["vessel"] == vessel_name), None) if port == at_port else None
+        if mine:   # she is already in this port's queue: keep her real place in line
+            x = _lu_simulate(berths, vessels, now).get(mine["id"]) or {}
+            arrive = _lu_dt(mine["arrived"]) or now
+            item["arrive"] = arrive.strftime("%Y-%m-%d %H:%M")
+        else:
+            sim = _lu_simulate(berths, vessels, now, extra={"id": "__x__", "status": "anchor" if arrive <= now else "expected",
+                                                             "draft": draft, "cargo": cargo, "qty": qty, "ready": arrive})
+            x = sim.get("__x__") or {}
+        if not x.get("start"):
+            item.update({"ok": False, "reason": "No berth available"})
+            res.append(item)
+            continue
+        wait = max(0, _lu_days(x["start"], arrive))
+        item.update({"ok": True, "berth": x["berth"], "start": x["start"].strftime("%Y-%m-%d %H:%M"), "end": x["end"].strftime("%Y-%m-%d %H:%M"),
+                     "wait": round(wait, 1), "days_alongside": _lu_days_alongside(cargo, qty),
+                     "tight": x.get("margin") is not None and x["margin"] < _LU_DRAFT_TIGHT, "margin": round(x["margin"], 2) if x.get("margin") is not None else None,
+                     "from_now": round(max(0, _lu_days(x["start"], now)), 1)})
+        res.append(item)
+    ok = [r for r in res if r.get("ok")]
+    best = min(ok, key=lambda r: (r["start"], r["wait"])) if ok else None
+    if best:
+        best["best"] = True
+    return res
+
+
+def _lu_n_days(x):
+    n = int(round(x))
+    return "1 day" if n == 1 else f"{n} days"
+
+
+def _lu_plan_message(results, vessel, draft, cargo, qty, at_port):
+    ok = sorted([r for r in results if r.get("ok")], key=lambda r: r["start"])
+    if not ok:
+        return ""
+    best = ok[0]
+    name = vessel.strip().upper() or "the vessel"
+    if name != "the vessel" and not name.startswith("MV "):
+        name = "MV " + name
+    cargo_txt = (f"{int(qty):,} MT of " if qty else "") + (cargo or "cargo").lower()
+    lines = []
+    if at_port and best["port"] == at_port:
+        head = (f"I have reviewed whether shifting {name} (arrival draft {draft:.1f} m, {cargo_txt}) to another port would shorten her waiting time. "
+                f"Based on today's line-ups, remaining at {best['full']} gives the earliest berthing, estimated on {_lu_fmt_day(best['start'])}"
+                + (f" at {best['berth']}." if best.get("berth") else "."))
+    elif at_port and best["port"] != at_port:
+        cur = next((r for r in results if r["port"] == at_port), None)
+        head = (f"Further to my review of today's line-ups, I recommend shifting {name} (arrival draft {draft:.1f} m, {cargo_txt}) "
+                f"from {_LU_PORT[at_port][1]} to {best['full']}.")
+        if cur and cur.get("ok"):
+            saved = _lu_days(_lu_dt(cur["start"]), _lu_dt(best["start"]))
+            head += (f" Allowing about {_lu_n_days(best['transit']) if best['transit'] >= 1 else 'one day'} for the passage, she is expected to berth at {best['full']} on {_lu_fmt_day(best['start'])}, "
+                     f"against {_lu_fmt_day(cur['start'])} if she remains at {_LU_PORT[at_port][1]}, which saves approximately {_lu_n_days(max(0, saved))}.")
+    else:
+        head = (f"Further to my review of today's line-ups for {name} (arrival draft {draft:.1f} m, {cargo_txt}), "
+                f"I recommend {best['full']}, where she is expected to berth on {_lu_fmt_day(best['start'])}"
+                + (" on arrival." if best["wait"] < 0.5 else f", after approximately {_lu_n_days(best['wait'])} at anchorage."))
+    lines.append(head)
+    lines.append("")
+    lines.append("Comparison of the three ports based on her draft:")
+    for r in results:
+        if r.get("ok"):
+            if at_port:
+                where = " (present position)" if r["port"] == at_port else f" (about {_lu_n_days(r['transit']) if r['transit'] >= 1 else 'one day'} passage)"
+                when = "berthing within the day" if r["from_now"] < 0.5 else f"berthing in approximately {_lu_n_days(r['from_now'])}"
+                lines.append(f"- {r['full']}{where}: estimated berthing {_lu_fmt_day(r['start'])}, {when}; {r['fit_count']} of {r['berths']} berths accept her draft.")
+                continue
+            w = "berthing on arrival" if r["wait"] < 0.5 else f"approximately {_lu_n_days(r['wait'])} at anchorage"
+            lines.append(f"- {r['full']}: estimated berthing {_lu_fmt_day(r['start'])}, {w}; {r['fit_count']} of {r['berths']} berths accept her draft.")
+        else:
+            lines.append(f"- {r['full']}: {r.get('reason', 'not available')}.")
+    lines.append("")
+    lines.append("These estimates are based on the line-ups published today and on current berth occupancy, and remain subject to port authority allocation, priority vessels and weather.")
+    return "Dear Sir,\n\n" + "\n".join(lines) + "\n\nI shall keep you updated on any change.\n\nBest regards,\nSea Power Marine Services Co. Ltd"
+
+
+# ----- routes -----
+
+@app.route("/lineups")
+@login_required
+def lineups_page():
+    return render_template_string(LINEUP_HTML, username=session.get("username"), role=session.get("role"))
+
+
+@app.route("/api/lineups", methods=["GET"])
+@login_required
+def lineups_overview():
+    db = get_db()
+    return jsonify({
+        "now": _lu_now().strftime("%Y-%m-%d %H:%M"),
+        "ports": [_lu_port_state(db, p) for p, _, _ in LINEUP_PORTS],
+        "settings": {"our_names": get_setting("lineup_our_names", "SEA POWER"), "wait_limit": float(get_setting("lineup_wait_limit", "4") or 4)},
+        "rates": _LU_RATES, "rate_labels": _LU_RATE_LABEL,
+    })
+
+
+@app.route("/api/lineups/import", methods=["POST"])
+@login_required
+def lineups_import():
+    port = (request.form.get("port") or "").upper()
+    day = (request.form.get("date") or "").strip() or _riyadh_today().isoformat()
+    try:
+        ref = datetime.strptime(day, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify({"error": "Choose the line-up date."}), 400
+    results = []
+    sources = []
+    for f in request.files.getlist("files"):
+        raw = f.read()
+        if not raw:
+            continue
+        if len(raw) > 25 * 1024 * 1024:
+            return jsonify({"error": f"{f.filename} is larger than 25 MB."}), 400
+        sources.append((f.filename or "file", raw))
+    text = (request.form.get("text") or "").strip()
+    if text:
+        sources.append(("pasted text", text.encode("utf-8")))
+    if not sources:
+        return jsonify({"error": "Add a line-up file or paste the line-up text."}), 400
+    db = get_db()
+    for fname, raw in sources:
+        try:
+            tables = _lu_tables_from_upload(raw, fname if fname != "pasted text" else "")
+        except Exception:
+            results.append({"source": fname, "error": "This file could not be opened. Try Excel, CSV, Word, PDF, or paste the table."})
+            continue
+        rows = _lu_rows_from_tables(tables, ref)
+        p = port or _lu_guess_port(fname) or _lu_guess_port(" ".join(" ".join(r) for t in tables for r in t["rows"][:8]))
+        if p not in _LU_PORT:
+            results.append({"source": fname, "error": "Which port is this line-up for? Choose the port and upload again."})
+            continue
+        if not rows:
+            results.append({"source": fname, "error": "No vessel table found. The line-up needs a header row with at least the vessel name and two of: agent, cargo, quantity, draft, arrival, berth."})
+            continue
+        now_txt = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+        snap_id = db.execute("INSERT INTO lu_snapshots (port, lineup_date, source, created_by, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
+                             (p, day, fname[:120], _who(), now_txt)).fetchone()["id"]
+        known = {_lu_norm_berth(b["name"]) for b in db.execute("SELECT name FROM lu_berths WHERE port = ?", (p,)).fetchall()}
+        prev = _lu_latest(db, p, before_id=snap_id)
+        prev_rows = {v["vessel"]: v for v in _lu_vessels(db, prev["id"])} if prev else {}
+        for i, r in enumerate(rows):
+            pv = prev_rows.get(r["vessel"], {})
+            ours = 1 if (_lu_is_ours(r["agent"]) or pv.get("ours")) else 0
+            db.execute(
+                "INSERT INTO lu_vessels (snapshot_id, seq, vessel, agent, cargo, qty, loa, draft, arrived, eta, etb, berth, berthed, etd, status, ours, principal, remarks) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (snap_id, i, r["vessel"], r["agent"], r["cargo"], r["qty"], r["loa"], r["draft"], r["arrived"], r["eta"], r["etb"], r["berth"],
+                 r["berthed"], r["etd"], r["status"], ours, pv.get("principal") or "", r["remarks"]))
+            k = _lu_norm_berth(r["berth"])
+            if r["berth"] and k not in known:
+                known.add(k)
+                db.execute("INSERT INTO lu_berths (port, name, max_draft, active, sort) VALUES (?, ?, NULL, 1, 999)",
+                           (p, ("Berth " + k) if re.match(r"^\d+[A-Z]?$", k) else r["berth"].title()))
+        db.commit()
+        results.append({"source": fname, "port": p, "port_name": _LU_PORT[p][0], "vessels": len(rows), "snapshot": snap_id})
+    return jsonify({"results": results})
+
+
+def _lu_vessel_fields(data):
+    f = {}
+    for k in ("vessel", "agent", "cargo", "principal", "remarks", "berth"):
+        if k in data:
+            f[k] = str(data.get(k) or "").strip()[:120]
+    if "vessel" in f:
+        bare = re.sub(r"^M\s*[./]?\s*[VT]\b[./]?\s*", "", f["vessel"].upper()).strip()
+        f["vessel"] = ("MV " + bare) if bare else ""
+    for k in ("qty", "loa", "draft"):
+        if k in data:
+            f[k] = _lu_num(data.get(k))
+    for k in ("arrived", "eta", "etb", "berthed", "etd"):
+        if k in data:
+            v = str(data.get(k) or "").strip().replace("T", " ")
+            d = _lu_dt(v[:16]) if len(v) >= 16 else (_lu_dt(v + " 12:00") if len(v) == 10 else None)
+            f[k] = d.strftime("%Y-%m-%d %H:%M") if d else ""
+    if "status" in data and data["status"] in ("alongside", "anchor", "expected"):
+        f["status"] = data["status"]
+    if "ours" in data:
+        f["ours"] = 1 if data.get("ours") else 0
+    return f
+
+
+@app.route("/api/lineups/vessels/<int:vid>", methods=["PUT", "DELETE"])
+@login_required
+def lineups_vessel(vid):
+    db = get_db()
+    if not db.execute("SELECT 1 FROM lu_vessels WHERE id = ?", (vid,)).fetchone():
+        return jsonify({"error": "Not found."}), 404
+    if request.method == "DELETE":
+        db.execute("DELETE FROM lu_vessels WHERE id = ?", (vid,))
+        db.commit()
+        return jsonify({"ok": True})
+    f = _lu_vessel_fields(request.get_json(force=True) or {})
+    if "vessel" in f and not f["vessel"]:
+        return jsonify({"error": "Enter the vessel name."}), 400
+    if f:
+        db.execute(f"UPDATE lu_vessels SET {', '.join(k + ' = ?' for k in f)} WHERE id = ?", (*f.values(), vid))
+        db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/lineups/<port>/vessels", methods=["POST"])
+@login_required
+def lineups_add_vessel(port):
+    port = port.upper()
+    if port not in _LU_PORT:
+        return jsonify({"error": "Unknown port."}), 404
+    db = get_db()
+    f = _lu_vessel_fields(request.get_json(force=True) or {})
+    if not f.get("vessel"):
+        return jsonify({"error": "Enter the vessel name."}), 400
+    snap = _lu_latest(db, port)
+    today = _riyadh_today().isoformat()
+    if not snap or snap["lineup_date"] != today:
+        # start today's line-up as a copy of the last one, so adding a vessel never loses the others
+        sid = db.execute("INSERT INTO lu_snapshots (port, lineup_date, source, created_by, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
+                         (port, today, "entered by hand", _who(), datetime.utcnow().strftime("%Y-%m-%d %H:%M"))).fetchone()["id"]
+        if snap:
+            for v in _lu_vessels(db, snap["id"]):
+                cols = [c for c in v if c not in ("id", "snapshot_id")]
+                db.execute(f"INSERT INTO lu_vessels (snapshot_id, {', '.join(cols)}) VALUES (?, {', '.join('?' for _ in cols)})", (sid, *[v[c] for c in cols]))
+        snap_id = sid
+    else:
+        snap_id = snap["id"]
+    f.setdefault("status", "anchor")
+    f["ours"] = 1 if (f.get("ours") or _lu_is_ours(f.get("agent"))) else 0
+    seq = (db.execute("SELECT MAX(seq) AS m FROM lu_vessels WHERE snapshot_id = ?", (snap_id,)).fetchone()["m"] or 0) + 1
+    cols = ["snapshot_id", "seq"] + list(f.keys())
+    db.execute(f"INSERT INTO lu_vessels ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})", (snap_id, seq, *f.values()))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/lineups/<port>/berths", methods=["PUT"])
+@login_required
+def lineups_berths(port):
+    """Replaces the berth list of one port: [{id?, name, max_draft}]."""
+    port = port.upper()
+    if port not in _LU_PORT:
+        return jsonify({"error": "Unknown port."}), 404
+    items = (request.get_json(force=True) or {}).get("berths") or []
+    db = get_db()
+    keep = []
+    for i, b in enumerate(items):
+        name = re.sub(r"\s+", " ", str(b.get("name") or "")).strip()[:40]
+        if not name:
+            continue
+        md = _lu_num(b.get("max_draft"))
+        if md is not None and not (3 <= md <= 25):
+            return jsonify({"error": f"Max draft for {name} looks wrong ({md} m)."}), 400
+        if b.get("id"):
+            db.execute("UPDATE lu_berths SET name = ?, max_draft = ?, active = 1, sort = ? WHERE id = ? AND port = ?", (name, md, i, int(b["id"]), port))
+            keep.append(int(b["id"]))
+        else:
+            keep.append(db.execute("INSERT INTO lu_berths (port, name, max_draft, active, sort) VALUES (?, ?, ?, 1, ?) RETURNING id", (port, name, md, i)).fetchone()["id"])
+    if keep:
+        db.execute(f"DELETE FROM lu_berths WHERE port = ? AND id NOT IN ({', '.join('?' for _ in keep)})", (port, *keep))
+    else:
+        db.execute("DELETE FROM lu_berths WHERE port = ?", (port,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/lineups/settings", methods=["POST"])
+@login_required
+def lineups_settings():
+    data = request.get_json(force=True) or {}
+    if "our_names" in data:
+        names = ", ".join(x.strip().upper() for x in str(data["our_names"]).split(",") if x.strip())[:200]
+        set_setting("lineup_our_names", names or "SEA POWER")
+    if "wait_limit" in data:
+        try:
+            set_setting("lineup_wait_limit", str(max(0.5, min(30.0, float(data["wait_limit"])))))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Enter the waiting limit in days."}), 400
+    return jsonify({"ok": True})
+
+
+@app.route("/api/lineups/plan", methods=["POST"])
+@login_required
+def lineups_plan():
+    data = request.get_json(force=True) or {}
+    draft = _lu_num(data.get("draft"))
+    if not draft or not (2 <= draft <= 25):
+        return jsonify({"error": "Enter the arrival draft in metres."}), 400
+    qty = _lu_num(data.get("qty")) or 0
+    cargo = str(data.get("cargo") or "general")
+    cargo_txt = _LU_RATE_LABEL.get(cargo, cargo)
+    at_port = (data.get("at_port") or "").upper()
+    if at_port and at_port not in _LU_PORT:
+        at_port = ""
+    now = _lu_now()
+    if at_port:
+        eta = now
+    else:
+        e = str(data.get("eta") or "")
+        eta = _lu_dt(e + " 12:00") if len(e) == 10 else None
+        eta = eta or now
+        if eta < now:
+            eta = now
+    db = get_db()
+    res = _lu_plan(db, draft, cargo_txt, qty, eta, at_port, (data.get("vessel_in_lineup") or "").upper())
+    msg = _lu_plan_message(res, str(data.get("vessel") or ""), draft, cargo_txt, qty, at_port)
+    return jsonify({"results": res, "message": msg})
+
+
+
 # ---------- Templates ----------
 
 AUTH_STYLE = """
@@ -9903,6 +10811,15 @@ HUB_HTML = """
       </div>
       <h3>Statement of Facts</h3>
       <p>Log a vessel call's event timeline field-by-field and export it as a signed-off SOF.</p>
+      <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
+    </a>
+
+    <a class="tile" href="/lineups">
+      <div class="tile-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v14M7 8h10"/><circle cx="12" cy="3" r="1"/><path d="M5 13a7 7 0 0 0 14 0"/><path d="M3 21c2 1 4 1 6 0s4-1 6 0 4 1 6 0"/></svg>
+      </div>
+      <h3>Port Line-ups</h3>
+      <p>Daily line-ups for Jeddah, Yanbu and Dammam: berth plan by draft, waiting times, and which port gets a vessel alongside first.</p>
       <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
     </a>
   </div>
@@ -13351,6 +14268,471 @@ loadTemplates();
 loadSettings();
 loadAlertSettings();
 {% endif %}
+</script>
+</body></html>
+"""
+
+LINEUP_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compass - Port Line-ups</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + r"""">
+<style>
+:root{
+  --bg:#f2f4f7;--card:#ffffff;--text:#1c2b3a;--muted:#5c6874;--faint:#8a96a3;--line:#e5e9ee;--soft:#f5f7fa;
+  --navy:#123a56;--navy-soft:#dfe8f0;--gold:#c9a227;--gold-soft:#f7edcf;--gold-text:#8a6a0c;--blk:#123a56;
+  --ok:#1c7c4d;--ok-soft:#e3f3ea;--warn:#9a6700;--warn-soft:#fbf0d4;--bad:#b3261e;--bad-soft:#fbe6e4;--info:#1d5f93;--info-soft:#e3eef8;
+  --shadow:0 1px 2px rgba(11,39,64,.04),0 8px 24px rgba(11,39,64,.06);color-scheme:light}
+:root[data-theme="dark"]{
+  --bg:#121921;--card:#1a232e;--text:#e9eef3;--muted:#a9b6c4;--faint:#7d8b9a;--line:#29343f;--soft:#1f2a36;
+  --navy:#5aa2d1;--navy-soft:#1d3346;--gold:#e3bb4c;--gold-soft:#3a3216;--gold-text:#e3bb4c;--blk:#2f74a6;
+  --ok:#6fd49c;--ok-soft:#16352a;--warn:#f0cf72;--warn-soft:#3a3010;--bad:#ff8f87;--bad-soft:#431b19;--info:#8cc4ee;--info-soft:#14304a;--shadow:none;color-scheme:dark}
+*{box-sizing:border-box}[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Arial,sans-serif;font-size:14.5px;line-height:1.45;-webkit-font-smoothing:antialiased;padding:0 16px 56px}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible,a:focus-visible{outline:3px solid var(--gold);outline-offset:2px}
+.num{font-variant-numeric:tabular-nums}
+.topbar{position:sticky;top:0;z-index:30;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 16px;margin:0 -16px 22px;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:saturate(180%) blur(14px);-webkit-backdrop-filter:saturate(180%) blur(14px);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:inherit}
+.brand img{height:32px;width:auto}
+.brand b{display:block;font-size:14.5px}.brand span{display:block;font-size:11px;color:var(--muted)}
+.topbar-right{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--muted);flex-wrap:wrap}
+.topbar-right a{color:var(--navy);text-decoration:none;font-weight:600;padding:6px 12px;border-radius:20px}
+.topbar-right a:hover{background:var(--line)}
+.theme-switch{position:relative;display:inline-flex;width:54px;height:29px;cursor:pointer}
+.theme-switch input{opacity:0;width:0;height:0;position:absolute}
+.theme-track{position:absolute;inset:0;border-radius:999px;display:flex;align-items:center;justify-content:space-between;padding:0 7px;background:linear-gradient(135deg,#8fcaf0,#f4d58d)}
+:root[data-theme="dark"] .theme-track{background:linear-gradient(135deg,#1f2b42,#33456a)}
+.theme-icon{width:13px;height:13px;color:#fff;z-index:1}.theme-icon svg{width:100%;height:100%}
+.theme-knob{position:absolute;top:3px;left:3px;width:23px;height:23px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.3);transition:transform .3s}
+input:checked+.theme-track .theme-knob{transform:translateX(25px);background:#0b2740}
+.wrap{max-width:1180px;margin:0 auto;display:grid;gap:18px}
+.title{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px;justify-content:space-between}
+.title .eyebrow{font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--gold-text)}
+.title h1{font-size:28px;margin:2px 0 0;letter-spacing:-.02em}
+.title p{margin:2px 0 0;color:var(--muted);font-size:13.5px}
+.title .acts{display:flex;gap:8px;flex-wrap:wrap}
+.btn{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:8px 15px;font-weight:600;font-size:13.5px}
+.btn:hover{border-color:var(--faint)}
+.btn.pri{background:#123a56;border-color:#123a56;color:#fff}
+:root[data-theme="dark"] .btn.pri{background:#2f74a6;border-color:#2f74a6}
+.btn.pri:hover{filter:brightness(1.12)}
+.btn.sm{padding:6px 12px;font-size:12.5px}
+.btn.danger{color:var(--bad)}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:18px 20px}
+.panel h2{font-size:15.5px;margin:0 0 4px}
+.panel .sub{font-size:12.5px;color:var(--muted);margin:0 0 12px}
+.frow{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:10px}
+.frow label,.fld{display:grid;gap:5px;font-size:12px;font-weight:600;color:var(--muted)}
+.frow input,.frow select,.frow textarea,.fld input,.fld select,.fld textarea{border:1px solid var(--line);background:var(--soft);border-radius:10px;padding:9px 11px;font-size:14px;width:100%;min-width:0}
+textarea{resize:vertical;min-height:110px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px!important}
+.result{font-size:13.5px;border-radius:10px;padding:9px 12px;margin-top:8px}
+.result.ok{background:var(--ok-soft);color:var(--ok)}.result.bad{background:var(--bad-soft);color:var(--bad)}
+.ports{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.port{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:14px 16px 10px;text-align:left;display:grid;gap:2px;min-width:0}
+.port:hover{border-color:var(--faint)}
+.port[aria-selected="true"]{border-color:var(--text);box-shadow:0 0 0 1px var(--text),var(--shadow)}
+.port .pn{display:flex;justify-content:space-between;gap:8px;align-items:center;font-weight:600;font-size:14px}
+.port .pn small{font-weight:500;color:var(--muted);font-size:12px;white-space:nowrap}
+.port .big{font-size:32px;font-weight:650;letter-spacing:-.02em;line-height:1.1;margin-top:4px}
+.port .big small{font-size:14px;font-weight:500;color:var(--muted);margin-left:4px;letter-spacing:0}
+.port .st{display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600}
+.port svg{width:100%;height:38px;display:block;margin-top:4px}
+.port .none{font-size:13px;color:var(--muted);margin-top:8px}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex:none}
+.c-calm{color:var(--ok)}.c-busy{color:var(--warn)}.c-cong{color:var(--bad)}.c-none{color:var(--faint)}
+.layout{display:grid;grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);gap:18px;grid-template-areas:"hero alerts" "ours ours" "plan plan" "planner side" "lineup lineup"}
+.a-hero{grid-area:hero}.a-alerts{grid-area:alerts}.a-ours{grid-area:ours}.a-plan{grid-area:plan}.a-planner{grid-area:planner}.a-side{grid-area:side}.a-lineup{grid-area:lineup}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:18px 20px;min-width:0}
+.card-h{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.card-h h2{font-size:15.5px;margin:0}
+.card-h span{font-size:12.5px;color:var(--muted)}
+.stack{display:grid;gap:18px;align-content:start}
+.hero .eyebrow{display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600}
+.hero h2{font-size:26px;line-height:1.2;letter-spacing:-.02em;margin:6px 0 4px;text-wrap:balance}
+.hero p{margin:0;color:var(--muted)}
+.facts{display:flex;gap:22px;flex-wrap:wrap;margin:16px 0 18px}
+.facts div{display:grid}.facts b{font-size:20px;font-weight:650}.facts span{font-size:12px;color:var(--muted)}
+.ohead{display:flex;justify-content:space-between;gap:10px;font-size:12.5px;color:var(--muted);border-top:1px solid var(--line);padding-top:14px;margin-bottom:10px}
+.ohead b{color:var(--text)}
+.outlook{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px}
+.outlook div{display:grid;justify-items:center;gap:6px;font-size:12px;color:var(--muted)}
+.outlook .col{height:84px;width:100%;max-width:34px;display:flex;align-items:flex-end;background:var(--soft);border-radius:8px;overflow:hidden}
+.outlook .col i{display:block;width:100%;border-radius:8px}
+.outlook b{color:var(--text);font-size:13px}
+.outlook .today{color:var(--text);font-weight:700}
+.empty{color:var(--muted);font-size:14px;padding:6px 0}
+.al{display:grid;grid-template-columns:22px minmax(0,1fr);gap:10px;padding:11px 0;border-top:1px solid var(--line);font-size:13.5px}
+.al:first-of-type{border-top:0;padding-top:0}
+.al .ic{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;font-weight:800;font-size:12px}
+.al.bad .ic{background:var(--bad-soft);color:var(--bad)}.al.warn .ic{background:var(--warn-soft);color:var(--warn)}.al.info .ic{background:var(--info-soft);color:var(--info)}
+.al b{font-weight:650}.al p{margin:0;color:var(--muted)}.al .btn{margin-top:6px}
+.vgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.vc{border:1px solid var(--line);border-radius:16px;padding:16px;display:grid;gap:14px;min-width:0}
+.vc.flag{border-color:color-mix(in srgb,var(--bad) 45%,var(--line))}
+.vtop{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.vtop .nm{font-weight:700;font-size:15px}
+.vtop .pr{font-size:12.5px;color:var(--muted)}
+.vtop .when{text-align:right;flex:none}
+.vtop .when b{display:block;font-size:20px;font-weight:650;letter-spacing:-.01em}
+.vtop .when span{font-size:11.5px;color:var(--muted)}
+.journey{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));position:relative}
+.journey::before{content:"";position:absolute;left:12.5%;right:12.5%;top:6px;height:2px;background:var(--line)}
+.journey .fill{position:absolute;left:12.5%;top:6px;height:2px;background:var(--navy)}
+.step{display:grid;justify-items:center;text-align:center;gap:5px;position:relative;font-size:11.5px;color:var(--muted)}
+.step i{width:14px;height:14px;border-radius:50%;background:var(--card);border:2px solid var(--line)}
+.step.done i{background:var(--navy);border-color:var(--navy)}
+.step.cur i{background:var(--card);border-color:var(--navy);box-shadow:0 0 0 4px var(--navy-soft)}
+.step b{color:var(--text);font-weight:600;font-size:12px}
+.vrow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12.5px}
+.chip{border-radius:999px;padding:3px 9px;font-weight:600;font-size:12px;background:var(--soft);color:var(--muted)}
+.chip.ok{background:var(--ok-soft);color:var(--ok)}.chip.bad{background:var(--bad-soft);color:var(--bad)}.chip.warn{background:var(--warn-soft);color:var(--warn)}.chip.info{background:var(--info-soft);color:var(--info)}
+.chip.no{text-decoration:line-through;opacity:.55}
+.vfoot{display:flex;justify-content:space-between;align-items:center;gap:8px;border-top:1px solid var(--line);padding-top:12px;font-size:12.5px;color:var(--muted);flex-wrap:wrap}
+.vfoot .b{display:flex;gap:6px;flex-wrap:wrap}
+.tl-scroll{overflow-x:auto;margin:0 -4px;padding:0 4px 4px}
+.tl{min-width:760px;display:grid;gap:8px}
+.tl-head,.tl-row{display:grid;grid-template-columns:118px minmax(0,1fr);gap:10px;align-items:center}
+.days{display:grid;grid-template-columns:repeat(7,1fr);font-size:12px;color:var(--muted)}
+.days div{padding-left:6px;border-left:1px solid var(--line)}
+.days .td{color:var(--text);font-weight:700}
+.bl{font-size:13px;font-weight:650;position:sticky;left:0;z-index:2;background:var(--card);padding:4px 0}
+.bl small{display:block;font-weight:500;color:var(--muted);font-size:11.5px}
+.bl small.unset{color:var(--warn)}
+.track{position:relative;height:40px;border-radius:10px;background:var(--soft);background-image:repeating-linear-gradient(90deg,transparent 0,transparent calc(100%/7 - 1px),var(--line) calc(100%/7 - 1px),var(--line) calc(100%/7))}
+.blk{position:absolute;top:5px;bottom:5px;border-radius:8px;padding:0 9px;display:flex;align-items:center;font-size:12px;font-weight:650;white-space:nowrap;overflow:hidden;border:1.5px solid transparent;text-align:left;min-width:0}
+.blk span{overflow:hidden;text-overflow:ellipsis}
+.blk.al1{background:var(--blk);color:#fff}
+.blk.pl{background:var(--navy-soft);color:var(--navy);border-style:dashed;border-color:color-mix(in srgb,var(--navy) 55%,transparent)}
+.blk.ours.al1{background:var(--gold);color:#1c2b3a}
+.blk.ours.pl{background:var(--gold-soft);color:var(--gold-text);border-color:var(--gold)}
+.blk.cut-l{border-top-left-radius:2px;border-bottom-left-radius:2px}
+.blk.cut-r{border-top-right-radius:2px;border-bottom-right-radius:2px}
+.blk[aria-pressed="true"]{box-shadow:0 0 0 2px var(--card),0 0 0 4px var(--text)}
+.nowl{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--bad);border-radius:2px;pointer-events:none}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:10px}
+.legend i{display:inline-block;width:14px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.detail{margin-top:14px;border-top:1px solid var(--line);padding-top:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px 18px;font-size:13px}
+.detail div span{display:block;color:var(--muted);font-size:11.5px;letter-spacing:.04em;text-transform:uppercase}
+.detail div b{font-weight:650}
+.detail .hint{grid-column:1/-1;color:var(--muted)}
+.nofit{margin-top:10px;font-size:13px;color:var(--bad)}
+.pform{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:14px}
+.res{display:grid;gap:8px}
+.ro{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:center;border:1px solid var(--line);border-radius:14px;padding:12px 14px}
+.ro.best{border-color:var(--ok);background:color-mix(in srgb,var(--ok-soft) 60%,var(--card))}
+.ro .pn{font-weight:650;display:flex;flex-wrap:wrap;gap:4px 8px;align-items:center}
+.ro .sub{font-size:12.5px;color:var(--muted)}
+.ro .d{text-align:right}.ro .d b{display:block;font-size:17px;font-weight:650}.ro .d span{font-size:12px;color:var(--muted)}
+.ro.none{opacity:.65}
+.pnote{font-size:12.5px;color:var(--muted);margin:10px 0 0}
+.pact{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.chg{display:grid;grid-template-columns:76px minmax(0,1fr);gap:8px;padding:8px 0;border-top:1px solid var(--line);font-size:13.5px}
+.chg:first-of-type{border-top:0;padding-top:0}
+.chg em{font-style:normal;font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);padding-top:2px}
+.chg em.r{color:var(--bad)}.chg em.g{color:var(--ok)}
+details.lu summary{list-style:none;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-weight:650;font-size:15.5px;gap:10px;flex-wrap:wrap}
+details.lu summary::-webkit-details-marker{display:none}
+details.lu summary span{font-weight:500;font-size:12.5px;color:var(--muted)}
+.tbl{overflow-x:auto;margin-top:14px;border:1px solid var(--line);border-radius:12px}
+table{border-collapse:collapse;width:100%;min-width:980px;font-size:13px}
+th,td{padding:9px 11px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);background:var(--soft)}
+th.r,td.r{text-align:right}
+tr:last-child td{border-bottom:0}
+tr.mine td{background:color-mix(in srgb,var(--gold) 9%,transparent)}
+tr.mine td:first-child{box-shadow:inset 3px 0 0 var(--gold)}
+.brow{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr) auto;gap:8px;margin-bottom:8px;align-items:center}
+.brow input{border:1px solid var(--line);background:var(--soft);border-radius:10px;padding:8px 10px;width:100%;min-width:0}
+.modal{position:fixed;inset:0;background:rgba(8,16,26,.5);display:grid;place-items:center;padding:16px;z-index:60}
+.sheet{background:var(--card);border-radius:18px;max-width:640px;width:100%;padding:20px;display:grid;gap:12px;max-height:92vh;overflow:auto}
+.sheet h3{margin:0;font-size:16px}
+.sheet pre{white-space:pre-wrap;font-family:inherit;background:var(--soft);border-radius:12px;padding:14px;margin:0;font-size:14px}
+.sheet .b{display:flex;gap:8px;flex-wrap:wrap}
+.toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:10px 16px;border-radius:10px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:70;max-width:90vw}
+.toast.on{opacity:1}
+@media (max-width:900px){.layout{grid-template-columns:1fr;grid-template-areas:"hero" "alerts" "ours" "plan" "planner" "side" "lineup"}.pform{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:600px){.ports{gap:8px}.port{padding:11px 11px 8px;border-radius:14px}.port .pn small{display:none}.port .big{font-size:24px}.port .big small{font-size:12px}.port .st span{display:none}.title h1{font-size:24px}.hero h2{font-size:22px}.card,.panel{padding:16px}.vgrid{grid-template-columns:1fr}.topbar-right .who{display:none}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style></head><body>
+<div class="topbar">
+  <a href="/" class="brand"><img src="data:image/png;base64,""" + LOGO_B64 + r"""" alt="Sea Power"><div><b>Compass</b><span>Port Line-ups</span></div></a>
+  <div class="topbar-right">
+    <label class="theme-switch" title="Toggle dark mode"><input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')"><span class="theme-track"><span class="theme-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg></span><span class="theme-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg></span><span class="theme-knob"></span></span></label>
+    <a href="/do-tracker">DO Tracker</a>
+    <a href="/jobs">Jobs</a>
+    <span class="who">Signed in as <b>{{ display_name }}</b></span>
+    <a href="/logout">Log out</a>
+  </div>
+</div>
+
+<div class="wrap">
+  <div class="title">
+    <div><div class="eyebrow">Daily port intelligence</div><h1>Line-ups</h1><p id="asof">Loading…</p></div>
+    <div class="acts"><button class="btn" id="setBtn" aria-expanded="false">Berths and settings</button><button class="btn pri" id="upBtn" aria-expanded="false">Upload line-ups</button></div>
+  </div>
+
+  <section class="panel" id="upPanel" hidden>
+    <h2>Upload line-ups</h2>
+    <p class="sub">Excel, CSV, Word or PDF, or paste the table straight from the email. Each upload is kept as that day's line-up, and Compass compares it with the day before.</p>
+    <div class="frow">
+      <label>Port<select id="upPort"><option value="">Recognise from the file</option><option value="JED">Jeddah Islamic Port</option><option value="YNB">Yanbu Commercial Port</option><option value="DMM">King Abdulaziz Port Dammam</option></select></label>
+      <label>Line-up date<input type="date" id="upDate"></label>
+      <label>Files<input type="file" id="upFiles" multiple accept=".xlsx,.xlsm,.xls,.csv,.txt,.pdf,.docx"></label>
+    </div>
+    <label class="fld">Or paste the line-up table<textarea id="upText" placeholder="Copy the table from Excel or the email, header row included, and paste it here"></textarea></label>
+    <div class="pact"><button class="btn pri" id="upGo">Import</button><button class="btn" id="upClose">Close</button></div>
+    <div id="upRes"></div>
+  </section>
+
+  <section class="panel" id="setPanel" hidden>
+    <h2 id="setTitle">Berths</h2>
+    <p class="sub">The general cargo berths at this port and the maximum draft each one accepts. Compass only places a vessel at a berth her draft fits.</p>
+    <div id="berthRows"></div>
+    <div class="pact"><button class="btn sm" id="addBerth">+ Add berth</button></div>
+    <div style="border-top:1px solid var(--line);margin:16px 0 12px"></div>
+    <h2>Settings</h2>
+    <div class="frow">
+      <label>Our agency name in line-ups<input id="setNames" placeholder="SEA POWER"></label>
+      <label>Waiting limit before an alert (days)<input type="number" id="setLimit" min="0.5" max="30" step="0.5"></label>
+    </div>
+    <div class="pact"><button class="btn pri" id="setSave">Save</button><button class="btn" id="setClose">Close</button></div>
+  </section>
+
+  <div class="ports" role="tablist" aria-label="Port" id="ports"></div>
+
+  <div class="layout">
+    <section class="card hero a-hero" id="hero"></section>
+    <section class="card a-alerts" id="alerts"></section>
+    <section class="card a-ours" id="ours"></section>
+    <section class="card a-plan" id="plan"></section>
+    <section class="card a-planner" id="planner"></section>
+    <div class="stack a-side"><section class="card" id="changes"></section></div>
+    <section class="card a-lineup"><details class="lu" id="lu"><summary>Full line-up <span id="luCount"></span></summary><div id="luBody"></div></details></section>
+  </div>
+</div>
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+(function initTheme(){var s=null;try{s=localStorage.getItem('theme')}catch(e){}var m=s||'light';document.documentElement.setAttribute('data-theme',m);window.addEventListener('DOMContentLoaded',function(){var c=document.getElementById('themeToggle');if(c)c.checked=m==='dark'})})();
+function setTheme(m){document.documentElement.setAttribute('data-theme',m);try{localStorage.setItem('theme',m)}catch(e){}}
+(function(){
+var D=null,cur='JED',sel=null,NOW=null,FRAC=0;
+var MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'],DOW=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+function $(i){return document.getElementById(i)}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function toast(t){var e=$('toast');e.textContent=t;e.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(function(){e.classList.remove('on')},2600)}
+function pd(s){if(!s)return null;var m=s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?/);return m?new Date(+m[1],+m[2]-1,+m[3],+(m[4]||12),+(m[5]||0)):null}
+function day(s){var d=typeof s==='string'?pd(s):s;return d?d.getDate()+' '+MON[d.getMonth()]:''}
+function offDay(off){var d=new Date(NOW.getTime()+off*864e5);return d}
+function fmtN(n){return n==null?'':Math.round(n).toLocaleString('en-US')}
+function ord(n){var s=['th','st','nd','rd'],v=n%100;return n+(s[(v-20)%10]||s[v]||s[0])}
+function api(url,opt){return fetch(url,Object.assign({headers:{'Content-Type':'application/json'}},opt||{})).then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||'Something went wrong');return j})})}
+function P(){return D.ports.filter(function(p){return p.port===cur})[0]}
+function level(avg){if(avg==null)return['none','No line-up'];return avg>=4?['cong','Congested']:avg>=2?['busy','Busy']:['calm','Calm']}
+function lvColor(l){return l==='cong'?'var(--bad)':l==='busy'?'var(--warn)':l==='calm'?'var(--ok)':'var(--faint)'}
+function waiting(p){return p.vessels.filter(function(v){return v.status==='anchor'})}
+
+function load(keepSel){return api('/api/lineups').then(function(j){D=j;NOW=pd(j.now);FRAC=(NOW.getHours()+NOW.getMinutes()/60)/24;if(!keepSel)sel=null;draw()}).catch(function(e){toast(e.message)})}
+
+function spark(p){
+  var h=p.history.map(function(x){return x.waiting}),o=p.outlook,lv=level(p.wait_today)[0],col=lvColor(lv);
+  if(!h.length&&!o.length)return '';
+  if(!h.length)h=[o[0]];
+  var all=h.concat(o.slice(1)),mx=Math.max.apply(0,all)+1,W=200,H=38,n=Math.max(all.length,2),step=W/(n-1);
+  function pt(i,v){return (i*step).toFixed(1)+','+(H-3-(H-8)*v/mx).toFixed(1)}
+  var a=h.map(function(v,i){return pt(i,v)}).join(' '),b=[pt(h.length-1,h[h.length-1])].concat(o.slice(1).map(function(v,i){return pt(h.length+i,v)})).join(' ');
+  var tp=pt(h.length-1,h[h.length-1]).split(',');
+  return '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" aria-hidden="true">'+(h.length>1?'<polyline points="'+a+'" fill="none" stroke="'+col+'" stroke-width="2" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>':'')+'<polyline points="'+b+'" fill="none" stroke="'+col+'" stroke-width="2" stroke-dasharray="3 4" opacity=".7" vector-effect="non-scaling-stroke"/><circle cx="'+tp[0]+'" cy="'+tp[1]+'" r="3" fill="'+col+'"/></svg>'}
+
+function drawPorts(){
+  $('ports').innerHTML=D.ports.map(function(p){var lv=level(p.snapshot?p.wait_today:null),w=waiting(p).length;
+    return '<button class="port" role="tab" data-port="'+p.port+'" aria-selected="'+(p.port===cur)+'"><span class="pn">'+esc(p.name)+(p.snapshot?'<small>'+w+' waiting</small>':'')+'</span>'+
+     (p.snapshot&&p.wait_today!=null?'<span class="big num">'+p.wait_today.toFixed(1)+'<small>days wait today</small></span><span class="st c-'+lv[0]+'"><i class="dot"></i><span>'+lv[1]+'</span></span>'+spark(p):'<span class="none">'+(p.snapshot?'Add berths to see waiting times':'No line-up yet')+'</span>')+'</button>'}).join('');
+}
+function names(list){var n=list.map(function(b){return b.name});if(n.every(function(x){return /^Berth\s+/i.test(x)})){var k=n.map(function(x){return x.replace(/^Berth\s+/i,'')});return (k.length>1?'Berths ':'Berth ')+(k.length>1?k.slice(0,-1).join(', ')+' and '+k[k.length-1]:k[0])}return n.length>1?n.slice(0,-1).join(', ')+' and '+n[n.length-1]:n[0]}
+function why(p){
+  var w=waiting(p),fam={};w.forEach(function(v){var c=(v.cargo||'').toUpperCase(),k=/STEEL|COIL|PIPE|BILLET|PLATE|REBAR|BEAM|IRON/.test(c)?'steel':/BAG|RICE|SUGAR|FLOUR|FERTILI/.test(c)?'bagged':'other';fam[k]=(fam[k]||0)+1});
+  var parts=[];
+  if(w.length){var top=Object.keys(fam).filter(function(k){return k!=='other'}).sort(function(a,b){return fam[b]-fam[a]})[0];
+    if(top&&fam[top]>=2&&fam[top]/w.length>=0.5)parts.push(fam[top]+' of the '+w.length+' vessels waiting carry '+(top==='steel'?'steel':'bagged cargo'));
+    else parts.push(w.length+' vessel'+(w.length===1?'':'s')+' waiting at anchor')}
+  else parts.push('Nobody is waiting at anchor');
+  var deep=p.berths.filter(function(b){return b.max_draft&&b.max_draft>=11});
+  if(p.berths.length&&deep.length&&deep.length<p.berths.length)parts.push('only '+names(deep)+' take'+(deep.length===1?'s':'')+' drafts of 11 m or more');
+  return parts.join(', and ')+'.'}
+function drawHero(p){
+  var el=$('hero');
+  if(!p.snapshot){el.innerHTML='<div class="eyebrow c-none"><i class="dot"></i>'+esc(p.full)+'</div><h2>No line-up yet.</h2><p>Upload today\'s '+esc(p.name)+' line-up to see the queue, the berth plan and how long a new arrival would wait.</p><div class="pact"><button class="btn pri" data-open-upload="'+p.port+'">Upload the '+esc(p.name)+' line-up</button></div>';return}
+  var lv=level(p.wait_today),o=p.outlook,mx=Math.max(Math.max.apply(0,o.concat([1])),Math.max.apply(0,p.history.map(function(x){return x.waiting}).concat([1]))),col=lvColor(lv[0]);
+  var pr=p.probe||{},head;
+  if(!p.berths.length)head='Add the '+p.name+' berths to see waiting times.';
+  else if(pr.normal==null)head='No berth here takes a 10 m draft.';
+  else head=pr.normal<0.5?'A vessel arriving today would berth on arrival.':'A vessel arriving today would wait about '+Math.round(pr.normal)+' day'+(Math.round(pr.normal)===1?'':'s')+' at anchor.';
+  if(pr.deep!=null&&pr.normal!=null&&pr.deep-pr.normal>=1)head=head.replace(/\.$/,'')+', about '+Math.round(pr.deep)+' if her draft is over 11 m.';
+  var along=p.vessels.filter(function(v){return v.status==='alongside'}).length,exp=p.vessels.filter(function(v){return v.status==='expected'&&v.ready_off!=null&&v.ready_off<=7}).length,w=waiting(p).length;
+  var d=(p.avg_wait!=null&&p.avg_wait_prev!=null)?p.avg_wait-p.avg_wait_prev:null;
+  el.innerHTML='<div class="eyebrow c-'+lv[0]+'"><i class="dot"></i>'+esc(p.full)+' · '+lv[1]+'</div><h2>'+esc(head)+'</h2><p>'+esc(why(p))+'</p>'+
+   '<div class="facts"><div><b class="num">'+w+'</b><span>at anchor</span></div><div><b class="num">'+along+'</b><span>alongside</span></div><div><b class="num">'+exp+'</b><span>arriving this week</span></div>'+
+   (p.avg_wait!=null?'<div><b class="num">'+p.avg_wait.toFixed(1)+' d</b><span>average wait, last 14 days</span></div>':'')+
+   (d!=null?'<div><b class="num" style="color:'+(d>0?'var(--bad)':'var(--ok)')+'">'+(d>0?'+':'−')+Math.abs(d).toFixed(1)+' d</b><span>vs the two weeks before</span></div>':'')+'</div>'+
+   '<div class="ohead"><b>Vessels waiting, next 7 days</b><span>from today\'s line-up</span></div><div class="outlook">'+o.map(function(v,i){var dd=offDay(i);return '<div><span class="'+(i===0?'today':'')+'">'+(i===0?'Today':DOW[dd.getDay()])+'</span><span class="col"><i style="height:'+Math.max(6,v/mx*100)+'%;background:'+(i===0?col:'color-mix(in srgb,'+col+' 45%,transparent)')+'"></i></span><b class="num">'+v+'</b></div>'}).join('')+'</div>'}
+function drawAlerts(p){
+  $('alerts').innerHTML='<div class="card-h"><h2>Needs attention</h2><span>'+p.alerts.length+'</span></div>'+(p.alerts.length?p.alerts.map(function(a){
+    return '<div class="al '+a.tone+'"><span class="ic">'+(a.tone==='info'?'i':'!')+'</span><div><b>'+esc(a.title)+'</b><p>'+esc(a.text)+'</p>'+(a.msg&&a.vessel?'<button class="btn sm" data-msg="'+a.vessel+'">Update principal</button>':'')+'</div></div>'}).join(''):'<p class="empty">Nothing needs you at '+esc(p.name)+' right now.</p>')}
+function status(v){return v.status==='alongside'?'Alongside':v.status==='anchor'?'At anchor':'Expected'}
+function drawOurs(p){
+  var ours=p.vessels.filter(function(v){return v.ours});
+  if(!p.snapshot){$('ours').innerHTML='<div class="card-h"><h2>Our vessels</h2></div><p class="empty">They show here once a line-up is uploaded.</p>';return}
+  $('ours').innerHTML='<div class="card-h"><h2>Our vessels</h2><span>'+ours.length+' at '+esc(p.name)+' · picked out by agent name, or tick "Ours" on any vessel</span></div>'+(ours.length?'<div class="vgrid">'+ours.map(function(v){
+    var st=v.status,flag=!!v.slipped_from||v.nofit;
+    var fit=p.berths.map(function(b){var ok=!v.draft||!b.max_draft||v.draft<=b.max_draft,tight=ok&&v.draft&&b.max_draft&&b.max_draft-v.draft<0.3;return '<span class="chip '+(ok?(tight?'warn':'ok'):'no')+'">'+esc(b.name.replace(/^Berth\s*/i,'B'))+(b.max_draft?' · '+b.max_draft.toFixed(1):'')+'</span>'}).join('');
+    var arr=pd(v.arrived),eta=pd(v.eta);
+    var steps=[['Arrived',arr?day(arr):(eta?'ETA '+day(eta):'—'),arr?'done':'cur'],
+      ['At anchor',st==='expected'?'—':(st==='anchor'?(v.waited!=null?Math.round(v.waited)+' days so far':'waiting'):(arr&&pd(v.berthed)?Math.max(0,Math.round((pd(v.berthed)-arr)/864e5))+' days':'—')),st==='alongside'?'done':(st==='anchor'?'cur':'')],
+      [v.est_berth||v.berth||'Berth',st==='alongside'?(v.berthed?'since '+day(v.berthed):'now'):(v.est_start?'~'+day(v.est_start):'—'),st==='alongside'?'cur':''],
+      ['Sails',v.est_end?'~'+day(v.est_end):'—','']];
+    var fill=st==='alongside'?50:st==='anchor'?25:0;
+    var when=st==='alongside'?[v.est_end?'~'+day(v.est_end):'—','est. sailing']:[v.est_start?'~'+day(v.est_start):'—','est. berthing'];
+    var tag=st==='alongside'?'<span class="chip ok">Alongside '+esc(v.est_berth||v.berth||'')+'</span>':st==='anchor'?'<span class="chip '+(flag?'bad':'warn')+'">'+(v.position?ord(v.position)+' in line':'At anchor')+(v.slipped_from?' · slipped':'')+'</span>':'<span class="chip info">Arrives '+(eta?day(eta):'')+'</span>';
+    if(v.nofit)tag+='<span class="chip bad">No berth fits</span>';
+    return '<article class="vc'+(flag?' flag':'')+'"><div class="vtop"><div><div class="nm">'+esc(v.vessel)+'</div><div class="pr">'+esc([v.principal||'Principal not set',v.cargo,v.qty?fmtN(v.qty)+' MT':''].filter(Boolean).join(' · '))+'</div></div><div class="when"><b>'+when[0]+'</b><span>'+when[1]+'</span></div></div>'+
+     '<div class="journey"><span class="fill" style="width:'+fill+'%"></span>'+steps.map(function(s){return '<div class="step '+s[2]+'"><i></i><b>'+esc(s[0])+'</b><span>'+esc(s[1])+'</span></div>'}).join('')+'</div>'+
+     '<div class="vrow">'+tag+(v.draft?'<span class="chip">Draft '+v.draft.toFixed(1)+' m</span>':'<span class="chip warn">Draft unknown</span>')+'</div>'+
+     (st==='alongside'||!p.berths.length?'':'<div class="vrow"><span style="color:var(--muted);margin-right:2px">Fits</span>'+fit+'</div>')+
+     '<div class="vfoot"><span>'+(st==='alongside'?'Working cargo':v.total_wait!=null?(v.total_wait<0.5?'Berths on arrival':'About '+Math.round(v.total_wait)+' days waiting in total'):'')+'</span><span class="b">'+(st!=='alongside'&&v.draft?'<button class="btn sm" data-cmp="'+v.id+'">Compare ports</button>':'')+'<button class="btn sm" data-msg="'+v.id+'">Update principal</button></span></div></article>'}).join('')+'</div>':'<p class="empty">None of the vessels on the '+esc(p.name)+' line-up is marked as ours. Open the full line-up and tick "Ours", or set your agency name in Berths and settings.</p>')}
+function drawPlan(p){
+  var el=$('plan');
+  if(!p.snapshot){el.innerHTML='<div class="card-h"><h2>Berth plan</h2></div><p class="empty">The 7-day berth plan appears once a line-up is uploaded.</p>';return}
+  if(!p.berths.length){el.innerHTML='<div class="card-h"><h2>Berth plan</h2></div><p class="empty">Add the '+esc(p.name)+' berths and their maximum drafts in Berths and settings to see the plan.</p>';return}
+  var days='';for(var i=0;i<7;i++){var dd=offDay(i);days+='<div class="'+(i===0?'td':'')+'">'+(i===0?'Today':DOW[dd.getDay()])+' '+dd.getDate()+'</div>'}
+  function key(n){var m=String(n||'').toUpperCase().match(/(\d+[A-Z]?)\s*$/);return m?m[1]:String(n||'').toUpperCase()}
+  var rows=p.berths.map(function(b){
+    var blocks=p.vessels.filter(function(v){return key(v.est_berth||(v.status==='alongside'?v.berth:''))===key(b.name)&&v.end_off!=null}).map(function(v){
+      var s0=(v.start_off==null?-1:v.start_off)+FRAC,e0=v.end_off+FRAC;if(e0<=0||s0>=7)return '';
+      var s=Math.max(s0,0),e=Math.min(e0,7),kind=v.status==='alongside'?'al1':'pl';
+      return '<button class="blk '+kind+(v.ours?' ours':'')+(s0<0?' cut-l':'')+(e0>7?' cut-r':'')+'" style="left:'+(s/7*100)+'%;width:calc('+((e-s)/7*100)+'% - 3px)" data-v="'+v.id+'" aria-pressed="'+(sel===v.id)+'" title="'+esc(v.vessel)+'"><span>'+esc(v.vessel.replace(/^MV\s+/,''))+'</span></button>'}).join('');
+    return '<div class="tl-row"><div class="bl">'+esc(b.name)+(b.max_draft?'<small>max draft '+b.max_draft.toFixed(1)+' m</small>':'<small class="unset">max draft not set</small>')+'</div><div class="track">'+blocks+'<span class="nowl" style="left:'+(FRAC/7*100)+'%"></span></div></div>'}).join('');
+  var nof=p.vessels.filter(function(v){return v.nofit});
+  var d='<div class="detail"><div class="hint">Tap a vessel on the plan to see its details.</div></div>';
+  var v=p.vessels.filter(function(x){return x.id===sel})[0];
+  if(v)d='<div class="detail"><div><span>Vessel</span><b>'+esc(v.vessel)+'</b></div><div><span>Agent</span><b>'+esc(v.agent||'—')+'</b></div><div><span>Cargo</span><b>'+esc([v.cargo,v.qty?fmtN(v.qty)+' MT':''].filter(Boolean).join(', ')||'—')+'</b></div><div><span>LOA / draft</span><b>'+(v.loa?Math.round(v.loa)+' m':'—')+' / '+(v.draft?v.draft.toFixed(1)+' m':'—')+'</b></div>'+
+    '<div><span>'+(v.status==='alongside'?'Alongside since':'Est. berthing')+'</span><b>'+(v.status==='alongside'?(v.berthed?day(v.berthed):'—'):(v.est_start?'~'+day(v.est_start):'—'))+'</b></div><div><span>Est. sailing</span><b>'+(v.est_end?'~'+day(v.est_end):'—')+'</b></div>'+(v.margin!=null?'<div><span>Draft margin</span><b>'+v.margin.toFixed(2)+' m</b></div>':'')+'</div>';
+  el.innerHTML='<div class="card-h"><h2>Berth plan</h2><span>next 7 days · '+p.berths.length+' berths</span></div><div class="tl-scroll"><div class="tl"><div class="tl-head"><div></div><div class="days">'+days+'</div></div>'+rows+'</div></div>'+
+   '<div class="legend"><span><i style="background:var(--blk)"></i>Alongside</span><span><i style="background:var(--navy-soft);border:1.5px dashed var(--navy)"></i>Expected to berth</span><span><i style="background:var(--gold)"></i>Ours</span><span><i style="background:var(--bad);width:3px"></i>Now</span></div>'+
+   (nof.length?'<div class="nofit">No berth takes: '+nof.map(function(v){return esc(v.vessel)+' ('+v.draft.toFixed(1)+' m)'}).join(', ')+'</div>':'')+d}
+
+/* ---------- plan a call ---------- */
+var PL={vessel:'',draft:10.8,cargo:'steel',qty:15000,at:'',eta:'',inLineup:''};
+function drawPlanner(){
+  var el=$('planner');
+  if(!el.querySelector('.pform')){
+    el.innerHTML='<div class="card-h"><h2>Plan a call</h2><span>which port gets her alongside first?</span></div>'+
+     '<div class="pform">'+
+     '<label class="fld">Vessel (optional)<input id="pv" placeholder="MV …"></label>'+
+     '<label class="fld">Arrival draft (m)<input type="number" id="pd" step="0.1" min="3" max="20"></label>'+
+     '<label class="fld">Cargo<select id="pc">'+Object.keys(D.rate_labels).map(function(k){return '<option value="'+k+'">'+D.rate_labels[k]+'</option>'}).join('')+'</select></label>'+
+     '<label class="fld">Quantity (MT)<input type="number" id="pq" step="500" min="0"></label>'+
+     '<label class="fld">Where is she now?<select id="pa"><option value="">At sea, arriving on</option>'+D.ports.map(function(p){return '<option value="'+p.port+'">At '+p.name+' anchorage</option>'}).join('')+'</select></label>'+
+     '<label class="fld" id="peWrap">Arrival date<input type="date" id="pe"></label></div>'+
+     '<div class="res" id="pres"></div><div class="pact" id="pact" hidden><button class="btn pri" id="pmsg">Recommendation for the principal</button></div>'+
+     '<p class="pnote">Worked out from the latest line-up of each port: she takes the first berth that accepts her draft and is free once she arrives. Sailing time is added when she shifts from one port to another. Check the cargo\'s final destination before advising a shift.</p>';
+    var t0=new Date(NOW.getTime()+2*864e5);PL.eta=t0.getFullYear()+'-'+String(t0.getMonth()+1).padStart(2,'0')+'-'+String(t0.getDate()).padStart(2,'0');
+    ['pv','pd','pc','pq','pa','pe'].forEach(function(id){$(id).addEventListener('input',function(){readPL();runPlan()})});
+    $('pmsg').addEventListener('click',function(){if(lastPlan&&lastPlan.message)sheet('Recommendation for the principal',lastPlan.message)});
+    fillPL();
+  }
+  runPlan()}
+function fillPL(){$('pv').value=PL.vessel;$('pd').value=PL.draft;$('pc').value=PL.cargo;$('pq').value=PL.qty;$('pa').value=PL.at;$('pe').value=PL.eta;$('peWrap').hidden=!!PL.at}
+function readPL(){PL.vessel=$('pv').value;PL.draft=parseFloat($('pd').value)||0;PL.cargo=$('pc').value;PL.qty=parseFloat($('pq').value)||0;var at=$('pa').value;if(at!==PL.at)PL.inLineup='';PL.at=at;PL.eta=$('pe').value;$('peWrap').hidden=!!PL.at}
+var lastPlan=null,planT=null;
+function runPlan(){clearTimeout(planT);planT=setTimeout(function(){
+  if(!PL.draft){$('pres').innerHTML='<p class="empty">Enter her arrival draft.</p>';$('pact').hidden=true;return}
+  api('/api/lineups/plan',{method:'POST',body:JSON.stringify({vessel:PL.vessel,draft:PL.draft,cargo:PL.cargo,qty:PL.qty,at_port:PL.at,eta:PL.eta,vessel_in_lineup:PL.inLineup})}).then(function(j){lastPlan=j;
+    $('pres').innerHTML=j.results.map(function(r){
+      if(!r.ok)return '<div class="ro none"><div><div class="pn">'+esc(r.full)+'</div><div class="sub">'+esc(r.reason)+'</div></div><div class="d"><b>—</b><span>'+(r.has_lineup?'':'no line-up')+'</span></div></div>';
+      var w=r.wait;return '<div class="ro'+(r.best?' best':'')+'"><div><div class="pn">'+esc(r.full)+(r.best?' <span class="chip ok">Earliest berthing</span>':'')+(PL.at===r.port?' <span class="chip">She is here</span>':'')+'</div>'+
+       '<div class="sub">'+(r.transit?'~'+r.transit+' day'+(r.transit===1?'':'s')+' sailing · ':'')+'Fits '+r.fit_count+' of '+r.berths+' berths · '+esc(r.berth)+(r.tight?' (tight: '+r.margin.toFixed(2)+' m margin)':'')+' · about '+r.days_alongside+' days alongside'+(r.lineup_date&&r.lineup_date<D.now.slice(0,10)?' · line-up of '+day(r.lineup_date+' 12:00'):'')+'</div></div>'+
+       '<div class="d"><b>'+day(r.start)+'</b><span>'+(PL.at?(r.from_now<0.5?'berths today':'in ~'+Math.round(r.from_now)+' day'+(Math.round(r.from_now)===1?'':'s')):(w<0.5?'berths on arrival':'waits ~'+Math.round(w)+' day'+(Math.round(w)===1?'':'s')))+'</span></div></div>'}).join('');
+    $('pact').hidden=!j.message}).catch(function(e){$('pres').innerHTML='<p class="empty">'+esc(e.message)+'</p>';$('pact').hidden=true})},250)}
+
+function drawSide(p){
+  $('changes').innerHTML='<div class="card-h"><h2>Since the last line-up</h2><span>'+(p.changes.length?p.changes.length+' changes':'')+'</span></div>'+(p.changes.length?p.changes.map(function(c){return '<div class="chg"><em class="'+c.tone+'">'+esc(c.kind)+'</em><span>'+esc(c.text)+'</span></div>'}).join(''):'<p class="empty">'+(p.snapshot?'Changes show from the second line-up onwards.':'No line-up yet.')+'</p>')}
+function drawLineup(p){
+  var vs=p.vessels.slice().sort(function(a,b){var o={alongside:0,anchor:1,expected:2};return o[a.status]-o[b.status]||((a.start_off==null?99:a.start_off)-(b.start_off==null?99:b.start_off))});
+  $('luCount').innerHTML=(p.snapshot?vs.length+' vessels · '+esc(p.snapshot.source)+' · '+day(p.snapshot.date+' 12:00'):'');
+  var cls={alongside:'ok',anchor:'warn',expected:'info'};
+  $('luBody').innerHTML='<div class="pact"><button class="btn sm" data-add="1">+ Add vessel</button></div>'+(vs.length?'<div class="tbl"><table><thead><tr><th>Status</th><th>Vessel</th><th>Agent</th><th>Cargo</th><th class="r">Qty (MT)</th><th class="r">LOA</th><th class="r">Draft</th><th>Arrived / ETA</th><th>Berth</th><th>Est. berthing</th><th>Est. sailing</th><th></th></tr></thead><tbody>'+
+   vs.map(function(v){return '<tr class="'+(v.ours?'mine':'')+'"><td><span class="chip '+cls[v.status]+'">'+status(v)+'</span></td><td><b>'+esc(v.vessel)+'</b></td><td>'+esc(v.agent)+'</td><td>'+esc(v.cargo)+'</td><td class="r num">'+fmtN(v.qty)+'</td><td class="r num">'+(v.loa?Math.round(v.loa):'')+'</td><td class="r num">'+(v.draft?v.draft.toFixed(1):'')+'</td><td>'+(v.arrived?day(v.arrived):v.eta?'ETA '+day(v.eta):'')+'</td><td>'+esc(v.status==='alongside'?v.berth:(v.est_berth||''))+'</td><td>'+(v.status==='alongside'?(v.berthed?day(v.berthed):'—'):(v.est_start?'~'+day(v.est_start):v.nofit?'no berth fits':'—'))+'</td><td>'+(v.est_end?'~'+day(v.est_end):'')+'</td><td><button class="btn sm" data-edit="'+v.id+'">Edit</button></td></tr>'}).join('')+'</tbody></table></div>':'')}
+
+function draw(){var p=P();drawPorts();drawHero(p);drawAlerts(p);drawOurs(p);drawPlan(p);drawSide(p);drawLineup(p);drawPlanner();
+  var s=D.ports.filter(function(x){return x.snapshot});$('asof').textContent=s.length?s.map(function(x){return x.name+' '+day(x.snapshot.date+' 12:00')}).join(' · '):'No line-ups yet. Upload the first ones to start.'}
+
+/* ---------- messages ---------- */
+function msgFor(v,p){
+  var b;
+  if(v.status==='alongside')b='I wish to advise that '+v.vessel+' is alongside '+(v.berth||'her berth')+' at '+p.full+(v.cargo?', working '+v.cargo.toLowerCase():'')+'. The estimated time of sailing is '+(v.est_end?day(v.est_end)+' '+pd(v.est_end).getFullYear():'to be confirmed')+', subject to cargo operations and weather.';
+  else if(v.status==='anchor')b='I wish to advise that '+v.vessel+' has been at anchorage at '+p.full+(v.arrived?' since '+day(v.arrived):'')+(v.position?' and is presently '+ord(v.position)+' in line':'')+'. Based on the current line-up and berth occupancy, the estimated time of berthing is '+(v.est_start?day(v.est_start)+' '+pd(v.est_start).getFullYear()+(v.est_berth?' at '+v.est_berth:''):'to be confirmed')+', subject to port congestion and berth availability.'+(v.draft&&p.berths.length&&v.fits&&v.fits.length<p.berths.length?' Please note that at her arrival draft of '+v.draft.toFixed(1)+' m only '+v.fits.length+' of the '+p.berths.length+' berths can accept her, which limits the options.':'');
+  else b='I wish to advise that '+v.vessel+' is expected at '+p.full+(v.eta?' on '+day(v.eta)+' '+pd(v.eta).getFullYear():'')+'. Based on the current line-up, the estimated time of berthing is '+(v.est_start?day(v.est_start)+' '+pd(v.est_start).getFullYear()+(v.est_berth?' at '+v.est_berth:''):'to be confirmed')+', subject to berth availability.';
+  return 'Dear Sir,\n\n'+b+'\n\nI shall keep you updated on any change.\n\nBest regards,\nSea Power Marine Services Co. Ltd'}
+function sheet(t,x){var m=document.createElement('div');m.className='modal';
+  m.innerHTML='<div class="sheet" role="dialog" aria-modal="true" aria-label="'+esc(t)+'"><h3>'+esc(t)+'</h3><pre id="mt"></pre><div class="b"><button class="btn pri" id="mc">Copy</button><a class="btn" id="mm" href="#">Open in email</a><button class="btn" id="mx">Close</button></div></div>';
+  document.body.appendChild(m);$('mt').textContent=x;$('mc').focus();
+  var subj=(t.indexOf('Recommendation')===0?'Port recommendation':'Vessel position update');
+  $('mm').href='mailto:?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(x);
+  $('mx').onclick=function(){m.remove()};m.onclick=function(e){if(e.target===m)m.remove()};
+  $('mc').onclick=function(){function s(){var r=document.createRange();r.selectNodeContents($('mt'));var g=getSelection();g.removeAllRanges();g.addRange(r);toast('Text selected, press Ctrl+C')}
+    try{navigator.clipboard.writeText(x).then(function(){toast('Copied')},s)}catch(e){s()}}}
+
+/* ---------- edit a vessel ---------- */
+function dtIn(s){return s?s.replace(' ','T'):''}
+function editVessel(v){
+  var p=P(),add=!v;v=v||{status:'anchor',ours:0};
+  var m=document.createElement('div');m.className='modal';
+  function f(id,label,val,type,extra){return '<label class="fld">'+label+'<input id="'+id+'" type="'+(type||'text')+'" value="'+esc(val==null?'':val)+'"'+(extra||'')+'></label>'}
+  m.innerHTML='<div class="sheet" role="dialog" aria-modal="true"><h3>'+(add?'Add a vessel to the '+esc(p.name)+' line-up':esc(v.vessel))+'</h3>'+
+   '<div class="frow">'+f('ev','Vessel',v.vessel)+f('ea','Agent',v.agent)+'<label class="fld">Status<select id="es"><option value="anchor">At anchor</option><option value="alongside">Alongside</option><option value="expected">Expected</option></select></label></div>'+
+   '<div class="frow">'+f('ec','Cargo',v.cargo)+f('eq','Quantity (MT)',v.qty,'number',' step="100"')+f('el','LOA (m)',v.loa,'number',' step="1"')+f('ed','Draft (m)',v.draft,'number',' step="0.1"')+'</div>'+
+   '<div class="frow">'+f('ear','Arrived',dtIn(v.arrived),'datetime-local')+f('eet','ETA',dtIn(v.eta),'datetime-local')+f('eb','Berth',v.berth)+f('ebd','Berthed',dtIn(v.berthed),'datetime-local')+f('etd','ETD',dtIn(v.etd),'datetime-local')+'</div>'+
+   '<div class="frow">'+f('epr','Principal',v.principal)+'<label class="fld" style="align-content:end"><span><input type="checkbox" id="eo"'+(v.ours?' checked':'')+'> Ours (Sea Power)</span></label></div>'+
+   '<div class="b"><button class="btn pri" id="esv">Save</button>'+(add?'':'<button class="btn danger" id="edl">Remove from line-up</button>')+'<button class="btn" id="ex">Cancel</button></div></div>';
+  document.body.appendChild(m);$('es').value=v.status;$('ev').focus();
+  $('ex').onclick=function(){m.remove()};
+  $('esv').onclick=function(){var body={vessel:$('ev').value,agent:$('ea').value,status:$('es').value,cargo:$('ec').value,qty:$('eq').value,loa:$('el').value,draft:$('ed').value,arrived:$('ear').value,eta:$('eet').value,berth:$('eb').value,berthed:$('ebd').value,etd:$('etd').value,principal:$('epr').value,ours:$('eo').checked};
+    api(add?'/api/lineups/'+p.port+'/vessels':'/api/lineups/vessels/'+v.id,{method:add?'POST':'PUT',body:JSON.stringify(body)}).then(function(){m.remove();toast('Saved');load(true)}).catch(function(e){toast(e.message)})};
+  if(!add)$('edl').onclick=function(){if($('edl').dataset.sure){api('/api/lineups/vessels/'+v.id,{method:'DELETE'}).then(function(){m.remove();toast('Removed');load()}).catch(function(e){toast(e.message)})}else{$('edl').dataset.sure=1;$('edl').textContent='Press again to remove'}}}
+
+/* ---------- berths and settings ---------- */
+function openSettings(){var p=P();$('setTitle').textContent=p.full+' berths';
+  $('berthRows').innerHTML=(p.berths.length?p.berths:[{name:'',max_draft:''}]).map(berthRow).join('');
+  $('setNames').value=D.settings.our_names;$('setLimit').value=D.settings.wait_limit;$('setPanel').hidden=false;$('setBtn').setAttribute('aria-expanded','true')}
+function berthRow(b){return '<div class="brow" data-id="'+(b.id||'')+'"><input class="bn" placeholder="Berth name, e.g. Berth 5" value="'+esc(b.name)+'" aria-label="Berth name"><input class="bd" type="number" step="0.1" min="3" max="25" placeholder="Max draft (m)" value="'+(b.max_draft==null?'':b.max_draft)+'" aria-label="Maximum draft in metres"><button class="btn sm danger" data-rmb="1" aria-label="Remove berth">Remove</button></div>'}
+
+document.addEventListener('click',function(e){var b=e.target.closest('button,[data-open-upload]');if(!b)return;
+  if(b.dataset.port){cur=b.dataset.port;sel=null;draw();if(!$('setPanel').hidden)openSettings();return}
+  if(b.dataset.v){var id=+b.dataset.v;sel=sel===id?null:id;drawPlan(P());return}
+  if(b.dataset.msg){var v=P().vessels.filter(function(x){return x.id===+b.dataset.msg})[0];if(v)sheet('Update to '+(v.principal||'the principal')+': '+v.vessel,msgFor(v,P()));return}
+  if(b.dataset.cmp){var v2=P().vessels.filter(function(x){return x.id===+b.dataset.cmp})[0];if(!v2)return;
+    PL.vessel=v2.vessel;PL.draft=v2.draft;var c=(v2.cargo||'').toUpperCase();PL.cargo=/STEEL|COIL|PIPE|BILLET|PLATE|REBAR|BEAM|IRON/.test(c)?'steel':/BAG|RICE|SUGAR|FLOUR|FERTILI/.test(c)?'bagged':/PROJECT|HEAVY|MACHIN|EQUIP/.test(c)?'project':/BULK|GRAIN|WHEAT|CLINKER/.test(c)?'bulk':'general';
+    PL.qty=v2.qty||0;PL.at=v2.status==='anchor'?P().port:'';PL.inLineup=v2.vessel;if(v2.status==='expected'&&v2.eta)PL.eta=v2.eta.slice(0,10);fillPL();runPlan();$('planner').scrollIntoView({behavior:'smooth',block:'start'});return}
+  if(b.dataset.edit){editVessel(P().vessels.filter(function(x){return x.id===+b.dataset.edit})[0]);return}
+  if(b.dataset.add){editVessel(null);return}
+  if(b.dataset.openUpload!==undefined&&b.dataset.openUpload!==''){$('upPort').value=b.dataset.openUpload;$('upPanel').hidden=false;$('upBtn').setAttribute('aria-expanded','true');$('upPanel').scrollIntoView({behavior:'smooth'});return}
+  if(b.dataset.rmb){b.closest('.brow').remove();return}
+  if(b.id==='upBtn'){var u=$('upPanel');u.hidden=!u.hidden;b.setAttribute('aria-expanded',!u.hidden);if(!u.hidden&&!$('upDate').value){var t=D?D.now.slice(0,10):'';$('upDate').value=t}return}
+  if(b.id==='upClose'){$('upPanel').hidden=true;$('upBtn').setAttribute('aria-expanded','false');return}
+  if(b.id==='setBtn'){if($('setPanel').hidden)openSettings();else{$('setPanel').hidden=true;b.setAttribute('aria-expanded','false')}return}
+  if(b.id==='setClose'){$('setPanel').hidden=true;$('setBtn').setAttribute('aria-expanded','false');return}
+  if(b.id==='addBerth'){$('berthRows').insertAdjacentHTML('beforeend',berthRow({name:'',max_draft:''}));$('berthRows').lastElementChild.querySelector('.bn').focus();return}
+  if(b.id==='setSave'){var rows=[].map.call($('berthRows').querySelectorAll('.brow'),function(r){return{id:r.dataset.id?+r.dataset.id:null,name:r.querySelector('.bn').value,max_draft:r.querySelector('.bd').value}}).filter(function(r){return r.name.trim()});
+    api('/api/lineups/'+cur+'/berths',{method:'PUT',body:JSON.stringify({berths:rows})}).then(function(){return api('/api/lineups/settings',{method:'POST',body:JSON.stringify({our_names:$('setNames').value,wait_limit:$('setLimit').value})})}).then(function(){toast('Saved');return load(true)}).then(function(){openSettings()}).catch(function(err){toast(err.message)});return}
+  if(b.id==='upGo'){var fd=new FormData();fd.append('port',$('upPort').value);fd.append('date',$('upDate').value);[].forEach.call($('upFiles').files,function(f){fd.append('files',f)});fd.append('text',$('upText').value);
+    b.disabled=true;b.textContent='Reading…';
+    fetch('/api/lineups/import',{method:'POST',body:fd}).then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||'Upload failed');return j})}).then(function(j){
+      $('upRes').innerHTML=j.results.map(function(r){return r.error?'<div class="result bad"><b>'+esc(r.source)+':</b> '+esc(r.error)+'</div>':'<div class="result ok"><b>'+esc(r.source)+':</b> '+r.vessels+' vessels read for '+esc(r.port_name)+'</div>'}).join('');
+      var okr=j.results.filter(function(r){return !r.error});if(okr.length){cur=okr[0].port;$('upFiles').value='';$('upText').value='';load()}}).catch(function(err){$('upRes').innerHTML='<div class="result bad">'+esc(err.message)+'</div>'}).then(function(){b.disabled=false;b.textContent='Import'});return}
+});
+document.addEventListener('keydown',function(e){if(e.key==='Escape'){var m=document.querySelectorAll('.modal');if(m.length)m[m.length-1].remove()}});
+load();
+})();
 </script>
 </body></html>
 """
