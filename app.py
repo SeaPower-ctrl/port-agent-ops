@@ -852,6 +852,17 @@ def init_db():
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_lu_vessels_snap ON lu_vessels (snapshot_id)")
     cur.execute(
+        """CREATE TABLE IF NOT EXISTS lu_predictions (
+            id SERIAL PRIMARY KEY,
+            port TEXT NOT NULL,
+            vessel TEXT NOT NULL,
+            made_on TEXT NOT NULL,
+            pred_start TEXT DEFAULT '',
+            pred_berth TEXT DEFAULT ''
+        )"""
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_lu_predictions ON lu_predictions (port, made_on)")
+    cur.execute(
         """CREATE TABLE IF NOT EXISTS records (
             bl_number TEXT PRIMARY KEY,
             consignee TEXT DEFAULT '',
@@ -8897,17 +8908,6 @@ def _lu_cargo_family(text):
     return "general"
 
 
-def _lu_days_alongside(cargo, qty):
-    fam = _lu_cargo_family(cargo)
-    try:
-        q = float(qty or 0)
-    except (TypeError, ValueError):
-        q = 0
-    if q <= 0:
-        return 2.0
-    return max(0.5, round(q / _LU_RATES[fam], 1))
-
-
 _LU_MONTHS = {m: i for i, m in enumerate(["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1)}
 
 
@@ -9155,14 +9155,37 @@ def _lu_dt(s):
         return None
 
 
-def _lu_simulate(berths, vessels, now, extra=None):
-    """Works out the berth plan. Returns {vessel_id: {...}} plus the extra
-    (hypothetical) vessel's result under key '__extra__'.
-    Times are datetimes. Berths without a max draft accept any draft."""
+def _lu_days_alongside(cargo, qty, rates=None):
+    fam = _lu_cargo_family(cargo)
+    try:
+        q = float(qty or 0)
+    except (TypeError, ValueError):
+        q = 0
+    if q <= 0:
+        return 2.0
+    rate = (rates or {}).get(fam) or _LU_RATES[fam]
+    return max(0.5, round(q / rate, 1))
+
+
+def _lu_simulate(berths, vessels, now, extra=None, learn=None, force=None, shift=None, phantoms=None, use_bias=True):
+    """Works out the berth plan, first come first served by readiness.
+    learn: what Compass has learned at this port (discharge rates, queue jumping,
+    the bias of past estimates) - applied when given.
+    force: {vessel_id: berth_key} - that waiting vessel may only use that berth.
+    shift: {vessel_id: (berth_key, when)} - that alongside vessel shifts berth at `when`.
+    phantoms: vessels not on the line-up yet but likely to arrive (from history).
+    Returns {vessel_id: {...}}; the extra (hypothetical) vessel keeps its own id."""
+    learn = learn or {}
+    rates = learn.get("rates_use")
+    jr = learn.get("jump_rate_use") or 0.0
+    bias = (learn.get("bias_use") or 0.0) if use_bias else 0.0
+    force = force or {}
+    shift = shift or {}
     bmap = {_lu_norm_berth(b["name"]): b for b in berths}
     free = {k: now for k in bmap}
     res = {}
-    # 1) vessels alongside hold their berth until they sail
+    # 1) vessels alongside hold their berth until they sail (or until a requested shift)
+    later = []
     for v in vessels:
         if v["status"] != "alongside":
             continue
@@ -9170,10 +9193,23 @@ def _lu_simulate(berths, vessels, now, extra=None):
         start = _lu_dt(v["berthed"]) or now
         end = _lu_dt(v["etd"])
         if not end or end <= now:
-            end = max(now + timedelta(hours=6), start + timedelta(days=_lu_days_alongside(v["cargo"], v["qty"])))
+            end = max(now + timedelta(hours=6), start + timedelta(days=_lu_days_alongside(v["cargo"], v["qty"], rates)))
+        if v["id"] in shift:
+            later.append((v, k, start, end))
+            continue
         res[v["id"]] = {"berth": bmap[k]["name"] if k in bmap else (v["berth"] or ""), "start": start, "end": end, "ready": _lu_dt(v["arrived"]) or start}
         if k in free:
             free[k] = max(free[k], end)
+    for v, k, start, end in later:
+        to, when = shift[v["id"]]
+        when = max(when, now)
+        if k in free:
+            free[k] = max(free[k], when + timedelta(hours=2))
+        s2 = max(free.get(to, now), when)
+        end2 = s2 + (end - when) + timedelta(hours=6)          # same remaining cargo work, plus the shifting time
+        free[to] = end2
+        res[v["id"]] = {"berth": bmap[to]["name"], "start": start, "end": end2, "ready": _lu_dt(v["arrived"]) or start,
+                        "shifted_from": bmap[k]["name"] if k in bmap else v["berth"], "shift_at": s2}
     # 2) waiting and expected vessels, first come first served by readiness
     queue = []
     for v in vessels:
@@ -9182,6 +9218,8 @@ def _lu_simulate(berths, vessels, now, extra=None):
         ready = _lu_dt(v["arrived"]) if v["status"] == "anchor" else _lu_dt(v["eta"])
         ready = ready or (now if v["status"] == "anchor" else now + timedelta(days=1))
         queue.append((ready, v.get("seq") or 0, v))
+    for ph in (phantoms or []):
+        queue.append((ph["ready"], 10 ** 5, ph))
     if extra:
         queue.append((extra["ready"], 10 ** 6, extra))
     queue.sort(key=lambda x: (x[0], x[1]))
@@ -9191,11 +9229,12 @@ def _lu_simulate(berths, vessels, now, extra=None):
         if not fits:
             res[v["id"]] = {"berth": "", "start": None, "end": None, "ready": ready, "nofit": True}
             continue
+        allowed = [force[v["id"]]] if v["id"] in force and force[v["id"]] in fits else fits
         etb = _lu_dt(v.get("etb") or "")
         want = _lu_norm_berth(v.get("berth") or "")
         best = None
-        for k in fits:
-            start = max(free[k], ready, now if v["status"] != "expected" else ready)
+        for k in allowed:
+            start = max(free[k], ready, now)
             if etb and want == k:
                 start = max(start, etb)
             score = (start, bmap[k].get("max_draft") or 99)       # earliest; on a tie keep deep berths for deep vessels
@@ -9204,13 +9243,368 @@ def _lu_simulate(berths, vessels, now, extra=None):
             if best is None or score < best[0]:
                 best = (score, k, start)
         _, k, start = best
-        end = start + timedelta(days=_lu_days_alongside(v.get("cargo"), v.get("qty")))
-        free[k] = end
+        dur = timedelta(days=_lu_days_alongside(v.get("cargo"), v.get("qty"), rates))
+        free[k] = start + dur
         b = bmap[k]
+        # what history says about this port: priority vessels stretch the wait, and past estimates ran early/late
+        base = max(ready, now)
+        adj = timedelta(days=max(0.0, _lu_days(start, base)) * jr + bias)
+        shown = max(base, start + adj)
         margin = (b["max_draft"] - draft) if (draft and b.get("max_draft")) else None
-        res[v["id"]] = {"berth": b["name"], "start": start, "end": end, "ready": ready, "margin": margin,
-                        "fits": [bmap[x]["name"] for x in fits]}
+        res[v["id"]] = {"berth": b["name"], "berth_key": k, "start": shown, "end": shown + dur, "ready": ready, "margin": margin,
+                        "fits": [bmap[x]["name"] for x in fits], "raw_start": start}
     return res
+
+
+def _lu_median(xs):
+    xs = sorted(xs)
+    if not xs:
+        return None
+    m = len(xs) // 2
+    return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2
+
+
+def _lu_history(db, port, days, now):
+    """{date: {vessel: row}} for the latest line-up of each day in the window."""
+    since = (now.date() - timedelta(days=days)).isoformat()
+    rows = db.execute(
+        "SELECT s.id AS sid, s.lineup_date, v.* FROM lu_vessels v JOIN lu_snapshots s ON s.id = v.snapshot_id "
+        "WHERE s.port = ? AND s.lineup_date >= ? AND s.lineup_date <= ? ORDER BY s.lineup_date, s.id",
+        (port, since, now.date().isoformat())).fetchall()
+    last_sid = {}
+    for r in rows:
+        last_sid[r["lineup_date"]] = r["sid"]
+    hist = {}
+    for r in rows:
+        if r["sid"] == last_sid[r["lineup_date"]]:
+            hist.setdefault(r["lineup_date"], {})[r["vessel"]] = dict(r)
+    return hist
+
+
+def _lu_learn(db, port, now=None):
+    """What Compass has learned at a port from the line-ups uploaded so far:
+    real discharge rates, how often priority vessels jump the queue, how many
+    vessels turn up that weren't on the line-up yet, and how accurate past
+    berthing estimates were (and in which direction)."""
+    cache = g.setdefault("_lu_learn", {})
+    if port in cache:
+        return cache[port]
+    now = now or _lu_now()
+    hist = _lu_history(db, port, 60, now)
+    dates = sorted(hist)
+    berths = {_lu_norm_berth(b["name"]): b for b in _lu_berths(db, port)}
+    out = {"days": len(dates)}
+
+    # 1) discharge rates: berthed -> gone from the line-up (or its last ETD)
+    samples = {}
+    seen = {}
+    for i, d in enumerate(dates):
+        for name, v in hist[d].items():
+            if v["status"] == "alongside":
+                seen.setdefault(name, []).append(i)
+    for name, idxs in seen.items():
+        last = idxs[-1]
+        if last + 1 >= len(dates) or name in hist[dates[last + 1]]:
+            continue                                   # still alongside, or no later line-up yet
+        v = hist[dates[last]][name]
+        berthed = _lu_dt(v["berthed"])
+        if not berthed or not v["qty"]:
+            continue
+        nxt = datetime.strptime(dates[last + 1], "%Y-%m-%d") + timedelta(hours=7)
+        etd = _lu_dt(v["etd"])
+        dep = etd if (etd and datetime.strptime(dates[last], "%Y-%m-%d") <= etd <= nxt) else nxt
+        days = _lu_days(dep, berthed)
+        if 0.3 <= days <= 25:
+            samples.setdefault(_lu_cargo_family(v["cargo"]), []).append(float(v["qty"]) / days)
+    rates_use, rates = {}, []
+    for fam, label in _LU_RATE_LABEL.items():
+        s = samples.get(fam, [])
+        learned = len(s) >= 3
+        rate = round(_lu_median(s)) if learned else _LU_RATES[fam]
+        rates_use[fam] = rate
+        rates.append({"fam": fam, "label": label, "rate": rate, "n": len(s), "learned": learned, "default": _LU_RATES[fam]})
+    out["rates"], out["rates_use"] = rates, rates_use
+
+    # 2) queue jumping: a vessel berths while one that arrived earlier, and fits that berth, is still waiting
+    jumps = berthings = 0
+    for d0, d1 in zip(dates, dates[1:]):
+        a, b = hist[d0], hist[d1]
+        for name, v in b.items():
+            if v["status"] != "alongside" or (name in a and a[name]["status"] == "alongside"):
+                continue
+            arr = _lu_dt(v["arrived"])
+            if not arr:
+                continue
+            berthings += 1
+            bk = berths.get(_lu_norm_berth(v["berth"]))
+            limit = bk.get("max_draft") if bk else None
+            for other in b.values():
+                oa = _lu_dt(other["arrived"])
+                if other["status"] == "anchor" and oa and oa < arr - timedelta(hours=6) and (not limit or not other["draft"] or other["draft"] <= limit):
+                    jumps += 1
+                    break
+    jr = (jumps / berthings) if berthings else 0.0
+    out["jumps"] = {"jumps": jumps, "berthings": berthings, "rate": round(jr, 2), "active": berthings >= 5}
+    out["jump_rate_use"] = round(jr, 2) if berthings >= 5 else 0.0
+
+    # 3) vessels that appear on the line-up: how many a week, and how far ahead
+    first, firsts_lead = {}, []
+    for d in dates:
+        for name, v in hist[d].items():
+            if name not in first:
+                first[name] = (d, v)
+    new_names = [n for n, (d, v) in first.items() if dates and d != dates[0]]
+    span = (datetime.strptime(dates[-1], "%Y-%m-%d") - datetime.strptime(dates[0], "%Y-%m-%d")).days if len(dates) > 1 else 0
+    for n in new_names:
+        d, v = first[n]
+        eta = _lu_dt(v["eta"])
+        if v["status"] == "expected" and eta:
+            firsts_lead.append(max(0.0, _lu_days(eta, datetime.strptime(d, "%Y-%m-%d") + timedelta(hours=7))))
+        elif v["status"] != "expected":
+            firsts_lead.append(0.0)                   # turned up without ever being listed as expected
+    per_day = (len(new_names) / span) if span else 0.0
+    lead = _lu_median(firsts_lead)
+    out["arrivals"] = {"per_week": round(per_day * 7, 1), "lead": round(lead, 1) if lead is not None else None,
+                       "days": span, "active": span >= 7 and per_day > 0}
+    out["arrival_rate"] = per_day if span >= 7 else 0.0
+    out["lead_use"] = lead if lead is not None else 3.0
+    out["leads"] = sorted(firsts_lead)
+
+    # 4) accuracy of past berthing estimates (made 0-10 days before the vessel actually berthed)
+    actual = {}
+    for d in dates:
+        for name, v in hist[d].items():
+            if v["status"] == "alongside" and _lu_dt(v["berthed"]):
+                actual.setdefault(name, set()).add(v["berthed"])
+    since = (now.date() - timedelta(days=45)).isoformat()
+    errs = []
+    for p in db.execute("SELECT vessel, made_on, pred_start FROM lu_predictions WHERE port = ? AND made_on >= ?", (port, since)).fetchall():
+        made = datetime.strptime(p["made_on"], "%Y-%m-%d")
+        pred = _lu_dt(p["pred_start"])
+        if not pred:
+            continue
+        hits = sorted(b for b in (_lu_dt(x) for x in actual.get(p["vessel"], ())) if b and made <= b <= made + timedelta(days=10))
+        if hits:
+            errs.append(_lu_days(hits[0], pred))
+    n = len(errs)
+    acc = {"n": n, "active": n >= 10}
+    if n:
+        acc.update({"within1": round(100 * sum(1 for e in errs if abs(e) <= 1) / n), "mae": round(sum(abs(e) for e in errs) / n, 1),
+                    "bias": round(sum(errs) / n, 1)})
+    out["accuracy"] = acc
+    out["bias_use"] = acc["bias"] if (n >= 10 and abs(acc.get("bias", 0)) >= 0.5) else 0.0     # only a clear, settled lean
+    cache[port] = out
+    return out
+
+
+def _lu_phantoms(learn, vessels, now, horizon_days=10):
+    """Vessels that are not on the line-up yet but, going by the last weeks, will
+    arrive. A vessel due in x days is already listed if the port normally gives
+    more than x days' notice, so only the share that is usually not listed yet
+    is added (no double counting of vessels already on the line-up)."""
+    rate = learn.get("arrival_rate") or 0.0
+    if rate <= 0:
+        return []
+    leads = learn.get("leads") or []
+    lead = learn.get("lead_use") or 3.0
+
+    def unlisted(x):                                   # share of vessels due in x days not on the line-up yet
+        if len(leads) >= 5:
+            return sum(1 for d in leads if d < x) / len(leads)
+        return 1.0 if x >= lead else 0.0
+    drafts = [v["draft"] for v in vessels if v.get("draft")]
+    qtys = [v["qty"] for v in vessels if v.get("qty")]
+    fams = [_lu_cargo_family(v["cargo"]) for v in vessels if v.get("cargo")]
+    fam = max(set(fams), key=fams.count) if fams else "general"
+    out, cum, x, step = [], 0.0, 0.0, 1.0 / 24
+    while x <= horizon_days and len(out) < 40:
+        cum += rate * unlisted(x + step / 2) * step
+        if cum >= len(out) + 0.5:
+            out.append({"id": f"__p{len(out)}", "status": "expected", "draft": _lu_median(drafts) or 10.0,
+                        "cargo": _LU_RATE_LABEL[fam], "qty": _lu_median(qtys) or 8000,
+                        "ready": now + timedelta(days=x), "phantom": True})
+        x += step
+    return out
+
+
+def _lu_record_predictions(db, port, snap_id):
+    """Keeps each day's estimated berthing time for every waiting/expected vessel,
+    so Compass can later check itself against when they actually berthed."""
+    snap = db.execute("SELECT * FROM lu_snapshots WHERE id = ?", (snap_id,)).fetchone()
+    if not snap:
+        return
+    real_now = _lu_now()
+    day_start = datetime.strptime(snap["lineup_date"], "%Y-%m-%d") + timedelta(hours=7)
+    now = day_start if snap["lineup_date"] < real_now.date().isoformat() else real_now
+    berths = _lu_berths(db, port)
+    vessels = _lu_vessels(db, snap_id)
+    learn = _lu_learn(db, port, now)
+    sim = _lu_simulate(berths, vessels, now, learn=learn, phantoms=_lu_phantoms(learn, vessels, now), use_bias=False)
+    for v in vessels:
+        s = sim.get(v["id"]) or {}
+        if v["status"] == "alongside" or not s.get("start"):
+            continue
+        db.execute("DELETE FROM lu_predictions WHERE port = ? AND vessel = ? AND made_on = ?", (port, v["vessel"], snap["lineup_date"]))
+        db.execute("INSERT INTO lu_predictions (port, vessel, made_on, pred_start, pred_berth) VALUES (?, ?, ?, ?, ?)",
+                   (port, v["vessel"], snap["lineup_date"], s["start"].strftime("%Y-%m-%d %H:%M"), s.get("berth", "")))
+    db.commit()
+
+
+def _lu_suggestions(port, berths, vessels, now, learn, phantoms, base):
+    """Berth re-allocations the agent can ask the terminal for: under first come,
+    first served nobody loses their turn, but a vessel can often take a smaller
+    berth (or shift to one) and free the deep berth our vessel needs. Only moves
+    that bring our vessel in at least half a day earlier, and delay nobody else by
+    more than a few hours, are suggested."""
+    bmap = {_lu_norm_berth(b["name"]): b for b in berths}
+    if not bmap:
+        return []
+    real = {v["id"]: v for v in vessels}
+
+    def fits(v, k):
+        b = bmap[k]
+        return not v.get("draft") or not b.get("max_draft") or v["draft"] <= b["max_draft"]
+
+    out = []
+    for o in vessels:
+        if not o["ours"] or o["status"] == "alongside" or not (base.get(o["id"]) or {}).get("start"):
+            continue
+        o0 = base[o["id"]]["start"]
+        cands = []
+        for v in vessels:                                   # a vessel ahead of ours takes another berth
+            if v["id"] == o["id"] or v["status"] == "alongside":
+                continue
+            bv = base.get(v["id"]) or {}
+            if not bv.get("start") or bv["start"] > o0 + timedelta(hours=2):
+                continue
+            for k in bmap:
+                if k != bv.get("berth_key") and fits(v, k):
+                    cands.append(("reallocate", v, k, None))
+        for v in vessels:                                   # a vessel alongside shifts to a smaller berth that frees first
+            if v["id"] == o["id"] or v["status"] != "alongside":
+                continue
+            a = _lu_norm_berth(v["berth"])
+            bv = base.get(v["id"]) or {}
+            if a not in bmap or not bv.get("end"):
+                continue
+            for k in bmap:
+                if k == a or not fits(v, k):
+                    continue
+                busy_until = max([now] + [(base.get(x["id"]) or {}).get("end") or now for x in vessels
+                                          if x["status"] == "alongside" and _lu_norm_berth(x["berth"]) == k])
+                if busy_until < bv["end"] - timedelta(hours=12):
+                    cands.append(("shift", v, k, busy_until))
+        best_for_o = []
+        for kind, v, k, when in cands:
+            sim = _lu_simulate(berths, vessels, now, learn=learn, phantoms=phantoms,
+                               force={v["id"]: k} if kind == "reallocate" else None,
+                               shift={v["id"]: (k, when)} if kind == "shift" else None)
+            o1 = (sim.get(o["id"]) or {}).get("start")
+            if not o1:
+                continue
+            gain = _lu_days(o0, o1)
+            if gain < 0.5:
+                continue
+            worst, who = 0.0, []
+            for vid, r0 in base.items():
+                if vid not in real or vid == o["id"]:
+                    continue
+                r1 = sim.get(vid) or {}
+                key = "end" if real[vid]["status"] == "alongside" else "start"
+                if r0.get(key) and r1.get(key):
+                    dly = _lu_days(r1[key], r0[key])
+                    if dly > 0.1:
+                        who.append((real[vid]["vessel"], round(dly, 2)))
+                    worst = max(worst, dly)
+            if worst > 0.25:                                  # someone would lose their turn: not a fair request
+                continue
+            nb = (sim.get(o["id"]) or {}).get("berth", "")
+            if kind == "reallocate":
+                when = (sim.get(v["id"]) or {}).get("start")
+            item = {"vessel_id": o["id"], "vessel": o["vessel"], "kind": kind, "other_id": v["id"], "other": v["vessel"],
+                    "other_draft": v.get("draft"), "other_from": (base.get(v["id"]) or {}).get("berth") or v.get("berth") or "",
+                    "to_berth": bmap[k]["name"], "when": when.strftime("%Y-%m-%d %H:%M") if when else "",
+                    "o_from": o0.strftime("%Y-%m-%d %H:%M"), "o_to": o1.strftime("%Y-%m-%d %H:%M"), "o_berth": nb,
+                    "gain": round(gain, 1), "delays": who, "worst": round(max(worst, 0.0), 2),
+                    "o_fits": (base.get(o["id"]) or {}).get("fits") or []}
+            item["message"] = _lu_request_message(port, o, v, item)
+
+            def off(x):
+                return round(_lu_days(x, now), 2)
+            prev = []                                         # the berth plan with the change, for the preview
+            for vid, r in sim.items():
+                if vid not in real or not r.get("end") or not r.get("berth"):
+                    continue
+                if r.get("shifted_from"):
+                    prev.append([vid, r["shifted_from"], off(r["start"]), off(r["shift_at"])])
+                    prev.append([vid, r["berth"], off(r["shift_at"]), off(r["end"])])
+                else:
+                    prev.append([vid, r["berth"], off(r["start"]) if r.get("start") else None, off(r["end"])])
+            item["preview"] = prev
+            item["moved"] = [o["id"], v["id"]]
+            best_for_o.append(item)
+        best_for_o.sort(key=lambda x: (-x["gain"], x["worst"]))
+        seen = set()
+        for it in best_for_o:
+            key = (it["kind"], it["other"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(it)
+            if len([x for x in out if x["vessel_id"] == o["id"]]) >= 2:
+                break
+    out.sort(key=lambda x: -x["gain"])
+    return out
+
+
+def _lu_signer():
+    try:
+        return session.get("display_name") or session.get("username") or ""
+    except RuntimeError:                                # outside a request (background work)
+        return ""
+
+
+def _lu_request_message(port, o, v, it):
+    """Formal request to the terminal / harbour master for a berth re-allocation."""
+    full = _LU_PORT[port][1]
+    od = f" (arrival draft {o['draft']:.1f} m)" if o.get("draft") else ""
+    if o["status"] == "anchor" and o.get("arrived"):
+        since = f" has been waiting at anchorage since {_lu_fmt_day(o['arrived'])}"
+    else:
+        since = " is expected" + (f" on {_lu_fmt_day(o['eta'])}" if o.get("eta") else "")
+    vd = f" (draft {v['draft']:.1f} m)" if v.get("draft") else ""
+    if it["kind"] == "reallocate":
+        on = f" when it becomes available on {_lu_fmt_day(it['when'])}" if it.get("when") else ""
+        ask = f"I request that {v['vessel']}{vd} be allocated {it['to_berth']}{on}, instead of {it['other_from']}."
+        if it.get("o_fits") == [it["other_from"]]:
+            ask += (f" {it['other_from']} is the only berth able to accept {o['vessel']}'s draft, "
+                    f"while {it['to_berth']} accepts {v['vessel']}'s.")
+        else:
+            ask += f" {it['to_berth']} accepts her draft."
+    else:
+        ask = (f"I request that {v['vessel']}{vd}, presently alongside {it['other_from']}, be shifted to {it['to_berth']} "
+               f"when that berth becomes available on {_lu_fmt_day(it['when'])}, as it accepts her draft.")
+    gain = (f"This allows {o['vessel']} to berth at {it['o_berth']} on {_lu_fmt_day(it['o_to'])} instead of "
+            f"{_lu_fmt_day(it['o_from'])}, reducing her waiting time by approximately {_lu_n_days(it['gain'])}.")
+    effects = []
+    for name, d in it.get("delays", []):
+        h = max(1, round(d * 24))
+        if name == v["vessel"] and it["kind"] == "shift":
+            effects.append(f"the only effect on {name} is the shifting time of approximately {h} hours")
+        else:
+            effects.append(f"{name} would berth approximately {h} hours later")
+    if effects:
+        fair = "Based on the current line-up, " + "; ".join(effects) + ". The first-come-first-served order is otherwise unchanged."
+    elif it["kind"] == "reallocate":
+        fair = f"Based on the current line-up, {v['vessel']} keeps her turn and no other vessel is delayed."
+    else:
+        fair = f"Based on the current line-up, {v['vessel']} completes her cargo operations as planned and no other vessel is delayed."
+    me = _lu_signer()
+    return ("Dear Sir,\n\n"
+            f"I write regarding the berthing sequence at {full}. {o['vessel']}{od}{since}.\n\n"
+            f"{ask} {gain} {fair}\n\n"
+            "Kindly confirm the revised allocation.\n\n"
+            "Best regards,\n" + (me + "\n" if me else "") + COMPANY_NAME_EN)
 
 
 def _lu_days(a, b):
@@ -9228,7 +9622,9 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
     if not snap:
         return out
     vessels = _lu_vessels(db, snap["id"])
-    sim = _lu_simulate(berths, vessels, now)
+    learn = _lu_learn(db, port, now)
+    phantoms = _lu_phantoms(learn, vessels, now)
+    sim = _lu_simulate(berths, vessels, now, learn=learn, phantoms=phantoms)
     out["snapshot"] = {"id": snap["id"], "date": snap["lineup_date"], "source": snap["source"], "by": snap["created_by"], "at": snap["created_at"]}
     waiting = [v for v in vessels if v["status"] == "anchor"]
     waiting_sorted = sorted(waiting, key=lambda v: (sim.get(v["id"], {}).get("start") or now + timedelta(days=99), _lu_dt(v["arrived"]) or now))
@@ -9254,7 +9650,8 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
 
     # waiting time a new arrival can expect today, for a normal and a deep draft
     def probe(draft):
-        r = _lu_simulate(berths, vessels, now, extra={"id": "__x__", "status": "anchor", "draft": draft, "cargo": "general", "qty": 8000, "ready": now})
+        r = _lu_simulate(berths, vessels, now, extra={"id": "__x__", "status": "anchor", "draft": draft, "cargo": "general", "qty": 8000, "ready": now},
+                         learn=learn, phantoms=phantoms)
         x = r.get("__x__") or {}
         return None if x.get("nofit") or not x.get("start") else round(max(0, _lu_days(x["start"], now)), 1)
     out["probe"] = {"normal": probe(10.0), "deep": probe(11.5) if any((b.get("max_draft") or 0) >= 11.5 for b in berths) else None}
@@ -9270,7 +9667,13 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
             to = _lu_days(t, now)
             if rd is not None and rd <= to and (st is None or st > to):
                 n += 1
-        out["outlook"].append(n)
+        u = 0
+        for ph in phantoms:                       # likely arrivals not on the line-up yet
+            r = sim.get(ph["id"]) or {}
+            if r.get("ready") and _lu_days(r["ready"], now) <= _lu_days(t, now) and (not r.get("start") or r["start"] > t):
+                u += 1
+        out["outlook"].append(n + u)
+        out.setdefault("outlook_unlisted", []).append(u)
 
     # history (last 30 days of line-ups): waiting count per day, and real waiting times
     since = (now.date() - timedelta(days=30)).isoformat()
@@ -9308,7 +9711,7 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
         old_list = _lu_vessels(db, prev["id"])
         old = {v["vessel"]: v for v in old_list}
         new = {v["vessel"]: v for v in vessels}
-        old_sim = _lu_simulate(berths, old_list, now)    # yesterday's queue worked out the same way, so places compare like with like
+        old_sim = _lu_simulate(berths, old_list, now, learn=learn)    # yesterday's queue worked out the same way, so places compare like with like
         old_wait = [v["vessel"] for v in sorted([v for v in old_list if v["status"] == "anchor"],
                     key=lambda v: (old_sim.get(v["id"], {}).get("start") or now + timedelta(days=99), _lu_dt(v["arrived"]) or now))]
         new_pos = {v["vessel"]: v["position"] for v in out["vessels"] if v["position"]}
@@ -9374,6 +9777,18 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
             out["alerts"].append({"tone": "info", "title": f"{v['vessel']} berths ~{_lu_fmt_day(v['est_start'])}", "text": "Book the surveyor and gangs."})
     rank = {"bad": 0, "warn": 1, "info": 2}
     out["alerts"].sort(key=lambda a: rank[a["tone"]])
+    out["learn"] = {k: learn[k] for k in ("days", "rates", "jumps", "arrivals", "accuracy")}
+    out["learn"]["bias_use"] = learn["bias_use"]
+    out["learn"]["jump_use"] = learn["jump_rate_use"]
+    try:
+        out["suggestions"] = _lu_suggestions(port, berths, vessels, now, learn, phantoms, sim)
+    except Exception:
+        app.logger.exception("line-up suggestions failed")
+        out["suggestions"] = []
+    for sgt in out["suggestions"]:
+        for item in out["vessels"]:
+            if item["id"] == sgt["vessel_id"]:
+                item["best_gain"] = max(item.get("best_gain") or 0, sgt["gain"])
     return out
 
 
@@ -9401,6 +9816,8 @@ def _lu_plan(db, draft, cargo, qty, eta, at_port="", vessel_name=""):
         berths = _lu_berths(db, port)
         snap = _lu_latest(db, port)
         vessels = _lu_vessels(db, snap["id"]) if snap else []
+        learn = _lu_learn(db, port, now)
+        phantoms = _lu_phantoms(learn, vessels, now, horizon_days=20)
         arrive = (max(now, eta) + timedelta(days=_lu_transit(at_port, port))) if at_port else eta
         item = {"port": port, "name": short, "full": full, "arrive": arrive.strftime("%Y-%m-%d %H:%M"),
                 "transit": _lu_transit(at_port, port) if at_port else 0, "has_lineup": bool(snap),
@@ -9418,12 +9835,13 @@ def _lu_plan(db, draft, cargo, qty, eta, at_port="", vessel_name=""):
             continue
         mine = next((v for v in vessels if vessel_name and v["vessel"] == vessel_name), None) if port == at_port else None
         if mine:   # she is already in this port's queue: keep her real place in line
-            x = _lu_simulate(berths, vessels, now).get(mine["id"]) or {}
+            x = _lu_simulate(berths, vessels, now, learn=learn, phantoms=phantoms).get(mine["id"]) or {}
             arrive = _lu_dt(mine["arrived"]) or now
             item["arrive"] = arrive.strftime("%Y-%m-%d %H:%M")
         else:
             sim = _lu_simulate(berths, vessels, now, extra={"id": "__x__", "status": "anchor" if arrive <= now else "expected",
-                                                             "draft": draft, "cargo": cargo, "qty": qty, "ready": arrive})
+                                                             "draft": draft, "cargo": cargo, "qty": qty, "ready": arrive},
+                                learn=learn, phantoms=phantoms)
             x = sim.get("__x__") or {}
         if not x.get("start"):
             item.update({"ok": False, "reason": "No berth available"})
@@ -9431,7 +9849,7 @@ def _lu_plan(db, draft, cargo, qty, eta, at_port="", vessel_name=""):
             continue
         wait = max(0, _lu_days(x["start"], arrive))
         item.update({"ok": True, "berth": x["berth"], "start": x["start"].strftime("%Y-%m-%d %H:%M"), "end": x["end"].strftime("%Y-%m-%d %H:%M"),
-                     "wait": round(wait, 1), "days_alongside": _lu_days_alongside(cargo, qty),
+                     "wait": round(wait, 1), "days_alongside": _lu_days_alongside(cargo, qty, learn.get("rates_use")),
                      "tight": x.get("margin") is not None and x["margin"] < _LU_DRAFT_TIGHT, "margin": round(x["margin"], 2) if x.get("margin") is not None else None,
                      "from_now": round(max(0, _lu_days(x["start"], now)), 1)})
         res.append(item)
@@ -9489,7 +9907,9 @@ def _lu_plan_message(results, vessel, draft, cargo, qty, at_port):
             lines.append(f"- {r['full']}: {r.get('reason', 'not available')}.")
     lines.append("")
     lines.append("These estimates are based on the line-ups published today and on current berth occupancy, and remain subject to port authority allocation, priority vessels and weather.")
-    return "Dear Sir,\n\n" + "\n".join(lines) + "\n\nI shall keep you updated on any change.\n\nBest regards,\nSea Power Marine Services Co. Ltd"
+    me = _lu_signer()
+    return ("Dear Sir,\n\n" + "\n".join(lines) + "\n\nI shall keep you updated on any change.\n\nBest regards,\n"
+            + (me + "\n" if me else "") + COMPANY_NAME_EN)
 
 
 # ----- routes -----
@@ -9508,7 +9928,7 @@ def lineups_overview():
         "now": _lu_now().strftime("%Y-%m-%d %H:%M"),
         "ports": [_lu_port_state(db, p) for p, _, _ in LINEUP_PORTS],
         "settings": {"our_names": get_setting("lineup_our_names", "SEA POWER"), "wait_limit": float(get_setting("lineup_wait_limit", "4") or 4)},
-        "rates": _LU_RATES, "rate_labels": _LU_RATE_LABEL,
+        "rates": _LU_RATES, "rate_labels": _LU_RATE_LABEL, "me": _lu_signer(),
     })
 
 
@@ -9625,6 +10045,10 @@ def lineups_import():
                 db.execute("INSERT INTO lu_berths (port, name, max_draft, active, sort) VALUES (?, ?, NULL, 1, 999)",
                            (p, ("Berth " + k) if re.match(r"^\d+[A-Z]?$", k) else r["berth"].title()))
         db.commit()
+        try:
+            _lu_record_predictions(db, p, snap_id)
+        except Exception:
+            app.logger.exception("recording line-up predictions failed")
         total = db.execute("SELECT COUNT(*) AS n FROM lu_vessels WHERE snapshot_id = ?", (snap_id,)).fetchone()["n"]
         for res in results:
             if res.get("port") == p and "error" not in res:
@@ -14385,9 +14809,11 @@ input:checked+.theme-track .theme-knob{transform:translateX(25px);background:#0b
 .btn.pri:hover{filter:brightness(1.12)}
 .btn.sm{padding:6px 12px;font-size:12.5px}
 .btn.danger{color:var(--bad)}
+a.btn{text-decoration:none;color:inherit;display:inline-flex;align-items:center}
 .panel{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:18px 20px}
 .panel h2{font-size:15.5px;margin:0 0 4px}
 .panel .sub{font-size:12.5px;color:var(--muted);margin:0 0 12px}
+.panel h2+.frow{margin-top:14px}
 .frow{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:10px}
 .frow label,.fld{display:grid;gap:5px;font-size:12px;font-weight:600;color:var(--muted)}
 .frow input,.frow select,.frow textarea,.fld input,.fld select,.fld textarea{border:1px solid var(--line);background:var(--soft);border-radius:10px;padding:9px 11px;font-size:14px;width:100%;min-width:0}
@@ -14407,9 +14833,9 @@ textarea{resize:vertical;min-height:110px;font-family:ui-monospace,SFMono-Regula
 .port .none{font-size:13px;color:var(--muted);margin-top:8px}
 .dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex:none}
 .c-calm{color:var(--ok)}.c-busy{color:var(--warn)}.c-cong{color:var(--bad)}.c-none{color:var(--faint)}
-.layout{display:grid;grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);gap:18px;grid-template-areas:"hero alerts" "ours ours" "plan plan" "planner side" "lineup lineup"}
-.a-hero{grid-area:hero}.a-alerts{grid-area:alerts}.a-ours{grid-area:ours}.a-plan{grid-area:plan}.a-planner{grid-area:planner}.a-side{grid-area:side}.a-lineup{grid-area:lineup}
-.card{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:18px 20px;min-width:0}
+.layout{display:grid;grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);gap:18px;grid-template-areas:"hero alerts" "opps opps" "ours ours" "plan plan" "planner side" "lineup lineup"}
+.a-opps{grid-area:opps}.a-hero{grid-area:hero}.a-alerts{grid-area:alerts}.a-ours{grid-area:ours}.a-plan{grid-area:plan}.a-planner{grid-area:planner}.a-side{grid-area:side}.a-lineup{grid-area:lineup}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:18px 20px;min-width:0;scroll-margin-top:84px}
 .card-h{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:12px;flex-wrap:wrap}
 .card-h h2{font-size:15.5px;margin:0}
 .card-h span{font-size:12.5px;color:var(--muted)}
@@ -14424,7 +14850,9 @@ textarea{resize:vertical;min-height:110px;font-family:ui-monospace,SFMono-Regula
 .outlook{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px}
 .outlook div{display:grid;justify-items:center;gap:6px;font-size:12px;color:var(--muted)}
 .outlook .col{height:84px;width:100%;max-width:34px;display:flex;align-items:flex-end;background:var(--soft);border-radius:8px;overflow:hidden}
-.outlook .col i{display:block;width:100%;border-radius:8px}
+.outlook .stk{display:flex;flex-direction:column;width:100%;border-radius:8px;overflow:hidden}
+.outlook .stk i{display:block;width:100%;min-height:0}
+.outlook .stk i.u{background-image:repeating-linear-gradient(135deg,transparent 0 3px,color-mix(in srgb,var(--card) 70%,transparent) 3px 6px)}
 .outlook b{color:var(--text);font-size:13px}
 .outlook .today{color:var(--text);font-weight:700}
 .empty{color:var(--muted);font-size:14px;padding:6px 0}
@@ -14517,8 +14945,39 @@ tr.mine td:first-child{box-shadow:inset 3px 0 0 var(--gold)}
 .sheet .b{display:flex;gap:8px;flex-wrap:wrap}
 .toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:10px 16px;border-radius:10px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:70;max-width:90vw}
 .toast.on{opacity:1}
-@media (max-width:900px){.layout{grid-template-columns:1fr;grid-template-areas:"hero" "alerts" "ours" "plan" "planner" "side" "lineup"}.pform{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:900px){.layout{grid-template-columns:1fr;grid-template-areas:"hero" "alerts" "opps" "ours" "plan" "planner" "side" "lineup"}.pform{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media (max-width:600px){.ports{gap:8px}.port{padding:11px 11px 8px;border-radius:14px}.port .pn small{display:none}.port .big{font-size:24px}.port .big small{font-size:12px}.port .st span{display:none}.title h1{font-size:24px}.hero h2{font-size:22px}.card,.panel{padding:16px}.vgrid{grid-template-columns:1fr}.topbar-right .who{display:none}}
+.opps{border-color:color-mix(in srgb,var(--gold) 55%,var(--line))}
+.opps .card-h h2{display:flex;align-items:center;gap:8px}
+.opps .card-h h2 i{width:8px;height:8px;border-radius:50%;background:var(--gold)}
+.op{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px 18px;padding:14px 0;border-top:1px solid var(--line);align-items:start}
+.op:first-of-type{border-top:0;padding-top:0}
+.op-t{font-size:15px;font-weight:650}
+.op-t em{font-style:normal;color:var(--ok)}
+.op-ask{font-size:13.5px;margin-top:5px}
+.op-fx{font-size:12.5px;color:var(--muted);margin-top:4px}
+.op-when{text-align:right}
+.op-when b{display:block;font-size:20px;font-weight:650;letter-spacing:-.01em}
+.op-when span{font-size:12px;color:var(--muted)}
+.op .b{grid-column:1/-1;display:flex;gap:8px;flex-wrap:wrap}
+.pvbar{display:flex;justify-content:space-between;align-items:center;gap:8px 12px;flex-wrap:wrap;background:var(--gold-soft);color:var(--gold-text);border-radius:12px;padding:8px 8px 8px 12px;font-size:13px;font-weight:600;margin-bottom:12px}
+.blk.moved{box-shadow:0 0 0 2px var(--card),0 0 0 4px var(--gold)}
+.chip.gold{background:var(--gold-soft);color:var(--gold-text)}
+button.chip{border:0;font-family:inherit;cursor:pointer}
+button.chip:hover{filter:brightness(.97)}
+.lr{display:grid;grid-template-columns:84px minmax(0,1fr);gap:8px;padding:10px 0;border-top:1px solid var(--line);font-size:13.5px}
+.lr:first-of-type{border-top:0;padding-top:0}
+.lr em{font-style:normal;font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);padding-top:2px}
+.lr b{font-weight:650}
+.lr p{margin:2px 0 0;color:var(--muted);font-size:12.5px}
+.lr .big{font-size:20px;font-weight:650;letter-spacing:-.01em;line-height:1.2}
+.rates{display:grid;gap:3px}
+.rates div{display:flex;justify-content:space-between;gap:8px}
+.rates small{color:var(--muted);font-size:12px;white-space:nowrap}
+.lbar{height:6px;border-radius:6px;background:var(--soft);overflow:hidden;margin:12px 0 6px}
+.lbar i{display:block;height:100%;background:var(--navy);border-radius:6px}
+.lnote{margin:0;color:var(--muted);font-size:13px}
+@media (max-width:600px){.op{grid-template-columns:1fr}.op-when{text-align:left;display:flex;align-items:baseline;gap:8px}.op-when b{font-size:18px}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style></head><body>
 <div class="topbar">
@@ -14540,13 +14999,11 @@ tr.mine td:first-child{box-shadow:inset 3px 0 0 var(--gold)}
 
   <section class="panel" id="upPanel" hidden>
     <h2>Upload line-ups</h2>
-    <p class="sub">Excel, CSV, Word or PDF, or paste the table straight from the email. Files for the same port and day are combined into one line-up, so for Dammam upload the berthing line-up and the expected-vessels list together. Uploading again the same day adds to that day's line-up. Compass compares each day with the day before.</p>
     <div class="frow">
       <label>Port<select id="upPort"><option value="">Recognise from the file</option><option value="JED">Jeddah Islamic Port</option><option value="YNB">Yanbu Commercial Port</option><option value="DMM">King Abdulaziz Port Dammam</option></select></label>
       <label>Line-up date<input type="date" id="upDate"></label>
       <label>Files<input type="file" id="upFiles" multiple accept=".xlsx,.xlsm,.xls,.csv,.txt,.pdf,.docx"></label>
     </div>
-    <label class="fld">Or paste the line-up table<textarea id="upText" placeholder="Copy the table from Excel or the email, header row included, and paste it here"></textarea></label>
     <div class="pact"><button class="btn pri" id="upGo">Import</button><button class="btn" id="upClose">Close</button></div>
     <div id="upRes"></div>
   </section>
@@ -14570,10 +15027,11 @@ tr.mine td:first-child{box-shadow:inset 3px 0 0 var(--gold)}
   <div class="layout">
     <section class="card hero a-hero" id="hero"></section>
     <section class="card a-alerts" id="alerts"></section>
+    <section class="card a-opps opps" id="opps" hidden></section>
     <section class="card a-ours" id="ours"></section>
     <section class="card a-plan" id="plan"></section>
     <section class="card a-planner" id="planner"></section>
-    <div class="stack a-side"><section class="card" id="changes"></section></div>
+    <div class="stack a-side"><section class="card" id="changes"></section><section class="card" id="learn"></section></div>
     <section class="card a-lineup"><details class="lu" id="lu"><summary>Full line-up <span id="luCount"></span></summary><div id="luBody"></div></details></section>
   </div>
 </div>
@@ -14583,7 +15041,7 @@ tr.mine td:first-child{box-shadow:inset 3px 0 0 var(--gold)}
 (function initTheme(){var s=null;try{s=localStorage.getItem('theme')}catch(e){}var m=s||'light';document.documentElement.setAttribute('data-theme',m);window.addEventListener('DOMContentLoaded',function(){var c=document.getElementById('themeToggle');if(c)c.checked=m==='dark'})})();
 function setTheme(m){document.documentElement.setAttribute('data-theme',m);try{localStorage.setItem('theme',m)}catch(e){}}
 (function(){
-var D=null,cur='JED',sel=null,NOW=null,FRAC=0;
+var D=null,cur='JED',sel=null,NOW=null,FRAC=0,PV=null;
 var MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'],DOW=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 function $(i){return document.getElementById(i)}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
@@ -14599,7 +15057,7 @@ function level(avg){if(avg==null)return['none','No line-up'];return avg>=4?['con
 function lvColor(l){return l==='cong'?'var(--bad)':l==='busy'?'var(--warn)':l==='calm'?'var(--ok)':'var(--faint)'}
 function waiting(p){return p.vessels.filter(function(v){return v.status==='anchor'})}
 
-function load(keepSel){return api('/api/lineups').then(function(j){D=j;NOW=pd(j.now);FRAC=(NOW.getHours()+NOW.getMinutes()/60)/24;if(!keepSel)sel=null;draw()}).catch(function(e){toast(e.message)})}
+function load(keepSel){return api('/api/lineups').then(function(j){D=j;NOW=pd(j.now);FRAC=(NOW.getHours()+NOW.getMinutes()/60)/24;if(!keepSel)sel=null;PV=null;draw()}).catch(function(e){toast(e.message)})}
 
 function spark(p){
   var h=p.history.map(function(x){return x.waiting}),o=p.outlook,lv=level(p.wait_today)[0],col=lvColor(lv);
@@ -14630,7 +15088,7 @@ function why(p){
 function drawHero(p){
   var el=$('hero');
   if(!p.snapshot){el.innerHTML='<div class="eyebrow c-none"><i class="dot"></i>'+esc(p.full)+'</div><h2>No line-up yet.</h2><p>Upload today\'s '+esc(p.name)+' line-up to see the queue, the berth plan and how long a new arrival would wait.</p><div class="pact"><button class="btn pri" data-open-upload="'+p.port+'">Upload the '+esc(p.name)+' line-up</button></div>';return}
-  var lv=level(p.wait_today),o=p.outlook,mx=Math.max(Math.max.apply(0,o.concat([1])),Math.max.apply(0,p.history.map(function(x){return x.waiting}).concat([1]))),col=lvColor(lv[0]);
+  var U=p.outlook_unlisted||[],lv=level(p.wait_today),o=p.outlook,mx=Math.max(Math.max.apply(0,o.concat([1])),Math.max.apply(0,p.history.map(function(x){return x.waiting}).concat([1]))),col=lvColor(lv[0]);
   var pr=p.probe||{},head;
   if(!p.berths.length)head='Add the '+p.name+' berths to see waiting times.';
   else if(pr.normal==null)head='No berth here takes a 10 m draft.';
@@ -14642,7 +15100,8 @@ function drawHero(p){
    '<div class="facts"><div><b class="num">'+w+'</b><span>at anchor</span></div><div><b class="num">'+along+'</b><span>alongside</span></div><div><b class="num">'+exp+'</b><span>arriving this week</span></div>'+
    (p.avg_wait!=null?'<div><b class="num">'+p.avg_wait.toFixed(1)+' d</b><span>average wait, last 14 days</span></div>':'')+
    (d!=null?'<div><b class="num" style="color:'+(d>0?'var(--bad)':'var(--ok)')+'">'+(d>0?'+':'−')+Math.abs(d).toFixed(1)+' d</b><span>vs the two weeks before</span></div>':'')+'</div>'+
-   '<div class="ohead"><b>Vessels waiting, next 7 days</b><span>from today\'s line-up</span></div><div class="outlook">'+o.map(function(v,i){var dd=offDay(i);return '<div><span class="'+(i===0?'today':'')+'">'+(i===0?'Today':DOW[dd.getDay()])+'</span><span class="col"><i style="height:'+Math.max(6,v/mx*100)+'%;background:'+(i===0?col:'color-mix(in srgb,'+col+' 45%,transparent)')+'"></i></span><b class="num">'+v+'</b></div>'}).join('')+'</div>'}
+   '<div class="ohead"><b>Vessels waiting, next 7 days</b><span>'+(U.some(function(x){return x>0})?'striped: likely arrivals not on the line-up yet':'from the latest line-up')+'</span></div><div class="outlook">'+o.map(function(v,i){var dd=offDay(i),u=U[i]||0,c=(i===0?col:'color-mix(in srgb,'+col+' 45%,transparent)');
+     return '<div title="'+(v-u)+' on the line-up'+(u?' + '+u+' likely arrival'+(u===1?'':'s')+' not listed yet':'')+'"><span class="'+(i===0?'today':'')+'">'+(i===0?'Today':DOW[dd.getDay()])+'</span><span class="col"><span class="stk" style="height:'+Math.max(6,v/mx*100)+'%">'+(u?'<i class="u" style="flex:'+u+';background-color:color-mix(in srgb,'+col+' 30%,transparent)"></i>':'')+(v-u>0||!u?'<i style="flex:'+Math.max(v-u,1)+';background:'+c+'"></i>':'')+'</span></span><b class="num">'+v+'</b></div>'}).join('')+'</div>'}
 function drawAlerts(p){
   $('alerts').innerHTML='<div class="card-h"><h2>Needs attention</h2><span>'+p.alerts.length+'</span></div>'+(p.alerts.length?p.alerts.map(function(a){
     return '<div class="al '+a.tone+'"><span class="ic">'+(a.tone==='info'?'i':'!')+'</span><div><b>'+esc(a.title)+'</b><p>'+esc(a.text)+'</p>'+(a.msg&&a.vessel?'<button class="btn sm" data-msg="'+a.vessel+'">Update principal</button>':'')+'</div></div>'}).join(''):'<p class="empty">Nothing needs you at '+esc(p.name)+' right now.</p>')}
@@ -14662,6 +15121,7 @@ function drawOurs(p){
     var when=st==='alongside'?[v.est_end?'~'+day(v.est_end):'—','est. sailing']:[v.est_start?'~'+day(v.est_start):'—','est. berthing'];
     var tag=st==='alongside'?'<span class="chip ok">Alongside '+esc(v.est_berth||v.berth||'')+'</span>':st==='anchor'?'<span class="chip '+(flag?'bad':'warn')+'">'+(v.position?ord(v.position)+' in line':'At anchor')+(v.slipped_from?' · slipped':'')+'</span>':'<span class="chip info">Arrives '+(eta?day(eta):'')+'</span>';
     if(v.nofit)tag+='<span class="chip bad">No berth fits</span>';
+    if(v.best_gain)tag+='<button class="chip gold" data-goopp="1">Could berth ~'+gainTxt(v.best_gain)+' earlier</button>';
     return '<article class="vc'+(flag?' flag':'')+'"><div class="vtop"><div><div class="nm">'+esc(v.vessel)+'</div><div class="pr">'+esc([v.principal||'Principal not set',v.cargo,v.qty?fmtN(v.qty)+' MT':''].filter(Boolean).join(' · '))+'</div></div><div class="when"><b>'+when[0]+'</b><span>'+when[1]+'</span></div></div>'+
      '<div class="journey"><span class="fill" style="width:'+fill+'%"></span>'+steps.map(function(s){return '<div class="step '+s[2]+'"><i></i><b>'+esc(s[0])+'</b><span>'+esc(s[1])+'</span></div>'}).join('')+'</div>'+
      '<div class="vrow">'+tag+(v.draft?'<span class="chip">Draft '+v.draft.toFixed(1)+' m</span>':'<span class="chip warn">Draft unknown</span>')+'</div>'+
@@ -14673,18 +15133,23 @@ function drawPlan(p){
   if(!p.berths.length){el.innerHTML='<div class="card-h"><h2>Berth plan</h2></div><p class="empty">Add the '+esc(p.name)+' berths and their maximum drafts in Berths and settings to see the plan.</p>';return}
   var days='';for(var i=0;i<7;i++){var dd=offDay(i);days+='<div class="'+(i===0?'td':'')+'">'+(i===0?'Today':DOW[dd.getDay()])+' '+dd.getDate()+'</div>'}
   function key(n){var m=String(n||'').toUpperCase().match(/(\d+[A-Z]?)\s*$/);return m?m[1]:String(n||'').toUpperCase()}
+  var pv=PV!=null&&p.suggestions?p.suggestions[PV]:null,over={},segs=[];
+  if(pv)pv.preview.forEach(function(x){(over[x[0]]=over[x[0]]||[]).push({b:x[1],s:x[2],e:x[3]})});
+  p.vessels.forEach(function(v){(over[v.id]||(v.end_off!=null?[{b:v.est_berth||(v.status==='alongside'?v.berth:''),s:v.start_off,e:v.end_off}]:[])).forEach(function(x){segs.push({v:v,b:x.b,s:x.s,e:x.e})})});
   var rows=p.berths.map(function(b){
-    var blocks=p.vessels.filter(function(v){return key(v.est_berth||(v.status==='alongside'?v.berth:''))===key(b.name)&&v.end_off!=null}).map(function(v){
-      var s0=(v.start_off==null?-1:v.start_off)+FRAC,e0=v.end_off+FRAC;if(e0<=0||s0>=7)return '';
-      var s=Math.max(s0,0),e=Math.min(e0,7),kind=v.status==='alongside'?'al1':'pl';
-      return '<button class="blk '+kind+(v.ours?' ours':'')+(s0<0?' cut-l':'')+(e0>7?' cut-r':'')+'" style="left:'+(s/7*100)+'%;width:calc('+((e-s)/7*100)+'% - 3px)" data-v="'+v.id+'" aria-pressed="'+(sel===v.id)+'" title="'+esc(v.vessel)+'"><span>'+esc(v.vessel.replace(/^MV\s+/,''))+'</span></button>'}).join('');
+    var blocks=segs.filter(function(x){return key(x.b)===key(b.name)&&x.e!=null}).map(function(x){var v=x.v;
+      var s0=(x.s==null?-1:x.s)+FRAC,e0=x.e+FRAC;if(e0<=0||s0>=7)return '';
+      var s=Math.max(s0,0),e=Math.min(e0,7),kind=v.status==='alongside'?'al1':'pl',mv=pv&&pv.moved.indexOf(v.id)>=0;
+      return '<button class="blk '+kind+(v.ours?' ours':'')+(mv?' moved':'')+(s0<0?' cut-l':'')+(e0>7?' cut-r':'')+'" style="left:'+(s/7*100)+'%;width:calc('+((e-s)/7*100)+'% - 3px)" data-v="'+v.id+'" aria-pressed="'+(sel===v.id)+'" title="'+esc(v.vessel)+'"><span>'+esc(v.vessel.replace(/^MV\s+/,''))+'</span></button>'}).join('');
     return '<div class="tl-row"><div class="bl">'+esc(b.name)+(b.max_draft?'<small>max draft '+b.max_draft.toFixed(1)+' m</small>':'<small class="unset">max draft not set</small>')+'</div><div class="track">'+blocks+'<span class="nowl" style="left:'+(FRAC/7*100)+'%"></span></div></div>'}).join('');
   var nof=p.vessels.filter(function(v){return v.nofit});
   var d='<div class="detail"><div class="hint">Tap a vessel on the plan to see its details.</div></div>';
   var v=p.vessels.filter(function(x){return x.id===sel})[0];
   if(v)d='<div class="detail"><div><span>Vessel</span><b>'+esc(v.vessel)+'</b></div><div><span>Agent</span><b>'+esc(v.agent||'—')+'</b></div><div><span>Cargo</span><b>'+esc([v.cargo,v.qty?fmtN(v.qty)+' MT':''].filter(Boolean).join(', ')||'—')+'</b></div><div><span>LOA / draft</span><b>'+(v.loa?Math.round(v.loa)+' m':'—')+' / '+(v.draft?v.draft.toFixed(1)+' m':'—')+'</b></div>'+
     '<div><span>'+(v.status==='alongside'?'Alongside since':'Est. berthing')+'</span><b>'+(v.status==='alongside'?(v.berthed?day(v.berthed):'—'):(v.est_start?'~'+day(v.est_start):'—'))+'</b></div><div><span>Est. sailing</span><b>'+(v.est_end?'~'+day(v.est_end):'—')+'</b></div>'+(v.margin!=null?'<div><span>Draft margin</span><b>'+v.margin.toFixed(2)+' m</b></div>':'')+'</div>';
-  el.innerHTML='<div class="card-h"><h2>Berth plan</h2><span>next 7 days · '+p.berths.length+' berths</span></div><div class="tl-scroll"><div class="tl"><div class="tl-head"><div></div><div class="days">'+days+'</div></div>'+rows+'</div></div>'+
+  el.innerHTML='<div class="card-h"><h2>Berth plan</h2><span>next 7 days · '+p.berths.length+' berths</span></div>'+
+   (pv?'<div class="pvbar"><span>With the change: '+esc(short(pv.other))+' at '+esc(pv.to_berth)+', '+esc(short(pv.vessel))+' alongside '+day(pv.o_to)+'</span><button class="btn sm" data-prev="'+PV+'">Back to current plan</button></div>':'')+
+   '<div class="tl-scroll"><div class="tl"><div class="tl-head"><div></div><div class="days">'+days+'</div></div>'+rows+'</div></div>'+
    '<div class="legend"><span><i style="background:var(--blk)"></i>Alongside</span><span><i style="background:var(--navy-soft);border:1.5px dashed var(--navy)"></i>Expected to berth</span><span><i style="background:var(--gold)"></i>Ours</span><span><i style="background:var(--bad);width:3px"></i>Now</span></div>'+
    (nof.length?'<div class="nofit">No berth takes: '+nof.map(function(v){return esc(v.vessel)+' ('+v.draft.toFixed(1)+' m)'}).join(', ')+'</div>':'')+d}
 
@@ -14702,7 +15167,7 @@ function drawPlanner(){
      '<label class="fld">Where is she now?<select id="pa"><option value="">At sea, arriving on</option>'+D.ports.map(function(p){return '<option value="'+p.port+'">At '+p.name+' anchorage</option>'}).join('')+'</select></label>'+
      '<label class="fld" id="peWrap">Arrival date<input type="date" id="pe"></label></div>'+
      '<div class="res" id="pres"></div><div class="pact" id="pact" hidden><button class="btn pri" id="pmsg">Recommendation for the principal</button></div>'+
-     '<p class="pnote">Worked out from the latest line-up of each port: she takes the first berth that accepts her draft and is free once she arrives. Sailing time is added when she shifts from one port to another. Check the cargo\'s final destination before advising a shift.</p>';
+     '<p class="pnote">Worked out from the latest line-up of each port, with the cargo rates and arrival patterns Compass has learned there: she takes the first berth that accepts her draft and is free once she arrives. Sailing time is added when she shifts from one port to another. Check the cargo\'s final destination before advising a shift.</p>';
     var t0=new Date(NOW.getTime()+2*864e5);PL.eta=t0.getFullYear()+'-'+String(t0.getMonth()+1).padStart(2,'0')+'-'+String(t0.getDate()).padStart(2,'0');
     ['pv','pd','pc','pq','pa','pe'].forEach(function(id){$(id).addEventListener('input',function(){readPL();runPlan()})});
     $('pmsg').addEventListener('click',function(){if(lastPlan&&lastPlan.message)sheet('Recommendation for the principal',lastPlan.message)});
@@ -14722,6 +15187,36 @@ function runPlan(){clearTimeout(planT);planT=setTimeout(function(){
        '<div class="d"><b>'+day(r.start)+'</b><span>'+(PL.at?(r.from_now<0.5?'berths today':'in ~'+Math.round(r.from_now)+' day'+(Math.round(r.from_now)===1?'':'s')):(w<0.5?'berths on arrival':'waits ~'+Math.round(w)+' day'+(Math.round(w)===1?'':'s')))+'</span></div></div>'}).join('');
     $('pact').hidden=!j.message}).catch(function(e){$('pres').innerHTML='<p class="empty">'+esc(e.message)+'</p>';$('pact').hidden=true})},250)}
 
+function short(n){return String(n||'').replace(/^MV\s+/,'')}
+function gainTxt(g){var d=Math.round(g);return g<1?Math.round(g*24)+' hours':d+' day'+(d===1?'':'s')}
+function hrs(d){var h=Math.max(1,Math.round(d*24));return h+' h'}
+function drawOpps(p){
+  var el=$('opps'),S=p.suggestions||[];
+  if(!S.length){el.hidden=true;el.innerHTML='';PV=null;return}
+  el.hidden=false;
+  el.innerHTML='<div class="card-h"><h2><i></i>Berthing opportunities</h2><span>berth changes the terminal can make without anyone losing their turn</span></div>'+S.map(function(s,i){
+    var od=s.other_draft?' ('+s.other_draft.toFixed(1)+' m)':'';
+    var ask=s.kind==='reallocate'?'Ask for <b>'+esc(s.other)+'</b>'+od+' to take <b>'+esc(s.to_berth)+'</b> instead of '+esc(s.other_from)+'.'
+      :'Ask for <b>'+esc(s.other)+'</b>'+od+' to shift from '+esc(s.other_from)+' to <b>'+esc(s.to_berth)+'</b> when it frees on '+day(s.when)+'.';
+    if(s.o_fits&&s.o_fits.length===1&&s.o_fits[0]===s.other_from)ask+=' '+esc(s.other_from)+' is the only berth that takes '+esc(short(s.vessel))+'.';
+    var fx=s.delays.length?s.delays.map(function(d){return esc(short(d[0]))+(d[0]===s.other&&s.kind==='shift'?' loses ~'+hrs(d[1])+' to the shift':' berths ~'+hrs(d[1])+' later')}).join(' · ')+' · the order stays first come, first served':'No other vessel is delayed';
+    return '<div class="op"><div><div class="op-t">'+esc(s.vessel)+' could berth <em>'+gainTxt(s.gain)+' earlier</em></div><div class="op-ask">'+ask+'</div><div class="op-fx">'+fx+'</div></div>'+
+     '<div class="op-when"><b>'+day(s.o_to)+'</b><span>instead of '+day(s.o_from)+'</span></div>'+
+     '<div class="b"><button class="btn pri sm" data-req="'+i+'">Request to terminal</button><button class="btn sm" data-prev="'+i+'" aria-pressed="'+(PV===i)+'">'+(PV===i?'Back to current plan':'Preview on berth plan')+'</button></div></div>'}).join('')}
+function drawLearn(p){
+  var el=$('learn'),L=p.learn;
+  if(!p.snapshot||!L){el.innerHTML='<div class="card-h"><h2>What Compass has learned</h2></div><p class="empty">Compass learns from every line-up you upload.</p>';return}
+  var h='<div class="card-h"><h2>What Compass has learned</h2><span>'+L.days+' day'+(L.days===1?'':'s')+' of line-ups</span></div>';
+  if(L.days<7){el.innerHTML=h+'<p class="lnote">Upload the '+esc(p.name)+' line-up every day. Compass learns the real cargo rates, how many vessels turn up unannounced, how often the queue is jumped and how close its own estimates came, and uses them from the first week.</p><div class="lbar"><i style="width:'+Math.round(L.days/7*100)+'%"></i></div><p class="lnote">'+L.days+' of 7 days</p>';return}
+  var a=L.accuracy,r='';
+  r+='<div class="lr"><em>Estimates</em><div>'+(a.active?'<div class="big num">'+a.within1+'%</div>within a day of the real berthing<p>off by '+a.mae.toFixed(1)+' days on average · '+a.n+' checked'+(L.bias_use?' · vessels berthed '+Math.abs(L.bias_use).toFixed(1)+' d '+(L.bias_use<0?'earlier':'later')+' than estimated, now allowed for':'')+'</p>':'Checking itself against real berthings<p>'+(a.n||0)+' of 10 so far</p>')+'</div></div>';
+  var lr=L.rates.filter(function(x){return x.n>0||x.learned});
+  r+='<div class="lr"><em>Cargo rates</em><div class="rates">'+(lr.length?lr.map(function(x){return '<div><span>'+esc(x.label)+' <b class="num">'+fmtN(x.rate)+'</b> t/day</span><small>'+(x.learned?'from '+x.n+' vessels':'standard, '+x.n+' of 3 seen')+'</small></div>'}).join(''):'<div><span>Standard rates</span><small>until 3 vessels of a cargo have sailed</small></div>')+'</div></div>';
+  var ar=L.arrivals;
+  r+='<div class="lr"><em>Arrivals</em><div>'+(ar.active?'<b>~'+Math.round(ar.per_week)+' new vessels a week</b>'+(ar.lead!=null?', usually listed '+ar.lead.toFixed(1)+' days ahead':'')+'<p>added to the waiting forecast</p>':'Needs a week of line-ups')+'</div></div>';
+  var j=L.jumps;
+  r+='<div class="lr"><em>Queue</em><div>'+(j.active?(j.jumps?'<b>'+j.jumps+' of '+j.berthings+'</b> berthings went ahead of an earlier vessel<p>waiting times stretched by '+Math.round(j.rate*100)+'%</p>':'<b>First come, first served</b><p>no queue jumping in '+j.berthings+' berthings</p>'):'Watching for queue jumping<p>'+j.berthings+' of 5 berthings seen</p>')+'</div></div>';
+  el.innerHTML=h+r}
 function drawSide(p){
   $('changes').innerHTML='<div class="card-h"><h2>Since the last line-up</h2><span>'+(p.changes.length?p.changes.length+' changes':'')+'</span></div>'+(p.changes.length?p.changes.map(function(c){return '<div class="chg"><em class="'+c.tone+'">'+esc(c.kind)+'</em><span>'+esc(c.text)+'</span></div>'}).join(''):'<p class="empty">'+(p.snapshot?'Changes show from the second line-up onwards.':'No line-up yet.')+'</p>')}
 function drawLineup(p){
@@ -14731,7 +15226,7 @@ function drawLineup(p){
   $('luBody').innerHTML='<div class="pact"><button class="btn sm" data-add="1">+ Add vessel</button></div>'+(vs.length?'<div class="tbl"><table><thead><tr><th>Status</th><th>Vessel</th><th>Agent</th><th>Cargo</th><th class="r">Qty (MT)</th><th class="r">LOA</th><th class="r">Draft</th><th>Arrived / ETA</th><th>Berth</th><th>Est. berthing</th><th>Est. sailing</th><th></th></tr></thead><tbody>'+
    vs.map(function(v){return '<tr class="'+(v.ours?'mine':'')+'"><td><span class="chip '+cls[v.status]+'">'+status(v)+'</span></td><td><b>'+esc(v.vessel)+'</b></td><td>'+esc(v.agent)+'</td><td>'+esc(v.cargo)+'</td><td class="r num">'+fmtN(v.qty)+'</td><td class="r num">'+(v.loa?Math.round(v.loa):'')+'</td><td class="r num">'+(v.draft?v.draft.toFixed(1):'')+'</td><td>'+(v.arrived?day(v.arrived):v.eta?'ETA '+day(v.eta):'')+'</td><td>'+esc(v.status==='alongside'?v.berth:(v.est_berth||''))+'</td><td>'+(v.status==='alongside'?(v.berthed?day(v.berthed):'—'):(v.est_start?'~'+day(v.est_start):v.nofit?'no berth fits':'—'))+'</td><td>'+(v.est_end?'~'+day(v.est_end):'')+'</td><td><button class="btn sm" data-edit="'+v.id+'">Edit</button></td></tr>'}).join('')+'</tbody></table></div>':'')}
 
-function draw(){var p=P();drawPorts();drawHero(p);drawAlerts(p);drawOurs(p);drawPlan(p);drawSide(p);drawLineup(p);drawPlanner();
+function draw(){var p=P();drawPorts();drawHero(p);drawAlerts(p);drawOpps(p);drawOurs(p);drawPlan(p);drawSide(p);drawLearn(p);drawLineup(p);drawPlanner();
   var s=D.ports.filter(function(x){return x.snapshot});$('asof').textContent=s.length?s.map(function(x){return x.name+' '+day(x.snapshot.date+' 12:00')}).join(' · '):'No line-ups yet. Upload the first ones to start.'}
 
 /* ---------- messages ---------- */
@@ -14740,11 +15235,11 @@ function msgFor(v,p){
   if(v.status==='alongside')b='I wish to advise that '+v.vessel+' is alongside '+(v.berth||'her berth')+' at '+p.full+(v.cargo?', working '+v.cargo.toLowerCase():'')+'. The estimated time of sailing is '+(v.est_end?day(v.est_end)+' '+pd(v.est_end).getFullYear():'to be confirmed')+', subject to cargo operations and weather.';
   else if(v.status==='anchor')b='I wish to advise that '+v.vessel+' has been at anchorage at '+p.full+(v.arrived?' since '+day(v.arrived):'')+(v.position?' and is presently '+ord(v.position)+' in line':'')+'. Based on the current line-up and berth occupancy, the estimated time of berthing is '+(v.est_start?day(v.est_start)+' '+pd(v.est_start).getFullYear()+(v.est_berth?' at '+v.est_berth:''):'to be confirmed')+', subject to port congestion and berth availability.'+(v.draft&&p.berths.length&&v.fits&&v.fits.length<p.berths.length?' Please note that at her arrival draft of '+v.draft.toFixed(1)+' m only '+v.fits.length+' of the '+p.berths.length+' berths can accept her, which limits the options.':'');
   else b='I wish to advise that '+v.vessel+' is expected at '+p.full+(v.eta?' on '+day(v.eta)+' '+pd(v.eta).getFullYear():'')+'. Based on the current line-up, the estimated time of berthing is '+(v.est_start?day(v.est_start)+' '+pd(v.est_start).getFullYear()+(v.est_berth?' at '+v.est_berth:''):'to be confirmed')+', subject to berth availability.';
-  return 'Dear Sir,\n\n'+b+'\n\nI shall keep you updated on any change.\n\nBest regards,\nSea Power Marine Services Co. Ltd'}
-function sheet(t,x){var m=document.createElement('div');m.className='modal';
+  return 'Dear Sir,\n\n'+b+'\n\nI shall keep you updated on any change.\n\nBest regards,\n'+(D.me?D.me+'\n':'')+'Sea Power Marine Services Co. Ltd'}
+function sheet(t,x,sj){var m=document.createElement('div');m.className='modal';
   m.innerHTML='<div class="sheet" role="dialog" aria-modal="true" aria-label="'+esc(t)+'"><h3>'+esc(t)+'</h3><pre id="mt"></pre><div class="b"><button class="btn pri" id="mc">Copy</button><a class="btn" id="mm" href="#">Open in email</a><button class="btn" id="mx">Close</button></div></div>';
   document.body.appendChild(m);$('mt').textContent=x;$('mc').focus();
-  var subj=(t.indexOf('Recommendation')===0?'Port recommendation':'Vessel position update');
+  var subj=sj||(t.indexOf('Recommendation')===0?'Port recommendation':'Vessel position update');
   $('mm').href='mailto:?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(x);
   $('mx').onclick=function(){m.remove()};m.onclick=function(e){if(e.target===m)m.remove()};
   $('mc').onclick=function(){function s(){var r=document.createRange();r.selectNodeContents($('mt'));var g=getSelection();g.removeAllRanges();g.addRange(r);toast('Text selected, press Ctrl+C')}
@@ -14775,8 +15270,11 @@ function openSettings(){var p=P();$('setTitle').textContent=p.full+' berths';
 function berthRow(b){return '<div class="brow" data-id="'+(b.id||'')+'"><input class="bn" placeholder="Berth name, e.g. Berth 5" value="'+esc(b.name)+'" aria-label="Berth name"><input class="bd" type="number" step="0.1" min="3" max="25" placeholder="Max draft (m)" value="'+(b.max_draft==null?'':b.max_draft)+'" aria-label="Maximum draft in metres"><button class="btn sm danger" data-rmb="1" aria-label="Remove berth">Remove</button></div>'}
 
 document.addEventListener('click',function(e){var b=e.target.closest('button,[data-open-upload]');if(!b)return;
-  if(b.dataset.port){cur=b.dataset.port;sel=null;draw();if(!$('setPanel').hidden)openSettings();return}
+  if(b.dataset.port){cur=b.dataset.port;sel=null;PV=null;draw();if(!$('setPanel').hidden)openSettings();return}
   if(b.dataset.v){var id=+b.dataset.v;sel=sel===id?null:id;drawPlan(P());return}
+  if(b.dataset.req){var sq=P().suggestions[+b.dataset.req];if(sq)sheet('Request to the terminal: '+sq.vessel,sq.message,'Berth allocation request - '+sq.vessel);return}
+  if(b.dataset.prev){var k=+b.dataset.prev;PV=PV===k?null:k;drawOpps(P());drawPlan(P());if(PV!=null)$('plan').scrollIntoView({behavior:'smooth',block:'start'});return}
+  if(b.dataset.goopp){$('opps').scrollIntoView({behavior:'smooth',block:'start'});return}
   if(b.dataset.msg){var v=P().vessels.filter(function(x){return x.id===+b.dataset.msg})[0];if(v)sheet('Update to '+(v.principal||'the principal')+': '+v.vessel,msgFor(v,P()));return}
   if(b.dataset.cmp){var v2=P().vessels.filter(function(x){return x.id===+b.dataset.cmp})[0];if(!v2)return;
     PL.vessel=v2.vessel;PL.draft=v2.draft;var c=(v2.cargo||'').toUpperCase();PL.cargo=/STEEL|COIL|PIPE|BILLET|PLATE|REBAR|BEAM|IRON/.test(c)?'steel':/BAG|RICE|SUGAR|FLOUR|FERTILI/.test(c)?'bagged':/PROJECT|HEAVY|MACHIN|EQUIP/.test(c)?'project':/BULK|GRAIN|WHEAT|CLINKER/.test(c)?'bulk':'general';
@@ -14792,11 +15290,11 @@ document.addEventListener('click',function(e){var b=e.target.closest('button,[da
   if(b.id==='addBerth'){$('berthRows').insertAdjacentHTML('beforeend',berthRow({name:'',max_draft:''}));$('berthRows').lastElementChild.querySelector('.bn').focus();return}
   if(b.id==='setSave'){var rows=[].map.call($('berthRows').querySelectorAll('.brow'),function(r){return{id:r.dataset.id?+r.dataset.id:null,name:r.querySelector('.bn').value,max_draft:r.querySelector('.bd').value}}).filter(function(r){return r.name.trim()});
     api('/api/lineups/'+cur+'/berths',{method:'PUT',body:JSON.stringify({berths:rows})}).then(function(){return api('/api/lineups/settings',{method:'POST',body:JSON.stringify({our_names:$('setNames').value,wait_limit:$('setLimit').value})})}).then(function(){toast('Saved');return load(true)}).then(function(){openSettings()}).catch(function(err){toast(err.message)});return}
-  if(b.id==='upGo'){var fd=new FormData();fd.append('port',$('upPort').value);fd.append('date',$('upDate').value);[].forEach.call($('upFiles').files,function(f){fd.append('files',f)});fd.append('text',$('upText').value);
+  if(b.id==='upGo'){var fd=new FormData();fd.append('port',$('upPort').value);fd.append('date',$('upDate').value);[].forEach.call($('upFiles').files,function(f){fd.append('files',f)});
     b.disabled=true;b.textContent='Reading…';
     fetch('/api/lineups/import',{method:'POST',body:fd}).then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||'Upload failed');return j})}).then(function(j){
       $('upRes').innerHTML=j.results.map(function(r){return r.error?'<div class="result bad"><b>'+esc(r.source)+':</b> '+esc(r.error)+'</div>':'<div class="result ok"><b>'+esc(r.source)+':</b> '+r.vessels+' vessels read for '+esc(r.port_name)+(r.combined?' · combined into the '+esc(r.port_name)+' line-up of '+day($('upDate').value+' 12:00')+', '+r.total+' vessels in all':'')+'</div>'}).join('');
-      var okr=j.results.filter(function(r){return !r.error});if(okr.length){cur=okr[0].port;$('upFiles').value='';$('upText').value='';load()}}).catch(function(err){$('upRes').innerHTML='<div class="result bad">'+esc(err.message)+'</div>'}).then(function(){b.disabled=false;b.textContent='Import'});return}
+      var okr=j.results.filter(function(r){return !r.error});if(okr.length){cur=okr[0].port;$('upFiles').value='';load()}}).catch(function(err){$('upRes').innerHTML='<div class="result bad">'+esc(err.message)+'</div>'}).then(function(){b.disabled=false;b.textContent='Import'});return}
 });
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){var m=document.querySelectorAll('.modal');if(m.length)m[m.length-1].remove()}});
 load();
