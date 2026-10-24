@@ -9254,25 +9254,75 @@ _OCR = {}
 _OCR_LOCK = threading.Lock()
 
 
+_OCR_WHEEL = ("rapidocr-onnxruntime", "1.4.4")      # carries the PP-OCRv4 text-recognition model (Apache-2.0)
+_OCR_MODEL_NAME = "ch_PP-OCRv4_rec_infer.onnx"
+
+
+def _ocr_model_path():
+    """Where the text-recognition model is: the installed rapidocr package, a copy next to
+    app.py (or OCR_MODEL_PATH), or - the first time a scan is read - downloaded once from
+    PyPI (the package's wheel; checked against PyPI's sha256) and kept in a cache folder."""
+    import importlib.util
+    import tempfile
+    try:
+        spec = importlib.util.find_spec("rapidocr_onnxruntime")
+    except (ImportError, ValueError):
+        spec = None
+    if spec and spec.submodule_search_locations:
+        cand = os.path.join(list(spec.submodule_search_locations)[0], "models", _OCR_MODEL_NAME)
+        if os.path.exists(cand):
+            return cand
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.environ.get("OCR_MODEL_PATH") or "", os.path.join(here, _OCR_MODEL_NAME),
+                 os.path.join(here, "models", _OCR_MODEL_NAME)):
+        if cand and os.path.exists(cand):
+            return cand
+    cache = os.path.join(tempfile.gettempdir(), "compass_ocr")
+    target = os.path.join(cache, _OCR_MODEL_NAME)
+    if os.path.exists(target) and os.path.getsize(target) > 1_000_000:
+        return target
+    import urllib.request
+    os.makedirs(cache, exist_ok=True)
+    name, ver = _OCR_WHEEL
+    with urllib.request.urlopen(f"https://pypi.org/pypi/{name}/{ver}/json", timeout=30) as r:
+        meta = json.loads(r.read().decode("utf-8"))
+    whl = next(u for u in meta["urls"] if u["filename"].endswith(".whl"))
+    with urllib.request.urlopen(whl["url"], timeout=120) as r:
+        data = r.read()
+    if hashlib.sha256(data).hexdigest() != whl["digests"]["sha256"]:
+        raise RuntimeError("OCR model download did not match PyPI's checksum")
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        member = next(n for n in z.namelist() if n.endswith("/" + _OCR_MODEL_NAME))
+        tmp = target + ".part"
+        with open(tmp, "wb") as fh:
+            fh.write(z.read(member))
+    os.replace(tmp, target)
+    return target
+
+
+class _LuOcrUnavailable(Exception):
+    pass
+
+
 def _ocr_session():
     with _OCR_LOCK:
         if "sess" not in _OCR:
-            import importlib.util
+            try:
+                import onnxruntime  # noqa: F401
+            except ImportError:
+                raise _LuOcrUnavailable("onnxruntime is not installed")
+            try:
+                _ocr_model_path()
+            except Exception as exc:
+                raise _LuOcrUnavailable(f"text model unavailable: {exc}")
             import onnxruntime as ort
-            spec = importlib.util.find_spec("rapidocr_onnxruntime")
-            if not spec or not spec.submodule_search_locations:
-                raise RuntimeError("OCR model not installed")
-            mdir = os.path.join(list(spec.submodule_search_locations)[0], "models")
-            recs = sorted(f for f in os.listdir(mdir) if "rec" in f and f.endswith(".onnx"))
-            if not recs:
-                raise RuntimeError("OCR model not installed")
-            path = os.path.join(mdir, "ch_PP-OCRv4_rec_infer.onnx" if "ch_PP-OCRv4_rec_infer.onnx" in recs else recs[-1])
+            import numpy as np
+            path = _ocr_model_path()
             so = ort.SessionOptions()
             so.intra_op_num_threads = 2
             sess = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
             chars = sess.get_modelmeta().custom_metadata_map["character"].splitlines()
             _OCR["chars"] = ["<blank>"] + chars + [" "]
-            import numpy as np
             _OCR["ascii"] = np.array([i == 0 or (len(c) == 1 and 33 <= ord(c) < 127) for i, c in enumerate(_OCR["chars"])])
             _OCR["sess"] = sess
         return _OCR["sess"]
@@ -10653,6 +10703,10 @@ def lineups_import():
     for fname, raw in sources:
         try:
             tables = _lu_tables_from_upload(raw, fname if fname != "pasted text" else "")
+        except _LuOcrUnavailable:
+            app.logger.exception("scan reader unavailable: %s", fname)
+            results.append({"source": fname, "error": "This is a scanned line-up, and the scan reader could not start on the server. Try again in a minute; if it keeps failing, check that requirements.txt was deployed."})
+            continue
         except Exception:
             app.logger.exception("line-up file could not be read: %s", fname)
             results.append({"source": fname, "error": "This file could not be read. Upload the line-up as the port sends it (PDF, scan, Excel or Word)."})
