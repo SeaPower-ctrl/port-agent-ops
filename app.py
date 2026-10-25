@@ -784,6 +784,12 @@ def init_db():
     # the Owner (there is only one); any other admin becomes a Manager.
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS manager_id INTEGER")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS features TEXT")
+    cur.execute("""CREATE TABLE IF NOT EXISTS consignee_book (
+        ckey TEXT PRIMARY KEY, name TEXT DEFAULT '', email TEXT DEFAULT '', attn TEXT DEFAULT '', updated_at TEXT DEFAULT '')""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS notice_log (
+        id SERIAL PRIMARY KEY, port TEXT DEFAULT '', vessel TEXT DEFAULT '', ckey TEXT DEFAULT '', consignee TEXT DEFAULT '',
+        sent_to TEXT DEFAULT '', bls TEXT DEFAULT '', kind TEXT DEFAULT '', sent_by TEXT DEFAULT '', sent_at TEXT DEFAULT '', test INTEGER DEFAULT 0)""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_notice_log_vessel ON notice_log (port, vessel, ckey)")
     cur.execute("SELECT 1 FROM users WHERE role = 'owner' LIMIT 1")
     if not cur.fetchone():
         cur.execute("UPDATE users SET role = 'owner' WHERE id = (SELECT MIN(id) FROM users WHERE role = 'admin')")
@@ -1786,7 +1792,7 @@ def email_configured():
     return bool(os.environ.get("SMTP_HOST") and os.environ.get("SMTP_USER") and os.environ.get("SMTP_PASSWORD"))
 
 
-def send_email(to_addrs, subject, body, attachments=None):
+def send_email(to_addrs, subject, body, attachments=None, cc=None, html=None, inline_images=None):
     """Sends through SMTP creds in the environment (SMTP_HOST/PORT/USER/
     PASSWORD/FROM, optional SMTP_FROM_NAME) - nothing is hardcoded here,
     same pattern as DATABASE_URL/APP_SECRET_KEY. Returns (ok, error_message)
@@ -1815,7 +1821,14 @@ def send_email(to_addrs, subject, body, attachments=None):
         msg["From"] = formataddr((sender_name, sender)) if sender_name else sender
         msg["To"] = ", ".join(to_addrs)
         msg["Subject"] = subject
+        cc = [a for a in (cc or []) if a]
+        if cc:
+            msg["Cc"] = ", ".join(cc)
         msg.set_content(body)
+        if html:
+            msg.add_alternative(html, subtype="html")
+            for cid, img in (inline_images or []):
+                msg.get_payload()[-1].add_related(img, "image", "png", cid="<%s>" % cid)
         for fname, data, mime in (attachments or []):
             maintype, _, subtype = (mime or "application/octet-stream").partition("/")
             msg.add_attachment(data, maintype=maintype, subtype=subtype or "octet-stream", filename=fname)
@@ -1823,12 +1836,12 @@ def send_email(to_addrs, subject, body, attachments=None):
         if port == 465:
             with smtplib.SMTP_SSL(host, port, timeout=12, context=ctx) as server:
                 server.login(user, password)
-                server.send_message(msg, from_addr=sender, to_addrs=to_addrs)
+                server.send_message(msg, from_addr=sender, to_addrs=list(to_addrs) + cc)
         else:
             with smtplib.SMTP(host, port, timeout=12) as server:
                 server.starttls(context=ctx)
                 server.login(user, password)
-                server.send_message(msg, from_addr=sender, to_addrs=to_addrs)
+                server.send_message(msg, from_addr=sender, to_addrs=list(to_addrs) + cc)
         return True, None
     except smtplib.SMTPAuthenticationError:
         return False, "auth"
@@ -1944,12 +1957,13 @@ def admin_required(f):
     return wrapper
 
 
-FEATURES = [("do", "DO Tracker"), ("direct", "Direct Delivery"), ("jobs", "Jobs and PDAs"), ("sof", "Statement of Facts"),
+FEATURES = [("do", "DO Tracker"), ("manifest", "Manifest Desk"), ("direct", "Direct Delivery"), ("jobs", "Jobs and PDAs"), ("sof", "Statement of Facts"),
             ("lineup", "Port Line-ups"), ("vessel", "Vessel Tracker"), ("kpi", "Port Agent KPI")]
 FEATURE_KEYS = [k for k, _ in FEATURES]
 FEATURE_PRESETS = [("Everything", FEATURE_KEYS),
                    ("DO team", ["do"]),
-                   ("Operations", ["do", "direct", "jobs", "sof", "lineup", "vessel"])]
+                   ("Manifest team", ["manifest"]),
+                   ("Operations", ["do", "manifest", "direct", "jobs", "sof", "lineup", "vessel"])]
 
 
 def _feat_parse(raw):
@@ -1984,6 +1998,7 @@ def _features():
 
 
 _FEATURE_GATES = [
+    ("/manifest-desk", ("manifest",)), ("/api/desk", ("manifest",)),
     ("/do-tracker", ("do",)), ("/api/records", ("do",)), ("/api/manifest", ("do", "direct")), ("/api/groups", ("do",)),
     ("/api/export", ("do",)), ("/api/attachments", ("do",)), ("/api/vessel", ("do",)),
     ("/vessel-tracker", ("vessel",)), ("/api/vessels", ("vessel",)),
@@ -4542,6 +4557,407 @@ def upload_manifest_excel():
     result["left_out"] = sum(1 for e in entries if e["note"] is not None)
     result["no_bls"] = not entries
     return jsonify(result)
+
+
+# ---------- Manifest Desk: one manifest -> DO Tracker B/Ls + arrival notices ----------
+
+_NOTICE_PORTS = [   # (text found in the board's port name, name used in the notice, city for "our ... office")
+    ("JEDDAH", "JEDDAH ISLAMIC PORT", "JEDDAH"),
+    ("YANBU COMMERCIAL", "YANBU COMMERCIAL PORT", "YANBU"),
+    ("YANBU INDUSTRIAL", "YANBU INDUSTRIAL PORT", "YANBU"),
+    ("YANBU", "YANBU PORT", "YANBU"),
+    ("DAMMAM", "KING ABDULAZIZ PORT, DAMMAM", "DAMMAM"),
+    ("JUBAIL", "JUBAIL COMMERCIAL PORT", "JUBAIL"),
+]
+NOTICE_COMPANY_LINES = [
+    "Sea Power For Marine Services Ltd Co.",
+    "Agency Operations",
+    "Tel: 966-12-6481866  Fax: 966-12-6486224",
+    "303, 3rd Floor, International Economic Tower, King Abdullah Br. Road, Al Baghdadiyah Gharbiyah,",
+    "P.O. Box 23411 Jeddah 21426",
+    "Agent in All Saudi Arabian ports",
+    "E-mail: ops@seapower.com.sa | www.seapower.com.sa",
+]
+NOTICE_KINDS = ("arriving", "anchorage", "berthed")
+
+
+def _notice_port(port):
+    p = (port or "").upper()
+    for key, official, city in _NOTICE_PORTS:
+        if key in p:
+            return official, city
+    base = re.sub(r"\s+PORT$", "", p).strip()
+    return (p or "THE PORT"), (base.split()[0] if base else "")
+
+
+def _ckey(name):
+    """Address-book key: a consignee's name without spaces, dots or case."""
+    return re.sub(r"[^A-Z0-9]", "", _mf_norm(name))
+
+
+def _desk_today():
+    return (datetime.utcnow() + timedelta(hours=3)).strftime("%d.%m.%Y")
+
+
+def _desk_scope_sql():
+    """(extra WHERE text, params) so a manager or staff member only ever works with their own team's B/Ls."""
+    team = _team()
+    return ("", ()) if team is None else (" AND created_by = ANY(?)", (team,))
+
+
+def _desk_rows(db, port, vessel):
+    extra, params = _desk_scope_sql()
+    return [dict(r) for r in db.execute(
+        "SELECT * FROM records WHERE port = ? AND vessel = ?" + extra + " ORDER BY bl_number", (port, vessel, *params)).fetchall()]
+
+
+def _book_get(db, key):
+    return db.execute("SELECT * FROM consignee_book WHERE ckey = ?", (key,)).fetchone() if key else None
+
+
+def _book_save(db, name, email=None, attn=None, only_fill=False):
+    key = _ckey(name)
+    if not key:
+        return
+    row = _book_get(db, key)
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    if row is None:
+        db.execute("INSERT INTO consignee_book (ckey, name, email, attn, updated_at) VALUES (?, ?, ?, ?, ?)",
+                   (key, str(name).strip()[:120], email or "", attn or "", now))
+        return
+    new_email = row["email"] if (only_fill and row["email"]) or email is None else email
+    new_attn = row["attn"] if (only_fill and row["attn"]) or attn is None else attn
+    db.execute("UPDATE consignee_book SET email = ?, attn = ?, updated_at = ? WHERE ckey = ?", (new_email or "", new_attn or "", now, key))
+
+
+def _desk_groups(db, port, vessel):
+    """The vessel's B/Ls grouped by consignee, with what is known about each: email, contact person, cargo, whether a notice went out."""
+    groups = {}
+    for r in _desk_rows(db, port, vessel):
+        name = re.sub(r"\s+", " ", r.get("consignee") or "").strip()
+        k = _ckey(name)
+        g_ = groups.setdefault(k, {"key": k, "name": name, "email": "", "attn": "", "bls": []})
+        if not g_["email"]:
+            g_["email"] = _clean_email(r.get("consignee_email"))
+        g_["bls"].append({"bl": r["bl_number"], "pol": r.get("loading_port") or "", "pkgs": r.get("packages") or "",
+                          "desc": r.get("cargo_desc") or ""})
+    out = []
+    for k, g_ in groups.items():
+        book = _book_get(db, k)
+        if book:
+            g_["email"] = g_["email"] or _clean_email(book["email"])
+            g_["attn"] = book["attn"] or ""
+        sent = db.execute("SELECT * FROM notice_log WHERE port = ? AND vessel = ? AND ckey = ? AND test = 0 ORDER BY id DESC LIMIT 1",
+                          (port, vessel, k)).fetchone()
+        g_["sent"] = None
+        if sent:
+            try:
+                sent_bls = set(json.loads(sent["bls"] or "[]"))
+            except ValueError:
+                sent_bls = set()
+            g_["sent"] = {"at": sent["sent_at"], "by": sent["sent_by"], "to": sent["sent_to"],
+                          "new_bls": len({b["bl"] for b in g_["bls"]} - sent_bls)}
+        g_["gaps"] = sum(1 for b in g_["bls"] if not (b["pkgs"] and b["desc"]))
+        if not g_["name"]:
+            g_["state"] = "needs_name"
+        elif not g_["email"]:
+            g_["state"] = "needs_email"
+        elif g_["sent"] and not g_["sent"]["new_bls"]:
+            g_["state"] = "sent"
+        elif g_["sent"]:
+            g_["state"] = "update"
+        else:
+            g_["state"] = "ready"
+        out.append(g_)
+    out.sort(key=lambda x: (x["name"] == "", x["name"]))
+    return out
+
+
+def _lu_eta_text(s):
+    try:
+        d = _lu_dt(s)
+        if d:
+            return d.strftime("%d.%m.%Y")
+    except Exception:
+        pass
+    return str(s or "").strip()
+
+
+def _desk_suggest(db, port, vessel):
+    """What to say about the vessel: taken from the latest line-up for the port when the vessel is on it."""
+    out = {"kind": "arriving", "eta": "", "berth": "", "source": ""}
+    row = db.execute("SELECT eta FROM records WHERE port = ? AND vessel = ? AND eta <> '' LIMIT 1", (port, vessel)).fetchone()
+    if row:
+        out["eta"] = _lu_eta_text(row["eta"])
+    code = _lu_guess_port(port)
+    if not code:
+        return out
+    snap = _lu_latest(db, code)
+    if not snap:
+        return out
+    base = re.sub(r"\s+V[-.\s]*[A-Z0-9]*\d\S*$", "", (vessel or "").upper().strip())
+    key = _lu_name_key(_lu_clean_name(base))
+    if not key:
+        return out
+    for v in _lu_vessels(db, snap["id"]):
+        if _lu_name_key(v["vessel"]) == key:
+            out["kind"] = {"alongside": "berthed", "anchor": "anchorage", "next": "anchorage", "expected": "arriving"}.get(v["status"], "arriving")
+            out["berth"] = (v.get("berth") or "").strip() if out["kind"] == "berthed" else ""
+            if v.get("eta"):
+                out["eta"] = _lu_eta_text(v["eta"])
+            out["source"] = "Line-up of " + str(snap["lineup_date"])
+            break
+    return out
+
+
+def _qr_png(url):
+    buf = io.BytesIO()
+    segno.make(url, error="m").save(buf, kind="png", scale=3, border=1, dark="#123a56")
+    return buf.getvalue()
+
+
+def _desk_notice(db, port, vessel, group, kind, eta, berth, sender, inline):
+    """Builds one arrival notice. inline='cid' for an email (QR pictures travel inside it),
+    inline='data' for the on-screen preview. Returns (subject, text, html, images)."""
+    esc = lambda x: html.escape(str(x or ""), quote=True)
+    official, city = _notice_port(port)
+    v = (vessel or "").upper().strip()
+    mv = v if re.match(r"^M\.?\s?V\.?\s", v) else "M.V. " + v
+    if kind == "berthed":
+        status = "VESSEL HAS BERTHED AT " + official + ((", BERTH " + berth.upper()) if berth else "") + "."
+        verb = "HAS ARRIVED AT"
+    elif kind == "anchorage":
+        status = ("VESSEL HAS ARRIVED AT OUTER ANCHORAGE AND IS AWAITING BERTHING. TO DATE, NO BERTHING PLAN HAS BEEN RECEIVED "
+                  "FROM THE PORT AUTHORITIES. WE WILL REVERT ONCE THE BERTHING PLAN IS RECEIVED.")
+        verb = "IS ARRIVING AT"
+    else:
+        status = "VESSEL IS EXPECTED TO ARRIVE AT " + official + ((" ON " + eta) if eta else "") + "."
+        verb = "IS ARRIVING AT"
+    intro = "WE ARE PLEASED TO ADVISE YOU THAT THE ABOVE VESSEL " + verb + " " + official + " WITH YOUR FOLLOWING CARGO:"
+    ask = ("KINDLY SUBMIT THE ORIGINAL BL TO OUR " + (city + " " if city else "") + "OFFICE, BEARING THE CORRECT CONSIGNEE STAMP TOGETHER "
+           "WITH THE IMPORTER NUMBER, TO OBTAIN OUR PRINCIPAL'S APPROVAL FOR ISSUANCE OF THE DELIVERY ORDER AND CLEAR YOUR CARGO WITHOUT DELAY.")
+    thanks = "THANK YOU FOR SHIPPING YOUR VALUED CARGO PER OUR AGENCY VESSEL."
+    subject = "ARRIVAL NOTICE - " + mv + " - " + official
+    base = _public_base_url()
+    images, rows_html, rows_txt = [], [], []
+    for i, b in enumerate(group["bls"]):
+        token = _ensure_track_token(db, b["bl"])
+        url = base + "/t/" + token if token else ""
+        png = _qr_png(url) if url else b""
+        cell = ""
+        if png:
+            if inline == "cid":
+                cid = "qr%d@compass" % i
+                images.append((cid, png))
+                src = "cid:" + cid
+            else:
+                src = "data:image/png;base64," + base64.b64encode(png).decode()
+            cell = '<img src="%s" width="64" height="64" alt="QR" style="display:block;">' % src
+        rows_html.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            esc(b["bl"]), esc(b["pol"]), esc(b["pkgs"]), esc(b["desc"]), cell))
+        rows_txt.append("%-22s %-14s %-12s %s%s" % (b["bl"], b["pol"], b["pkgs"], b["desc"], ("\n    Track: " + url) if url else ""))
+    date = _desk_today()
+    head_txt = ["TO : %s%s" % (group["name"].upper(), (" - " + city) if city else "")]
+    head_html = ["<b>TO :</b> %s%s" % (esc(group["name"].upper()), esc((" – " + city) if city else ""))]
+    if group.get("attn"):
+        head_txt.append("ATTN : " + group["attn"].upper())
+        head_html.append("<b>ATTN :</b> " + esc(group["attn"].upper()))
+    head_txt.append("FM : SEA POWER FOR MARINE SERVICES LTD. CO." + ((" - " + city) if city else ""))
+    head_html.append("<b>FM :</b> SEA POWER FOR MARINE SERVICES LTD. CO." + esc((" – " + city) if city else ""))
+    sig_name = sender or "Agency Operations"
+    text = "\n".join(head_txt) + "\n\n" + date + "\n\n" + mv + "\n" + status + "\n\n" + intro + "\n\n" + \
+        "%-22s %-14s %-12s %s" % ("BL #", "LOADING PORT", "PKGS", "DESCRIPTION OF CARGO") + "\n" + "\n".join(rows_txt) + \
+        "\n\n" + ask + "\n\n" + thanks + "\n\nKind regards,\n" + sig_name + "\n" + "\n".join(NOTICE_COMPANY_LINES) + "\n"
+    th = "border:1px solid #c9d1d9;padding:6px 9px;background:#eef2f6;text-align:left;font-size:12.5px;"
+    table = ('<table style="border-collapse:collapse;margin:10px 0;font-family:Arial,Helvetica,sans-serif;"><tr>'
+             + "".join('<th style="%s">%s</th>' % (th, h) for h in ("BL #", "LOADING PORT", "PKGS", "DESCRIPTION OF CARGO", "TRACK"))
+             + "</tr>" + "".join(r.replace("<td>", '<td style="border:1px solid #c9d1d9;padding:6px 9px;font-size:12.5px;vertical-align:middle;">')
+                                 for r in rows_html) + "</table>")
+    sig_html = "<br>".join(esc(l) for l in NOTICE_COMPANY_LINES)
+    html_body = ('<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.55;color:#111;">'
+                 + "<br>".join(head_html) + "<br><br>" + date + "<br><br><b>" + esc(mv) + "</b><br>" + esc(status) + "<br><br>"
+                 + esc(intro) + table + "<br>" + esc(ask) + "<br><br>" + esc(thanks) + "<br><br>Kind regards,<br><b>"
+                 + esc(sig_name) + "</b><br>" + sig_html + "</div>")
+    return subject, text, html_body, images
+
+
+def _desk_args(data):
+    port = str(data.get("port") or "").strip().upper()
+    vessel = str(data.get("vessel") or "").strip().upper()
+    kind = data.get("kind") if data.get("kind") in NOTICE_KINDS else "arriving"
+    return port, vessel, kind, str(data.get("eta") or "").strip()[:40], str(data.get("berth") or "").strip()[:20]
+
+
+def _desk_group(db, port, vessel, key):
+    for g_ in _desk_groups(db, port, vessel):
+        if g_["key"] == key:
+            return g_
+    return None
+
+
+@app.route("/manifest-desk")
+@login_required
+def manifest_desk_page():
+    page = DESK_HTML.replace("__NAME__", html.escape(session.get("display_name") or session.get("username") or "", quote=True))
+    return Response(page, mimetype="text/html")
+
+
+@app.route("/api/desk/vessels")
+@login_required
+def desk_vessels():
+    extra, params = _desk_scope_sql()
+    rows = get_db().execute(
+        "SELECT port, vessel, COUNT(*) AS n, MAX(created_at) AS last FROM records WHERE vessel <> ''" + extra +
+        " GROUP BY port, vessel ORDER BY MAX(created_at) DESC LIMIT 12", params).fetchall()
+    return jsonify([{"port": r["port"], "vessel": r["vessel"], "n": r["n"]} for r in rows])
+
+
+@app.route("/api/desk/upload", methods=["POST"])
+@login_required
+def desk_upload():
+    port = request.form.get("port", "").strip().upper()
+    vessel = request.form.get("vessel", "").strip().upper()
+    if not port or not vessel:
+        return jsonify({"error": "Type the port and the vessel first."}), 400
+    files = [f for f in request.files.getlist("file") if f and f.filename]
+    if not files:
+        return jsonify({"error": "Choose a manifest file."}), 400
+    db = get_db()
+    added = skipped = 0
+    failed, elsewhere = [], []
+    for f in files:
+        entries, err = _manifest_read_upload(f)
+        if err and err != "no_bls":
+            failed.append(f.filename + ": " + _MANIFEST_ERROR_TEXT[err])
+            continue
+        live = [e for e in entries if e["note"] is None]
+        if not live:
+            failed.append(f.filename + ": " + _MANIFEST_ERROR_TEXT["no_bls"])
+            continue
+        items = [{"bl": e["bl"], **e["contact"], "loading_port": e["cargo"]["pol"], "packages": e["cargo"]["pkgs"],
+                  "cargo_desc": e["cargo"]["desc"]} for e in live]
+        res = _manifest_add(port, vessel, items)
+        added += res["added"]
+        skipped += res["skipped"]
+        elsewhere += res["duplicate_elsewhere"]
+        for e in live:
+            c = e["contact"]
+            if c.get("name") and _clean_email(c.get("email")):
+                _book_save(db, c["name"], email=_clean_email(c["email"]), only_fill=True)
+        db.commit()
+    return jsonify({"added": added, "skipped": skipped, "failed": failed, "duplicate_elsewhere": elsewhere[:5]})
+
+
+@app.route("/api/desk/notices")
+@login_required
+def desk_notices():
+    port, vessel, _, _, _ = _desk_args(request.args)
+    if not port or not vessel:
+        return jsonify({"error": "Type the port and the vessel first."}), 400
+    db = get_db()
+    groups = _desk_groups(db, port, vessel)
+    official, city = _notice_port(port)
+    me = db.execute("SELECT email FROM users WHERE id = ?", (session.get("user_id"),)).fetchone()
+    return jsonify({"groups": groups, "suggest": _desk_suggest(db, port, vessel), "official": official,
+                    "my_email": (me["email"] if me else "") or "", "email_ready": email_configured()})
+
+
+@app.route("/api/desk/contact", methods=["POST"])
+@login_required
+def desk_contact():
+    data = request.get_json(force=True, silent=True) or {}
+    port, vessel, _, _, _ = _desk_args(data)
+    key = str(data.get("key") or "")
+    db = get_db()
+    g_ = _desk_group(db, port, vessel, key)
+    if not g_:
+        return jsonify({"error": "Consignee not found."}), 404
+    email = str(data.get("email") or "").strip()
+    if email and not _clean_email(email):
+        return jsonify({"error": "That doesn't look like an email address."}), 400
+    attn = re.sub(r"\s+", " ", str(data.get("attn") or "")).strip()[:80]
+    for b in g_["bls"]:
+        db.execute("UPDATE records SET consignee_email = ? WHERE bl_number = ?", (_clean_email(email), b["bl"]))
+    _book_save(db, g_["name"], email=_clean_email(email), attn=attn)
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/desk/bl", methods=["POST"])
+@login_required
+def desk_bl():
+    data = request.get_json(force=True, silent=True) or {}
+    bl = str(data.get("bl") or "").upper()
+    if not _owns_record(bl):
+        return jsonify({"error": "Not your record."}), 403
+    db = get_db()
+    if not db.execute("SELECT 1 FROM records WHERE bl_number = ?", (bl,)).fetchone():
+        return jsonify({"error": "BL not found."}), 404
+    db.execute("UPDATE records SET loading_port = ?, packages = ?, cargo_desc = ? WHERE bl_number = ?",
+               (_mf_flat(data.get("loading_port"))[:80], _mf_flat(data.get("packages"))[:60], _mf_flat(data.get("cargo_desc"))[:300], bl))
+    _log_audit(bl, "edited", "cargo details", "", "")
+    db.commit()
+    return jsonify({"ok": True})
+
+
+def _desk_my_email(db):
+    r = db.execute("SELECT email FROM users WHERE id = ?", (session.get("user_id"),)).fetchone()
+    return _clean_email(r["email"]) if r else ""
+
+
+@app.route("/api/desk/preview", methods=["POST"])
+@login_required
+def desk_preview():
+    data = request.get_json(force=True, silent=True) or {}
+    port, vessel, kind, eta, berth = _desk_args(data)
+    db = get_db()
+    g_ = _desk_group(db, port, vessel, str(data.get("key") or ""))
+    if not g_ or not g_["name"]:
+        return jsonify({"error": "Consignee not found."}), 404
+    subject, text, body, _ = _desk_notice(db, port, vessel, g_, kind, eta, berth, session.get("display_name") or "", "data")
+    db.commit()
+    return jsonify({"subject": subject, "to": g_["email"], "cc": _desk_my_email(db), "html": body})
+
+
+@app.route("/api/desk/send", methods=["POST"])
+@login_required
+def desk_send():
+    data = request.get_json(force=True, silent=True) or {}
+    port, vessel, kind, eta, berth = _desk_args(data)
+    test = bool(data.get("test"))
+    db = get_db()
+    g_ = _desk_group(db, port, vessel, str(data.get("key") or ""))
+    if not g_ or not g_["name"]:
+        return jsonify({"error": "Consignee not found.", "error_code": "not_found"}), 404
+    if not email_configured():
+        return jsonify({"error": "Email isn't set up yet.", "error_code": "email_not_configured"}), 400
+    mine = _desk_my_email(db)
+    if test:
+        if not mine:
+            return jsonify({"error": "Your account has no email address, so there is nowhere to send a test copy."}), 400
+        to, cc = [mine], []
+    else:
+        if not g_["email"]:
+            return jsonify({"error": "This consignee has no email address yet.", "error_code": "no_recipient"}), 400
+        to = [g_["email"]]
+        cc = [mine] if mine and mine.lower() != g_["email"].lower() else []
+        extra = [a for a in (os.environ.get("DESK_CC", "") or "").replace(";", ",").split(",") if _clean_email(a.strip())]
+        cc += [a.strip() for a in extra if a.strip().lower() not in [c.lower() for c in cc + to]]
+    subject, text, body, images = _desk_notice(db, port, vessel, g_, kind, eta, berth, session.get("display_name") or "", "cid")
+    db.commit()
+    ok, err = send_email(to, ("[TEST] " if test else "") + subject, text, cc=cc, html=body, inline_images=images)
+    if not ok:
+        code = {"unreachable": "email_unreachable", "auth": "email_auth", "recipient": "email_recipient"}.get(err, "send_failed")
+        return jsonify({"error": "The email could not be sent: " + str(err), "error_code": code}), 502
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    db.execute("INSERT INTO notice_log (port, vessel, ckey, consignee, sent_to, bls, kind, sent_by, sent_at, test) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               (port, vessel, g_["key"], g_["name"], ", ".join(to), json.dumps([b["bl"] for b in g_["bls"]]), kind,
+                session.get("display_name") or session.get("username") or "", now, 1 if test else 0))
+    if not test:
+        for b in g_["bls"]:
+            _log_audit(b["bl"], "notified", "arrival notice", "", ", ".join(to))
+    db.commit()
+    return jsonify({"ok": True, "sent_to": to})
 
 
 # ---------- Direct Delivery Classifier ----------
@@ -12460,6 +12876,332 @@ async function delUser(id, username) {
 </body></html>
 """
 
+DESK_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compass - Manifest Desk</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + r"""">
+<style>
+  :root {
+    --bg: #f2f4f7; --card: #ffffff; --text: #1c2b3a; --muted: #7a8794; --border: #e6e9ed;
+    --navy: #123a56; --navy-deep: #0b2740; --navy-light: #1f5c85; --gold: #c9a227; --gold-light: #e0bd53;
+    --danger: #d1483f; --danger-bg: #fbeceb; --ok: #2e9e6b; --warn: #b87714;
+    --shadow-sm: 0 1px 2px rgba(18,58,86,0.05);
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --bg: #131a23; --card: #1a232f; --text: #e9eef3; --muted: #93a1b1; --border: #29323f;
+    --navy: #3f86ba; --navy-deep: #274a67; --navy-light: #5aa2d1; --gold: #e3bb4c; --gold-light: #f0cf72;
+    --danger: #e2685f; --danger-bg: #3a2220; --ok: #43c08a; --warn: #e0a640;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.25);
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0 16px 40px; transition: background-color .25s ease, color .25s ease; }
+  .topbar { position: sticky; top: 0; z-index: 50; display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 14px 16px; margin: 0 -16px 20px; background: color-mix(in srgb, var(--bg) 86%, transparent); backdrop-filter: saturate(180%) blur(14px); -webkit-backdrop-filter: saturate(180%) blur(14px); border-bottom: 1px solid var(--border); }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+  .brand img { height: 32px; width: auto; }
+  .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
+  .app-name { font-size: 14.5px; font-weight: 700; color: var(--text); }
+  .app-tag { font-size: 11px; color: var(--muted); }
+  .topbar-right { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+  .topbar-right a { color: var(--navy); text-decoration: none; font-weight: 600; font-size: 13px; padding: 6px 12px; border-radius: 20px; }
+  :root[data-theme="dark"] .topbar-right a { color: var(--navy-light); }
+  .topbar-right a:hover { background: var(--border); }
+  .theme-switch { position: relative; display: inline-flex; width: 54px; height: 29px; cursor: pointer; }
+  .theme-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .theme-track { position: absolute; inset: 0; border-radius: 999px; display: flex; align-items: center; justify-content: space-between; padding: 0 7px; background: linear-gradient(135deg,#8fcaf0,#f4d58d); }
+  :root[data-theme="dark"] .theme-track { background: linear-gradient(135deg,#1f2b42,#33456a); }
+  .theme-icon { width: 13px; height: 13px; color: #fff; opacity: .9; z-index: 1; }
+  .theme-icon svg { width: 100%; height: 100%; }
+  .theme-knob { position: absolute; top: 3px; left: 3px; width: 23px; height: 23px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.3); transition: transform .3s cubic-bezier(.4,0,.2,1); }
+  input:checked + .theme-track .theme-knob { transform: translateX(25px); background: #0b2740; }
+
+  .wrap { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 4px 0 4px; letter-spacing: -.01em; }
+  .sub { color: var(--muted); font-size: 13.5px; margin-bottom: 18px; }
+  .grid { display: grid; grid-template-columns: 400px minmax(0, 1fr); gap: 16px; align-items: start; }
+  @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px; margin-bottom: 16px; box-shadow: var(--shadow-sm); min-width: 0; }
+  .lab { font-size: 12px; font-weight: 600; color: var(--navy); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 10px; }
+  :root[data-theme="dark"] .lab { color: var(--navy-light); }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  input[type=text], select { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 14px; font-family: inherit; background: var(--bg); color: var(--text); min-width: 0; }
+  input[type=text]:focus, select:focus { outline: none; border-color: var(--navy-light); background: var(--card); box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 20%, transparent); }
+  button { background: var(--navy); color: #fff; border: none; border-radius: 999px; padding: 10px 18px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; transition: background .15s ease, transform .08s ease; }
+  button:hover { background: var(--navy-light); }
+  button:active { transform: scale(.97); }
+  button:disabled { opacity: .45; cursor: default; transform: none; }
+  button.sec { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  button.sec:hover { background: var(--border); }
+  button.gold { background: var(--gold); color: #241c00; }
+  button.gold:hover { background: var(--gold-light); }
+  button.small { padding: 6px 12px; font-size: 12px; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+  .vchip { border: 1px solid var(--border); background: var(--card); color: var(--text); border-radius: 99px; padding: 5px 11px; font-size: 12.5px; font-weight: 500; }
+  .vchip:hover { background: var(--border); }
+  .drop { border: 2px dashed var(--border); border-radius: 14px; padding: 16px; text-align: center; color: var(--muted); font-size: 13px; cursor: pointer; }
+  .drop.over { border-color: var(--navy-light); background: color-mix(in srgb, var(--navy-light) 8%, transparent); }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 99px; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
+  .pill.ok { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+  .pill.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  .pill.mut { background: var(--border); color: var(--muted); }
+  .pill.info { background: color-mix(in srgb, var(--navy-light) 16%, transparent); color: var(--navy-light); }
+  .item { padding: 12px; border: 1px solid var(--border); border-radius: 12px; margin-bottom: 8px; cursor: pointer; background: var(--card); }
+  .item.sel { border-color: var(--navy-light); background: color-mix(in srgb, var(--navy-light) 7%, var(--card)); }
+  .item b { display: block; font-size: 14px; }
+  .item small { color: var(--muted); font-size: 12px; }
+  .item .top { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
+  .edit { margin-top: 10px; display: grid; gap: 8px; }
+  .edit input { width: 100%; }
+  .bl-edit { border-top: 1px dashed var(--border); padding-top: 8px; display: grid; gap: 6px; grid-template-columns: 1fr 1fr; font-size: 12px; }
+  .bl-edit .bl-name { grid-column: 1 / -1; font-weight: 600; font-size: 12.5px; }
+  .bl-edit input { padding: 7px 9px; font-size: 12.5px; width: 100%; }
+  .bl-edit input.wide { grid-column: 1 / -1; }
+  .note { background: color-mix(in srgb, var(--gold) 14%, transparent); border: 1px solid color-mix(in srgb, var(--gold) 40%, transparent); border-radius: 12px; padding: 10px 14px; font-size: 13px; margin-bottom: 12px; }
+  .bad { background: var(--danger-bg); border-color: var(--danger); }
+  .mailwrap { border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; background: #fff; color: #111; overflow-x: auto; }
+  .mailhead { color: #6b7a89; font-size: 12px; margin-bottom: 12px; font-family: Arial, Helvetica, sans-serif; word-break: break-word; }
+  .empty { color: var(--muted); font-size: 13.5px; text-align: center; padding: 30px 10px; }
+  .actions { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .actions .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  #toastHost { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; max-width: min(340px, calc(100vw - 40px)); }
+  .toast { background: var(--navy-deep); color: #fff; padding: 11px 16px; border-radius: 12px; font-size: 13px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+  .toast.error { background: var(--danger); }
+</style>
+<script>
+(function () {
+  var saved = null;
+  try { saved = localStorage.getItem('theme'); } catch (e) {}
+  var mode = saved || 'light';
+  document.documentElement.setAttribute('data-theme', mode);
+  window.addEventListener('DOMContentLoaded', function () { var cb = document.getElementById('themeToggle'); if (cb) cb.checked = mode === 'dark'; });
+})();
+function setTheme(mode) { document.documentElement.setAttribute('data-theme', mode); try { localStorage.setItem('theme', mode); } catch (e) {} }
+</script>
+</head><body>
+<div class="topbar">
+  <a href="/" class="brand"><img src="data:image/png;base64,""" + LOGO_B64 + r"""" alt="Sea Power"><div class="brand-text"><span class="app-name">Compass</span><span class="app-tag">Manifest Desk</span></div></a>
+  <div class="topbar-right">
+    <label class="theme-switch" title="Toggle dark mode"><input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')"><span class="theme-track"><span class="theme-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg></span><span class="theme-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg></span><span class="theme-knob"></span></span></label>
+    <a href="/">&larr; Back to board</a>
+    <span><b>__NAME__</b></span>
+    <a href="/logout">Log out</a>
+  </div>
+</div>
+<div class="wrap">
+  <h1>Manifest Desk</h1>
+  <div class="sub">Add the manifest once. The B/Ls go onto the DO Tracker and an arrival notice is made for every consignee.</div>
+  <div class="grid">
+    <div>
+      <div class="card">
+        <div class="lab">1 &middot; Vessel</div>
+        <div class="row">
+          <input type="text" id="port" list="ports" placeholder="Port" autocomplete="off" style="flex:1 1 150px;">
+          <input type="text" id="vessel" placeholder="Vessel and voyage" autocomplete="off" style="flex:1.4 1 170px;">
+          <button onclick="openVessel()">Open</button>
+        </div>
+        <datalist id="ports"><option value="JEDDAH PORT"><option value="YANBU COMMERCIAL PORT"><option value="YANBU INDUSTRIAL PORT"><option value="DAMMAM PORT"><option value="JUBAIL COMMERCIAL PORT"></datalist>
+        <div class="chips" id="recent"></div>
+      </div>
+      <div class="card">
+        <div class="lab">2 &middot; Add manifest</div>
+        <div class="drop" id="drop" onclick="document.getElementById('file').click()">Drop the manifest here or tap to choose<div id="fname" style="margin-top:6px;font-weight:600;color:var(--text);"></div></div>
+        <input type="file" id="file" multiple accept=".xlsx,.xlsm,.xls,.csv,.docx,.pdf" style="display:none" onchange="stage()">
+        <div class="row" style="margin-top:12px;"><button id="addBtn" onclick="uploadManifest()" disabled>Add manifest</button><span style="font-size:12px;color:var(--muted);">Excel, Word, PDF or CSV. Any layout.</span></div>
+      </div>
+      <div class="card">
+        <div class="lab">3 &middot; Consignees</div>
+        <div id="list"><div class="empty">Open a vessel to see its consignees.</div></div>
+      </div>
+    </div>
+    <div>
+      <div class="card">
+        <div class="row" style="margin-bottom:12px;">
+          <div class="lab" style="margin:0;flex:1;">Arrival notice</div>
+          <select id="kind" onchange="refreshPreview()"><option value="arriving">Vessel arriving</option><option value="anchorage">At anchorage, awaiting berth</option><option value="berthed">Berthed</option></select>
+          <input type="text" id="eta" placeholder="ETA (dd.mm.yyyy)" style="width:150px;" oninput="debouncePreview()">
+          <input type="text" id="berth" placeholder="Berth" style="width:90px;display:none;" oninput="debouncePreview()">
+        </div>
+        <div id="src" class="note" style="display:none;"></div>
+        <div id="mailbox"><div class="empty">Pick a consignee to preview its notice.</div></div>
+      </div>
+      <div class="card actions">
+        <div><b id="sumTitle">Nothing to send yet</b><div id="sumSub" style="color:var(--muted);font-size:12.5px;">Nothing is sent until you press a button.</div></div>
+        <div class="btns"><button class="sec" id="testBtn" onclick="sendTest()" disabled>Send me a test copy</button><button class="sec" id="oneBtn" onclick="sendSelected()" disabled>Send this one</button><button class="gold" id="allBtn" onclick="sendAll()" disabled>Send all</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="toastHost"></div>
+<script>
+var S = {port: '', vessel: '', data: null, sel: null, timer: null, arm: null};
+function $(id) { return document.getElementById(id); }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
+function toast(msg, err) { var d = document.createElement('div'); d.className = 'toast' + (err ? ' error' : ''); d.textContent = msg; $('toastHost').appendChild(d); setTimeout(function () { d.remove(); }, err ? 7000 : 3500); }
+async function api(url, opts) {
+  var res = await fetch(url, opts); var data = {};
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok || data.error) throw new Error(data.error || 'Something went wrong.');
+  return data;
+}
+function post(url, body) { return api(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}); }
+function base() { return {port: S.port, vessel: S.vessel, kind: $('kind').value, eta: $('eta').value.trim(), berth: $('berth').value.trim()}; }
+
+async function loadRecent() {
+  try {
+    var r = await api('/api/desk/vessels');
+    $('recent').innerHTML = r.map(function (v, i) { return '<button class="vchip" data-i="' + i + '">' + esc(v.vessel) + ' &middot; ' + esc(v.port) + ' (' + v.n + ')</button>'; }).join('');
+    $('recent').querySelectorAll('button').forEach(function (b) { b.onclick = function () { var v = r[+b.dataset.i]; $('port').value = v.port; $('vessel').value = v.vessel; openVessel(); }; });
+  } catch (e) {}
+}
+function stage() {
+  var f = Array.prototype.slice.call($('file').files || []);
+  $('fname').textContent = f.map(function (x) { return x.name; }).join(', ');
+  $('addBtn').disabled = !f.length;
+}
+(function () {
+  var d = $('drop');
+  ['dragenter', 'dragover'].forEach(function (e) { d.addEventListener(e, function (ev) { ev.preventDefault(); d.classList.add('over'); }); });
+  ['dragleave', 'drop'].forEach(function (e) { d.addEventListener(e, function (ev) { ev.preventDefault(); d.classList.remove('over'); }); });
+  d.addEventListener('drop', function (ev) { if (ev.dataTransfer && ev.dataTransfer.files.length) { $('file').files = ev.dataTransfer.files; stage(); } });
+})();
+async function uploadManifest() {
+  var port = $('port').value.trim().toUpperCase(), vessel = $('vessel').value.trim().toUpperCase();
+  if (!port || !vessel) { toast('Type the port and the vessel first.', true); return; }
+  var fd = new FormData();
+  Array.prototype.forEach.call($('file').files, function (f) { fd.append('file', f); });
+  fd.append('port', port); fd.append('vessel', vessel);
+  $('addBtn').disabled = true; $('addBtn').textContent = 'Reading...';
+  try {
+    var r = await api('/api/desk/upload', {method: 'POST', body: fd});
+    (r.failed || []).forEach(function (m) { toast(m, true); });
+    toast(r.added + ' B/L' + (r.added === 1 ? '' : 's') + ' added to the DO Tracker' + (r.skipped ? ', ' + r.skipped + ' already there' : '') + '.');
+    (r.duplicate_elsewhere || []).forEach(function (d) { toast(d.bl_number + ' is already on the board under ' + (d.existing_vessel || 'another vessel') + '.', true); });
+    $('file').value = ''; stage();
+    await openVessel(); loadRecent();
+  } catch (e) { toast(e.message, true); }
+  $('addBtn').textContent = 'Add manifest'; stage();
+}
+async function openVessel() {
+  S.port = $('port').value.trim().toUpperCase(); S.vessel = $('vessel').value.trim().toUpperCase();
+  if (!S.port || !S.vessel) { toast('Type the port and the vessel first.', true); return; }
+  try {
+    S.data = await api('/api/desk/notices?port=' + encodeURIComponent(S.port) + '&vessel=' + encodeURIComponent(S.vessel));
+  } catch (e) { toast(e.message, true); return; }
+  var sg = S.data.suggest || {};
+  if (!S.kindTouched) $('kind').value = sg.kind || 'arriving';
+  if (!$('eta').value) $('eta').value = sg.eta || '';
+  if (!$('berth').value) $('berth').value = sg.berth || '';
+  $('src').style.display = sg.source ? '' : 'none';
+  $('src').innerHTML = sg.source ? '<b>Vessel status</b> picked up from the line-up (' + esc(sg.source) + '). Change it if needed.' : '';
+  syncKind();
+  if (!S.sel || !S.data.groups.some(function (g) { return g.key === S.sel; })) {
+    var first = S.data.groups.filter(function (g) { return g.name; })[0];
+    S.sel = first ? first.key : null;
+  }
+  renderList(); refreshPreview(); renderSummary();
+}
+function syncKind() { $('berth').style.display = $('kind').value === 'berthed' ? '' : 'none'; }
+var STATE = {ready: ['Ready', 'ok'], sent: ['Sent', 'info'], update: ['New B/Ls', 'warn'], needs_email: ['Needs email', 'warn'], needs_name: ['No consignee', 'warn']};
+function renderList() {
+  var g = S.data.groups;
+  if (!g.length) { $('list').innerHTML = '<div class="empty">No B/Ls for this vessel yet. Add the manifest above.</div>'; return; }
+  $('list').innerHTML = g.map(function (x) {
+    var st = STATE[x.state], sel = x.key === S.sel;
+    var sent = x.sent ? '<div><small>Sent ' + esc(x.sent.at) + ' UTC by ' + esc(x.sent.by) + '</small></div>' : '';
+    var gaps = x.gaps ? '<div><small style="color:var(--warn);">' + x.gaps + ' B/L' + (x.gaps === 1 ? '' : 's') + ' missing packages or description</small></div>' : '';
+    var edit = '';
+    if (sel && x.name) {
+      edit = '<div class="edit" onclick="event.stopPropagation()">' +
+        '<input type="text" id="em" placeholder="Email address" value="' + esc(x.email) + '" autocapitalize="none">' +
+        '<input type="text" id="at" placeholder="Attention (contact person, optional)" value="' + esc(x.attn) + '">' +
+        '<div class="row"><button class="small" onclick="saveContact()">Save contact</button></div>' +
+        x.bls.map(function (b, i) { return '<div class="bl-edit" data-bl="' + esc(b.bl) + '"><div class="bl-name">' + esc(b.bl) + '</div>' +
+          '<input type="text" class="f-pol" placeholder="Loading port" value="' + esc(b.pol) + '">' +
+          '<input type="text" class="f-pk" placeholder="Packages" value="' + esc(b.pkgs) + '">' +
+          '<input type="text" class="f-ds wide" placeholder="Description of cargo" value="' + esc(b.desc) + '"></div>'; }).join('') +
+        '<div class="row"><button class="small sec" onclick="saveCargo()">Save cargo details</button></div></div>';
+    }
+    return '<div class="item' + (sel ? ' sel' : '') + '" onclick="pick(\'' + x.key + '\')"><div class="top"><div><b>' + esc(x.name || 'No consignee name') + '</b><small>' +
+      esc(x.email || (x.name ? 'No email yet' : 'These B/Ls have no consignee in the manifest')) + ' &middot; ' + x.bls.length + ' B/L' + (x.bls.length === 1 ? '' : 's') + '</small></div>' +
+      '<span class="pill ' + st[1] + '">' + st[0] + '</span></div>' + sent + gaps + edit + '</div>';
+  }).join('');
+}
+function pick(key) { if (S.sel === key) return; S.sel = key; renderList(); refreshPreview(); renderSummary(); }
+function debouncePreview() { clearTimeout(S.timer); S.timer = setTimeout(refreshPreview, 350); }
+async function refreshPreview() {
+  syncKind();
+  if (!S.data || !S.sel) { $('mailbox').innerHTML = '<div class="empty">Pick a consignee to preview its notice.</div>'; return; }
+  try {
+    var r = await post('/api/desk/preview', Object.assign(base(), {key: S.sel}));
+    $('mailbox').innerHTML = '<div class="mailwrap"><div class="mailhead">To: ' + esc(r.to || 'no email yet') + (r.cc ? ' &nbsp;&middot;&nbsp; Cc: ' + esc(r.cc) : '') + ' &nbsp;&middot;&nbsp; Subject: ' + esc(r.subject) + '</div>' + r.html + '</div>';
+  } catch (e) { $('mailbox').innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
+}
+function sendable() { return S.data.groups.filter(function (g) { return (g.state === 'ready' || g.state === 'update') && g.email; }); }
+function renderSummary() {
+  var d = S.data; if (!d) return;
+  var n = sendable().length, miss = d.groups.filter(function (g) { return g.state === 'needs_email' || g.state === 'needs_name'; }).length;
+  $('sumTitle').textContent = n ? (n + ' notice' + (n === 1 ? '' : 's') + ' ready to send') : 'Nothing ready to send';
+  var sub = [];
+  if (miss) sub.push(miss + ' need' + (miss === 1 ? 's' : '') + ' an email or consignee name.');
+  if (!d.email_ready) sub.push('Email is not set up on this server yet, so sending is switched off.');
+  if (!sub.length) sub.push('Nothing is sent until you press a button.');
+  $('sumSub').textContent = sub.join(' ');
+  var cur = d.groups.filter(function (g) { return g.key === S.sel; })[0];
+  $('allBtn').disabled = !n || !d.email_ready; $('allBtn').textContent = n ? 'Send ' + n + ' notice' + (n === 1 ? '' : 's') : 'Send all';
+  $('oneBtn').disabled = !cur || !cur.email || !d.email_ready;
+  $('testBtn').disabled = !cur || !cur.name || !d.email_ready || !d.my_email;
+  $('testBtn').title = d.my_email ? 'Sends this notice to ' + d.my_email : 'Your account has no email address';
+}
+async function saveContact() {
+  try { await post('/api/desk/contact', {port: S.port, vessel: S.vessel, key: S.sel, email: $('em').value.trim(), attn: $('at').value.trim()}); toast('Saved. It is remembered for next time.'); await openVessel(); }
+  catch (e) { toast(e.message, true); }
+}
+async function saveCargo() {
+  var rows = document.querySelectorAll('.bl-edit');
+  try {
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      await post('/api/desk/bl', {bl: r.dataset.bl, loading_port: r.querySelector('.f-pol').value, packages: r.querySelector('.f-pk').value, cargo_desc: r.querySelector('.f-ds').value});
+    }
+    toast('Cargo details saved.'); await openVessel();
+  } catch (e) { toast(e.message, true); }
+}
+async function sendOneKey(key, test) { return post('/api/desk/send', Object.assign(base(), {key: key, test: !!test})); }
+async function sendTest() {
+  $('testBtn').disabled = true;
+  try { var r = await sendOneKey(S.sel, true); toast('Test copy sent to ' + r.sent_to.join(', ') + '.'); } catch (e) { toast(e.message, true); }
+  renderSummary();
+}
+async function sendSelected() {
+  var g = S.data.groups.filter(function (x) { return x.key === S.sel; })[0];
+  if (!g) return;
+  $('oneBtn').disabled = true;
+  try { var r = await sendOneKey(g.key, false); toast('Sent to ' + r.sent_to.join(', ') + '.'); } catch (e) { toast(e.message, true); }
+  await openVessel();
+}
+async function sendAll() {
+  var list = sendable(), b = $('allBtn');
+  if (!S.arm) {
+    S.arm = setTimeout(function () { S.arm = null; renderSummary(); }, 6000);
+    b.textContent = 'Press again to send ' + list.length;
+    return;
+  }
+  clearTimeout(S.arm); S.arm = null; b.disabled = true;
+  var ok = 0, fail = [];
+  for (var i = 0; i < list.length; i++) {
+    b.textContent = 'Sending ' + (i + 1) + ' of ' + list.length + '...';
+    try { await sendOneKey(list[i].key, false); ok++; } catch (e) { fail.push(list[i].name + ': ' + e.message); if (/set up|reach|sign in|could not be sent/i.test(e.message)) break; }
+  }
+  if (ok) toast(ok + ' notice' + (ok === 1 ? '' : 's') + ' sent.');
+  fail.slice(0, 3).forEach(function (m) { toast(m, true); });
+  await openVessel();
+}
+$('kind').addEventListener('change', function () { S.kindTouched = true; });
+loadRecent();
+</script>
+</body></html>
+"""
+
+
 HUB_HTML = """
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Compass</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + """">
@@ -12591,6 +13333,16 @@ HUB_HTML = """
     </a>
 {% endif %}
 
+{% if 'manifest' in feats %}
+    <a class="tile" href="/manifest-desk">
+      <div class="tile-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M4 9h16M9 9v11"/><path d="M13 13h4M13 16.5h4"/></svg>
+      </div>
+      <h3>Manifest Desk</h3>
+      <p>Add a manifest once: B/Ls go on the DO Tracker and arrival notices are ready to send to every consignee.</p>
+      <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
+    </a>
+{% endif %}
 {% if 'vessel' in feats %}
     <a class="tile" href="/vessel-tracker">
       <div class="tile-icon">
