@@ -780,6 +780,13 @@ def init_db():
     for _col, _ddl in (("email", "TEXT DEFAULT ''"), ("full_name", "TEXT DEFAULT ''"), ("totp_secret", "TEXT DEFAULT ''"),
                        ("totp_enabled", "INTEGER DEFAULT 0"), ("totp_last_step", "BIGINT DEFAULT 0"), ("recovery_codes", "TEXT DEFAULT ''")):
         cur.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {_col} {_ddl}")
+    # Owner / Manager / Staff. Staff report to a manager (manager_id). The first admin becomes
+    # the Owner (there is only one); any other admin becomes a Manager.
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS manager_id INTEGER")
+    cur.execute("SELECT 1 FROM users WHERE role = 'owner' LIMIT 1")
+    if not cur.fetchone():
+        cur.execute("UPDATE users SET role = 'owner' WHERE id = (SELECT MIN(id) FROM users WHERE role = 'admin')")
+    cur.execute("UPDATE users SET role = 'manager' WHERE role = 'admin'")
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users (LOWER(email)) WHERE email <> ''")
     # One row per signed-in browser. The cookie only carries this row's id, so signing out,
     # removing a user or resetting their password ends the session on the server - a copied
@@ -1889,13 +1896,57 @@ def login_required(f):
     return wrapper
 
 
+def _role():
+    """The signed-in person's level: owner, manager or staff ('admin' is the old name for the owner)."""
+    r = session.get("role")
+    return "owner" if r == "admin" else r
+
+
+def _is_owner():
+    return _role() == "owner"
+
+
+def _oversees():
+    """The Owner and the managers: may see history, step a job back, and see a workload breakdown."""
+    return _role() in ("owner", "manager")
+
+
+def _team():
+    """Usernames whose records the signed-in person may see and change: None = everyone (the Owner);
+    a manager = themselves and the staff who report to them; staff = themselves."""
+    if _is_owner():
+        return None
+    cached = g.get("_team_names")
+    if cached is None:
+        names = [session.get("username") or ""]
+        if _role() == "manager":
+            for r in get_db().execute("SELECT username FROM users WHERE manager_id = ?", (session.get("user_id"),)).fetchall():
+                names.append(r["username"])
+        cached = g._team_names = names
+    return cached
+
+
+def _sees(created_by):
+    t = _team()
+    return t is None or (created_by or "") in t
+
+
 def admin_required(f):
+    """Kept under its old name: the page or action is for the Owner only."""
     @wraps(f)
     def wrapper(*args, **kwargs):
-        if session.get("role") != "admin":
-            return "Admins only.", 403
+        if not _is_owner():
+            return "Owner only.", 403
         return f(*args, **kwargs)
     return wrapper
+
+
+def _valid_manager_id(db, raw):
+    try:
+        mid = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return mid if db.execute("SELECT 1 FROM users WHERE id = ? AND role = 'manager'", (mid,)).fetchone() else None
 
 
 # ---------- Auth routes ----------
@@ -2284,7 +2335,7 @@ def setup():
         else:
             db = get_db()
             db.execute(
-                "INSERT INTO users (username, password_hash, role, created_at, full_name, email) VALUES (?, ?, 'admin', ?, ?, ?)",
+                "INSERT INTO users (username, password_hash, role, created_at, full_name, email) VALUES (?, ?, 'owner', ?, ?, ?)",
                 (username, generate_password_hash(password), datetime.utcnow().strftime("%Y-%m-%d %H:%M"), full_name, email),
             )
             db.commit()
@@ -2532,7 +2583,10 @@ def users_page():
     db = get_db()
     users = db.execute("SELECT id, username, full_name, email, role, created_at, totp_enabled FROM users ORDER BY created_at, id").fetchall()
     open_counts = {r["user_id"]: r["n"] for r in db.execute("SELECT user_id, COUNT(*) AS n FROM user_sessions GROUP BY user_id").fetchall()}
-    return render_template_string(USERS_HTML, users=users, username=session.get("username"), open_counts=open_counts)
+    users = [dict(u) for u in db.execute("SELECT id, username, full_name, email, role, created_at, totp_enabled, manager_id FROM users ORDER BY created_at, id").fetchall()]
+    mgr_names = {u["id"]: (u["full_name"] or u["username"]) for u in users if u["role"] == "manager"}
+    return render_template_string(USERS_HTML, users=users, username=session.get("username"), open_counts=open_counts,
+                                  managers=[{"id": k, "name": v} for k, v in mgr_names.items()], mgr_names=mgr_names)
 
 
 @app.route("/api/users", methods=["POST"])
@@ -2547,7 +2601,9 @@ def add_user():
     username = (data.get("username") or "").strip()
     password = data.get("password", "")
     role = data.get("role", "staff")
-    if role not in ("admin", "staff"):
+    if role == "admin":
+        role = "manager"
+    if role not in ("manager", "staff"):
         role = "staff"
     db = get_db()
     if not username and email:
@@ -2566,8 +2622,9 @@ def add_user():
         return jsonify({"error": "That email already has an account."}), 400
     try:
         db.execute(
-            "INSERT INTO users (username, password_hash, role, created_at, full_name, email) VALUES (?, ?, ?, ?, ?, ?)",
-            (username, generate_password_hash(password), role, datetime.utcnow().strftime("%Y-%m-%d %H:%M"), full_name, email),
+            "INSERT INTO users (username, password_hash, role, created_at, full_name, email, manager_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (username, generate_password_hash(password), role, datetime.utcnow().strftime("%Y-%m-%d %H:%M"), full_name, email,
+             _valid_manager_id(db, data.get("manager_id")) if role == "staff" else None),
         )
         db.commit()
     except psycopg2.IntegrityError:
@@ -2617,10 +2674,22 @@ def edit_user(user_id):
         if problem:
             return jsonify({"error": problem, "error_code": "weak_password"}), 400
         sets.append("password_hash = ?"); vals.append(generate_password_hash(data["password"]))
-    if data.get("role") in ("admin", "staff"):
-        if user_id == session.get("user_id") and data["role"] != u["role"]:
+    new_role = data.get("role")
+    if new_role == "admin":
+        new_role = "manager"
+    if new_role in ("manager", "staff"):
+        if u["role"] == "owner":
+            return jsonify({"error": "The Owner's level can't be changed."}), 400
+        if user_id == session.get("user_id") and new_role != u["role"]:
             return jsonify({"error": "You can't change your own role."}), 400
-        sets.append("role = ?"); vals.append(data["role"])
+        if new_role != u["role"]:
+            sets.append("role = ?"); vals.append(new_role)
+            if new_role == "manager":
+                sets.append("manager_id = NULL")
+            else:                                         # a manager moved down to staff: their team has no manager now
+                db.execute("UPDATE users SET manager_id = NULL WHERE manager_id = ?", (user_id,))
+    if "manager_id" in data and (new_role if new_role in ("manager", "staff") else u["role"]) == "staff":
+        sets.append("manager_id = ?"); vals.append(_valid_manager_id(db, data.get("manager_id")))
     if data.get("reset_2fa"):
         sets += ["totp_secret = ''", "totp_enabled = 0", "totp_last_step = 0", "recovery_codes = ''"]
     if not sets:
@@ -2653,6 +2722,10 @@ def delete_user(user_id):
     if user_id == session.get("user_id"):
         return jsonify({"error": "Can't delete your own account while logged in"}), 400
     db = get_db()
+    gone = db.execute("SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
+    if gone and gone["role"] == "owner":
+        return jsonify({"error": "The Owner can't be removed."}), 400
+    db.execute("UPDATE users SET manager_id = NULL WHERE manager_id = ?", (user_id,))
     db.execute("DELETE FROM users WHERE id = ?", (user_id,))
     db.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
     db.commit()
@@ -2670,12 +2743,12 @@ ATTACHMENT_FLAGS_SQL = """,
 @login_required
 def list_records():
     db = get_db()
-    if session.get("role") == "admin":
+    if _team() is None:
         rows = db.execute(f"SELECT r.*{ATTACHMENT_FLAGS_SQL} FROM records r ORDER BY created_at DESC").fetchall()
     else:
         rows = db.execute(
-            f"SELECT r.*{ATTACHMENT_FLAGS_SQL} FROM records r WHERE created_by = ? ORDER BY created_at DESC",
-            (session.get("username"),),
+            f"SELECT r.*{ATTACHMENT_FLAGS_SQL} FROM records r WHERE created_by = ANY(?) ORDER BY created_at DESC",
+            (_team(),),
         ).fetchall()
     out = []
     for r in rows:
@@ -2714,13 +2787,13 @@ def kpi_data():
         for them would just be a breakdown of one)
     """
     db = get_db()
-    is_admin = session.get("role") == "admin"
-    if is_admin:
+    is_admin = _oversees()
+    if _team() is None:
         rows = db.execute("SELECT * FROM records ORDER BY created_at ASC").fetchall()
     else:
         rows = db.execute(
-            "SELECT * FROM records WHERE created_by = ? ORDER BY created_at ASC",
-            (session.get("username"),),
+            "SELECT * FROM records WHERE created_by = ANY(?) ORDER BY created_at ASC",
+            (_team(),),
         ).fetchall()
     records = [dict(r) for r in rows]
 
@@ -2812,11 +2885,11 @@ def kpi_data():
 def _owns_record(bl_number):
     """Admins can touch any record. Staff can only touch records they
     created themselves."""
-    if session.get("role") == "admin":
+    if _team() is None:
         return True
     db = get_db()
     row = db.execute("SELECT created_by FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
-    return row is not None and row["created_by"] == session.get("username")
+    return row is not None and _sees(row["created_by"])
 
 
 def _log_audit(bl_number, action, field="", old_value="", new_value=""):
@@ -3970,7 +4043,7 @@ def _manifest_add(port, vessel, items):
             ).fetchone())
             index[bl] = existing
         skipped += 1
-        mine = is_admin or existing["created_by"] == me
+        mine = _sees(existing["created_by"])
         if mine and ((existing["vessel"] or "") != vessel or (existing["port"] or "") != port):
             duplicate_elsewhere.append({"bl_number": existing["bl_number"],
                                         "existing_port": existing["port"], "existing_vessel": existing["vessel"]})
@@ -4039,7 +4112,7 @@ def manifest_preview():
             k = bl_match_key(e["bl"])
             ex = index.get(k)
             fills = False
-            if ex is not None and not (is_admin or ex["created_by"] == me):
+            if ex is not None and not _sees(ex["created_by"]):
                 # Another user's BL: say it's taken, but not where it is or
                 # whose it is (staff only ever see their own BLs).
                 status, ex = "taken", None
@@ -5122,7 +5195,7 @@ def list_direct_delivery():
     BLs aren't shown here at all. Admins see everything; staff only see
     what they classified."""
     db = get_db()
-    if session.get("role") == "admin":
+    if _team() is None:
         rows = db.execute(
             "SELECT bl_number, is_direct, reason, classified_by, classified_at, needs_review, review_note "
             "FROM direct_delivery WHERE is_direct = 1 ORDER BY classified_at DESC, bl_number"
@@ -5130,8 +5203,8 @@ def list_direct_delivery():
     else:
         rows = db.execute(
             "SELECT bl_number, is_direct, reason, classified_by, classified_at, needs_review, review_note "
-            "FROM direct_delivery WHERE is_direct = 1 AND classified_by = ? ORDER BY classified_at DESC, bl_number",
-            (session.get("username"),),
+            "FROM direct_delivery WHERE is_direct = 1 AND classified_by = ANY(?) ORDER BY classified_at DESC, bl_number",
+            (_team(),),
         ).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -5145,7 +5218,7 @@ def list_direct_delivery_review():
     Direct Delivery list so an uncertain "not direct" doesn't just
     disappear (the main list only ever shows is_direct=1 rows)."""
     db = get_db()
-    if session.get("role") == "admin":
+    if _team() is None:
         rows = db.execute(
             "SELECT bl_number, is_direct, reason, classified_by, classified_at, review_note "
             "FROM direct_delivery WHERE needs_review = 1 ORDER BY classified_at DESC, bl_number"
@@ -5153,8 +5226,8 @@ def list_direct_delivery_review():
     else:
         rows = db.execute(
             "SELECT bl_number, is_direct, reason, classified_by, classified_at, review_note "
-            "FROM direct_delivery WHERE needs_review = 1 AND classified_by = ? ORDER BY classified_at DESC, bl_number",
-            (session.get("username"),),
+            "FROM direct_delivery WHERE needs_review = 1 AND classified_by = ANY(?) ORDER BY classified_at DESC, bl_number",
+            (_team(),),
         ).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -5167,12 +5240,12 @@ def delete_direct_delivery(bl):
     that was misread before a classifier bug was fixed). Admins can remove
     any row; staff can only remove rows they classified themselves."""
     db = get_db()
-    if session.get("role") == "admin":
+    if _team() is None:
         db.execute("DELETE FROM direct_delivery WHERE bl_number = ?", (bl,))
     else:
         db.execute(
-            "DELETE FROM direct_delivery WHERE bl_number = ? AND classified_by = ?",
-            (bl, session.get("username")),
+            "DELETE FROM direct_delivery WHERE bl_number = ? AND classified_by = ANY(?)",
+            (bl, _team()),
         )
     db.commit()
     return jsonify({"ok": True})
@@ -5287,9 +5360,9 @@ def _unstash_attachments(db, bl_number):
     and pick up someone else's files along with it."""
     params = [bl_number]
     owner_sql = ""
-    if session.get("role") != "admin":
-        owner_sql = " AND deleted_by = ?"
-        params.append(session.get("username", ""))
+    if _team() is not None:
+        owner_sql = " AND deleted_by = ANY(?)"
+        params.append(_team())
     db.execute(
         f"""INSERT INTO record_attachments
               (bl_number, kind, filename, content_type, data, file_size, uploaded_by, uploaded_at)
@@ -5332,10 +5405,8 @@ def _restore_one_record(db, data):
     # Staff can only ever remove their own BLs, so an Undo by staff always
     # restores to themselves - the client-supplied created_by is only
     # trusted from an admin (who may be restoring someone else's BL).
-    if session.get("role") == "admin":
-        owner = data.get("created_by") or session.get("username")
-    else:
-        owner = session.get("username")
+    wanted = data.get("created_by")
+    owner = wanted if (wanted and _sees(wanted)) else session.get("username")
 
     # Keep the BL's tracking link working after an Undo (the customer may
     # already have it) - unless that code is somehow in use elsewhere, in
@@ -5463,7 +5534,7 @@ def rename_group():
     # (otherwise "Tai Knight" and "TAI KNIGHT" become two different groups).
     new_value = re.sub(r"\s+", " ", str(data.get("new_value") or "")).strip().upper()
     db = get_db()
-    is_admin = session.get("role") == "admin"
+    is_admin = _team() is None
     if group_type not in ("port", "vessel"):
         return jsonify({"error": "invalid type"}), 400
     bl_numbers = data.get("bl_numbers")
@@ -5475,8 +5546,8 @@ def rename_group():
             sql = f"UPDATE records SET {group_type} = ? WHERE bl_number = ANY(?)"
             params = [new_value, bls]
             if not is_admin:
-                sql += " AND created_by = ?"
-                params.append(session.get("username"))
+                sql += " AND created_by = ANY(?)"
+                params.append(_team())
             db.execute(sql, tuple(params))
             db.commit()
         return jsonify({"ok": True})
@@ -5487,8 +5558,8 @@ def rename_group():
             db.execute("UPDATE records SET port = ? WHERE port = ?", (new_value, old_port))
         else:
             db.execute(
-                "UPDATE records SET port = ? WHERE port = ? AND created_by = ?",
-                (new_value, old_port, session.get("username")),
+                "UPDATE records SET port = ? WHERE port = ? AND created_by = ANY(?)",
+                (new_value, old_port, _team()),
             )
     elif group_type == "vessel":
         old_vessel = data.get("old_vessel", "")
@@ -5500,8 +5571,8 @@ def rename_group():
             )
         else:
             db.execute(
-                "UPDATE records SET vessel = ? WHERE port = ? AND vessel = ? AND created_by = ?",
-                (new_value, old_port, old_vessel, session.get("username")),
+                "UPDATE records SET vessel = ? WHERE port = ? AND vessel = ? AND created_by = ANY(?)",
+                (new_value, old_port, old_vessel, _team()),
             )
     else:
         return jsonify({"error": "invalid type"}), 400
@@ -5546,9 +5617,9 @@ def bulk_toggle_records():
         f"WHERE bl_number = ANY(?) AND COALESCE({field}, 0) <> ?"
     )
     params = [value, by_val, now, bl_numbers, value]
-    if session.get("role") != "admin":
-        sql += " AND created_by = ?"  # staff can only touch their own BLs, same as _owns_record
-        params.append(session.get("username"))
+    if _team() is not None:
+        sql += " AND created_by = ANY(?)"  # staff and managers only touch their own / their team's BLs, same as _owns_record
+        params.append(_team())
     sql += " RETURNING bl_number"
     updated = [r["bl_number"] for r in db.execute(sql, tuple(params)).fetchall()]
     for bl_number in updated:
@@ -5668,8 +5739,8 @@ def set_vessel_archived():
 @app.route("/api/records/<path:bl_number>/history", methods=["GET"])
 @login_required
 def record_history(bl_number):
-    if session.get("role") != "admin":
-        return "Admins only.", 403
+    if not _oversees():
+        return "Owner and managers only.", 403
     if not _owns_record(bl_number.upper()):
         return "Not your record.", 403
     db = get_db()
@@ -5772,11 +5843,11 @@ def detect_attachment():
     # (same scope _owns_record would allow) - no point surfacing a match
     # the uploader isn't permitted to attach to.
     db = get_db()
-    if session.get("role") == "admin":
+    if _team() is None:
         bl_rows = db.execute("SELECT bl_number FROM records").fetchall()
     else:
         bl_rows = db.execute(
-            "SELECT bl_number FROM records WHERE created_by = ?", (session.get("username"),)
+            "SELECT bl_number FROM records WHERE created_by = ANY(?)", (_team(),)
         ).fetchall()
     known_bls = [r["bl_number"] for r in bl_rows]
     found = _find_bl_in_text(text, known_bls)
@@ -6349,12 +6420,12 @@ def export_records():
     port = request.args.get("port", "")
     vessel = request.args.get("vessel", "")
     db = get_db()
-    is_admin = session.get("role") == "admin"
+    is_admin = _team() is None
     sql = "SELECT * FROM records WHERE port = ? AND vessel = ?"
     params = [port, vessel]
     if not is_admin:
-        sql += " AND created_by = ?"
-        params.append(session.get("username"))
+        sql += " AND created_by = ANY(?)"
+        params.append(_team())
     sql += " ORDER BY bl_number"
     rows = [dict(r) for r in db.execute(sql, tuple(params)).fetchall()]
 
@@ -6735,7 +6806,7 @@ def _pda_compute(doc, items):
 
 
 def _pda_scope_ok(row):
-    return row is not None and (session.get("role") == "admin" or (row["created_by"] or "") == session.get("username"))
+    return row is not None and _sees(row["created_by"])
 
 
 def _pda_get(db, pda_id):
@@ -6894,7 +6965,7 @@ def get_pda_settings():
         "fx": _pf(get_setting("pda_fx", ""), PDA_DEFAULT_FX) or PDA_DEFAULT_FX,
         "next_number": _pda_next_no(get_db(), datetime.utcnow().strftime("%y")),
         "ports": {k: {"name": v[0], "code": v[1]} for k, v in PDA_PORT_INFO.items()},
-        "is_admin": session.get("role") == "admin",
+        "is_admin": _is_owner(),
         "pricing_people": get_setting("pda_pricing_people", ""),
     })
 
@@ -7080,9 +7151,9 @@ def list_pda_customers():
     sql = ("SELECT customer_name, customer_address, customer_phone, customer_email FROM pda_documents "
            "WHERE customer_name <> ''")
     params = []
-    if session.get("role") != "admin":
-        sql += " AND created_by = ?"
-        params.append(session.get("username"))
+    if _team() is not None:
+        sql += " AND created_by = ANY(?)"
+        params.append(_team())
     sql += " ORDER BY id DESC"
     seen, out = set(), []
     for r in db.execute(sql, tuple(params)).fetchall():
@@ -7099,9 +7170,9 @@ def list_pda_documents():
     db = get_db()
     sql = "SELECT * FROM pda_documents"
     params = ()
-    if session.get("role") != "admin":
-        sql += " WHERE created_by = ?"
-        params = (session.get("username"),)
+    if _team() is not None:
+        sql += " WHERE created_by = ANY(?)"
+        params = (_team(),)
     rows = db.execute(sql + " ORDER BY id DESC", params).fetchall()
     by_doc = {}
     if rows:
@@ -7921,9 +7992,9 @@ def list_jobs():
     db = get_db()
     sql = "SELECT * FROM pda_documents"
     params = ()
-    if session.get("role") != "admin":
-        sql += " WHERE created_by = ?"
-        params = (session.get("username"),)
+    if _team() is not None:
+        sql += " WHERE created_by = ANY(?)"
+        params = (_team(),)
     rows = db.execute(sql + " ORDER BY id DESC LIMIT 2000", params).fetchall()
     ids = [r["id"] for r in rows]
     items_by, inv_by, pins = {}, {}, set()
@@ -7951,7 +8022,7 @@ def list_jobs():
             "pinned": r["id"] in pins, "one_off": bool(r["one_off"]), "principal_ref": r["principal_ref"],
             "client_id": r["client_id"], "handler": names.get(r["created_by"], r["created_by"]),
         })
-    return jsonify({"jobs": out, "stages": JOB_STAGES, "is_admin": session.get("role") == "admin"})
+    return jsonify({"jobs": out, "stages": JOB_STAGES, "is_admin": _oversees()})
 
 
 @app.route("/api/jobs/<int:pda_id>", methods=["GET"])
@@ -7979,8 +8050,8 @@ def set_job_stage(pda_id):
         return jsonify({"error": "Choose a stage."}), 400
     if to < 0 or to > 5 or abs(to - cur_stage) != 1:
         return jsonify({"error": "A job moves one step at a time."}), 400
-    if to < cur_stage and session.get("role") != "admin":
-        return jsonify({"error": "Only an admin can move a job back a step."}), 403
+    if to < cur_stage and not _oversees():
+        return jsonify({"error": "Only the owner or a manager can move a job back a step."}), 403
     now = _now_stamp()
     sets, vals = {"job_stage": to}, []
     today = _riyadh_today().isoformat()
@@ -11713,7 +11784,9 @@ USERS_HTML = """
   th { color: var(--muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; background: color-mix(in srgb, var(--border) 40%, transparent); }
   tbody tr:last-child td { border-bottom: none; }
   .role-pill { display: inline-block; font-size: 10.5px; font-weight: 700; padding: 2px 9px; border-radius: 999px; text-transform: uppercase; letter-spacing: .03em; }
-  .role-pill.admin { background: color-mix(in srgb, var(--gold) 18%, transparent); color: var(--gold); }
+  .role-pill.admin, .role-pill.manager { background: color-mix(in srgb, var(--gold) 18%, transparent); color: var(--gold); }
+  .role-pill.owner { background: var(--navy); color: #fff; }
+  .sub-line { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
   .role-pill.staff { background: color-mix(in srgb, var(--navy-light) 14%, transparent); color: var(--navy-light); }
   input[type=text], input[type=password] {
     border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 14px; font-family: inherit;
@@ -11799,24 +11872,25 @@ function setTheme(mode) {
       <input type="password" id="newPassword" placeholder="Temporary password" autocomplete="new-password" style="flex:1 1 150px;">
       <button type="button" class="sec" id="genPwBtn" onclick="genPw()">Generate</button>
       <button type="button" class="sec" id="copyPwBtn" onclick="copyPw()">Copy</button>
-      <select id="newRole"><option value="staff">Staff</option><option value="admin">Admin</option></select>
+      <select id="newRole" onchange="toggleNewMgr()"><option value="staff">Staff</option><option value="manager">Manager</option></select>
+      <select id="newMgr" title="Who this person reports to"><option value="">Reports to...</option>{% for m in managers %}<option value="{{ m['id'] }}">{{ m['name'] }}</option>{% endfor %}</select>
       <button onclick="addUser()">Add User</button>
     </div>
     <div id="newPwMeter" data-watch="newName,newEmail">""" + PW_METER_HTML + """</div>
     <div style="font-size:12px;color:var(--muted);margin-top:10px;">They sign in with this email and set up their authenticator app the first time.</div>
   </div>
-  <div class="card">
-    <table>
+  <div class="card" style="overflow-x:auto">
+    <table style="min-width:640px">
       <thead><tr><th>Name</th><th>Email / username</th><th>Role</th><th>2-step</th><th>Created</th><th></th></tr></thead>
       <tbody>
         {% for u in users %}
         <tr id="u{{ u['id'] }}">
-          <td><b>{{ u['full_name'] or u['username'] }}</b></td>
+          <td><b>{{ u['full_name'] or u['username'] }}</b>{% if u['role'] == 'staff' and u['manager_id'] and mgr_names.get(u['manager_id']) %}<div class="sub-line">Reports to {{ mgr_names.get(u['manager_id']) }}</div>{% endif %}</td>
           <td>{% if u['email'] %}{{ u['email'] }}<div style="font-size:11.5px;color:var(--muted);">{{ u['username'] }}</div>{% else %}{{ u['username'] }}<div style="font-size:11.5px;color:var(--muted);">no email yet</div>{% endif %}</td>
           <td><span class="role-pill {{ u['role'] }}">{{ u['role'] }}</span></td>
           <td>{% if u['totp_enabled'] %}<span class="role-pill staff" style="background:color-mix(in srgb,#2e9e6b 16%,transparent);color:#2e9e6b;">On</span>{% else %}<span class="role-pill" style="background:var(--border);color:var(--muted);">Not yet</span>{% endif %}</td>
           <td class="local-time" data-utc="{{ u['created_at'] }}">{{ u['created_at'] }}</td>
-          <td style="white-space:nowrap;"><button class="del" style="color:var(--navy-light);" onclick="toggleEdit({{ u['id'] }})">Edit</button><button class="del" onclick='delUser({{ u["id"] }}, {{ (u["full_name"] or u["username"])|tojson }})'>Remove</button></td>
+          <td style="white-space:nowrap;"><button class="del" style="color:var(--navy-light);" onclick="toggleEdit({{ u['id'] }})">Edit</button>{% if u['role'] != 'owner' %}<button class="del" onclick='delUser({{ u["id"] }}, {{ (u["full_name"] or u["username"])|tojson }})'>Remove</button>{% endif %}</td>
         </tr>
         <tr class="edit-row" id="e{{ u['id'] }}" data-username="{{ u['username'] }}" style="display:none;">
           <td colspan="6" style="background:color-mix(in srgb,var(--border) 30%,transparent);">
@@ -11825,6 +11899,8 @@ function setTheme(mode) {
               <input type="text" id="eu{{ u['id'] }}" value="{{ u['username'] }}" placeholder="Username" autocapitalize="none" autocomplete="off" style="flex:1 1 150px;">
               <input type="text" id="ee{{ u['id'] }}" value="{{ u['email'] }}" placeholder="name@seapower.com.sa" autocapitalize="none" style="flex:1.3 1 220px;">
               <input type="password" id="ep{{ u['id'] }}" placeholder="New password (optional)" autocomplete="new-password" style="flex:1 1 150px;">
+              {% if u['role'] != 'owner' %}<select id="er{{ u['id'] }}" onchange="toggleEditMgr({{ u['id'] }})"><option value="staff"{% if u['role'] == 'staff' %} selected{% endif %}>Staff</option><option value="manager"{% if u['role'] != 'staff' %} selected{% endif %}>Manager</option></select>
+              <select id="em{{ u['id'] }}" title="Reports to"{% if u['role'] != 'staff' %} style="display:none"{% endif %}><option value="">Reports to...</option>{% for m in managers %}<option value="{{ m['id'] }}"{% if u['manager_id'] == m['id'] %} selected{% endif %}>{{ m['name'] }}</option>{% endfor %}</select>{% endif %}
               <button onclick="saveUser({{ u['id'] }})">Save</button>
               {% if u['totp_enabled'] %}<button class="del" style="border:1px solid var(--border);" onclick="reset2fa({{ u['id'] }})">Reset 2-step</button>{% endif %}
               {% set n_open = open_counts.get(u['id'], 0) %}<button class="del" style="border:1px solid var(--border);" onclick="signOutAll({{ u['id'] }})" title="Ends every sign-in this person has open, on any phone or computer"{% if not n_open %} disabled{% endif %}>Sign out everywhere{% if n_open %} ({{ n_open }}){% endif %}</button>
@@ -11907,6 +11983,12 @@ function copyPw() {
   if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(i.value).then(done, fallback);
   else fallback();
 }
+function toggleNewMgr() {
+  document.getElementById('newMgr').style.display = document.getElementById('newRole').value === 'staff' ? '' : 'none';
+}
+function toggleEditMgr(id) {
+  document.getElementById('em' + id).style.display = document.getElementById('er' + id).value === 'staff' ? '' : 'none';
+}
 async function addUser() {
   const full_name = document.getElementById('newName').value.trim();
   const email = document.getElementById('newEmail').value.trim();
@@ -11914,7 +11996,7 @@ async function addUser() {
   const role = document.getElementById('newRole').value;
   if (!full_name || !email || !password) { showToast('Fill in the name, company email and a temporary password.', {error:true}); return; }
   const res = await fetch('/api/users', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({full_name, email, password, role})});
+    body: JSON.stringify({full_name, email, password, role, manager_id: document.getElementById('newMgr').value})});
   const data = await res.json();
   if (!res.ok || data.error) { showToast(data.error || 'Could not add that user.', {error:true}); return; }
   showToast(full_name + ' added.');
@@ -11944,6 +12026,8 @@ async function saveUser(id) {
   const body = {full_name: document.getElementById('en' + id).value.trim(), username: document.getElementById('eu' + id).value.trim(), email: document.getElementById('ee' + id).value.trim()};
   const pw = document.getElementById('ep' + id).value;
   if (pw) body.password = pw;
+  const er = document.getElementById('er' + id), em = document.getElementById('em' + id);
+  if (er) { body.role = er.value; if (er.value === 'staff' && em) body.manager_id = em.value; }
   const res = await fetch('/api/users/' + id, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.error) { showToast(data.error || 'Could not save.', {error:true}); return; }
@@ -12084,7 +12168,7 @@ HUB_HTML = """
           <span class="theme-knob"></span>
         </span>
       </label>
-      {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
+      {% if role == 'owner' %}<a href="/users">Manage Users</a>{% endif %}
       <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
@@ -12817,7 +12901,7 @@ KPI_HTML = """
         </span>
       </label>
       <a href="/do-tracker">DO Tracker</a>
-      {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
+      {% if role == 'owner' %}<a href="/users">Manage Users</a>{% endif %}
       <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
@@ -12826,7 +12910,7 @@ KPI_HTML = """
   <div class="page-head">
     <div class="eyebrow">Compass</div>
     <h1>Port Agent KPI</h1>
-    <p>{% if role == 'admin' %}Built from the DO Tracker board - every staff member's records.{% else %}Built from the DO Tracker board - your own records.{% endif %}</p>
+    <p>{% if role == 'owner' %}Built from the DO Tracker board - every staff member's records.{% elif role == 'manager' %}Built from the DO Tracker board - your team's records.{% else %}Built from the DO Tracker board - your own records.{% endif %}</p>
   </div>
 
   <div id="content">
@@ -12849,7 +12933,7 @@ function setTheme(mode) {
   try { localStorage.setItem('theme', mode); } catch (e) {}
 }
 
-const IS_ADMIN = {{ (role == 'admin')|tojson }};
+const IS_ADMIN = {{ (role in ['owner', 'manager'])|tojson }};
 
 // BL numbers, port/vessel names and usernames are user/file data - escape
 // before putting them into HTML so they can't inject markup or script.
@@ -13084,7 +13168,7 @@ DIRECT_DELIVERY_HTML = """
         </span>
       </label>
       <a href="/do-tracker">DO Tracker</a>
-      {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
+      {% if role == 'owner' %}<a href="/users">Manage Users</a>{% endif %}
       <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
@@ -13511,7 +13595,7 @@ JOBS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta
   </nav>
   <div class="topbar-right">
     <label class="theme-switch" title="Switch between light and dark"><input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')"><span class="theme-track"><span class="theme-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg></span><span class="theme-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg></span><span class="theme-knob"></span></span></label>
-    {% if role == 'admin' %}<a href="/pda" title="Rate cards, charge list, bank details and numbering">Settings</a><a href="/users">Users</a>{% endif %}
+    {% if role == 'owner' %}<a href="/pda" title="Rate cards, charge list, bank details and numbering">Settings</a><a href="/users">Users</a>{% endif %}
     <span><b>{{ display_name }}</b></span><a href="/logout">Log out</a>
   </div>
 </div>
@@ -13838,7 +13922,7 @@ function drawJob() {
     '<div class="row" style="gap:6px 22px;margin-top:14px;font-size:13px">' +
     [['Port', portName(d) || d.dis_port], ['Customer', d.customer_name], ['Voyage', d.voyage], ['ETA', d.eta ? fd(d.eta) : ''], ['Activity', d.operation], ['Principal ref', d.principal_ref]].filter(x => x[1]).map(x => '<span><span style="color:var(--muted)">' + x[0] + ':</span> ' + esc(x[1]) + '</span>').join('') + '</div>' +
     '<div class="stages">' + steps + '</div>' +
-    (ROLE === 'admin' && st > 0 ? '<div style="margin-top:10px"><button class="btn ghost small" data-act="stageBack">Moved too far? Go back one step (admin)</button></div>' : '') + '</div>' +
+    ((ROLE === 'owner' || ROLE === 'manager') && st > 0 ? '<div style="margin-top:10px"><button class="btn ghost small" data-act="stageBack">Moved too far? Go back one step</button></div>' : '') + '</div>' +
     tbh +
     '<div class="row">' + JTABS.map(t => '<button class="pill' + (S.jobTab === t ? ' on' : '') + '" data-act="jtab" data-t="' + esc(t) + '">' + esc(t) + (t === 'Invoices' && J.invoices.length ? ' <span class="ct">' + J.invoices.length + '</span>' : '') + (t === 'Husbandry and services' && J.services.length ? ' <span class="ct">' + J.services.length + '</span>' : '') + '</button>').join('') + '</div>' +
     '<div id="jbody"></div></div>';
@@ -14585,7 +14669,7 @@ PDA_HTML = """
           <span class="theme-knob"></span>
         </span>
       </label>
-      {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
+      {% if role == 'owner' %}<a href="/users">Manage Users</a>{% endif %}
       <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
@@ -14790,7 +14874,7 @@ PDA_HTML = """
     </div>
   </div>
 
-  {% if role == 'admin' %}
+  {% if role == 'owner' %}
   <div class="panel" id="settingsPanel">
     <h2>PDA settings</h2>
     <p class="panel-sub">Numbering, exchange rate and the details printed on every PDA.</p>
@@ -14881,7 +14965,7 @@ function escHtml(s) {
   return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-const IS_ADMIN = {{ 'true' if role == 'admin' else 'false' }};
+const IS_ADMIN = {{ 'true' if role == 'owner' else 'false' }};
 let currentDocId = null;
 let currentDoc = null;
 let currentItems = [];
@@ -15450,7 +15534,7 @@ document.addEventListener('click', function (e) { if (!e.target.closest('#chgBox
   if (m) openDocument(Number(m[1]));
 })();
 
-{% if role == 'admin' %}
+{% if role == 'owner' %}
 let templatesCache = {};
 const TEMPLATE_PORTS = ['DAMMAM PORT', 'JUBAIL COMMERCIAL PORT', 'JEDDAH PORT', 'YANBU COMMERCIAL PORT', 'YANBU INDUSTRIAL PORT', 'KAP'];
 const TPL_RULES = [['fixed', 'Fixed qty'], ['days', 'Port stay'], ['frt', 'Cargo FRT'], ['grt', 'GRT'], ['manual', 'Manual']];
@@ -16320,7 +16404,7 @@ SOF_HTML = """
         </span>
       </label>
       <a href="/pda">Disbursement Accounts</a>
-      {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
+      {% if role == 'owner' %}<a href="/users">Manage Users</a>{% endif %}
       <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
@@ -17723,7 +17807,7 @@ PAGE_HTML = """
           <span class="theme-knob"></span>
         </span>
       </label>
-      {% if role == 'admin' %}<a href="/users" data-i18n="manage_users">Manage Users</a>{% endif %}
+      {% if role == 'owner' %}<a href="/users" data-i18n="manage_users">Manage Users</a>{% endif %}
       <span class="who"><b>{{ display_name }}</b></span>
       <a href="/logout" data-i18n="log_out">Log out</a>
     </div>
@@ -17802,7 +17886,7 @@ PAGE_HTML = """
       <div class="glass-select-wrap" style="width:auto; min-width:200px;">
         <select id="jumpSelect" class="nice-select" onchange="jumpToVessel(this.value)"><option value="" data-i18n="select_vessel_to_view">Select a vessel to view</option></select>
       </div>
-      {% if role == 'admin' %}
+      {% if role in ['owner', 'manager'] %}
       <div class="glass-select-wrap" style="width:auto; min-width:140px;">
         <select id="operatorFilter" class="nice-select" onchange="render()"><option value="" data-i18n="all_operators">All operators</option></select>
       </div>
@@ -17905,7 +17989,7 @@ function setTheme(mode) {
 }
 
 const CURRENT_USER = {{ username|tojson }};
-const IS_ADMIN = {{ (role == 'admin')|tojson }};
+const IS_ADMIN = {{ (role in ['owner', 'manager'])|tojson }};
 let records = [];
 let suppressPollUntil = 0;
 let editingCount = 0;
@@ -18944,7 +19028,7 @@ function rowsHtml(list) {
       <td data-label="${t('th_remarks')}"><input class="remarks-input" type="text" dir="${autoDir(r.remarks)}" value="${esc(r.remarks || '')}"
             oninput="this.dir = autoDir(this.value); onRemarksInput(${jsq(r.bl_number)}, this.value)"
             onfocus="markEditing(1)" onblur="markEditing(-1)" placeholder="${t('notes_placeholder')}"></td>
-      <td>{% if role == 'admin' %}<button type="button" class="hist-btn" title="${t('history')}" onclick="showHistory(${jsq(r.bl_number)})">${t('history')}</button>{% endif %}</td>
+      <td>{% if role in ['owner', 'manager'] %}<button type="button" class="hist-btn" title="${t('history')}" onclick="showHistory(${jsq(r.bl_number)})">${t('history')}</button>{% endif %}</td>
       <td><button class="del" onclick="deleteRecord(${jsq(r.bl_number)})">${t('remove')}</button></td>
     </tr>`;
   }).join('');
