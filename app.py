@@ -1977,8 +1977,30 @@ def _password_problem(pw, username="", email="", full_name="", old_hash=None):
     return None
 
 
+def _clean_username(s):
+    """Lower case, letters/digits/space . _ - only, single spaces: 'Ahmed Al Baity' -> 'ahmed al baity'."""
+    s = re.sub(r"[^a-z0-9._\- ]", "", (s or "").lower())
+    return re.sub(r" +", " ", s).strip()
+
+
+def _username_in_use(db, uname):
+    """True when records in any table are saved under this username (it is used as the owner),
+    so renaming it would cut the person off from their own records."""
+    cols = db.execute("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public' "
+                      "AND column_name IN ('created_by', 'updated_by', 'classified_by', 'operator', 'owner')").fetchall()
+    for c in cols:
+        if c["table_name"] in ("users", "user_sessions"):
+            continue
+        try:
+            if db.execute(f'SELECT 1 FROM "{c["table_name"]}" WHERE LOWER("{c["column_name"]}") = LOWER(?) LIMIT 1', (uname,)).fetchone():
+                return True
+        except Exception:
+            db.conn.rollback()
+    return False
+
+
 def _unique_username(db, base):
-    base = re.sub(r"[^a-z0-9._\-]", "", (base or "").lower()) or "user"
+    base = _clean_username(base) or "user"
     name, n = base, 1
     while db.execute("SELECT 1 FROM users WHERE LOWER(username) = LOWER(?)", (name,)).fetchone():
         n += 1
@@ -2529,7 +2551,10 @@ def add_user():
         role = "staff"
     db = get_db()
     if not username and email:
-        username = _unique_username(db, email.split("@")[0])
+        base = _clean_username(full_name)                 # sign in with the name: "ahmed al baity"
+        if len(base) < 2:                                 # a name with no Latin letters: fall back to the email name
+            base = email.split("@")[0]
+        username = _unique_username(db, base)
     if not username or not password:
         return jsonify({"error": "Missing fields"}), 400
     problem = _password_problem(password, username, email, full_name)
@@ -2563,6 +2588,18 @@ def edit_user(user_id):
     sets, vals = [], []
     if "full_name" in data:
         sets.append("full_name = ?"); vals.append((data.get("full_name") or "").strip())
+    if "username" in data:
+        nu = _clean_username(data.get("username"))
+        if len(nu) < 2:
+            return jsonify({"error": "Use at least 2 letters or numbers for the username."}), 400
+        if db.execute("SELECT 1 FROM users WHERE LOWER(username) = LOWER(?) AND id <> ?", (nu, user_id)).fetchone():
+            return jsonify({"error": "That username is already taken."}), 400
+        if nu != (u["username"] or ""):
+            if _username_in_use(db, u["username"]):
+                return jsonify({"error": f"{u['username']} already has records saved under this username, so it can't be renamed."}), 400
+            sets.append("username = ?"); vals.append(nu)
+            if user_id == session.get("user_id"):
+                session["username"] = nu
     if "email" in data:
         email, err = _check_company_email(data.get("email"))
         if err:
@@ -11749,7 +11786,7 @@ function setTheme(mode) {
         </span>
       </label>
       <a href="/">&larr; Back to board</a>
-      <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
+      <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
   </div>
@@ -11785,6 +11822,7 @@ function setTheme(mode) {
           <td colspan="6" style="background:color-mix(in srgb,var(--border) 30%,transparent);">
             <div class="row">
               <input type="text" id="en{{ u['id'] }}" value="{{ u['full_name'] }}" placeholder="Full name" style="flex:1 1 160px;">
+              <input type="text" id="eu{{ u['id'] }}" value="{{ u['username'] }}" placeholder="Username" autocapitalize="none" autocomplete="off" style="flex:1 1 150px;">
               <input type="text" id="ee{{ u['id'] }}" value="{{ u['email'] }}" placeholder="name@seapower.com.sa" autocapitalize="none" style="flex:1.3 1 220px;">
               <input type="password" id="ep{{ u['id'] }}" placeholder="New password (optional)" autocomplete="new-password" style="flex:1 1 150px;">
               <button onclick="saveUser({{ u['id'] }})">Save</button>
@@ -11903,7 +11941,7 @@ function toggleEdit(id) {
   });
 })();
 async function saveUser(id) {
-  const body = {full_name: document.getElementById('en' + id).value.trim(), email: document.getElementById('ee' + id).value.trim()};
+  const body = {full_name: document.getElementById('en' + id).value.trim(), username: document.getElementById('eu' + id).value.trim(), email: document.getElementById('ee' + id).value.trim()};
   const pw = document.getElementById('ep' + id).value;
   if (pw) body.password = pw;
   const res = await fetch('/api/users/' + id, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
@@ -12047,8 +12085,7 @@ HUB_HTML = """
         </span>
       </label>
       {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
-      <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
-      <a href="/account/security">Security</a>
+      <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
   </div>
@@ -12322,7 +12359,7 @@ VESSEL_TRACKER_HTML = """
         </span>
       </label>
       <a href="/do-tracker">DO Tracker</a>
-      <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
+      <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
   </div>
@@ -12781,7 +12818,7 @@ KPI_HTML = """
       </label>
       <a href="/do-tracker">DO Tracker</a>
       {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
-      <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
+      <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
   </div>
@@ -13048,7 +13085,7 @@ DIRECT_DELIVERY_HTML = """
       </label>
       <a href="/do-tracker">DO Tracker</a>
       {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
-      <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
+      <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
   </div>
@@ -13475,7 +13512,7 @@ JOBS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta
   <div class="topbar-right">
     <label class="theme-switch" title="Switch between light and dark"><input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')"><span class="theme-track"><span class="theme-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg></span><span class="theme-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg></span><span class="theme-knob"></span></span></label>
     {% if role == 'admin' %}<a href="/pda" title="Rate cards, charge list, bank details and numbering">Settings</a><a href="/users">Users</a>{% endif %}
-    <span>Signed in as <b>{{ display_name }}</b></span><a href="/logout">Log out</a>
+    <span><b>{{ display_name }}</b></span><a href="/logout">Log out</a>
   </div>
 </div>
 <div id="toastHost" aria-live="polite"></div>
@@ -14549,7 +14586,7 @@ PDA_HTML = """
         </span>
       </label>
       {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
-      <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
+      <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
   </div>
@@ -15804,7 +15841,7 @@ td.lim{max-width:260px;overflow:hidden;text-overflow:ellipsis}
     <label class="theme-switch" title="Toggle dark mode"><input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')"><span class="theme-track"><span class="theme-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg></span><span class="theme-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg></span><span class="theme-knob"></span></span></label>
     <a href="/do-tracker">DO Tracker</a>
     <a href="/jobs">Jobs</a>
-    <span class="who">Signed in as <b>{{ display_name }}</b></span>
+    <span class="who"><b>{{ display_name }}</b></span>
     <a href="/logout">Log out</a>
   </div>
 </div>
@@ -16284,7 +16321,7 @@ SOF_HTML = """
       </label>
       <a href="/pda">Disbursement Accounts</a>
       {% if role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
-      <span style="padding:6px 4px;">Signed in as <b>{{ display_name }}</b></span>
+      <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
   </div>
@@ -17687,7 +17724,7 @@ PAGE_HTML = """
         </span>
       </label>
       {% if role == 'admin' %}<a href="/users" data-i18n="manage_users">Manage Users</a>{% endif %}
-      <span class="who"><span class="who-label" data-i18n="signed_in_as">Signed in as</span> <b>{{ display_name }}</b></span>
+      <span class="who"><b>{{ display_name }}</b></span>
       <a href="/logout" data-i18n="log_out">Log out</a>
     </div>
   </div>
