@@ -11689,6 +11689,8 @@ USERS_HTML = """
   button:active { transform: scale(.97); }
   .del { background: none; color: var(--danger); font-size: 12px; font-weight: 600; padding: 5px 10px; border-radius: 999px; }
   .del:hover { background: var(--danger-bg); }
+  button.sec { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  button.sec:hover { background: var(--border); }
   .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
   .pw-meter { margin-top: 8px; }
   .pw-meter .bar { height: 4px; border-radius: 99px; background: var(--border); overflow: hidden; }
@@ -11758,6 +11760,8 @@ function setTheme(mode) {
       <input type="text" id="newName" placeholder="Full name" autocomplete="off" style="flex:1 1 170px;">
       <input type="text" id="newEmail" placeholder="Company email (name@seapower.com.sa)" autocomplete="off" autocapitalize="none" style="flex:1.4 1 230px;">
       <input type="password" id="newPassword" placeholder="Temporary password" autocomplete="new-password" style="flex:1 1 150px;">
+      <button type="button" class="sec" id="genPwBtn" onclick="genPw()">Generate</button>
+      <button type="button" class="sec" id="copyPwBtn" onclick="copyPw()">Copy</button>
       <select id="newRole"><option value="staff">Staff</option><option value="admin">Admin</option></select>
       <button onclick="addUser()">Add User</button>
     </div>
@@ -11827,6 +11831,43 @@ function showToast(message, opts) {
     el.classList.add('fading');
     setTimeout(() => el.remove(), 220);
   }
+}
+function randInt(n) {
+  var a = new Uint32Array(1), lim = Math.floor(4294967296 / n) * n;
+  do { crypto.getRandomValues(a); } while (a[0] >= lim);
+  return a[0] % n;
+}
+function genPassword() {
+  var U = 'ABCDEFGHJKLMNPQRSTUVWXYZ', L = 'abcdefghijkmnpqrstuvwxyz', N = '23456789', S = '#$%&*+=?@', all = U + L + N + S;
+  function pick(set) { return set.charAt(randInt(set.length)); }
+  var avoid = [], email = document.getElementById('newEmail').value.split('@')[0], name = document.getElementById('newName').value;
+  email = email.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (email.length >= 3) avoid.push(email);
+  name.toLowerCase().split(/[^a-z0-9]+/).forEach(function (t) { if (t.length >= 4) avoid.push(t); });
+  var pw = '';
+  for (var tries = 0; tries < 30; tries++) {
+    var c = [pick(U), pick(L), pick(N), pick(S)];
+    while (c.length < 14) c.push(pick(all));
+    for (var i = c.length - 1; i > 0; i--) { var j = randInt(i + 1), t = c[i]; c[i] = c[j]; c[j] = t; }
+    pw = c.join('');
+    var flat = pw.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (!avoid.some(function (p) { return flat.indexOf(p) >= 0; })) break;
+  }
+  return pw;
+}
+function genPw() {
+  var i = document.getElementById('newPassword');
+  i.type = 'text';
+  i.value = genPassword();
+  i.dispatchEvent(new Event('input', {bubbles: true}));
+}
+function copyPw() {
+  var i = document.getElementById('newPassword');
+  if (!i.value) { showToast('Press Generate first.', {error: true}); return; }
+  function done() { showToast('Password copied.'); }
+  function fallback() { i.type = 'text'; i.select(); try { document.execCommand('copy'); done(); } catch (e) { showToast('Select the password and copy it.', {error: true}); } }
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(i.value).then(done, fallback);
+  else fallback();
 }
 async function addUser() {
   const full_name = document.getElementById('newName').value.trim();
