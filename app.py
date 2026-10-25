@@ -783,6 +783,7 @@ def init_db():
     # Owner / Manager / Staff. Staff report to a manager (manager_id). The first admin becomes
     # the Owner (there is only one); any other admin becomes a Manager.
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS manager_id INTEGER")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS features TEXT")
     cur.execute("SELECT 1 FROM users WHERE role = 'owner' LIMIT 1")
     if not cur.fetchone():
         cur.execute("UPDATE users SET role = 'owner' WHERE id = (SELECT MIN(id) FROM users WHERE role = 'admin')")
@@ -1941,6 +1942,78 @@ def admin_required(f):
     return wrapper
 
 
+FEATURES = [("do", "DO Tracker"), ("direct", "Direct Delivery"), ("jobs", "Jobs and PDAs"), ("sof", "Statement of Facts"),
+            ("lineup", "Port Line-ups"), ("vessel", "Vessel Tracker"), ("kpi", "Port Agent KPI")]
+FEATURE_KEYS = [k for k, _ in FEATURES]
+FEATURE_PRESETS = [("Everything", FEATURE_KEYS),
+                   ("DO team", ["do"]),
+                   ("Operations", ["do", "direct", "jobs", "sof", "lineup", "vessel"])]
+
+
+def _feat_parse(raw):
+    """Stored value -> set of feature keys. NULL = every feature; 'none' = nothing."""
+    if raw is None:
+        return set(FEATURE_KEYS)
+    return {k for k in str(raw).split(",") if k in FEATURE_KEYS}
+
+
+def _feat_store(val):
+    """Posted list of keys (or null) -> value to save. Everything ticked is saved as NULL (= all, now and later)."""
+    if val is None:
+        return None
+    keys = {k for k in (val if isinstance(val, list) else []) if k in FEATURE_KEYS}
+    if keys == set(FEATURE_KEYS):
+        return None
+    return ",".join(k for k in FEATURE_KEYS if k in keys) or "none"
+
+
+def _features():
+    """The features the signed-in person may open. The Owner always has all of them."""
+    c = g.get("_feats")
+    if c is not None:
+        return c
+    if _is_owner():
+        f = set(FEATURE_KEYS)
+    else:
+        row = get_db().execute("SELECT features FROM users WHERE id = ?", (session.get("user_id"),)).fetchone()
+        f = _feat_parse(row["features"] if row else None)
+    g._feats = f
+    return f
+
+
+_FEATURE_GATES = [
+    ("/do-tracker", ("do",)), ("/api/records", ("do",)), ("/api/manifest", ("do", "direct")), ("/api/groups", ("do",)),
+    ("/api/export", ("do",)), ("/api/attachments", ("do",)), ("/api/vessel", ("do",)),
+    ("/vessel-tracker", ("vessel",)), ("/api/vessels", ("vessel",)),
+    ("/kpi", ("kpi",)), ("/api/kpi", ("kpi",)),
+    ("/direct-delivery", ("direct",)), ("/api/direct-delivery", ("direct",)),
+    ("/jobs", ("jobs",)), ("/pda", ("jobs",)), ("/api/jobs", ("jobs",)), ("/api/pda", ("jobs",)),
+    ("/api/fleet", ("jobs",)), ("/api/clients", ("jobs",)),
+    ("/sof", ("sof",)), ("/api/sof", ("sof",)),
+    ("/lineups", ("lineup",)), ("/api/lineups", ("lineup",)),
+]
+
+
+@app.before_request
+def _feature_gate():
+    """A feature the Owner has not given to this account is closed everywhere, not just hidden."""
+    if "user_id" not in session:
+        return None
+    p = request.path
+    need = None
+    for prefix, feats in _FEATURE_GATES:
+        if p == prefix or p.startswith(prefix + "/"):
+            need = feats
+            break
+    if need is None or _is_owner():
+        return None
+    if _features() & set(need):
+        return None
+    if p.startswith("/api/"):
+        return jsonify({"error": "That isn't on your account. Ask the Owner.", "error_code": "feature_off"}), 403
+    return redirect(url_for("index"))
+
+
 def _valid_manager_id(db, raw):
     try:
         mid = int(raw)
@@ -2217,7 +2290,7 @@ def _inject_names():
     out = {"pw_config": {"on": PASSWORD_RULES, "min": PASSWORD_MIN_LENGTH, "common": _COMMON_BASES}}
     if "user_id" in session:
         dn = session.get("display_name") or session.get("username") or ""
-        out.update({"display_name": dn, "first_name": (dn.split() or [""])[0]})
+        out.update({"display_name": dn, "first_name": (dn.split() or [""])[0], "feats": _features()})
     return out
 
 
@@ -2583,10 +2656,16 @@ def users_page():
     db = get_db()
     users = db.execute("SELECT id, username, full_name, email, role, created_at, totp_enabled FROM users ORDER BY created_at, id").fetchall()
     open_counts = {r["user_id"]: r["n"] for r in db.execute("SELECT user_id, COUNT(*) AS n FROM user_sessions GROUP BY user_id").fetchall()}
-    users = [dict(u) for u in db.execute("SELECT id, username, full_name, email, role, created_at, totp_enabled, manager_id FROM users ORDER BY created_at, id").fetchall()]
+    users = [dict(u) for u in db.execute("SELECT id, username, full_name, email, role, created_at, totp_enabled, manager_id, features FROM users ORDER BY created_at, id").fetchall()]
+    for u in users:
+        have = _feat_parse(u["features"]) if u["role"] != "owner" else set(FEATURE_KEYS)
+        u["feat_list"] = [k for k in FEATURE_KEYS if k in have]
+        names = dict(FEATURES)
+        u["feat_text"] = "" if len(have) == len(FEATURE_KEYS) else ("No features yet" if not have else (names[u["feat_list"][0]] + " only" if len(have) == 1 else str(len(have)) + " of " + str(len(FEATURE_KEYS)) + " features"))
     mgr_names = {u["id"]: (u["full_name"] or u["username"]) for u in users if u["role"] == "manager"}
     return render_template_string(USERS_HTML, users=users, username=session.get("username"), open_counts=open_counts,
-                                  managers=[{"id": k, "name": v} for k, v in mgr_names.items()], mgr_names=mgr_names)
+                                  managers=[{"id": k, "name": v} for k, v in mgr_names.items()], mgr_names=mgr_names,
+                                  feature_defs=FEATURES, presets=dict(FEATURE_PRESETS))
 
 
 @app.route("/api/users", methods=["POST"])
@@ -2622,9 +2701,10 @@ def add_user():
         return jsonify({"error": "That email already has an account."}), 400
     try:
         db.execute(
-            "INSERT INTO users (username, password_hash, role, created_at, full_name, email, manager_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO users (username, password_hash, role, created_at, full_name, email, manager_id, features) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (username, generate_password_hash(password), role, datetime.utcnow().strftime("%Y-%m-%d %H:%M"), full_name, email,
-             _valid_manager_id(db, data.get("manager_id")) if role == "staff" else None),
+             _valid_manager_id(db, data.get("manager_id")) if role == "staff" else None,
+             _feat_store(data.get("features")) if "features" in data else None),
         )
         db.commit()
     except psycopg2.IntegrityError:
@@ -2690,6 +2770,8 @@ def edit_user(user_id):
                 db.execute("UPDATE users SET manager_id = NULL WHERE manager_id = ?", (user_id,))
     if "manager_id" in data and (new_role if new_role in ("manager", "staff") else u["role"]) == "staff":
         sets.append("manager_id = ?"); vals.append(_valid_manager_id(db, data.get("manager_id")))
+    if "features" in data and u["role"] != "owner":
+        sets.append("features = ?"); vals.append(_feat_store(data.get("features")))
     if data.get("reset_2fa"):
         sets += ["totp_secret = ''", "totp_enabled = 0", "totp_last_step = 0", "recovery_codes = ''"]
     if not sets:
@@ -11777,6 +11859,13 @@ USERS_HTML = """
   input:checked + .theme-track .theme-knob { transform: translateX(25px); background: #0b2740; }
 
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px; margin-bottom: 16px; box-shadow: var(--shadow-sm); }
+  .feat-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+  .feat-line .feat-title { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-right: 4px; }
+  .feat-line select { padding: 6px 10px; font-size: 13px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 11px; border: 1px solid var(--border); border-radius: 99px; font-size: 13px; cursor: pointer; background: var(--card); user-select: none; }
+  .chip input { margin: 0; accent-color: var(--navy); }
+  .chip:has(input:checked) { border-color: var(--navy); background: color-mix(in srgb, var(--navy) 9%, transparent); }
+  :root[data-theme="dark"] .chip:has(input:checked) { border-color: var(--navy-light); background: color-mix(in srgb, var(--navy-light) 18%, transparent); }
   .card-label { font-size: 12px; font-weight: 600; color: var(--navy); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 10px; }
   :root[data-theme="dark"] .card-label { color: var(--navy-light); }
   table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
@@ -11876,6 +11965,11 @@ function setTheme(mode) {
       <select id="newMgr" title="Who this person reports to"><option value="">Reports to...</option>{% for m in managers %}<option value="{{ m['id'] }}">{{ m['name'] }}</option>{% endfor %}</select>
       <button onclick="addUser()">Add User</button>
     </div>
+    <div class="feat-line" id="nf">
+      <span class="feat-title">Features</span>
+      {% for f in feature_defs %}<label class="chip"><input type="checkbox" value="{{ f[0] }}" checked> {{ f[1] }}</label>{% endfor %}
+      <select onchange="applyPreset(this, 'nf')" title="Tick a ready-made set"><option value="">Quick set...</option>{% for k in presets %}<option value="{{ k }}">{{ k }}</option>{% endfor %}</select>
+    </div>
     <div id="newPwMeter" data-watch="newName,newEmail">""" + PW_METER_HTML + """</div>
     <div style="font-size:12px;color:var(--muted);margin-top:10px;">They sign in with this email and set up their authenticator app the first time.</div>
   </div>
@@ -11885,7 +11979,7 @@ function setTheme(mode) {
       <tbody>
         {% for u in users %}
         <tr id="u{{ u['id'] }}">
-          <td><b>{{ u['full_name'] or u['username'] }}</b>{% if u['role'] == 'staff' and u['manager_id'] and mgr_names.get(u['manager_id']) %}<div class="sub-line">Reports to {{ mgr_names.get(u['manager_id']) }}</div>{% endif %}</td>
+          <td><b>{{ u['full_name'] or u['username'] }}</b>{% if u['role'] == 'staff' and u['manager_id'] and mgr_names.get(u['manager_id']) %}<div class="sub-line">Reports to {{ mgr_names.get(u['manager_id']) }}</div>{% endif %}{% if u['feat_text'] %}<div class="sub-line">{{ u['feat_text'] }}</div>{% endif %}</td>
           <td>{% if u['email'] %}{{ u['email'] }}<div style="font-size:11.5px;color:var(--muted);">{{ u['username'] }}</div>{% else %}{{ u['username'] }}<div style="font-size:11.5px;color:var(--muted);">no email yet</div>{% endif %}</td>
           <td><span class="role-pill {{ u['role'] }}">{{ u['role'] }}</span></td>
           <td>{% if u['totp_enabled'] %}<span class="role-pill staff" style="background:color-mix(in srgb,#2e9e6b 16%,transparent);color:#2e9e6b;">On</span>{% else %}<span class="role-pill" style="background:var(--border);color:var(--muted);">Not yet</span>{% endif %}</td>
@@ -11905,6 +11999,11 @@ function setTheme(mode) {
               {% if u['totp_enabled'] %}<button class="del" style="border:1px solid var(--border);" onclick="reset2fa({{ u['id'] }})">Reset 2-step</button>{% endif %}
               {% set n_open = open_counts.get(u['id'], 0) %}<button class="del" style="border:1px solid var(--border);" onclick="signOutAll({{ u['id'] }})" title="Ends every sign-in this person has open, on any phone or computer"{% if not n_open %} disabled{% endif %}>Sign out everywhere{% if n_open %} ({{ n_open }}){% endif %}</button>
             </div>
+            {% if u['role'] != 'owner' %}<div class="feat-line" id="ef{{ u['id'] }}">
+              <span class="feat-title">Features</span>
+              {% for f in feature_defs %}<label class="chip"><input type="checkbox" value="{{ f[0] }}"{% if f[0] in u['feat_list'] %} checked{% endif %}> {{ f[1] }}</label>{% endfor %}
+              <select onchange="applyPreset(this, 'ef{{ u['id'] }}')" title="Tick a ready-made set"><option value="">Quick set...</option>{% for k in presets %}<option value="{{ k }}">{{ k }}</option>{% endfor %}</select>
+            </div>{% endif %}
             <div class="pw-meter" id="epm{{ u['id'] }}" style="display:none;max-width:420px;"><div class="bar"><i></i></div><div class="hint"></div></div>
           </td>
         </tr>
@@ -11989,6 +12088,18 @@ function toggleNewMgr() {
 function toggleEditMgr(id) {
   document.getElementById('em' + id).style.display = document.getElementById('er' + id).value === 'staff' ? '' : 'none';
 }
+var PRESETS = {{ presets|tojson }};
+function applyPreset(sel, boxId) {
+  var keys = PRESETS[sel.value];
+  if (!keys) return;
+  document.querySelectorAll('#' + boxId + ' input[type=checkbox]').forEach(function (cb) { cb.checked = keys.indexOf(cb.value) >= 0; });
+  sel.value = '';
+}
+function readFeatures(boxId) {
+  var box = document.getElementById(boxId);
+  if (!box) return undefined;
+  return Array.prototype.map.call(box.querySelectorAll('input[type=checkbox]:checked'), function (cb) { return cb.value; });
+}
 async function addUser() {
   const full_name = document.getElementById('newName').value.trim();
   const email = document.getElementById('newEmail').value.trim();
@@ -11996,7 +12107,7 @@ async function addUser() {
   const role = document.getElementById('newRole').value;
   if (!full_name || !email || !password) { showToast('Fill in the name, company email and a temporary password.', {error:true}); return; }
   const res = await fetch('/api/users', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({full_name, email, password, role, manager_id: document.getElementById('newMgr').value})});
+    body: JSON.stringify({full_name, email, password, role, manager_id: document.getElementById('newMgr').value, features: readFeatures('nf')})});
   const data = await res.json();
   if (!res.ok || data.error) { showToast(data.error || 'Could not add that user.', {error:true}); return; }
   showToast(full_name + ' added.');
@@ -12028,6 +12139,7 @@ async function saveUser(id) {
   if (pw) body.password = pw;
   const er = document.getElementById('er' + id), em = document.getElementById('em' + id);
   if (er) { body.role = er.value; if (er.value === 'staff' && em) body.manager_id = em.value; }
+  var fl = readFeatures('ef' + id); if (fl) body.features = fl;
   const res = await fetch('/api/users/' + id, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.error) { showToast(data.error || 'Could not save.', {error:true}); return; }
@@ -12181,6 +12293,8 @@ HUB_HTML = """
   </div>
 
   <div class="grid">
+{% if not feats %}<p style="color:var(--muted);">Nothing is switched on for your account yet. Ask the Owner.</p>{% endif %}
+{% if 'do' in feats %}
     <a class="tile" href="/do-tracker">
       <div class="tile-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2h6a1 1 0 0 1 1 1v1h1a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h1V3a1 1 0 0 1 1-1Z"/><path d="M9 12l2 2 4-4"/></svg>
@@ -12189,7 +12303,9 @@ HUB_HTML = """
       <p>Track invoice, approval and DO status per Bill of Lading, organized by port and vessel.</p>
       <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
     </a>
+{% endif %}
 
+{% if 'vessel' in feats %}
     <a class="tile" href="/vessel-tracker">
       <div class="tile-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 21c2 1 4 1 6 0s4-1 6 0 4 1 6 0M4 18l1-9 2-3h10l2 3 1 9M9 6V3h6v3"/></svg>
@@ -12198,7 +12314,9 @@ HUB_HTML = """
       <p>Live positions for your vessels, straight from MarineTraffic - its own list, tagged by operator.</p>
       <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
     </a>
+{% endif %}
 
+{% if 'kpi' in feats %}
     <a class="tile" href="/kpi">
       <div class="tile-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M18 17V9M13 17V5M8 17v-4"/></svg>
@@ -12207,7 +12325,9 @@ HUB_HTML = """
       <p>Turnaround times, pending backlog and workload, built from the DO Tracker board.</p>
       <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
     </a>
+{% endif %}
 
+{% if 'direct' in feats %}
     <a class="tile" href="/direct-delivery">
       <div class="tile-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7l9-4 9 4-9 4-9-4z"/><path d="M3 7v10l9 4 9-4V7"/><path d="M12 11v10"/></svg>
@@ -12216,7 +12336,9 @@ HUB_HTML = """
       <p>Upload a cargo packing list and see which BLs need direct delivery, by weight and size.</p>
       <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
     </a>
+{% endif %}
 
+{% if 'jobs' in feats %}
     <a class="tile" href="/jobs">
       <div class="tile-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h8M8 17h4"/></svg>
@@ -12225,7 +12347,9 @@ HUB_HTML = """
       <p>Every vessel call in one place: PDA, appointment, charges, services, invoices and history, through to the final job report.</p>
       <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
     </a>
+{% endif %}
 
+{% if 'sof' in feats %}
     <a class="tile" href="/sof">
       <div class="tile-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/><path d="M9 12l2 2 4-4"/></svg>
@@ -12234,7 +12358,9 @@ HUB_HTML = """
       <p>Log a vessel call's event timeline field-by-field and export it as a signed-off SOF.</p>
       <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
     </a>
+{% endif %}
 
+{% if 'lineup' in feats %}
     <a class="tile" href="/lineups">
       <div class="tile-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v14M7 8h10"/><circle cx="12" cy="3" r="1"/><path d="M5 13a7 7 0 0 0 14 0"/><path d="M3 21c2 1 4 1 6 0s4-1 6 0 4 1 6 0"/></svg>
@@ -12243,6 +12369,7 @@ HUB_HTML = """
       <p>Daily line-ups for Jeddah, Yanbu and Dammam: berth plan by draft, waiting times, and which port gets a vessel alongside first.</p>
       <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
     </a>
+{% endif %}
   </div>
 
 <script>
@@ -16403,7 +16530,7 @@ SOF_HTML = """
           <span class="theme-knob"></span>
         </span>
       </label>
-      <a href="/pda">Disbursement Accounts</a>
+      {% if 'jobs' in feats %}<a href="/pda">Disbursement Accounts</a>{% endif %}
       {% if role == 'owner' %}<a href="/users">Manage Users</a>{% endif %}
       <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
