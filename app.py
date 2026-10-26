@@ -4417,20 +4417,22 @@ def _ai_count():
         pass
 
 
-def _gemini_pick_model(key):
-    """The newest 'flash' model this key may use (when no GEMINI_MODEL is set and the default name is refused)."""
+def _gemini_models(key):
+    """Models this key may use for generateContent, best candidates first (flash, then flash-lite)."""
     import urllib.request
     try:
         req = urllib.request.Request(_GEMINI_BASE + "/models?pageSize=200", headers={"x-goog-api-key": key})
         with urllib.request.urlopen(req, timeout=15) as r:
             models = json.loads(r.read().decode("utf-8", "replace")).get("models", [])
     except Exception:
-        return ""
+        return []
     names = [m.get("name", "").split("/", 1)[-1] for m in models
              if "generateContent" in (m.get("supportedGenerationMethods") or [])]
-    flash = [n for n in names if "flash" in n and not re.search(r"image|tts|live|audio|lite|thinking|exp|preview", n)]
-    flash.sort(key=lambda n: [int(x) if x.isdigit() else 0 for x in re.findall(r"\d+|[a-z]+", n)], reverse=True)
-    return (flash or [""])[0]
+    ok = [n for n in names if "flash" in n and not re.search(r"image|tts|live|audio|thinking|exp|preview|robotics|computer", n)]
+    ver = lambda n: [int(x) if x.isdigit() else 0 for x in re.findall(r"\d+", n)]
+    full = sorted([n for n in ok if "lite" not in n], key=ver, reverse=True)
+    lite = sorted([n for n in ok if "lite" in n], key=ver, reverse=True)
+    return full + lite
 
 
 def _gemini_call(user_text, deadline=None):
@@ -4439,51 +4441,61 @@ def _gemini_call(user_text, deadline=None):
     key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not key or time.time() < _AI_COOLDOWN["until"]:
         return None
-    model = GEMINI_MODEL or get_setting("gemini_model", "") or "gemini-flash-latest"
-    for attempt in range(3):
-        left = (deadline - time.time()) if deadline else 60
-        if left < 3:
-            _ai_note("stopped: time budget used up")
-            return None
-        body = json.dumps({
-            "systemInstruction": {"parts": [{"text": _AI_SYSTEM}]},
-            "contents": [{"role": "user", "parts": [{"text": user_text}]}],
-            "generationConfig": {"temperature": 0, "responseMimeType": "application/json", "maxOutputTokens": 16000},
-        }).encode()
-        req = urllib.request.Request("%s/models/%s:generateContent" % (_GEMINI_BASE, model), data=body, method="POST",
-                                     headers={"x-goog-api-key": key, "content-type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=min(60, left)) as r:
-                data = json.loads(r.read().decode("utf-8", "replace"))
-            parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-            text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and not p.get("thought"))
-            _ai_count()
-            _ai_note("ok (%s)" % model)
-            return text
-        except urllib.error.HTTPError as e:
+    first = GEMINI_MODEL or get_setting("gemini_model", "") or "gemini-flash-latest"
+    queue, tried, listed = [first], set(), False
+    last = ""
+    while queue:
+        model = queue.pop(0)
+        if model in tried:
+            continue
+        tried.add(model)
+        for attempt in range(2):
+            left = (deadline - time.time()) if deadline else 60
+            if left < 3:
+                _ai_note("stopped: time budget used up (last: %s)" % last)
+                return None
+            body = json.dumps({
+                "systemInstruction": {"parts": [{"text": _AI_SYSTEM}]},
+                "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+                "generationConfig": {"temperature": 0, "responseMimeType": "application/json", "maxOutputTokens": 16000},
+            }).encode()
+            req = urllib.request.Request("%s/models/%s:generateContent" % (_GEMINI_BASE, model), data=body, method="POST",
+                                         headers={"x-goog-api-key": key, "content-type": "application/json"})
             try:
-                detail = json.loads(e.read().decode("utf-8", "replace")).get("error", {}).get("message", "")
-            except Exception:
-                detail = ""
-            if e.code == 404 and not GEMINI_MODEL and attempt == 0:
-                picked = _gemini_pick_model(key)
-                if picked and picked != model:
-                    model = picked
+                with urllib.request.urlopen(req, timeout=min(40, left)) as r:
+                    data = json.loads(r.read().decode("utf-8", "replace"))
+                parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and not p.get("thought"))
+                _ai_count()
+                _ai_note("ok (%s)" % model)
+                if model != first and not GEMINI_MODEL:
                     try:
-                        set_setting("gemini_model", picked)
+                        set_setting("gemini_model", model)
                     except Exception:
                         pass
-                    continue
-            if e.code in (429, 500, 503) and attempt < 2:
-                time.sleep(3 * (attempt + 1))
-                continue
-            _ai_note("Gemini refused: HTTP %s %s" % (e.code, detail[:160]))
-            _AI_COOLDOWN["until"] = time.time() + 120
-            return None
-        except Exception as e:
-            _ai_note("Gemini not reachable: %s" % type(e).__name__)
-            _AI_COOLDOWN["until"] = time.time() + 120
-            return None
+                return text
+            except urllib.error.HTTPError as e:
+                try:
+                    detail = json.loads(e.read().decode("utf-8", "replace")).get("error", {}).get("message", "")
+                except Exception:
+                    detail = ""
+                last = "%s: HTTP %s %s" % (model, e.code, detail[:120])
+                if e.code in (429, 500, 503, 404) :
+                    if e.code in (429, 503) and attempt == 0 and (deadline is None or deadline - time.time() > 8):
+                        time.sleep(2)
+                        continue
+                    break          # overloaded / unknown model: try the next model
+                _ai_note("Gemini refused: " + last)
+                _AI_COOLDOWN["until"] = time.time() + 120
+                return None
+            except Exception as e:
+                last = "%s: %s" % (model, type(e).__name__)
+                break
+        if not listed:
+            listed = True
+            queue += _gemini_models(key)[:4]
+    _ai_note("Gemini not available - " + last)
+    _AI_COOLDOWN["until"] = time.time() + 120
     return None
 
 
