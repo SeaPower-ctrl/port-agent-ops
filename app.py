@@ -303,6 +303,13 @@ const I18N = {
     member_match_confirm: "Names one of the BLs in the combined entry {bl} - check it and attach",
     scan_read_confirm: "Read as {bl} from the scan - check it and attach",
     preview_unavailable: "Preview not available - open the full B/L.",
+    mf_port_clash: "Check the port: this manifest's heading says <b>{heading}</b>, but its B/L numbers {bl} point to <b>{codes}</b>. Which is right?",
+    mf_port_differs: "You picked <b>{picked}</b>, but this manifest says <b>{says}</b>.",
+    mf_use_port: "Use {port}",
+    mf_keep_port: "Keep {port}",
+    mf_pkgs_mismatch: "Compass read <b>{read}</b> packages, but the manifest's own total says <b>{total}</b>. Check the B/L lines after adding.",
+    mf_pkgs_mismatch_toast: "{name}: Compass read {read} packages, but the manifest's total says {total}. Check its B/L lines.",
+    mf_pick_port_first: "Pick the port first - the manifest heading and its B/L numbers disagree.",
     mp_status_taken: "Already on the board (another user's)",
     mp_status_fills: "Already on the board - adds missing contact details",
     mp_save_contacts_n: "Save contact details for {n} BL(s)",
@@ -580,6 +587,13 @@ const I18N = {
     member_match_confirm: "يذكر إحدى البوالص ضمن الإدخال المجمّع {bl} - تحقّق ثم أرفِق",
     scan_read_confirm: "قُرئ الرقم {bl} من المستند الممسوح - تحقّق منه ثم أرفِقه",
     preview_unavailable: "المعاينة غير متاحة - افتح البوليصة كاملة.",
+    mf_port_clash: "تحقّق من الميناء: رأس هذا المانيفست يذكر <b>{heading}</b>، لكن أرقام بوالصه {bl} تشير إلى <b>{codes}</b>. أيّهما الصحيح؟",
+    mf_port_differs: "اخترت <b>{picked}</b>، لكن هذا المانيفست يذكر <b>{says}</b>.",
+    mf_use_port: "استخدم {port}",
+    mf_keep_port: "أبقِ {port}",
+    mf_pkgs_mismatch: "قرأ Compass عدد <b>{read}</b> طرداً، لكن الإجمالي المذكور في المانيفست <b>{total}</b>. راجع سطور البوالص بعد الإضافة.",
+    mf_pkgs_mismatch_toast: "{name}: قرأ Compass عدد {read} طرداً، لكن إجمالي المانيفست {total}. راجع سطور بوالصه.",
+    mf_pick_port_first: "اختر الميناء أولاً - رأس المانيفست وأرقام بوالصه غير متطابقين.",
     mp_status_taken: "موجودة على اللوحة لدى مستخدم آخر",
     mp_status_fills: "موجودة - تُضاف بيانات الاتصال الناقصة",
     mp_save_contacts_n: "حفظ بيانات الاتصال لـ {n} بوليصة",
@@ -3859,7 +3873,7 @@ def _mf_analyse(tables):
 # ----- consignee contact details -----
 
 _MF_PARTY_MARK_RE = re.compile(
-    r"(?im)^[ \t]*(?:<[ \t]*(SHIPPER|SHPR|SH|CONSIGNEE|CNEE|CO|CN|ATTN|NOTIFY[ \t]*PARTY|NOTIFY|NF|NT)[ \t]*\d?[ \t]*:?[ \t]*>"
+    r"(?im)^[ \t]*(?:<[ \t]*(SHIPPER|SHPR|SH|CONSIGNEE|CNEE|CO|CN|ATTN|NOTIFY[ \t]*PARTY|NOTIFY|NF|NT)[ \t]*\d?[ \t]*(?::[ \t]*>?|>)"
     r"|(SHIPPER|SHPR|SH|CONSIGNEE|CNEE|CO|CN|ATTN|NOTIFY[ \t]*PARTY|NOTIFY|NF|NT)[ \t]*\d?[ \t]*:)[ \t]*"
 )
 _MF_PARTY_KIND = {"SHIPPER": "sh", "SHPR": "sh", "SH": "sh", "CONSIGNEE": "co", "CNEE": "co", "CO": "co", "CN": "co",
@@ -3874,7 +3888,12 @@ def _mf_split_parties(text):
     marks = []
     for m in _MF_PARTY_MARK_RE.finditer(text):
         word = re.sub(r"\s+", " ", (m.group(1) or m.group(2)).upper())
-        marks.append((m.start(), m.end(), _MF_PARTY_KIND[word]))
+        marks.append((m.start(), m.end(), _MF_PARTY_KIND[word], word))
+    # "ATTN:" stands for the consignee only when the cell has no consignee marker of its own
+    # ("SH:... ATTN:... NF:..."); under a <CO:> block it is the person to contact, phone and all.
+    if any(k == "co" and w != "ATTN" for _, _, k, w in marks):
+        marks = [x for x in marks if x[3] != "ATTN"]
+    marks = [(s, e, k) for s, e, k, _ in marks]
     kinds = {k for _, _, k in marks}
     if "sh" not in kinds or not ({"co", "nf"} & kinds):
         return {}
@@ -3909,7 +3928,39 @@ def _mf_party_name(block):
             name = name[:cut.start()].strip(" ,;:-")
     if len(lines) > 1 and _MF_NAME_CONT_RE.match(lines[1]) and not re.search(r"\d", lines[1]):
         name = f"{name} {lines[1]}"
-    return name[:120]
+    return _mf_tidy_name(name)[:120]
+
+
+_MF_CITY_RE = re.compile(r"(?:JEDDAH|JEDDA|RIYADH|RYADH|RIYAD|DAMMAM|MAKKAH|MAKKA|MECCA|JUBAIL|YANBU|AL[\s-]?KHOBAR|KHOBAR|DHAHRAN|"
+                         r"MADINAH|MEDINA|BURAYDAH|TABUK|ABHA|JIZAN|JAZAN|QASSIM|ABU\s+DHABI|DUBAI|SHARJAH|KUWAIT|DOHA|MANAMA|MUSCAT)\b", re.IGNORECASE)
+_MF_CO_SUFFIX_RE = re.compile(r"(?:\bCO|\bCOMPANY|\bLTD|\bLIMITED|LLC|L\.L\.C|\bW\.?L\.?L|\bEST|\bESTABLISHMENT|\bCORP(?:ORATION)?|\bINC|"
+                              r"\bPTE|\bPLC|\bFACTORY|\))\.?$", re.IGNORECASE)
+_MF_NAME_ADDR_RE = re.compile(r"[\s,]+(?:P\.?\s?O\.?\s*BOX\b|POB\b|C\.?\s?R\.?\s*(?:NO\b|#|NUMBER\b)|VAT\b|TEL\b|PHONE\b|MOB(?:ILE)?\b|FAX\b|"
+                              r"E-?MAIL\b|ADD(?:RESS)?\s*[:.]|POSTAL\s+CODE\b|BUILDING\s+NO)", re.IGNORECASE)
+_MF_TRAIL_COUNTRY_RE = re.compile(r"\s*[.,\u3001]\s*(?:KINGDOM\s+OF\s+)?(?:SAUDI\s+ARABIA|K\.?\s?S\.?\s?A\.?)\s*$", re.IGNORECASE)
+
+
+def _mf_tidy_name(name):
+    """The company name without the address that often runs on after it on the same line:
+    'ALSOBAY CONSTRUCTION EST.RYADH SAUDI ARABIA' -> 'ALSOBAY CONSTRUCTION EST.',
+    '... CO.LTD., PO BOX' -> '... CO.LTD.', '1) ROTARY ENGINEERING PTE LTD ABU DHABI, ...' ->
+    'ROTARY ENGINEERING PTE LTD'. A city is only cut when it clearly follows the name (after
+    'CO/LTD/LLC/EST...', a bracket or a full stop, or followed by a comma), so names such as
+    'GREIF SAUDI ARABIA LTD' or 'YANBU CEMENT CO' stay whole."""
+    n = re.sub(r"^\s*\(?\d{1,2}[).]\s*(?=[A-Za-z])", "", str(name or ""))
+    m = _MF_NAME_ADDR_RE.search(n)
+    if m and len(n[:m.start()].split()) >= 2:
+        n = n[:m.start()]
+    for m in _MF_CITY_RE.finditer(n):
+        before, after = n[:m.start()], n[m.end():]
+        if len(before.split()) < 2 or (m.start() > 0 and n[m.start() - 1].isalnum()):
+            continue
+        b = before.rstrip(" ,\u3001")
+        if (b and (b[-1] in ".)" or _MF_CO_SUFFIX_RE.search(b))) or re.match(r"\s*[,\u3001]", after):
+            n = before
+            break
+    n = _MF_TRAIL_COUNTRY_RE.sub("", n)
+    return n.strip(" ,;:-/\u3001")
 
 
 _MF_PHONE_GROUP_RE = re.compile(r"\+?\d+")
@@ -3944,6 +3995,12 @@ def _mf_phones(text):
                     if re.fullmatch(r"\+966[15]\d{8}", p):
                         used = (e, p)
                         break
+                    # a Saudi landline typed without its leading 0 - only right after a TEL/PHONE label
+                    if re.fullmatch(r"1[1-7]\d{7}", digits):
+                        lab = re.findall(r"[A-Z]+", line[:groups[k][0]].upper()[-14:])
+                        if lab and lab[-1] in ("TEL", "TELEPHONE", "PHONE", "PH", "T"):
+                            used = (e, "+966" + digits)
+                            break
             if used:
                 e, p = used
                 label = re.findall(r"[A-Z]+", line[:groups[k][0]].upper()[-14:])
@@ -3983,7 +4040,7 @@ def _mf_compact(text):
     return re.sub(r"[^A-Z0-9]", "", _mf_norm(text))
 
 
-def _mf_contact_from_parts(consignee, notify, extras, shipper=""):
+def _mf_contact_from_parts(consignee, notify, extras, shipper="", labelled=""):
     """name/email/phone for one BL. The consignee is the customer, unless
     the B/L is consigned 'TO ORDER' (of a bank / the shipper) - then the
     consignee block is the bank's own address, so it is skipped and the
@@ -3994,14 +4051,18 @@ def _mf_contact_from_parts(consignee, notify, extras, shipper=""):
     An e-mail whose domain is the shipper's own name (TOM@TOBEESTEEL.COM
     with shipper "TOBEE STEEL LIMITED") is the shipper's, not the
     customer's, and is skipped - unless the consignee/notify party carries
-    that name too (a local branch of the same group)."""
+    that name too (a local branch of the same group). labelled = contact lines the
+    description column itself labels as the importer's/consignee's ("IMPORTER E-MAIL: ...").
+    _own_email/_own_phone say the detail was written in the party's own block (or so
+    labelled): that makes it theirs even when a sister company lists the same one."""
     consignee = str(consignee or "").strip()
     notify = str(notify or "").strip()
     if _MF_SAME_AS_RE.match(notify):
         notify = ""
     to_order = bool(_MF_TO_ORDER_RE.match(_mf_party_name(consignee)))
     name = "" if to_order else _mf_party_name(consignee)
-    sources = ([] if to_order else [consignee]) + [notify] + [x for x in extras if x]
+    own = ([] if to_order else [consignee]) + [notify] + ([labelled] if labelled else [])
+    sources = own + [x for x in extras if x]
     shipper_key = _mf_compact(_mf_party_name(shipper))
     party_key = _mf_compact(name + " " + _mf_party_name(notify))
 
@@ -4012,7 +4073,25 @@ def _mf_contact_from_parts(consignee, notify, extras, shipper=""):
     email = next((e for s in sources for e in _mf_emails(s) if not (shipper_key and shippers_own(e))), "")
     phones = [_mf_phones(s) for s in sources]
     phone = next((m[0] for m, _ in phones if m), "") or next((l[0] for _, l in phones if l), "")
-    return {"name": name, "email": email, "phone": phone, "notify": _mf_party_name(notify)}
+    own_mail = {x.lower() for s in own for x in _mf_emails(s)}
+    own_phone = {p for s in own for ms, ls in [_mf_phones(s)] for p in ms + ls}
+    return {"name": name, "email": email, "phone": phone, "notify": _mf_party_name(notify),
+            "_own_email": bool(email) and email.lower() in own_mail, "_own_phone": bool(phone) and phone in own_phone}
+
+
+_MF_LABELLED_CONTACT_RE = re.compile(
+    r"(?:IMPORTER|CONSIGNEE|BUYER)['\u2019]?S?\s+(?:E-?\s?MAIL(?:\s+ADDRESS)?|MOBILE|PHONE|TEL(?:EPHONE)?|CONTACT)"
+    r"(?:\s+(?:NUMBER|NO\.?))?\s*[:\uff1a]\s*(?=(.{3,60}))", re.IGNORECASE)     # look ahead: labels can sit close together
+
+
+def _mf_labelled_contacts(text):
+    """Contact lines a description column labels as the importer's/consignee's own
+    ('5.IMPORTER E-MAIL: SHAMNAS(AT)USAIMISTEEL.NET'). Nothing else in the description is
+    read for contacts - it also carries the discharge agent's (Sea Power's) own details."""
+    out = []
+    for m in _MF_LABELLED_CONTACT_RE.finditer(_mf_flat(text)):
+        out.append(re.split(r"\s+\d{1,2}\s*[.)]\s*(?=[A-Za-z])", m.group(1))[0])
+    return "\n".join(out)
 
 
 _MF_CONTACT_COL_WORDS = ("CONTACT", "TEL", "PHONE", "MOBILE", "EMAIL", "E-MAIL", "REMARK", "TERM", "联系", "备注", "电话", "邮箱")
@@ -4039,7 +4118,7 @@ def _mf_contacts(tables):
         if t.get("role") != "source" or not t["data_rows"]:
             continue
         rows = t["rows"]
-        cols = {"party": None, "sh": None, "co": None, "nf": None, "extra": []}
+        cols = {"party": None, "sh": None, "co": None, "nf": None, "desc": None, "extra": []}
         if t["hdr"] >= 0:
             hdr = t["hdr"]
             # The header row, plus the row above/below when it is the other
@@ -4067,6 +4146,8 @@ def _mf_contacts(tables):
                     cols["co"] = j if cols["co"] is None else cols["co"]
                 elif is_nf:
                     cols["nf"] = j if cols["nf"] is None else cols["nf"]
+                elif _MF_DESC_RE.search(text) and cols["desc"] is None:
+                    cols["desc"] = j
                 elif any(w in text for w in _MF_CONTACT_COL_WORDS):
                     cols["extra"].append(j)
             # Unlabelled columns to the right of the header often hold a
@@ -4093,9 +4174,10 @@ def _mf_contacts(tables):
                 notify = notify or parts.get("nf", "")
                 shipper = shipper or parts.get("sh", "")
             extras = [cell(row, j) for j in cols["extra"]]
+            labelled = _mf_labelled_contacts(cell(row, cols["desc"])) if cols["desc"] is not None else ""
             for b in bls:
                 sheet = next((ref[m] for m in bl_members(b) if m in ref), "")
-                c = _mf_contact_from_parts(consignee, notify, extras + [sheet], shipper)
+                c = _mf_contact_from_parts(consignee, notify, extras + [sheet], shipper, labelled)
                 if c["name"] or c["email"] or c["phone"] or c["notify"]:
                     out.setdefault(bl_match_key(b), c)
     return out
@@ -4174,6 +4256,29 @@ def _mf_cargo(tables):
                     cols["pkg"] = j
                 elif _MF_UNIT_RE.search(text) and cols["unit"] is None:
                     cols["unit"] = j
+        elif hdr == -1 and t["data_rows"]:
+            # A Word table with no header row: the count column is the one that reads like '57 COILS',
+            # the description the one that carries the HS code.
+            idx = [i for i, _, _ in t["data_rows"]]
+            width = max(len(rows[i]) for i in idx)
+
+            def share(j, test):
+                return sum(1 for i in idx if j < len(rows[i]) and test(_mf_norm(_mf_flat(rows[i][j])))) / len(idx)
+
+            def is_qty(v):
+                mm = re.match(r"^\d[\d,]*(?:\.\d+)?\s*([A-Z]+)", v)
+                return bool(mm) and any(mm.group(1).startswith(w) for w in _MF_PACK_WORDS)
+
+            def has_hs(v):
+                return bool(re.search(r"H\.?\s?S\.?\s*CODE", v))
+            cand = [j for j in range(width) if j != t["bl_col"]]
+            q = max(cand, key=lambda j: share(j, is_qty), default=None)
+            if q is not None and share(q, is_qty) >= 0.6:
+                cols["pkg"] = q
+            d = max((j for j in cand if j != cols["pkg"]), key=lambda j: share(j, has_hs), default=None)
+            if d is not None and share(d, has_hs) >= 0.5:
+                cols["desc"] = d
+        if hdr is not None and hdr >= 0:
             # the unit written in the cell right after the count ("3587 | COILS"), under a merged header
             if cols["pkg"] is not None and cols["unit"] is None:
                 nxt = cols["pkg"] + 1
@@ -4181,17 +4286,11 @@ def _mf_cargo(tables):
                 taken = {v for k, v in cols.items() if v is not None}
                 if nxt not in taken and vals and sum(1 for v in vals if any(v.startswith(w) for w in _MF_PACK_WORDS)) >= 0.6 * len(vals):
                     cols["unit"] = nxt
-        # a "Port of Loading: BAYUQUAN" line above the table
+        t["pkg_col"] = cols["pkg"]
+        # a "Port of Loading: BAYUQUAN" line above the table (the label's own cell or the next one)
         doc_pol = ""
-        if cols["pol"] is None:
-            for r in rows[:max(0, (hdr or 0)) + 1]:
-                for c in r:
-                    m = _MF_POL_LINE_RE.search(_mf_norm(c))
-                    if m:
-                        doc_pol = m.group(1).strip(" .,-")
-                        break
-                if doc_pol:
-                    break
+        if cols["pol"] is None and hdr is not None and hdr > 0:
+            doc_pol = _mf_heading_fields(rows, hdr).get("pol", "")
         per = {}
         for i, _, bls in t["data_rows"]:
             row = rows[i]
@@ -4242,9 +4341,11 @@ def _mf_clean_desc(desc):
 
 
 def _mf_clean_pol(pol):
-    """'BAYUQUAN PORT IN CHINA' -> 'BAYUQUAN'."""
-    p = re.sub(r"\s+PORT\b.*$", "", _mf_flat(pol), flags=re.IGNORECASE)
-    p = re.sub(r"\s*,.*$", "", p).strip()
+    """'BAYUQUAN PORT IN CHINA' -> 'BAYUQUAN'; 'LANSHAN SEAPORT ,CHINA' -> 'LANSHAN'; 'TIANJIN CHINA' -> 'TIANJIN'."""
+    p = re.sub(r"\s*,.*$", "", _mf_flat(pol))
+    p = re.sub(r"\s+(?:SEA\s*)?PORT\b.*$", "", p, flags=re.IGNORECASE)
+    p = re.sub(r"\s+(?:IN\s+)?(?:P\.?\s?R\.?\s*)?CHINA$", "", p, flags=re.IGNORECASE)
+    p = p.strip(" .,-")
     return p or _mf_flat(pol)
 
 
@@ -4400,9 +4501,33 @@ def _mf_related(value, names):
     return any(a in b or b in a for a in toks for b in labels if b not in _MF_GENERIC_MAIL_LABELS)
 
 
+def _mf_same_party(a, b):
+    """The same company written two ways ('ALFULAH ALMADENY...' / 'ALFULATH ALMADENY...',
+    'BAZ INTL INDUSTRY CO., LTD' / 'BAZ INTL. INDUSTRY CO')."""
+    if a == b:
+        return True
+    if not a or not b:
+        return False
+    if min(len(a), len(b)) >= 10 and (a.startswith(b) or b.startswith(a)):
+        return True
+    import difflib
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.85
+
+
+def _mf_party_count(names):
+    groups = []
+    for n in names:
+        if not any(_mf_same_party(n, g) for g in groups):
+            groups.append(n)
+    return len(groups)
+
+
 def _mf_unshare_contacts(entries):
-    """One e-mail/phone typed on rows of several different parties is the manifest's general contact,
-    not each party's own: it stays only on the row of the party it obviously belongs to."""
+    """One e-mail/phone typed on rows of several different parties (in a remarks column or a contact
+    sheet) is the manifest's general contact, not each party's own: it stays only on the row of the
+    party it obviously belongs to. A detail written inside a party's own consignee/notify block is
+    always that party's - two sister companies can share one e-mail - and the same company spelled
+    two ways counts as one party."""
     who = lambda c: _mf_compact(c.get("name") or c.get("notify") or "")
     users = {"email": {}, "phone": {}}
     for e in entries:
@@ -4413,31 +4538,182 @@ def _mf_unshare_contacts(entries):
     for e in entries:
         c = e["contact"]
         names = (c.get("name") or "") + " " + (c.get("notify") or "")
-        own_email = bool(c.get("email")) and (len(users["email"].get(c["email"].lower(), ())) < 2 or _mf_related(c["email"], names))
+        own_email = bool(c.get("email")) and (c.get("_own_email") or _mf_party_count(users["email"].get(c["email"].lower(), ())) < 2
+                                              or _mf_related(c["email"], names))
         if c.get("email") and not own_email:
             c["email"] = ""
-        if c.get("phone") and len(users["phone"].get(c["phone"].lower(), ())) >= 2 and not (own_email and c.get("email")):
+        if (c.get("phone") and not c.get("_own_phone") and _mf_party_count(users["phone"].get(c["phone"].lower(), ())) >= 2
+                and not (own_email and c.get("email"))):
             c["phone"] = ""
+    for e in entries:
+        e["contact"].pop("_own_email", None)
+        e["contact"].pop("_own_phone", None)
+
+
+_MF_HEAD_RE = {
+    "vessel": re.compile(r"(?:NAME\s+OF\s+(?:THE\s+)?(?:SHIP|VESSEL)(?:\s*(?:&|AND)\s*VOY(?:AGE)?)?|SHIP'?S?\s*NAME(?:\s*(?:&|AND)?\s*VOY(?:AGE)?)?"
+                         r"|VESSEL(?:\s+NAME)?(?:\s*(?:&|AND|/)\s*VOY(?:AGE)?)?)\s*[:\uff1a]"),
+    "port": re.compile(r"(?:DISCHARG(?:E|ING)\s*PORT|PORT\s+OF\s+DISCHARG(?:E|ING)(?:\s*PORT)?|\bPOD\b)\s*[:\uff1a]"),
+    "pol": re.compile(r"(?:LOAD(?:ING)?\s*PORT|PORT\s+OF\s+LOADING(?:\s*PORT)?|\bPOL\b)\s*[:\uff1a]"),
+}
+_MF_CJK_RE = re.compile(r"[\u2e80-\u9fff\uf900-\ufaff\uff00-\uff60]+")
+
+
+def _mf_heading_fields(rows, hdr):
+    """Vessel line, discharge port and loading port as written above a B/L table.
+    The block nearest the B/L header wins (an old heading left on top of a reused
+    template - 'DISCHARGE PORT: DAMIETTA' - is ignored), and a label in one cell with
+    its value in the next ('LOADING PORT: | TIANJIN,CHINA') is read too."""
+    above = rows[:hdr] if hdr and hdr > 0 else rows[:15]
+    scan = list(reversed(above[-15:])) if hdr and hdr > 0 else above
+    out = {}
+    for r in scan:
+        cells = [_mf_norm(c).strip() for c in r]
+        for j, c in enumerate(cells):
+            for ln in c.splitlines() or [c]:
+                hits = sorted(((m.start(), m.end(), k) for k, rx in _MF_HEAD_RE.items() for m in rx.finditer(ln)))
+                for n, (s, e, k) in enumerate(hits):
+                    if k in out:
+                        continue
+                    val = ln[e:hits[n + 1][0]] if n + 1 < len(hits) else ln[e:]
+                    val = val.strip(" .,-\t")
+                    if not val:       # the value sits in the next filled cell of the row
+                        nxt = next((x for x in cells[j + 1:] if x.strip()), "")
+                        if nxt and not any(rx.search(nxt) for rx in _MF_HEAD_RE.values()):
+                            val = nxt.splitlines()[0].strip(" .,-\t")
+                    if val:
+                        out[k] = val
+    return out
+
+
+def _mf_vessel_voyage(raw):
+    """'MV.FU LIAN 69/\u5bcc\u805469\u8f6e V.26369' -> ('FU LIAN 69', '26369'); 'BRIGHT OCEAN (\u76db\u6d0b) V.26215' ->
+    ('BRIGHT OCEAN', '26215'); 'MV XIANG TIGER V. V2602A' -> ('XIANG TIGER', '2602A')."""
+    s = re.sub(r"\(\s*\)", "", _MF_CJK_RE.sub("", raw or ""))
+    s = re.sub(r"\s+", " ", s).strip(" .,-/")
+    parts = re.split(r"\s*/\s*|\s+V(?:OY(?:AGE)?)?\s*\.?\s*[-:]?\s*(?=[A-Z]{0,2}\d)", s, maxsplit=1)
+    vessel = re.sub(r"\s+V(?:OY)?\.?$", "", parts[0]).strip(" .,-")
+    vessel = re.sub(r"^M\.?\s?V(?:\.\s*|\s+)", "", vessel).strip(" .,-")
+    voyage = ""
+    if len(parts) > 1:
+        rest = parts[1].strip(" .,-")
+        m = re.search(r"\bV(?:OY(?:AGE)?)?\s*\.?\s*[-:]?\s*([A-Z]{0,2}\d[\w-]*)", rest)
+        voyage = m.group(1) if m else rest
+        voyage = re.sub(r"^V(?=\d)", "", voyage).strip(" .,-")
+    return vessel, voyage
+
+
+def _mf_source_head(tables):
+    src = next((t for t in tables if t.get("role") == "source" and t.get("hdr") is not None and t["hdr"] > 0), None)
+    if src is not None:
+        return _mf_heading_fields(src["rows"], src["hdr"])
+    for t in tables[:3]:
+        f = _mf_heading_fields(t["rows"], None)
+        if f:
+            return f
+    return {}
 
 
 def _mf_header_info(tables):
-    """Vessel and discharge port as the manifest's own heading states them."""
-    out = {"vessel": "", "port": "", "voyage": ""}
-    for t in tables[:3]:
-        for r in t["rows"][:15]:
-            for c in r:
-                for ln in str(c or "").splitlines():
-                    n = _mf_norm(ln).strip()
-                    m = re.search(r"(?:NAME\s+OF\s+(?:THE\s+)?(?:SHIP|VESSEL)(?:\s*&\s*VOYAGE)?|VESSEL(?:\s+NAME)?|SHIP\s*NAME)\s*[:：]\s*(.+)$", n)
-                    if m and not out["vessel"]:
-                        raw = m.group(1).strip(" .,-")
-                        parts = re.split(r"\s*/\s*|\s+V(?:OY)?\.?\s*[-:]?\s*(?=\d)", raw, maxsplit=1)
-                        out["vessel"] = re.sub(r"^M\.?\s?V\.?\s+", "", parts[0]).strip(" .,-")
-                        out["voyage"] = parts[1].strip() if len(parts) > 1 else ""
-                    m = re.search(r"(?:DISCHARG(?:E|ING)\s+PORT|PORT\s+OF\s+DISCHARGE|\bPOD\b)\s*[:：]\s*([^,]+)", n)
-                    if m and not out["port"]:
-                        out["port"] = m.group(1).strip(" .,-")
-    return out
+    """Vessel, voyage, discharge port and loading port as the manifest's own heading states them."""
+    f = _mf_source_head(tables)
+    vessel, voyage = _mf_vessel_voyage(f.get("vessel", ""))
+    port = re.split(r"\s*,", _MF_CJK_RE.sub("", f.get("port", "")))[0].strip(" .,-")
+    return {"vessel": vessel, "port": port, "voyage": voyage, "pol": _mf_clean_pol(f["pol"]) if f.get("pol") else ""}
+
+
+# ----- the reader checks itself -----
+
+_MF_TOTAL_LABEL_RE = re.compile(r"^\s*(?:(SUB)\s*-?\s*TOTALS?|(VOYAGE|GRAND)\s+TOTALS?|TOTALS?|TTL)\b\s*[:\uff1a.]?", re.IGNORECASE)
+_MF_TEXT_TOTAL_RE = re.compile(r"\bTOTAL\s*[:\uff1a]?\s*([\d,]+(?:\.\d+)?)\s*(?:PKGS?|PACKAGES?|PCS|PIECES|UNITS|COILS|BUNDLES|CTNS|CARTONS)\b", re.IGNORECASE)
+
+
+def _mf_pkg_count(s):
+    """'24 COILS' -> 24; '12 PACKAGES + 3 UNITS' -> 15."""
+    total = 0.0
+    for part in str(s or "").split("+"):
+        m = re.match(r"\s*(\d[\d,]*(?:\.\d+)?)", part)
+        if m:
+            total += float(m.group(1).replace(",", ""))
+    return total
+
+
+def _mf_lead_number(v):
+    m = re.match(r"^\s*(\d[\d,]*(?:\.\d+)?)\s*(?:[A-Za-z(\uff08]|$)", _mf_flat(v))
+    return float(m.group(1).replace(",", "")) if m else None
+
+
+def _mf_table_total(t):
+    """The package total a B/L table states under its last B/L: a VOYAGE/GRAND TOTAL line,
+    else the last TOTAL / SUB TOTAL / TTL line, else the sum line right under the B/Ls."""
+    rows, col = t["rows"], t.get("pkg_col")
+    data = {i for i, _, _ in t["data_rows"]}
+    last = max(data)
+    grand = labelled = plain = None
+    for i in range(last + 1, min(len(rows), last + 12)):
+        if i in data:
+            continue
+        r = rows[i]
+        lab = next((j for j, c in enumerate(r) if _MF_TOTAL_LABEL_RE.match(_mf_norm(c))), None)
+        val = _mf_lead_number(r[col]) if col is not None and col < len(r) else None
+        if val is None and lab is not None:
+            val = next((_mf_lead_number(c) for c in r[lab + 1:] if _mf_lead_number(c) is not None), None)
+        if val is None:
+            continue
+        if lab is not None:
+            m = _MF_TOTAL_LABEL_RE.match(_mf_norm(r[lab]))
+            if m.group(2):
+                grand = val
+            else:
+                labelled = val
+        elif plain is None and not str(r[t["bl_col"]] if t["bl_col"] < len(r) else "").strip():
+            plain = val
+    for v in (grand, labelled, plain):
+        if v is not None:
+            return v
+    return None
+
+
+def _mf_code_city(bl):
+    """The discharge port many load-port agents build into the B/L number: ...JED001 / ...JD14 =
+    Jeddah, ...YNB023 / ...YBU001 = Yanbu, ...DMM / ...DAM = Dammam."""
+    first = re.split(r"[/-]", bl_match_key(bl))[0]
+    m = re.match(r"^.*?([A-Z]+)\d+[A-Z]{0,2}$", first)
+    if not m:
+        return None
+    letters = m.group(1)
+    for city, codes in (("JEDDAH", ("JED", "JD")), ("YANBU", ("YNB", "YBU")), ("DAMMAM", ("DMM", "DAM"))):
+        if letters.endswith(codes):
+            return city
+    return None
+
+
+def _mf_checks(entries, tables, text, info):
+    """The reader checks its own work: do the packages it read add up to the total the manifest
+    states, and do the B/L numbers point to the same discharge port as the heading?"""
+    live = [e for e in entries if e["note"] is None]
+    read_live = sum(_mf_pkg_count(e["cargo"].get("pkgs")) for e in live)
+    read_all = sum(_mf_pkg_count(e.get("cargo", {}).get("pkgs")) for e in entries)
+    src = [t for t in tables if t.get("role") == "source" and t.get("data_rows")]
+    totals = [_mf_table_total(t) for t in src]
+    total = None
+    if totals and all(v is not None for v in totals):
+        total = sum(totals)
+    elif not any(v is not None for v in totals) and text:
+        m = _MF_TEXT_TOTAL_RE.search(_mf_norm(text))
+        total = float(m.group(1).replace(",", "")) if m else None
+    num = lambda v: int(v) if v is not None and float(v).is_integer() else v
+    ok = None if total is None else (abs(read_live - total) < 0.5 or abs(read_all - total) < 0.5)
+    cities = [_mf_code_city(e["bl"]) for e in live]
+    known = [c for c in cities if c]
+    says = None
+    if len(known) >= 2 and len(known) >= 0.8 * len(live):
+        top = max(set(known), key=known.count)
+        if known.count(top) >= 0.8 * len(known):
+            says = top
+    heading = next((c for c in ("JEDDAH", "YANBU", "DAMMAM", "JUBAIL") if c in (info.get("port") or "").upper()), None)
+    return {"pkgs_read": num(read_live), "pkgs_total": num(total), "pkgs_ok": ok,
+            "codes_say": says, "code_port": says if (says and heading and says != heading) else None}
 
 
 def _mf_needs_ai(entries):
@@ -4511,7 +4787,9 @@ def read_manifest(raw, filename, use_ai=True):
             ai_used = _mf_ai_read(ai_tables, entries)
         except Exception:
             ai_used = False
-    return {"entries": entries, "truncated": any(t.get("truncated") for t in tables), "ai_used": ai_used, "info": _mf_header_info(tables)}
+    info = _mf_header_info(tables)
+    return {"entries": entries, "truncated": any(t.get("truncated") for t in tables), "ai_used": ai_used, "info": info,
+            "checks": _mf_checks(entries, tables, text, info)}
 
 
 # ----- adding manifest B/Ls to the board -----
@@ -4602,9 +4880,10 @@ def _manifest_add(port, vessel, items):
             "contacts_found": contacts_filled}
 
 
-def _manifest_read_upload(file, with_truncation=False):
+def _manifest_read_upload(file, with_truncation=False, meta=None):
     """(entries, error_code) for one uploaded manifest file - plus whether
-    a huge sheet had to be cut short, when with_truncation is set."""
+    a huge sheet had to be cut short, when with_truncation is set. meta (a dict),
+    when given, receives the reader's heading and self-checks."""
     def done(entries, err, truncated=False):
         return (entries, err, truncated) if with_truncation else (entries, err)
     name = file.filename or ""
@@ -4619,7 +4898,50 @@ def _manifest_read_upload(file, with_truncation=False):
         result = read_manifest(raw, name)
     except Exception:
         return done([], "unreadable")
+    if meta is not None:
+        meta.update(checks=result.get("checks") or {}, info=result.get("info") or {})
     return done(result["entries"], None if result["entries"] else "no_bls", result.get("truncated", False))
+
+
+def _board_port_name(port):
+    """A port as the manifest writes it -> the port name used on the board ('' when it isn't one of ours)."""
+    pn = (port or "").upper()
+    return next((b for k, b in (("JEDDAH", "JEDDAH PORT"), ("YANBU", "YANBU COMMERCIAL PORT"), ("DAMMAM", "DAMMAM PORT"),
+                                ("JUBAIL", "JUBAIL COMMERCIAL PORT")) if k in pn), "")
+
+
+def _manifest_peek_payload(r):
+    """What the screen needs the moment a manifest is dropped, before anything is added."""
+    info, chk = r.get("info") or {}, r.get("checks") or {}
+    live = [e for e in r["entries"] if e["note"] is None]
+    pn = (info.get("port") or "").upper()
+    return {"ok": True, "vessel": info.get("vessel") or "", "voyage": info.get("voyage") or "",
+            "port": _board_port_name(pn) or pn, "codes_port": _board_port_name(chk.get("codes_say")),
+            "port_clash": bool(chk.get("code_port")), "clash_sample": live[0]["bl"] if live else "",
+            "pkgs_read": chk.get("pkgs_read"), "pkgs_total": chk.get("pkgs_total"), "pkgs_ok": chk.get("pkgs_ok"),
+            "lines": len(live)}
+
+
+def _read_for_peek():
+    f = request.files.get("file")
+    if not f or not f.filename or not f.filename.lower().endswith(_MANIFEST_EXTS):
+        return None
+    raw = f.read(_MANIFEST_MAX_BYTES + 1)
+    if not raw or len(raw) > _MANIFEST_MAX_BYTES:
+        return None
+    try:
+        return read_manifest(raw, f.filename, use_ai=False)
+    except Exception:
+        return None
+
+
+@app.route("/api/manifest/peek", methods=["POST"])
+@login_required
+def manifest_peek():
+    """DO Tracker: reads a dropped manifest without adding anything, so the screen can say straight
+    away if its heading and B/L numbers name different ports, or its packages don't add up."""
+    r = _read_for_peek()
+    return jsonify(_manifest_peek_payload(r) if r else {"ok": False})
 
 
 _MANIFEST_ERROR_TEXT = {
@@ -4705,7 +5027,8 @@ def upload_manifest_excel():
     file = request.files["file"]
     if not file.filename:
         return jsonify({"error": "No file selected"}), 400
-    entries, err = _manifest_read_upload(file)
+    meta = {}
+    entries, err = _manifest_read_upload(file, meta=meta)
     if err and err != "no_bls":
         return jsonify({"error": _MANIFEST_ERROR_TEXT[err], "error_code": err}), 400
     port = request.form.get("port", "").strip().upper()
@@ -4716,6 +5039,7 @@ def upload_manifest_excel():
     # Hidden rows / hidden sheets / crossed-out B/Ls aren't added; say how many.
     result["left_out"] = sum(1 for e in entries if e["note"] is not None)
     result["no_bls"] = not entries
+    result["checks"] = meta.get("checks") or {}
     return jsonify(result)
 
 
@@ -4984,9 +5308,10 @@ def desk_upload():
         return jsonify({"error": "Choose a manifest file."}), 400
     db = get_db()
     added = skipped = 0
-    failed, elsewhere = [], []
+    failed, elsewhere, warnings = [], [], []
     for f in files:
-        entries, err = _manifest_read_upload(f)
+        meta = {}
+        entries, err = _manifest_read_upload(f, meta=meta)
         if err and err != "no_bls":
             failed.append(f.filename + ": " + _MANIFEST_ERROR_TEXT[err])
             continue
@@ -5000,34 +5325,25 @@ def desk_upload():
         added += res["added"]
         skipped += res["skipped"]
         elsewhere += res["duplicate_elsewhere"]
+        chk = meta.get("checks") or {}
+        if chk.get("pkgs_ok") is False:
+            warnings.append(f"{f.filename}: Compass read {chk.get('pkgs_read')} packages, but the manifest's total says "
+                            f"{chk.get('pkgs_total')}. Check its B/L lines.")
         for e in live:
             c = e["contact"]
             who = c.get("name") or c.get("notify")
             if who and _clean_email(c.get("email")):
                 _book_save(db, who, email=_clean_email(c["email"]), only_fill=True)
         db.commit()
-    return jsonify({"added": added, "skipped": skipped, "failed": failed, "duplicate_elsewhere": elsewhere[:5]})
+    return jsonify({"added": added, "skipped": skipped, "failed": failed, "duplicate_elsewhere": elsewhere[:5], "warnings": warnings})
 
 
 @app.route("/api/desk/peek", methods=["POST"])
 @login_required
 def desk_peek():
     """Reads the manifest's heading (vessel, discharge port) and counts its lines, without adding anything."""
-    f = request.files.get("file")
-    if not f or not f.filename or not f.filename.lower().endswith(_MANIFEST_EXTS):
-        return jsonify({"ok": False})
-    raw = f.read(_MANIFEST_MAX_BYTES + 1)
-    if not raw or len(raw) > _MANIFEST_MAX_BYTES:
-        return jsonify({"ok": False})
-    try:
-        r = read_manifest(raw, f.filename, use_ai=False)
-    except Exception:
-        return jsonify({"ok": False})
-    info = r.get("info") or {}
-    pn = (info.get("port") or "").upper()
-    board = next((b for k, b in (("JEDDAH", "JEDDAH PORT"), ("YANBU", "YANBU COMMERCIAL PORT"), ("DAMMAM", "DAMMAM PORT"), ("JUBAIL", "JUBAIL COMMERCIAL PORT")) if k in pn), "")
-    return jsonify({"ok": True, "vessel": info.get("vessel") or "", "voyage": info.get("voyage") or "", "port": board or pn,
-                    "lines": sum(1 for e in r["entries"] if e["note"] is None)})
+    r = _read_for_peek()
+    return jsonify(_manifest_peek_payload(r) if r else {"ok": False})
 
 
 @app.route("/api/desk/notices")
@@ -6906,7 +7222,7 @@ def _find_bl_in_scan(text, known_bls):
     toks = {t.translate(_OCR_LOOKALIKE) for t in re.findall(r"[A-Z0-9]+", _mf_norm(text)) if len(t) >= 5}
     if not toks:
         return []
-    found = []
+    found, hits = [], {}
     for bl in known_bls:
         bl_u = (bl or "").strip().upper()
         if not bl_u:
@@ -6914,9 +7230,12 @@ def _find_bl_in_scan(text, known_bls):
         members = bl_members(bl_u)
         if bl_u.translate(_OCR_LOOKALIKE) in toks or members[0].translate(_OCR_LOOKALIKE) in toks:
             found.append((bl, True))
-        elif any(m.translate(_OCR_LOOKALIKE) in toks for m in members[1:]):
-            found.append((bl, False))
-    return found
+        else:
+            h = [m for m in members[1:] if m.translate(_OCR_LOOKALIKE) in toks]
+            if h:
+                found.append((bl, False))
+                hits[bl] = h
+    return _mf_exact_wins(found, hits)
 
 
 _RECEIPT_RE = re.compile(r"\bRECEIPT\b|PAYMENT\s+(?:SUCCESSFUL|CONFIRM|COMPLETED)|(?:PAYMENT\s+)?STATUS\s*[:：]?\s*PAID\b|\bPAID\s+SUCCESSFULLY\b")
@@ -6977,7 +7296,7 @@ def _find_bl_in_text(text, known_bls):
             return s in tokens
         return re.search(r"(?<![A-Z0-9])" + re.escape(s) + r"(?![A-Z0-9])", upper) is not None
 
-    found = []
+    found, hits = [], {}
     for bl in known_bls:
         bl_u = (bl or "").strip().upper()
         if not bl_u:
@@ -6985,9 +7304,22 @@ def _find_bl_in_text(text, known_bls):
         members = bl_members(bl_u)
         if present(bl_u) or present(members[0]):
             found.append((bl, True))
-        elif any(present(m) for m in members[1:]):
-            found.append((bl, False))
-    return found
+        else:
+            h = [m for m in members[1:] if present(m)]
+            if h:
+                found.append((bl, False))
+                hits[bl] = h
+    return _mf_exact_wins(found, hits)
+
+
+def _mf_exact_wins(found, hits):
+    """A document naming a B/L that has its own line on the board belongs to that line - not also
+    to a combined entry whose range happens to include the same number (XT26220RJED026 vs
+    XT26220RJED010-27, which is one B/L number in its own right)."""
+    exact = {bl_match_key(b) for b, ex in found if ex}
+    if not exact:
+        return found
+    return [(b, ex) for b, ex in found if ex or any(bl_match_key(h) not in exact for h in hits.get(b, []))]
 
 
 @app.route("/api/attachments/detect", methods=["POST"])
@@ -13777,6 +14109,10 @@ DESK_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="vie
   .vchip:hover { background: var(--border); }
   .drop { border: 2px dashed var(--border); border-radius: 14px; padding: 16px; text-align: center; color: var(--muted); font-size: 13px; cursor: pointer; }
   .drop.over { border-color: var(--navy-light); background: color-mix(in srgb, var(--navy-light) 8%, transparent); }
+  .pick { margin-top: 12px; padding: 12px 14px; border-radius: 14px; font-size: 13px; line-height: 1.5; color: var(--text);
+    background: color-mix(in srgb, var(--warn) 10%, var(--card)); border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent); }
+  .pick .acts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .pick .acts button { padding: 7px 14px; }
   .pill { display: inline-block; padding: 2px 9px; border-radius: 99px; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
   .pill.ok { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
   .pill.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
@@ -13836,6 +14172,7 @@ function setTheme(mode) { document.documentElement.setAttribute('data-theme', mo
           <input type="text" id="vessel" placeholder="Vessel and voyage" autocomplete="off" style="flex:1.4 1 170px;">
           <button onclick="openVessel()">Open</button>
         </div>
+        <div class="pick" id="portPick" style="display:none"></div>
         <datalist id="ports"><option value="JEDDAH PORT"><option value="YANBU COMMERCIAL PORT"><option value="YANBU INDUSTRIAL PORT"><option value="DAMMAM PORT"><option value="JUBAIL COMMERCIAL PORT"></datalist>
         <div class="chips" id="recent"></div>
       </div>
@@ -13892,6 +14229,7 @@ async function loadRecent() {
 }
 function stage() {
   var f = Array.prototype.slice.call($('file').files || []);
+  if (S.clash) { S.clash = null; $('portPick').style.display = 'none'; }
   $('fname').textContent = f.map(function (x) { return x.name; }).join(', ');
   $('addBtn').disabled = !f.length;
   if (f.length) peekManifest(f[0]);
@@ -13904,9 +14242,23 @@ async function peekManifest(file) {
     var v = (r.vessel ? r.vessel + (r.voyage ? ' V-' + r.voyage : '') : '').toUpperCase();
     if (v && !$('vessel').value.trim()) $('vessel').value = v;
     var typed = $('port').value.trim().toUpperCase();
-    if (r.port && !typed) $('port').value = r.port;
+    if (r.port_clash && r.port && r.codes_port) {
+      // The heading and the B/L numbers name different ports: nothing is guessed, the user picks.
+      S.clash = r;
+      $('portPick').innerHTML = 'Check the port: the manifest heading says <b>' + esc(r.port) + '</b>, but its B/L numbers (' + esc(r.clash_sample) +
+        '&hellip;) point to <b>' + esc(r.codes_port) + '</b>. Which is right?<div class="acts">' +
+        '<button type="button" class="sec" data-p="' + esc(r.port) + '">' + esc(r.port) + '</button>' +
+        '<button type="button" class="sec" data-p="' + esc(r.codes_port) + '">' + esc(r.codes_port) + '</button></div>';
+      $('portPick').querySelectorAll('button').forEach(function (b) { b.onclick = function () { pickPort(b.dataset.p); }; });
+      $('portPick').style.display = '';
+    } else if (r.port && !typed) $('port').value = r.port;
     else if (r.port && typed.split(' ')[0] !== r.port.split(' ')[0]) toast('This manifest says discharge port ' + r.port + ', but ' + typed + ' is selected.', true);
+    if (r.pkgs_ok === false) toast('Compass read ' + r.pkgs_read + ' packages, but the manifest total says ' + r.pkgs_total + '. Check the B/L lines after adding.', true);
   } catch (e) {}
+}
+function pickPort(p) {
+  $('port').value = p; S.clash = null;
+  $('portPick').style.display = 'none'; $('portPick').innerHTML = '';
 }
 (function () {
   var d = $('drop');
@@ -13916,6 +14268,7 @@ async function peekManifest(file) {
 })();
 async function uploadManifest() {
   var port = $('port').value.trim().toUpperCase(), vessel = $('vessel').value.trim().toUpperCase();
+  if (S.clash) { toast('Pick the port first - the manifest heading and its B/L numbers disagree.', true); return; }
   if (!port || !vessel) { toast('Type the port and the vessel first.', true); return; }
   var fd = new FormData();
   Array.prototype.forEach.call($('file').files, function (f) { fd.append('file', f); });
@@ -13924,6 +14277,7 @@ async function uploadManifest() {
   try {
     var r = await api('/api/desk/upload', {method: 'POST', body: fd});
     (r.failed || []).forEach(function (m) { toast(m, true); });
+    (r.warnings || []).forEach(function (m) { toast(m, true); });
     toast(r.added + ' B/L' + (r.added === 1 ? '' : 's') + ' added to the DO Tracker' + (r.skipped ? ', ' + r.skipped + ' already there' : '') + '.');
     (r.duplicate_elsewhere || []).forEach(function (d) { toast(d.bl_number + ' is already on the board under ' + (d.existing_vessel || 'another vessel') + '.', true); });
     $('file').value = ''; stage();
@@ -19264,6 +19618,18 @@ PAGE_HTML = """
   .dropzone-text b { font-weight: 700; }
   .dropzone-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
   .dropzone-filename { font-size: 12px; color: var(--navy-light); font-weight: 600; margin-top: 4px; }
+  /* What the manifest itself says, shown the moment it is dropped (before "Add to board") */
+  .mf-check { display: grid; gap: 8px; margin-top: 12px; }
+  .mf-check[hidden] { display: none; }
+  .mf-note { display: flex; gap: 11px; align-items: flex-start; padding: 12px 14px; border-radius: 14px; font-size: 13px; line-height: 1.5; color: var(--text);
+    background: color-mix(in srgb, var(--gold) 10%, var(--card)); border: 1px solid color-mix(in srgb, var(--gold) 38%, transparent); }
+  .mf-note .ic { flex: 0 0 auto; width: 18px; height: 18px; margin-top: 1px; color: var(--gold); }
+  .mf-note .tx { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .mf-note .acts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .mf-note .acts button { appearance: none; -webkit-appearance: none; margin: 0; padding: 6px 14px; border-radius: 999px; font: inherit; font-size: 12.5px; font-weight: 600;
+    background: var(--card); color: var(--text); border: 1px solid var(--border); box-shadow: none; cursor: pointer; transition: background .15s ease, border-color .15s ease; }
+  .mf-note .acts button:hover { border-color: var(--navy-light); }
+  .mf-note .acts button.pri { background: var(--navy); border-color: var(--navy); color: #fff; }
 
   /* Summary stats */
   .summary { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -19979,6 +20345,7 @@ PAGE_HTML = """
       </div>
       <input type="file" id="manifestFile" accept=".xlsx,.xlsm,.xls,.csv,.docx,.pdf" multiple style="display:none" onchange="stageManifestFile()">
     </label>
+    <div class="mf-check" id="manifestCheck" hidden></div>
     <div class="row" style="margin-top:14px;">
       <button type="button" id="addManifestBtn" onclick="uploadExcel()" disabled data-i18n="add_to_board">Add to board</button>
     </div>
@@ -20278,11 +20645,81 @@ function stageManifestFile() {
   const files = Array.from(document.getElementById('manifestFile').files || []);
   const btn = document.getElementById('addManifestBtn');
   const label = document.getElementById('dropzoneFilename');
-  if (!files.length) { label.textContent = ''; btn.disabled = true; return; }
+  if (!files.length) { label.textContent = ''; btn.disabled = true; checkManifest(null); return; }
   label.textContent = files.length === 1 ? files[0].name
     : t('n_files_selected', {n: files.length, names: files.map(f => f.name).join(', ')});
   btn.disabled = false;
+  checkManifest(files[0]);
 }
+
+/* The moment a manifest is dropped, Compass reads it (nothing is added yet) and says if
+   its heading and its B/L numbers name different ports - you pick which - if it names a
+   different port from the one chosen above, or if its packages don't add up to its own total. */
+let mfCheck = null, mfCheckSeq = 0;
+async function checkManifest(file) {
+  const seq = ++mfCheckSeq;
+  mfCheck = null;
+  renderManifestCheck();
+  if (!file) return;
+  let r = null;
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const res = await fetch('/api/manifest/peek', {method: 'POST', body: fd});
+    r = await res.json();
+  } catch (e) { return; }
+  if (seq !== mfCheckSeq || !r || !r.ok) return;
+  mfCheck = r;
+  renderManifestCheck();
+}
+function boardPortLabel(v) {
+  const o = [...document.getElementById('portField').options].find(o => o.value === v);
+  return o ? o.textContent : '';
+}
+function setManifestPort(v) {
+  const sel = document.getElementById('portField');
+  if (boardPortLabel(v)) { sel.value = v; syncGlassSelectLabel('portField'); }
+  if (mfCheck) mfCheck.resolved = true;
+  renderManifestCheck();
+}
+function keepManifestPort() {
+  if (mfCheck) mfCheck.resolved = true;
+  renderManifestCheck();
+}
+function renderManifestCheck() {
+  const box = document.getElementById('manifestCheck');
+  const r = mfCheck;
+  const notes = [];
+  const icon = '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M10.3 3.9L1.8 18a2 2 0 001.7 3h17a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>';
+  const note = (text, acts) => `<div class="mf-note">${icon}<div class="tx">${text}${acts ? `<div class="acts">${acts}</div>` : ''}</div></div>`;
+  if (r) {
+    const picked = document.getElementById('portField').value;
+    const heading = boardPortLabel(r.port) ? r.port : '';
+    const codes = boardPortLabel(r.codes_port) ? r.codes_port : '';
+    if (r.port_clash && heading && codes && !r.resolved) {
+      const btn = v => `<button type="button" class="${picked === v ? 'pri' : ''}" onclick="setManifestPort(${jsq(v)})">${esc(boardPortLabel(v))}</button>`;
+      notes.push(note(t('mf_port_clash', {heading: esc(boardPortLabel(heading)), codes: esc(boardPortLabel(codes)), bl: '<bdi dir="ltr">(' + esc(r.clash_sample) + '&hellip;)</bdi>'}), btn(heading) + btn(codes)));
+    } else if (!r.port_clash && !r.resolved) {
+      const says = heading || codes;
+      if (says && picked && picked !== says) {
+        notes.push(note(t('mf_port_differs', {picked: esc(boardPortLabel(picked)), says: esc(boardPortLabel(says))}),
+          `<button type="button" class="pri" onclick="setManifestPort(${jsq(says)})">${esc(t('mf_use_port', {port: boardPortLabel(says)}))}</button>` +
+          `<button type="button" onclick="keepManifestPort()">${esc(t('mf_keep_port', {port: boardPortLabel(picked)}))}</button>`));
+      }
+    }
+    if (r.pkgs_ok === false) {
+      notes.push(note(t('mf_pkgs_mismatch', {read: esc(Number(r.pkgs_read).toLocaleString()), total: esc(Number(r.pkgs_total).toLocaleString())})));
+    }
+  }
+  box.innerHTML = notes.join('');
+  box.hidden = !notes.length;
+}
+document.getElementById('portField').addEventListener('change', () => {
+  // Choosing the port by hand settles a clash too.
+  if (mfCheck && mfCheck.port_clash) mfCheck.resolved = true;
+  renderManifestCheck();
+});
 
 // One file at a time, so a BL listed in two of the files is simply
 // "already on the board" by the second one instead of racing itself.
@@ -20291,6 +20728,7 @@ async function uploadExcel() {
   const files = Array.from(fileInput.files || []);
   if (!files.length) { showToast(t('choose_manifest_first')); return; }
 
+  if (mfCheck && mfCheck.port_clash && !mfCheck.resolved) { showToast(t('mf_pick_port_first'), {duration: 6000}); return; }
   const btn = document.getElementById('addManifestBtn');
   btn.disabled = true;
   const originalLabel = btn.textContent;
@@ -20298,7 +20736,7 @@ async function uploadExcel() {
   const vessel = document.getElementById('vesselField').value.trim().toUpperCase();
 
   let added = 0, skipped = 0, contacts = 0, leftOut = 0;
-  const dupElsewhere = [], failed = [];
+  const dupElsewhere = [], failed = [], checkWarnings = [];
   for (let i = 0; i < files.length; i++) {
     btn.textContent = files.length > 1 ? t('adding_progress', {i: i + 1, n: files.length}) : t('adding_ellipsis');
     const formData = new FormData();
@@ -20323,11 +20761,14 @@ async function uploadExcel() {
     contacts += data.contacts_found || 0;
     leftOut += data.left_out || 0;
     (data.duplicate_elsewhere || []).forEach(d => dupElsewhere.push(d));
+    const ck = data.checks || {};
+    if (ck.pkgs_ok === false) checkWarnings.push(t('mf_pkgs_mismatch_toast', {name: files[i].name, read: Number(ck.pkgs_read).toLocaleString(), total: Number(ck.pkgs_total).toLocaleString()}));
   }
 
   // Reset the dropzone so the same "Add to board" flow can be repeated.
   fileInput.value = '';
   document.getElementById('dropzoneFilename').textContent = '';
+  checkManifest(null);
   btn.textContent = originalLabel;
   btn.disabled = true;
 
@@ -20337,6 +20778,7 @@ async function uploadExcel() {
       {duration: leftOut ? 8000 : 3500});
   }
   failed.forEach(msg => showToast(msg, {duration: 9000}));
+  checkWarnings.forEach(msg => showToast(msg, {duration: 9000}));
   try { await fetchRecords(true); } catch (e) {}
 
   // A BL that's already on the board under a DIFFERENT vessel than the one
