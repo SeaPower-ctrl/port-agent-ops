@@ -4996,10 +4996,22 @@ def ai_status():
            "calls_this_month": int(get_setting(_ai_month_key(), "0") or 0), "monthly_cap": AI_MONTHLY_CALLS,
            "every_manifest": os.environ.get("AI_EVERY_MANIFEST", "1") != "0",
            "last_status": get_setting("ai_last_status", "(nothing yet)")}
+    if request.args.get("test") and _ai_provider() == "gemini":
+        import urllib.request
+        _AI_COOLDOWN["until"] = 0
+        t0 = time.time()
+        try:
+            rq = urllib.request.Request(_GEMINI_BASE + "/models?pageSize=5", headers={"x-goog-api-key": os.environ.get("GEMINI_API_KEY", "").strip()})
+            with urllib.request.urlopen(rq, timeout=15) as r_:
+                out["step1_reach_google"] = "ok (HTTP %s, %.1fs)" % (r_.status, time.time() - t0)
+        except Exception as e_:
+            out["step1_reach_google"] = "FAILED after %.1fs: %s %s" % (time.time() - t0, type(e_).__name__, str(getattr(e_, "code", ""))[:20])
     if request.args.get("test") and _ai_provider():
+        t1 = time.time()
         reply = _ai_call("Manifest:\nr1: B/L NO | CONSIGNEE | PACKAGES | DESCRIPTION\n"
                          "r2: TEST26001XJED001 | ACME TRADING CO., LTD | 57 COILS | HOT ROLLED STEEL IN COILS, HS CODE 7208.39, L/C NO. 123, G.W. 1,234 KG\n",
                          time.time() + 40)
+        out["step2_read_seconds"] = round(time.time() - t1, 1)
         out["test_rows"] = _ai_rows_from_reply(reply)
         out["test_ok"] = bool(out["test_rows"])
         out["last_status"] = get_setting("ai_last_status", "")
