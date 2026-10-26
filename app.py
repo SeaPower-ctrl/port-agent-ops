@@ -1150,6 +1150,22 @@ def init_db():
         )"""
     )
 
+    # What Compass has learned about manifests: the layouts it has met, and cargo names people confirmed per consignee.
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS mf_layouts (
+            fingerprint TEXT PRIMARY KEY, label TEXT DEFAULT '', header TEXT DEFAULT '',
+            seen INTEGER DEFAULT 0, first_seen TEXT DEFAULT '', last_seen TEXT DEFAULT '', last_file TEXT DEFAULT '',
+            ai_helped INTEGER DEFAULT 0, pkgs_ok INTEGER DEFAULT 0, pkgs_bad INTEGER DEFAULT 0
+        )"""
+    )
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS mf_memory (
+            id SERIAL PRIMARY KEY, kind TEXT DEFAULT 'cargo', consignee TEXT DEFAULT '', match_key TEXT DEFAULT '',
+            old_value TEXT DEFAULT '', new_value TEXT DEFAULT '', created_by TEXT DEFAULT '', created_at TEXT DEFAULT '',
+            uses INTEGER DEFAULT 0
+        )"""
+    )
+
     # --- Disbursement Accounts v2: customer/voyage/vessel details, grouped rate x qty charges,
     # USD + SAR totals, automatic PDA numbers. Everything is additive, so existing PDAs stay as they were
     # (each old charge becomes rate = its amount, qty = 1).
@@ -4983,6 +4999,85 @@ def _mf_needs_ai(entries):
     return gaps / len(live) >= 0.2
 
 
+def _mf_layout_fp(tables):
+    """A short fingerprint of the manifest's column headings: the same load-port agent sends the same layout every time."""
+    src = next((t for t in tables if t.get("role") == "source" and t.get("data_rows")), None)
+    if not src:
+        return None
+    rows, h = src["rows"], src.get("hdr")
+    if h is not None and 0 <= h < len(rows):
+        cells = [re.sub(r"[^A-Z0-9]", "", _mf_norm(c)) for c in rows[h]]
+        cells = [c for c in cells if c]
+        label = " | ".join(_mf_flat(c)[:20] for c in rows[h] if _mf_flat(c))[:140]
+    else:
+        ncols = max((len(r) for r in rows[:30]), default=0)
+        cells, label = ["HEADERLESS%d" % ncols], "No heading row, %d columns" % ncols
+    if not cells:
+        return None
+    return {"fp": hashlib.sha1("|".join(cells).encode()).hexdigest()[:12], "label": label}
+
+
+_MEM_WORD_RE = re.compile(r"[A-Z]{2,}")
+
+
+def _mem_desc_key(desc):
+    """The first four words of a cargo description: what a correction is matched on."""
+    return " ".join(_MEM_WORD_RE.findall(_mf_norm(desc or ""))[:4])
+
+
+def _mf_apply_memory(entries, count=True):
+    """Cargo names people confirmed for a consignee are used again, the next time the same wording comes up."""
+    db = get_db()
+    rows = db.execute("SELECT id, consignee, match_key, new_value FROM mf_memory WHERE kind = 'cargo'").fetchall()
+    if not rows:
+        return 0
+    used, n = [], 0
+    for e in entries:
+        if e["note"] is not None:
+            continue
+        who = _mf_compact(e["contact"].get("name") or e["contact"].get("notify") or "")
+        key = _mem_desc_key(e["cargo"].get("desc"))
+        if not who or not key:
+            continue
+        for r in rows:
+            if r["match_key"] == key and _mf_same_party(who, _mf_compact(r["consignee"])):
+                if e["cargo"]["desc"] != r["new_value"]:
+                    e["cargo"]["desc"] = r["new_value"]
+                    e["remembered"] = True
+                    n += 1
+                used.append(r["id"])
+                break
+    if count and used:
+        for i in set(used):
+            db.execute("UPDATE mf_memory SET uses = uses + 1 WHERE id = ?", (i,))
+        db.commit()
+    return n
+
+
+def _mf_note_layout(result, filename):
+    """Counts one manifest against its layout. Returns True when the layout had not been seen before."""
+    lay = result.get("layout")
+    if not lay:
+        return False
+    db = get_db()
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    chk = result.get("checks") or {}
+    ok, bad = (1 if chk.get("pkgs_ok") else 0), (1 if chk.get("pkgs_ok") is False else 0)
+    ai = 1 if result.get("ai_used") else 0
+    row = db.execute("SELECT seen FROM mf_layouts WHERE fingerprint = ?", (lay["fp"],)).fetchone()
+    if row is None:
+        db.execute("INSERT INTO mf_layouts (fingerprint, label, header, seen, first_seen, last_seen, last_file, ai_helped, pkgs_ok, pkgs_bad) "
+                   "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?) ON CONFLICT (fingerprint) DO NOTHING",
+                   (lay["fp"], lay["label"][:140], lay["label"][:300], now, now, (filename or "")[:120], ai, ok, bad))
+        db.commit()
+        return True
+    db.execute("UPDATE mf_layouts SET seen = seen + 1, last_seen = ?, last_file = ?, ai_helped = ai_helped + ?, "
+               "pkgs_ok = pkgs_ok + ?, pkgs_bad = pkgs_bad + ? WHERE fingerprint = ?",
+               (now, (filename or "")[:120], ai, ok, bad, lay["fp"]))
+    db.commit()
+    return False
+
+
 def read_manifest(raw, filename, use_ai=True):
     """Reads one uploaded manifest file (.xlsx/.xlsm/.xls/.csv/.docx/.pdf).
     Returns {"entries": [{"bl", "note", "contact"}...]}; entries is empty
@@ -5053,8 +5148,13 @@ def read_manifest(raw, filename, use_ai=True):
             checks = _mf_ai_reconcile(entries, tables, text, info, checks)
         except Exception:
             pass
+    remembered = 0
+    try:
+        remembered = _mf_apply_memory(entries, count=use_ai)
+    except Exception:
+        remembered = 0
     return {"entries": entries, "truncated": any(t.get("truncated") for t in tables), "ai_used": ai_used, "info": info,
-            "checks": checks}
+            "checks": checks, "layout": _mf_layout_fp(tables), "remembered": remembered}
 
 
 @app.route("/api/ai/status")
@@ -5225,6 +5325,12 @@ def _manifest_read_upload(file, with_truncation=False, meta=None):
         return done([], "unreadable")
     if meta is not None:
         meta.update(checks=result.get("checks") or {}, info=result.get("info") or {})
+        try:
+            meta["layout_new"] = _mf_note_layout(result, name)
+            meta["layout_label"] = (result.get("layout") or {}).get("label", "")
+        except Exception:
+            meta["layout_new"] = False
+        meta["remembered"] = result.get("remembered", 0)
     return done(result["entries"], None if result["entries"] else "no_bls", result.get("truncated", False))
 
 
@@ -5608,6 +5714,7 @@ def _desk_group(db, port, vessel, key):
 @login_required
 def manifest_desk_page():
     page = DESK_HTML.replace("__NAME__", html.escape(session.get("display_name") or session.get("username") or "", quote=True))
+    page = page.replace("__LEARNED__", '<a href="/learned">What Compass learned</a>' if _is_owner() else "")
     return Response(page, mimetype="text/html")
 
 
@@ -5633,7 +5740,7 @@ def desk_upload():
         return jsonify({"error": "Choose a manifest file."}), 400
     db = get_db()
     added = skipped = 0
-    failed, elsewhere, warnings = [], [], []
+    failed, elsewhere, warnings, notices = [], [], [], []
     for f in files:
         meta = {}
         entries, err = _manifest_read_upload(f, meta=meta)
@@ -5644,6 +5751,10 @@ def desk_upload():
         if not live:
             failed.append(f.filename + ": " + _MANIFEST_ERROR_TEXT["no_bls"])
             continue
+        if meta.get("layout_new"):
+            notices.append(f"{f.filename}: new manifest layout recognised and saved. Compass checked it against the manifest.")
+        if meta.get("remembered"):
+            notices.append(f"{f.filename}: {meta['remembered']} cargo name{'s' if meta['remembered'] != 1 else ''} filled in from what you confirmed before.")
         items = [{"bl": e["bl"], **e["contact"], "loading_port": e["cargo"]["pol"], "packages": e["cargo"]["pkgs"],
                   "cargo_desc": e["cargo"]["desc"]} for e in live]
         res = _manifest_add(port, vessel, items)
@@ -5660,7 +5771,8 @@ def desk_upload():
             if who and _clean_email(c.get("email")):
                 _book_save(db, who, email=_clean_email(c["email"]), only_fill=True)
         db.commit()
-    return jsonify({"added": added, "skipped": skipped, "failed": failed, "duplicate_elsewhere": elsewhere[:5], "warnings": warnings})
+    return jsonify({"added": added, "skipped": skipped, "failed": failed, "duplicate_elsewhere": elsewhere[:5], "warnings": warnings,
+                    "notices": notices})
 
 
 @app.route("/api/desk/peek", methods=["POST"])
@@ -5714,11 +5826,94 @@ def desk_bl():
     if not _owns_record(bl):
         return jsonify({"error": "Not your record."}), 403
     db = get_db()
-    if not db.execute("SELECT 1 FROM records WHERE bl_number = ?", (bl,)).fetchone():
+    before = db.execute("SELECT consignee, notify_name, cargo_desc FROM records WHERE bl_number = ?", (bl,)).fetchone()
+    if not before:
         return jsonify({"error": "BL not found."}), 404
+    new_desc = _mf_flat(data.get("cargo_desc"))[:300]
     db.execute("UPDATE records SET loading_port = ?, packages = ?, cargo_desc = ? WHERE bl_number = ?",
-               (_mf_flat(data.get("loading_port"))[:80], _mf_flat(data.get("packages"))[:60], _mf_flat(data.get("cargo_desc"))[:300], bl))
+               (_mf_flat(data.get("loading_port"))[:80], _mf_flat(data.get("packages"))[:60], new_desc, bl))
     _log_audit(bl, "edited", "cargo details", "", "")
+    db.commit()
+    out = {"ok": True}
+    old_desc, who = _mf_flat(before["cargo_desc"]), _mf_flat(before["consignee"] or before["notify_name"])
+    if new_desc and old_desc and who and new_desc != old_desc and _mem_desc_key(old_desc):
+        known = _mem_find(db, who, _mem_desc_key(old_desc))
+        if not known or known["new_value"] != new_desc:
+            out["learn"] = {"consignee": who, "old": old_desc, "new": new_desc}
+    return jsonify(out)
+
+
+def _mem_find(db, consignee, key):
+    who = _mf_compact(consignee)
+    for r in db.execute("SELECT id, consignee, match_key, new_value FROM mf_memory WHERE kind = 'cargo'").fetchall():
+        if r["match_key"] == key and _mf_same_party(who, _mf_compact(r["consignee"])):
+            return r
+    return None
+
+
+@app.route("/api/memory/cargo", methods=["POST"])
+@login_required
+def memory_cargo():
+    """'Remember this for the consignee': from now on this cargo wording reads as the name the person confirmed."""
+    data = request.get_json(force=True, silent=True) or {}
+    who, old, new = (_mf_flat(data.get(k)) for k in ("consignee", "old", "new"))
+    key = _mem_desc_key(old)
+    if not who or not new or not key:
+        return jsonify({"error": "Nothing to remember."}), 400
+    db = get_db()
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    row = _mem_find(db, who, key)
+    if row:
+        db.execute("UPDATE mf_memory SET new_value = ?, old_value = ?, created_by = ?, created_at = ? WHERE id = ?",
+                   (new[:300], old[:300], session.get("username") or "", now, row["id"]))
+    else:
+        db.execute("INSERT INTO mf_memory (kind, consignee, match_key, old_value, new_value, created_by, created_at) VALUES ('cargo', ?, ?, ?, ?, ?, ?)",
+                   (who[:160], key, old[:300], new[:300], session.get("username") or "", now))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+# ---------- Owner page: what Compass has learned ----------
+
+@app.route("/learned")
+@login_required
+def learned_page():
+    if not _is_owner():
+        return redirect("/")
+    page = LEARNED_HTML.replace("__NAME__", html.escape(session.get("display_name") or session.get("username") or "", quote=True))
+    return Response(page, mimetype="text/html")
+
+
+@app.route("/api/learned")
+@login_required
+def learned_data():
+    if not _is_owner():
+        return jsonify({"error": "Owner only"}), 403
+    db = get_db()
+    lay = [dict(r) for r in db.execute("SELECT fingerprint, label, seen, first_seen, last_seen, ai_helped, pkgs_ok, pkgs_bad "
+                                       "FROM mf_layouts ORDER BY last_seen DESC LIMIT 200").fetchall()]
+    mem = [dict(r) for r in db.execute("SELECT id, consignee, old_value, new_value, created_by, created_at, uses FROM mf_memory "
+                                       "WHERE kind = 'cargo' ORDER BY created_at DESC LIMIT 500").fetchall()]
+    return jsonify({"layouts": lay, "memory": mem, "ai": _ai_provider() or "none",
+                    "calls": int(get_setting(_ai_month_key(), "0") or 0)})
+
+
+@app.route("/api/learned/forget", methods=["POST"])
+@login_required
+def learned_forget():
+    if not _is_owner():
+        return jsonify({"error": "Owner only"}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    db = get_db()
+    if data.get("kind") == "layout":
+        db.execute("DELETE FROM mf_layouts WHERE fingerprint = ?", (str(data.get("id") or ""),))
+    elif data.get("kind") == "memory":
+        try:
+            db.execute("DELETE FROM mf_memory WHERE id = ?", (int(data.get("id")),))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Bad id"}), 400
+    else:
+        return jsonify({"error": "Bad request"}), 400
     db.commit()
     return jsonify({"ok": True})
 
@@ -14371,6 +14566,80 @@ async function delUser(id, username) {
 </body></html>
 """
 
+LEARNED_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compass - What Compass has learned</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + r"""">
+<style>
+  :root { --bg: #f2f4f7; --card: #ffffff; --text: #1c2b3a; --muted: #5f6d7b; --border: #e6e9ed; --navy: #123a56; --navy-light: #1f5c85; --ok: #1f7a54; --warn: #8a5a00; --danger: #d1483f; color-scheme: light; }
+  :root[data-theme="dark"] { --bg: #131a23; --card: #1a232f; --text: #e9eef3; --muted: #a3b0be; --border: #29323f; --navy: #3f86ba; --navy-light: #5aa2d1; --ok: #43c08a; --warn: #e0a640; --danger: #e2685f; color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0 16px 40px; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 14px 16px; margin: 0 -16px 20px; border-bottom: 1px solid var(--border); }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--text); }
+  .brand img { height: 32px; width: auto; }
+  .brand b { font-size: 14.5px; display: block; } .brand small { font-size: 11px; color: var(--muted); }
+  .topbar-right { display: flex; align-items: center; gap: 12px; font-size: 13px; flex-wrap: wrap; }
+  .topbar-right a { color: var(--navy-light); text-decoration: none; font-weight: 600; }
+  .wrap { max-width: 1000px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 4px 0 4px; letter-spacing: -.01em; }
+  .sub { color: var(--muted); font-size: 13.5px; margin-bottom: 18px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .stat, .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 16px 18px; }
+  .stat b { display: block; font-size: 28px; } .stat span { color: var(--muted); font-size: 13px; }
+  .card { margin-bottom: 16px; min-width: 0; }
+  .lab { font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 8px; }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; min-width: 560px; }
+  th { text-align: left; font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); padding: 8px 8px 8px 0; border-bottom: 1px solid var(--border); }
+  td { padding: 10px 8px 10px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
+  button { background: transparent; color: var(--text); border: 1px solid var(--border); border-radius: 999px; padding: 6px 12px; font-size: 12.5px; font-weight: 600; cursor: pointer; font-family: inherit; }
+  button:hover { background: var(--border); }
+  .ok { color: var(--ok); font-weight: 650; } .warn { color: var(--warn); font-weight: 650; }
+  .empty { color: var(--muted); font-size: 13.5px; padding: 14px 0; }
+  .muted { color: var(--muted); }
+</style>
+<script>
+(function () { var m = 'light'; try { m = localStorage.getItem('theme') || 'light'; } catch (e) {} document.documentElement.setAttribute('data-theme', m); })();
+</script>
+</head><body>
+<div class="topbar">
+  <a href="/" class="brand"><img src="data:image/png;base64,""" + LOGO_B64 + r"""" alt="Sea Power"><span><b>Compass</b><small>What Compass has learned</small></span></a>
+  <div class="topbar-right"><a href="/manifest-desk">&larr; Manifest Desk</a><span><b>__NAME__</b></span><a href="/logout">Log out</a></div>
+</div>
+<div class="wrap">
+  <h1>What Compass has learned</h1>
+  <div class="sub">Owner only. Layouts are recorded automatically. Cargo names are only remembered after someone confirms them.</div>
+  <div class="stats" id="stats"></div>
+  <div class="card"><div class="lab">Manifest layouts</div><div class="scroll" id="layouts"></div></div>
+  <div class="card"><div class="lab">Remembered cargo names</div><div class="scroll" id="memory"></div></div>
+</div>
+<script>
+function $(id) { return document.getElementById(id); }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
+async function load() {
+  var r = await fetch('/api/learned'); var d = await r.json();
+  if (!r.ok) { $('layouts').innerHTML = '<div class="empty">' + esc(d.error || 'Could not load.') + '</div>'; return; }
+  $('stats').innerHTML = '<div class="stat"><b>' + d.layouts.length + '</b><span>manifest layouts seen</span></div>' +
+    '<div class="stat"><b>' + d.memory.length + '</b><span>cargo names remembered</span></div>' +
+    '<div class="stat"><b>' + d.calls + '</b><span>AI reads this month (' + esc(d.ai) + ')</span></div>';
+  $('layouts').innerHTML = d.layouts.length ? '<table><tr><th>Layout (column headings)</th><th>Seen</th><th>Last seen</th><th>Package check</th><th></th></tr>' +
+    d.layouts.map(function (l) {
+      var chk = (l.pkgs_ok + l.pkgs_bad) ? (l.pkgs_bad ? '<span class="warn">Did not match ' + l.pkgs_bad + ' of ' + (l.pkgs_ok + l.pkgs_bad) + '</span>' : '<span class="ok">Matched every time</span>') : '<span class="muted">No total in the manifest</span>';
+      return '<tr><td>' + esc(l.label) + '</td><td>' + l.seen + (l.seen === 1 ? ' time' : ' times') + '</td><td>' + esc(l.last_seen) + '</td><td>' + chk +
+        '</td><td><button onclick="forget(\'layout\', \'' + esc(l.fingerprint) + '\')">Forget</button></td></tr>'; }).join('') + '</table>'
+    : '<div class="empty">No manifests have been read since this was switched on.</div>';
+  $('memory').innerHTML = d.memory.length ? '<table><tr><th>Consignee</th><th>When it reads</th><th>Compass writes</th><th>Used</th><th></th></tr>' +
+    d.memory.map(function (m) {
+      return '<tr><td>' + esc(m.consignee) + '</td><td class="muted">' + esc(m.old_value) + '</td><td><b>' + esc(m.new_value) + '</b></td><td>' + m.uses +
+        '</td><td><button onclick="forget(\'memory\', ' + m.id + ')">Forget</button></td></tr>'; }).join('') + '</table>'
+    : '<div class="empty">Nothing yet. When someone corrects a cargo name in Manifest Desk, Compass asks once whether to remember it.</div>';
+}
+async function forget(kind, id) {
+  await fetch('/api/learned/forget', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({kind: kind, id: id})});
+  load();
+}
+load();
+</script></body></html>"""
+
 DESK_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Compass - Manifest Desk</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + r"""">
 <style>
@@ -14480,7 +14749,7 @@ function setTheme(mode) { document.documentElement.setAttribute('data-theme', mo
   <a href="/" class="brand"><img src="data:image/png;base64,""" + LOGO_B64 + r"""" alt="Sea Power"><div class="brand-text"><span class="app-name">Compass</span><span class="app-tag">Manifest Desk</span></div></a>
   <div class="topbar-right">
     <label class="theme-switch" title="Toggle dark mode"><input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')"><span class="theme-track"><span class="theme-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg></span><span class="theme-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg></span><span class="theme-knob"></span></span></label>
-    <a href="/">&larr; Back to board</a>
+    __LEARNED__<a href="/">&larr; Back to board</a>
     <span><b>__NAME__</b></span>
     <a href="/logout">Log out</a>
   </div>
@@ -14509,6 +14778,7 @@ function setTheme(mode) { document.documentElement.setAttribute('data-theme', mo
       </div>
       <div class="card">
         <div class="lab">3 &middot; Consignees</div>
+        <div class="pick" id="learnBar" style="display:none" role="status"></div>
         <div id="list"><div class="empty">Open a vessel to see its consignees.</div></div>
       </div>
     </div>
@@ -14532,7 +14802,7 @@ function setTheme(mode) { document.documentElement.setAttribute('data-theme', mo
 </div>
 <div id="toastHost"></div>
 <script>
-var S = {port: '', vessel: '', data: null, sel: null, timer: null, arm: null};
+var S = {port: '', vessel: '', data: null, sel: null, timer: null, arm: null, learn: []};
 function $(id) { return document.getElementById(id); }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
 function toast(msg, err) { var d = document.createElement('div'); d.className = 'toast' + (err ? ' error' : ''); d.textContent = msg; $('toastHost').appendChild(d); setTimeout(function () { d.remove(); }, err ? 7000 : 3500); }
@@ -14603,6 +14873,7 @@ async function uploadManifest() {
     var r = await api('/api/desk/upload', {method: 'POST', body: fd});
     (r.failed || []).forEach(function (m) { toast(m, true); });
     (r.warnings || []).forEach(function (m) { toast(m, true); });
+    (r.notices || []).forEach(function (m) { toast(m); });
     toast(r.added + ' B/L' + (r.added === 1 ? '' : 's') + ' added to the DO Tracker' + (r.skipped ? ', ' + r.skipped + ' already there' : '') + '.');
     (r.duplicate_elsewhere || []).forEach(function (d) { toast(d.bl_number + ' is already on the board under ' + (d.existing_vessel || 'another vessel') + '.', true); });
     $('file').value = ''; stage();
@@ -14686,14 +14957,31 @@ async function saveContact() {
   catch (e) { toast(e.message, true); }
 }
 async function saveCargo() {
-  var rows = document.querySelectorAll('.bl-edit');
+  var rows = document.querySelectorAll('.bl-edit'), learns = {};
   try {
     for (var i = 0; i < rows.length; i++) {
       var r = rows[i];
-      await post('/api/desk/bl', {bl: r.dataset.bl, loading_port: r.querySelector('.f-pol').value, packages: r.querySelector('.f-pk').value, cargo_desc: r.querySelector('.f-ds').value});
+      var res = await post('/api/desk/bl', {bl: r.dataset.bl, loading_port: r.querySelector('.f-pol').value, packages: r.querySelector('.f-pk').value, cargo_desc: r.querySelector('.f-ds').value});
+      if (res && res.learn) learns[res.learn.consignee + '|' + res.learn.old + '|' + res.learn.new] = res.learn;
     }
-    toast('Cargo details saved.'); await openVessel();
+    toast('Cargo details saved.');
+    S.learn = S.learn.concat(Object.keys(learns).map(function (k) { return learns[k]; }));
+    await openVessel(); showLearn();
   } catch (e) { toast(e.message, true); }
+}
+function showLearn() {
+  var bar = $('learnBar'), x = S.learn[0];
+  if (!x) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
+  bar.style.display = '';
+  bar.innerHTML = '<b>Remember this for ' + esc(x.consignee) + '?</b><div style="margin-top:4px;">When its cargo reads &ldquo;' + esc(x.old) +
+    '&rdquo; Compass will write &ldquo;' + esc(x.new) + '&rdquo; from now on.</div><div class="acts"><button id="learnYes" onclick="learnAnswer(true)">Remember</button>' +
+    '<button class="sec" onclick="learnAnswer(false)">Just this once</button></div>';
+  $('learnYes').focus();
+}
+async function learnAnswer(yes) {
+  var x = S.learn.shift();
+  try { if (yes && x) { await post('/api/memory/cargo', x); toast('Remembered for ' + x.consignee + '.'); } } catch (e) { toast(e.message, true); }
+  showLearn();
 }
 async function sendOneKey(key, test) { return post('/api/desk/send', Object.assign(base(), {key: key, test: !!test})); }
 async function sendTest() {
