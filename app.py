@@ -925,7 +925,7 @@ def init_db():
     # customs broker - which one varies per BL), and the secret code behind
     # its public tracking link (/t/<token>). The token is random, never the
     # BL number, so nobody can look up someone else's cargo by guessing.
-    for col in ("loading_port", "packages", "cargo_desc"):
+    for col in ("loading_port", "packages", "cargo_desc", "notify_name"):
         cur.execute(f"ALTER TABLE records ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
     for col in ("consignee_email", "consignee_phone", "broker_email", "broker_phone", "track_token"):
         cur.execute(f"ALTER TABLE records ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
@@ -3888,9 +3888,18 @@ def _mf_phones(text):
     return mob, land
 
 
+_MF_AT_WORD_RE = re.compile(r"(E-?\s?MAIL\s*[:：]\s*)([A-Za-z0-9][A-Za-z0-9._ -]{1,40}?)\s+AT\s+([A-Za-z0-9-]+(?:\s*\.\s*[A-Za-z0-9-]+)+)", re.IGNORECASE)
+
+
+def _mf_undisguise(text):
+    t = unicodedata.normalize("NFKC", str(text or ""))
+    t = re.sub(r"\s*[(\[{]\s*AT\s*[)\]}]\s*", "@", t, flags=re.IGNORECASE)
+    return _MF_AT_WORD_RE.sub(lambda m: m.group(1) + re.sub(r"\s+", "", m.group(2)).lower() + "@" + re.sub(r"\s+", "", m.group(3)).lower(), t)
+
+
 def _mf_emails(text):
     out = []
-    for e in _EMAIL_RE.findall(unicodedata.normalize("NFKC", str(text or ""))):
+    for e in _EMAIL_RE.findall(_mf_undisguise(text)):
         e = _clean_email(e.strip(".;,-"))
         if e and e not in out:
             out.append(e)
@@ -3934,7 +3943,7 @@ def _mf_contact_from_parts(consignee, notify, extras, shipper=""):
     email = next((e for s in sources for e in _mf_emails(s) if not (shipper_key and shippers_own(e))), "")
     phones = [_mf_phones(s) for s in sources]
     phone = next((m[0] for m, _ in phones if m), "") or next((l[0] for _, l in phones if l), "")
-    return {"name": name, "email": email, "phone": phone}
+    return {"name": name, "email": email, "phone": phone, "notify": _mf_party_name(notify)}
 
 
 _MF_CONTACT_COL_WORDS = ("CONTACT", "TEL", "PHONE", "MOBILE", "EMAIL", "E-MAIL", "REMARK", "TERM", "联系", "备注", "电话", "邮箱")
@@ -4018,7 +4027,7 @@ def _mf_contacts(tables):
             for b in bls:
                 sheet = next((ref[m] for m in bl_members(b) if m in ref), "")
                 c = _mf_contact_from_parts(consignee, notify, extras + [sheet], shipper)
-                if c["name"] or c["email"] or c["phone"]:
+                if c["name"] or c["email"] or c["phone"] or c["notify"]:
                     out.setdefault(bl_match_key(b), c)
     return out
 
@@ -4096,6 +4105,13 @@ def _mf_cargo(tables):
                     cols["pkg"] = j
                 elif _MF_UNIT_RE.search(text) and cols["unit"] is None:
                     cols["unit"] = j
+            # the unit written in the cell right after the count ("3587 | COILS"), under a merged header
+            if cols["pkg"] is not None and cols["unit"] is None:
+                nxt = cols["pkg"] + 1
+                vals = [_mf_norm(rows[i][nxt]).strip() for i, _, _ in t["data_rows"] if nxt < len(rows[i]) and str(rows[i][nxt]).strip()]
+                taken = {v for k, v in cols.items() if v is not None}
+                if nxt not in taken and vals and sum(1 for v in vals if any(v.startswith(w) for w in _MF_PACK_WORDS)) >= 0.6 * len(vals):
+                    cols["unit"] = nxt
         # a "Port of Loading: BAYUQUAN" line above the table
         doc_pol = ""
         if cols["pol"] is None:
@@ -4111,7 +4127,7 @@ def _mf_cargo(tables):
         for i, _, bls in t["data_rows"]:
             row = rows[i]
             g_ = lambda j: _mf_flat(row[j]) if j is not None and j < len(row) else ""
-            pol, pk, un, desc = g_(cols["pol"]) or doc_pol, g_(cols["pkg"]), g_(cols["unit"]), g_(cols["desc"])
+            pol, pk, un, desc = _mf_clean_pol(g_(cols["pol"]) or doc_pol), g_(cols["pkg"]), g_(cols["unit"]), g_(cols["desc"])
             if pk and un and not re.search(r"[A-Za-z]", pk):
                 pk = pk + " " + un
             if desc and not pk:
@@ -4124,6 +4140,7 @@ def _mf_cargo(tables):
                 if m and any(_mf_norm(m.group(1)).startswith(w) for w in _MF_PACK_WORDS):
                     pk, desc = pk + " " + m.group(1).upper(), m.group(2)
             desc = re.sub(r"^(?:N\s*/\s*M|NO\s+MARKS?|AS\s+PER\s+B\s*/\s*L)\s*[-:,]?\s+", "", desc, flags=re.IGNORECASE)
+            desc = _mf_clean_desc(desc) if desc else desc
             for b in bls:
                 d = per.setdefault(bl_match_key(b), {"pol": [], "pk": [], "desc": []})
                 for k, v in (("pol", pol), ("pk", pk), ("desc", desc)):
@@ -4137,6 +4154,29 @@ def _mf_cargo(tables):
 
 
 _EMPTY_CARGO = {"pol": "", "pkgs": "", "desc": ""}
+
+_MF_DESC_CUT_RE = re.compile(r"\b(?:TOTAL\b|H\.?S\.?\s*CODE|L\s*/\s*C\b|LC\s*(?:NO|NUMBER)|LETTER\s+OF\s+CREDIT|NET\s*(?:/\s*GROSS\s*)?WEIGHT|GROSS\s+WEIGHT|G\.?\s?W\.?\b|N\.?\s?W\.?\s*[:=]|IMO\b|THE\s+VESSEL|QUANTITY\s*:|CONTRACT\s*(?:NO|#)|SHIPPING\s+MARKS?|AS\s+PER\s+(?:L/?C|CONTRACT))", re.IGNORECASE)
+_MF_LEAD_UNIT_RE = re.compile(r"^\s*\d[\d,]*(?:\.\d+)?\s*(?:X\s*)?([A-Za-z]+)\b\s*[-:,/]?\s*")
+
+
+def _mf_clean_desc(desc):
+    """The cargo name only: no totals, weights, HS code, L/C numbers, or the count that is already shown beside it."""
+    d = _mf_flat(desc)
+    m = _MF_DESC_CUT_RE.search(d)
+    if m and m.start() >= 5:
+        d = d[:m.start()]
+    m = _MF_LEAD_UNIT_RE.match(d)
+    if m and any(_mf_norm(m.group(1)).startswith(w) for w in _MF_PACK_WORDS):
+        d = d[m.end():]
+    d = d.strip(" ,;:-./")
+    return d or _mf_flat(desc)[:120]
+
+
+def _mf_clean_pol(pol):
+    """'BAYUQUAN PORT IN CHINA' -> 'BAYUQUAN'."""
+    p = re.sub(r"\s+PORT\b.*$", "", _mf_flat(pol), flags=re.IGNORECASE)
+    p = re.sub(r"\s*,.*$", "", p).strip()
+    return p or _mf_flat(pol)
 
 
 # ----- Layer 2: Claude reads the manifest when the built-in reader is unsure -----
@@ -4282,6 +4322,55 @@ def _mf_ai_read(tables, entries):
     return changed
 
 
+_MF_NAME_STOP = {"COMPANY", "FACTORY", "TRADING", "LIMITED", "ESTABLISHMENT", "CORPORATION", "INDUSTRIES", "SAUDI", "ARABIA", "JEDDAH", "GROUP", "MANUFACTURING"}
+
+
+def _mf_related(value, names):
+    toks = {t for t in re.findall(r"[A-Z0-9]{4,}", _mf_norm(names)) if t not in _MF_NAME_STOP}
+    labels = re.findall(r"[A-Z0-9]{4,}", _mf_norm(re.sub(r"[@._-]", " ", str(value))))
+    return any(a in b or b in a for a in toks for b in labels if b not in _MF_GENERIC_MAIL_LABELS)
+
+
+def _mf_unshare_contacts(entries):
+    """One e-mail/phone typed on rows of several different parties is the manifest's general contact,
+    not each party's own: it stays only on the row of the party it obviously belongs to."""
+    who = lambda c: _mf_compact(c.get("name") or c.get("notify") or "")
+    users = {"email": {}, "phone": {}}
+    for e in entries:
+        for f in ("email", "phone"):
+            v = (e["contact"].get(f) or "").lower()
+            if v:
+                users[f].setdefault(v, set()).add(who(e["contact"]))
+    for e in entries:
+        c = e["contact"]
+        names = (c.get("name") or "") + " " + (c.get("notify") or "")
+        own_email = bool(c.get("email")) and (len(users["email"].get(c["email"].lower(), ())) < 2 or _mf_related(c["email"], names))
+        if c.get("email") and not own_email:
+            c["email"] = ""
+        if c.get("phone") and len(users["phone"].get(c["phone"].lower(), ())) >= 2 and not (own_email and c.get("email")):
+            c["phone"] = ""
+
+
+def _mf_header_info(tables):
+    """Vessel and discharge port as the manifest's own heading states them."""
+    out = {"vessel": "", "port": "", "voyage": ""}
+    for t in tables[:3]:
+        for r in t["rows"][:15]:
+            for c in r:
+                for ln in str(c or "").splitlines():
+                    n = _mf_norm(ln).strip()
+                    m = re.search(r"(?:NAME\s+OF\s+(?:THE\s+)?(?:SHIP|VESSEL)(?:\s*&\s*VOYAGE)?|VESSEL(?:\s+NAME)?|SHIP\s*NAME)\s*[:：]\s*(.+)$", n)
+                    if m and not out["vessel"]:
+                        raw = m.group(1).strip(" .,-")
+                        parts = re.split(r"\s*/\s*|\s+V(?:OY)?\.?\s*[-:]?\s*(?=\d)", raw, maxsplit=1)
+                        out["vessel"] = re.sub(r"^M\.?\s?V\.?\s+", "", parts[0]).strip(" .,-")
+                        out["voyage"] = parts[1].strip() if len(parts) > 1 else ""
+                    m = re.search(r"(?:DISCHARG(?:E|ING)\s+PORT|PORT\s+OF\s+DISCHARGE|\bPOD\b)\s*[:：]\s*([^,]+)", n)
+                    if m and not out["port"]:
+                        out["port"] = m.group(1).strip(" .,-")
+    return out
+
+
 def _mf_needs_ai(entries):
     live = [e for e in entries if e["note"] is None]
     if not live:
@@ -4290,7 +4379,7 @@ def _mf_needs_ai(entries):
     return gaps / len(live) >= 0.2
 
 
-def read_manifest(raw, filename):
+def read_manifest(raw, filename, use_ai=True):
     """Reads one uploaded manifest file (.xlsx/.xlsm/.xls/.csv/.docx/.pdf).
     Returns {"entries": [{"bl", "note", "contact"}...]}; entries is empty
     when no B/L column could be found. Raises for a file that can't be
@@ -4343,16 +4432,17 @@ def read_manifest(raw, filename):
         e["contact"] = dict(contacts.get(bl_match_key(e["bl"]), {"name": "", "email": "", "phone": ""}))
         e["cargo"] = dict(cargo.get(bl_match_key(e["bl"]), _EMPTY_CARGO))
         e["ai"] = False
+    _mf_unshare_contacts(entries)
     ai_used = False
     ai_tables = tables
     if text.strip() and not any(t.get("rows") for t in tables):
         ai_tables = [{"name": "Document text", "rows": [[ln] for ln in text.splitlines() if ln.strip()], "role": None, "hdr": None}]
-    if ai_available() and ai_tables and _mf_needs_ai(entries):
+    if use_ai and ai_available() and ai_tables and _mf_needs_ai(entries):
         try:
             ai_used = _mf_ai_read(ai_tables, entries)
         except Exception:
             ai_used = False
-    return {"entries": entries, "truncated": any(t.get("truncated") for t in tables), "ai_used": ai_used}
+    return {"entries": entries, "truncated": any(t.get("truncated") for t in tables), "ai_used": ai_used, "info": _mf_header_info(tables)}
 
 
 # ----- adding manifest B/Ls to the board -----
@@ -4365,7 +4455,7 @@ def _manifest_board_index():
     """bl_match_key -> the existing record, for every B/L on the board (any
     owner, archived included) - one query instead of one per B/L."""
     rows = get_db().execute(
-        "SELECT bl_number, vessel, port, created_by, consignee, consignee_email, consignee_phone, loading_port, packages, cargo_desc FROM records"
+        "SELECT bl_number, vessel, port, created_by, consignee, consignee_email, consignee_phone, loading_port, packages, cargo_desc, notify_name FROM records"
     ).fetchall()
     return {bl_match_key(r["bl_number"]): dict(r) for r in rows}
 
@@ -4400,18 +4490,19 @@ def _manifest_add(port, vessel, items):
                  "email": _clean_email(item.get("email")),
                  "phone": _normalize_phone(item.get("phone")),
                  "pol": _mf_flat(item.get("loading_port"))[:80], "pkgs": _mf_flat(item.get("packages"))[:60],
-                 "desc": _mf_flat(item.get("cargo_desc"))[:300]}
+                 "desc": _mf_flat(item.get("cargo_desc"))[:300],
+                 "notify": _mf_flat(item.get("notify"))[:120]}
         existing = index.get(bl)
         if existing is None:
             inserted = db.execute(
-                "INSERT INTO records (bl_number, port, vessel, created_at, created_by, consignee, consignee_email, consignee_phone, loading_port, packages, cargo_desc) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (bl_number) DO NOTHING RETURNING bl_number",
-                (bl, port, vessel, now, me, found["name"], found["email"], found["phone"], found["pol"], found["pkgs"], found["desc"]),
+                "INSERT INTO records (bl_number, port, vessel, created_at, created_by, consignee, consignee_email, consignee_phone, loading_port, packages, cargo_desc, notify_name) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (bl_number) DO NOTHING RETURNING bl_number",
+                (bl, port, vessel, now, me, found["name"], found["email"], found["phone"], found["pol"], found["pkgs"], found["desc"], found["notify"]),
             ).fetchone()
             if inserted:
                 index[bl] = {"bl_number": bl, "vessel": vessel, "port": port, "created_by": me,
                              "consignee": found["name"], "consignee_email": found["email"], "consignee_phone": found["phone"],
-                             "loading_port": found["pol"], "packages": found["pkgs"], "cargo_desc": found["desc"]}
+                             "loading_port": found["pol"], "packages": found["pkgs"], "cargo_desc": found["desc"], "notify_name": found["notify"]}
                 if found["email"] or found["phone"]:
                     contacts_filled += 1
                 _log_audit(bl, "added", "", "", f"{port} / {vessel}")
@@ -4419,7 +4510,7 @@ def _manifest_add(port, vessel, items):
                 continue
             # Someone else added it a moment ago - treat like any existing B/L.
             existing = dict(db.execute(
-                "SELECT bl_number, vessel, port, created_by, consignee, consignee_email, consignee_phone, loading_port, packages, cargo_desc FROM records WHERE bl_number = ?",
+                "SELECT bl_number, vessel, port, created_by, consignee, consignee_email, consignee_phone, loading_port, packages, cargo_desc, notify_name FROM records WHERE bl_number = ?",
                 (bl,),
             ).fetchone())
             index[bl] = existing
@@ -4430,7 +4521,7 @@ def _manifest_add(port, vessel, items):
                                         "existing_port": existing["port"], "existing_vessel": existing["vessel"]})
         if mine:
             fills = {k: found[src] for k, src in (("consignee", "name"), ("consignee_email", "email"), ("consignee_phone", "phone"),
-                                                  ("loading_port", "pol"), ("packages", "pkgs"), ("cargo_desc", "desc"))
+                                                  ("loading_port", "pol"), ("packages", "pkgs"), ("cargo_desc", "desc"), ("notify_name", "notify"))
                      if found[src] and not (existing[k] or "").strip()}
             if fills:
                 db.execute("UPDATE records SET " + ", ".join(f"{k} = ?" for k in fills) + " WHERE bl_number = ?",
@@ -4634,7 +4725,7 @@ def _desk_groups(db, port, vessel):
     """The vessel's B/Ls grouped by consignee, with what is known about each: email, contact person, cargo, whether a notice went out."""
     groups = {}
     for r in _desk_rows(db, port, vessel):
-        name = re.sub(r"\s+", " ", r.get("consignee") or "").strip()
+        name = re.sub(r"\s+", " ", r.get("consignee") or r.get("notify_name") or "").strip()
         k = _ckey(name)
         g_ = groups.setdefault(k, {"key": k, "name": name, "email": "", "attn": "", "bls": []})
         if not g_["email"]:
@@ -4842,10 +4933,32 @@ def desk_upload():
         elsewhere += res["duplicate_elsewhere"]
         for e in live:
             c = e["contact"]
-            if c.get("name") and _clean_email(c.get("email")):
-                _book_save(db, c["name"], email=_clean_email(c["email"]), only_fill=True)
+            who = c.get("name") or c.get("notify")
+            if who and _clean_email(c.get("email")):
+                _book_save(db, who, email=_clean_email(c["email"]), only_fill=True)
         db.commit()
     return jsonify({"added": added, "skipped": skipped, "failed": failed, "duplicate_elsewhere": elsewhere[:5]})
+
+
+@app.route("/api/desk/peek", methods=["POST"])
+@login_required
+def desk_peek():
+    """Reads the manifest's heading (vessel, discharge port) and counts its lines, without adding anything."""
+    f = request.files.get("file")
+    if not f or not f.filename or not f.filename.lower().endswith(_MANIFEST_EXTS):
+        return jsonify({"ok": False})
+    raw = f.read(_MANIFEST_MAX_BYTES + 1)
+    if not raw or len(raw) > _MANIFEST_MAX_BYTES:
+        return jsonify({"ok": False})
+    try:
+        r = read_manifest(raw, f.filename, use_ai=False)
+    except Exception:
+        return jsonify({"ok": False})
+    info = r.get("info") or {}
+    pn = (info.get("port") or "").upper()
+    board = next((b for k, b in (("JEDDAH", "JEDDAH PORT"), ("YANBU", "YANBU COMMERCIAL PORT"), ("DAMMAM", "DAMMAM PORT"), ("JUBAIL", "JUBAIL COMMERCIAL PORT")) if k in pn), "")
+    return jsonify({"ok": True, "vessel": info.get("vessel") or "", "voyage": info.get("voyage") or "", "port": board or pn,
+                    "lines": sum(1 for e in r["entries"] if e["note"] is None)})
 
 
 @app.route("/api/desk/notices")
@@ -9773,6 +9886,7 @@ LINEUP_PORTS = [
     ("DMM", "Dammam", "King Abdulaziz Port Dammam"),
 ]
 _LU_PORT = {k: (short, full) for k, short, full in LINEUP_PORTS}
+_LU_SHOWN = [x for x in LINEUP_PORTS if x[0] in ("JED", "YNB")]       # Sea Power works Jeddah and Yanbu only
 # Sailing time between the ports in days at about 12 knots (Jeddah-Yanbu ~190 nm;
 # the Red Sea ports to Dammam go round the Arabian Peninsula, ~2,500-2,650 nm).
 _LU_TRANSIT_DAYS = {("JED", "YNB"): 0.7, ("JED", "DMM"): 8.7, ("YNB", "DMM"): 9.2}
@@ -10527,7 +10641,7 @@ def _lu_is_ours(agent):
 
 # What Sea Power told Compass about a port's berths (used until set or learned otherwise):
 # at Jeddah only Berth 3 takes deep general cargo; the other general cargo berths take up to 11.8 m.
-_LU_PORT_HINTS = {"JED": {"deep": {"3"}, "limit": 11.8}}
+_LU_PORT_HINTS = {"JED": {"deep": {"3"}, "limit": 11.8, "fixed": {"3": 13.5}}}
 
 
 def _lu_berths_raw(db, port):
@@ -10590,7 +10704,9 @@ def _lu_berths(db, port, now=None):
         else:
             general = st["n_general"] > 0 or not st["cats"]
         md, why = b.get("max_draft"), ("set" if b.get("max_draft") else "")
-        if md is None and general and hint and k not in hint.get("deep", set()):
+        if general and hint.get("fixed") is not None:          # the port's own limits are fixed, not set by hand
+            md, why = hint["fixed"].get(k, hint["limit"]), "port"
+        elif md is None and general and hint and k not in hint.get("deep", set()):
             md, why = hint["limit"], "port"
             if st["deep"] and st["deep"] > md:
                 md = st["deep"]
@@ -10636,7 +10752,7 @@ def _lu_days_alongside(cargo, qty, rates=None):
     return max(0.5, round(q / rate, 1))
 
 
-def _lu_simulate(berths, vessels, now, extra=None, learn=None, force=None, shift=None, phantoms=None, use_bias=True):
+def _lu_simulate(berths, vessels, now, extra=None, learn=None, force=None, shift=None, phantoms=None, use_bias=True, open_berths=False):
     """Works out the berth plan, first come first served by readiness, as the port runs it:
     each kind of ship only at the berths that kind uses, the terminal's own allocation
     followed (Jeddah's 2(a), 2(b) ...; Mawani's 1ST/2ND; Yanbu's ETB), the draft limits,
@@ -10646,6 +10762,8 @@ def _lu_simulate(berths, vessels, now, extra=None, learn=None, force=None, shift
     force: {vessel_id: berth_key} - that waiting vessel may only use that berth.
     shift: {vessel_id: (berth_key, when)} - that alongside vessel shifts berth at `when`.
     phantoms: vessels not on the line-up yet but likely to arrive (from history).
+    open_berths: waiting vessels may take any berth that suits them (first come first served),
+    instead of the berth the terminal has pencilled in - how a NEW arrival's queue really works.
     Returns {vessel_id: {...}}; the extra (hypothetical) vessel keeps its own id."""
     learn = learn or {}
     rates = learn.get("rates_use")
@@ -10726,7 +10844,7 @@ def _lu_simulate(berths, vessels, now, extra=None, learn=None, force=None, shift
         if v["id"] in force:
             continue
         k, sl = _lu_berth_slot(v.get("berth"))
-        if k in bmap and sl:
+        if k in bmap and sl and not open_berths:
             slots.setdefault(k, []).append(pos)
     for k, poss in slots.items():
         items = sorted((queue[p] for p in poss), key=lambda q: _lu_berth_slot(q[2].get("berth"))[1])
@@ -10735,7 +10853,7 @@ def _lu_simulate(berths, vessels, now, extra=None, learn=None, force=None, shift
     for ready, _, v in queue:
         draft = v.get("draft")
         cat = _lu_vcat(v)
-        tk = _lu_berth_slot(v.get("berth"))[0] if v["id"] not in force else ""
+        tk = _lu_berth_slot(v.get("berth"))[0] if (v["id"] not in force and not open_berths) else ""
         if v["id"] in force and force[v["id"]] in bmap:
             allowed = [force[v["id"]]]
         elif tk and tk in bmap:
@@ -11060,6 +11178,7 @@ def _lu_suggestions(port, berths, vessels, now, learn, phantoms, base):
             if gain < 0.5:
                 continue
             worst, who = 0.0, []
+            o_ready = (base.get(o["id"]) or {}).get("ready")
             for vid, r0 in base.items():
                 if vid not in real or vid == o["id"]:
                     continue
@@ -11068,9 +11187,11 @@ def _lu_suggestions(port, berths, vessels, now, learn, phantoms, base):
                 if r0.get(key) and r1.get(key):
                     dly = _lu_days(r1[key], r0[key])
                     if dly > 0.1:
-                        who.append((real[vid]["vessel"], round(dly, 2)))
-                    worst = max(worst, dly)
-            if worst > 0.25:                                  # someone would lose their turn: not a fair request
+                        later = bool(o_ready and r0.get("ready") and r0["ready"] > o_ready)
+                        who.append((real[vid]["vessel"], round(dly, 2), "later" if later else "earlier"))
+                        if not later:                         # a vessel that arrived before ours loses her turn: not a fair request
+                            worst = max(worst, dly)
+            if worst > 0.25:
                 continue
             nb = (sim.get(o["id"]) or {}).get("berth", "")
             if kind in ("reallocate", "move"):
@@ -11152,14 +11273,14 @@ def _lu_request_message(port, o, v, it):
         gain = (f"This allows her to berth on {_lu_fmt_day(it['o_to'])} instead of {_lu_fmt_day(it['o_from'])}, "
                 f"reducing her waiting time by approximately {_lu_n_days(it['gain'])}.")
     effects = []
-    for name, d in it.get("delays", []):
+    for name, d, *_ in it.get("delays", []):
         h = max(1, round(d * 24))
         if name == v["vessel"] and it["kind"] == "shift":
             effects.append(f"the only effect on {name} is the shifting time of approximately {h} hours")
         else:
             effects.append(f"{name} would berth approximately {h} hours later")
     if effects:
-        fair = "Based on the current line-up, " + "; ".join(effects) + ". The first-come-first-served order is otherwise unchanged."
+        fair = "Based on the current line-up, " + "; ".join(effects) + ". No vessel that arrived before her is delayed."
     elif it["kind"] == "move":
         fair = "Based on the current line-up, no other vessel is delayed."
     elif it["kind"] == "reallocate":
@@ -11236,13 +11357,17 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
     # waiting time a new arrival can expect today, for a normal and a deep draft
     def probe(draft):
         r = _lu_simulate(berths, vessels, now, extra={"id": "__x__", "status": "anchor", "draft": draft, "cargo": "general", "qty": 8000, "ready": now},
-                         learn=learn, phantoms=phantoms)
+                         learn=learn, phantoms=phantoms, open_berths=True)
         x = r.get("__x__") or {}
         return None if x.get("nofit") or not x.get("start") else round(max(0, _lu_days(x["start"], now)), 1)
     lims = sorted({b["max_draft"] for b in berths if b["general"] and b.get("max_draft")})
     deep_open = any(b["general"] and (not b.get("max_draft") or b["max_draft"] > (lims[0] if lims else 99)) for b in berths)
     over = round(lims[0] + 0.3, 1) if lims and deep_open else None
     out["probe"] = {"normal": probe(10.0), "deep": probe(over) if over else None, "deep_over": lims[0] if over else None}
+    # how many are already waiting ahead of a new arrival, shallow and deep
+    lim0 = lims[0] if (lims and over) else None
+    out["probe"]["ahead"] = sum(1 for v in waiting if not (lim0 and v.get("draft") and v["draft"] > lim0))
+    out["probe"]["ahead_deep"] = sum(1 for v in waiting if lim0 and v.get("draft") and v["draft"] > lim0)
 
     # outlook: vessels waiting at noon of each of the next 7 days (from today's line-up)
     for d in range(7):
@@ -11336,7 +11461,7 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
     limit = float(get_setting("lineup_wait_limit", "4") or 4)
     today = now.date().isoformat()
     if snap["lineup_date"] < today:
-        out["alerts"].append({"tone": "warn", "title": f"Today's {short} line-up is not in yet", "text": f"Showing the line-up of {_lu_fmt_day(snap['lineup_date'])}. Upload today's to refresh the plan."})
+        out["alerts"].append({"tone": "warn", "title": f"Today's {short} line-up is not in yet", "text": f"Showing the line-up of {_lu_fmt_day(snap['lineup_date'])}, {_lu_n_days(max(1, (now.date() - datetime.strptime(snap['lineup_date'], '%Y-%m-%d').date()).days))} old. Cargo left on board (ROB) is counted from that day, so berthing and sailing times for vessels alongside may be out of date. Upload today's to refresh the plan."})
     if prev_snap_had_expected(db, port, snap) and not any(v["status"] == "expected" for v in vessels):
         out["alerts"].append({"tone": "info", "title": "No expected vessels on this line-up",
                               "text": "The previous line-up had some. If the expected-vessels list came as a separate file, upload it too; it is added to the same day."})
@@ -11361,7 +11486,7 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
             over_limit.append(v)
         if v["status"] != "alongside" and v["margin"] is not None and v["margin"] < _LU_DRAFT_TIGHT:
             out["alerts"].append({"tone": "warn", "title": f"{v['vessel']}: tight draft at {v['est_berth']}",
-                                  "text": f"Only {v['margin']:.2f} m under the berth limit. Confirm with the harbour master before she shifts in.", "vessel": v["id"], "msg": True})
+                                  "text": (f"Only {v['margin']:.2f} m under the berth limit." if v["margin"] >= 0.005 else "Her draft is at the berth's limit, with no margin.") + " Confirm with the harbour master before she shifts in.", "vessel": v["id"], "msg": True})
         if v["status"] == "alongside" and v["end_off"] is not None and v["end_off"] <= 1.5:
             sailing.append(v)
         if v["status"] != "alongside" and v["start_off"] is not None and 0 <= v["start_off"] <= 1.5:
@@ -11424,7 +11549,7 @@ def _lu_plan(db, draft, cargo, qty, eta, at_port="", vessel_name=""):
     nearest port (or now, if she is already lying at at_port)."""
     now = _lu_now()
     res = []
-    for port, short, full in LINEUP_PORTS:
+    for port, short, full in _LU_SHOWN:
         berths = _lu_berths(db, port, now)
         snap = _lu_latest(db, port)
         vessels = _lu_vessels(db, snap["id"]) if snap else []
@@ -11540,7 +11665,7 @@ def lineups_overview():
     db = get_db()
     return jsonify({
         "now": _lu_now().strftime("%Y-%m-%d %H:%M"),
-        "ports": [_lu_port_state(db, p) for p, _, _ in LINEUP_PORTS],
+        "ports": [_lu_port_state(db, p) for p, _, _ in _LU_SHOWN],
         "settings": {"our_names": get_setting("lineup_our_names", "SEA POWER"), "wait_limit": float(get_setting("lineup_wait_limit", "4") or 4)},
         "rates": _LU_RATES, "rate_labels": _LU_RATE_LABEL, "me": _lu_signer(),
     })
@@ -13056,6 +13181,19 @@ function stage() {
   var f = Array.prototype.slice.call($('file').files || []);
   $('fname').textContent = f.map(function (x) { return x.name; }).join(', ');
   $('addBtn').disabled = !f.length;
+  if (f.length) peekManifest(f[0]);
+}
+async function peekManifest(file) {
+  try {
+    var fd = new FormData(); fd.append('file', file);
+    var r = await api('/api/desk/peek', {method: 'POST', body: fd});
+    if (!r.ok) return;
+    var v = (r.vessel ? r.vessel + (r.voyage ? ' V-' + r.voyage : '') : '').toUpperCase();
+    if (v && !$('vessel').value.trim()) $('vessel').value = v;
+    var typed = $('port').value.trim().toUpperCase();
+    if (r.port && !typed) $('port').value = r.port;
+    else if (r.port && typed.split(' ')[0] !== r.port.split(' ')[0]) toast('This manifest says discharge port ' + r.port + ', but ' + typed + ' is selected.', true);
+  } catch (e) {}
 }
 (function () {
   var d = $('drop');
@@ -17104,7 +17242,7 @@ td.lim{max-width:260px;overflow:hidden;text-overflow:ellipsis}
   <section class="panel" id="upPanel" hidden>
     <h2>Upload line-ups</h2>
     <div class="frow">
-      <label>Port<select id="upPort"><option value="">Recognise from the file</option><option value="JED">Jeddah Islamic Port</option><option value="YNB">Yanbu Commercial Port</option><option value="DMM">King Abdulaziz Port Dammam</option></select></label>
+      <label>Port<select id="upPort"><option value="">Recognise from the file</option><option value="JED">Jeddah Islamic Port</option><option value="YNB">Yanbu Commercial Port</option></select></label>
       <label>Line-up date<input type="date" id="upDate"></label>
       <label>Files<input type="file" id="upFiles" multiple accept=".xlsx,.xlsm,.xls,.csv,.txt,.pdf,.docx"></label>
     </div>
@@ -17158,6 +17296,7 @@ function ord(n){var s=['th','st','nd','rd'],v=n%100;return n+(s[(v-20)%10]||s[v]
 function api(url,opt){return fetch(url,Object.assign({headers:{'Content-Type':'application/json'}},opt||{})).then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||'Something went wrong');return j})})}
 function P(){return D.ports.filter(function(p){return p.port===cur})[0]}
 function level(avg){if(avg==null)return['none','No line-up'];return avg>=4?['cong','Congested']:avg>=2?['busy','Busy']:['calm','Calm']}
+function eff(p){if(p.wait_today==null)return null;return Math.max(p.wait_today,p.avg_wait||0)}
 function lvColor(l){return l==='cong'?'var(--bad)':l==='busy'?'var(--warn)':l==='calm'?'var(--ok)':'var(--faint)'}
 function waiting(p){return p.vessels.filter(function(v){return v.status==='anchor'&&v.relevant!==false})}
 function genBerths(p){return p.berths.filter(function(b){return b.general!==false})}
@@ -17165,7 +17304,7 @@ function genBerths(p){return p.berths.filter(function(b){return b.general!==fals
 function load(keepSel){return api('/api/lineups').then(function(j){D=j;NOW=pd(j.now);FRAC=(NOW.getHours()+NOW.getMinutes()/60)/24;if(!keepSel)sel=null;PV=null;draw()}).catch(function(e){toast(e.message)})}
 
 function spark(p){
-  var h=p.history.map(function(x){return x.waiting}),o=p.outlook,lv=level(p.wait_today)[0],col=lvColor(lv);
+  var h=p.history.map(function(x){return x.waiting}),o=p.outlook,lv=level(eff(p))[0],col=lvColor(lv);
   if(!h.length&&!o.length)return '';
   if(!h.length)h=[o[0]];
   var all=h.concat(o.slice(1)),mx=Math.max.apply(0,all)+1,W=200,H=38,n=Math.max(all.length,2),step=W/(n-1);
@@ -17175,9 +17314,9 @@ function spark(p){
   return '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" aria-hidden="true">'+(h.length>1?'<polyline points="'+a+'" fill="none" stroke="'+col+'" stroke-width="2" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>':'')+'<polyline points="'+b+'" fill="none" stroke="'+col+'" stroke-width="2" stroke-dasharray="3 4" opacity=".7" vector-effect="non-scaling-stroke"/><circle cx="'+tp[0]+'" cy="'+tp[1]+'" r="3" fill="'+col+'"/></svg>'}
 
 function drawPorts(){
-  $('ports').innerHTML=D.ports.map(function(p){var lv=level(p.snapshot?p.wait_today:null),w=waiting(p).length;
+  $('ports').innerHTML=D.ports.map(function(p){var lv=level(p.snapshot?eff(p):null),w=waiting(p).length;
     return '<button class="port" role="tab" data-port="'+p.port+'" aria-selected="'+(p.port===cur)+'"><span class="pn">'+esc(p.name)+(p.snapshot?'<small>'+w+' waiting</small>':'')+'</span>'+
-     (p.snapshot&&p.wait_today!=null?'<span class="big num">'+p.wait_today.toFixed(1)+'<small>days wait today</small></span><span class="st c-'+lv[0]+'"><i class="dot"></i><span>'+lv[1]+'</span></span>'+spark(p):'<span class="none">'+(p.snapshot?'Add berths to see waiting times':'No line-up yet')+'</span>')+'</button>'}).join('');
+     (p.snapshot&&p.wait_today!=null?'<span class="big num">'+p.wait_today.toFixed(1)+'<small>days wait'+((p.probe&&p.probe.deep!=null&&p.probe.deep-p.wait_today>=1)?' · deep '+Math.round(p.probe.deep)+' d':'')+'</small></span><span class="st c-'+lv[0]+'"><i class="dot"></i><span>'+lv[1]+'</span></span>'+spark(p):'<span class="none">'+(p.snapshot?'Add berths to see waiting times':'No line-up yet')+'</span>')+'</button>'}).join('');
 }
 function names(list){var n=list.map(function(b){return b.name});if(n.every(function(x){return /^Berth\s+/i.test(x)})){var k=n.map(function(x){return x.replace(/^Berth\s+/i,'')});return (k.length>1?'Berths ':'Berth ')+(k.length>1?k.slice(0,-1).join(', ')+' and '+k[k.length-1]:k[0])}return n.length>1?n.slice(0,-1).join(', ')+' and '+n[n.length-1]:n[0]}
 function why(p){
@@ -17193,18 +17332,18 @@ function why(p){
 function drawHero(p){
   var el=$('hero');
   if(!p.snapshot){el.innerHTML='<div class="eyebrow c-none"><i class="dot"></i>'+esc(p.full)+'</div><h2>No line-up yet.</h2><p>Upload today\'s '+esc(p.name)+' line-up to see the queue, the berth plan and how long a new arrival would wait.</p><div class="pact"><button class="btn pri" data-open-upload="'+p.port+'">Upload the '+esc(p.name)+' line-up</button></div>';return}
-  var U=p.outlook_unlisted||[],lv=level(p.wait_today),o=p.outlook,mx=Math.max(Math.max.apply(0,o.concat([1])),Math.max.apply(0,p.history.map(function(x){return x.waiting}).concat([1]))),col=lvColor(lv[0]);
+  var U=p.outlook_unlisted||[],lv=level(eff(p)),o=p.outlook,mx=Math.max(Math.max.apply(0,o.concat([1])),Math.max.apply(0,p.history.map(function(x){return x.waiting}).concat([1]))),col=lvColor(lv[0]);
   var pr=p.probe||{},head;
   if(!p.berths.length)head='Add the '+p.name+' berths to see waiting times.';
   else if(pr.normal==null)head='No berth here takes a 10 m draft.';
-  else head=pr.normal<0.5?'A vessel arriving today would berth on arrival.':'A vessel arriving today would wait about '+Math.round(pr.normal)+' day'+(Math.round(pr.normal)===1?'':'s')+' at anchor.';
-  if(pr.deep!=null&&pr.normal!=null&&pr.deep-pr.normal>=1)head=pr.normal<0.5?'A vessel arriving today would berth on arrival, but with a draft over '+pr.deep_over+' m she would wait about '+Math.round(pr.deep)+' days.':head.replace(/\.$/,'')+', about '+Math.round(pr.deep)+' if her draft is over '+pr.deep_over+' m.';
+  else head=(pr.normal<0.5&&!pr.ahead)?'A vessel arriving today would berth on arrival.':'A vessel arriving today would wait about '+(pr.normal<0.5?'less than a day':Math.round(pr.normal)+' day'+(Math.round(pr.normal)===1?'':'s'))+' at anchor'+(pr.ahead?', behind '+pr.ahead+' already waiting':'')+'.';
+  if(pr.deep!=null&&pr.normal!=null&&pr.deep-pr.normal>=1)head=head.replace(/\.$/,'')+'. With a draft over '+pr.deep_over+' m she would wait about '+Math.round(pr.deep)+' days'+(pr.ahead_deep?', behind '+pr.ahead_deep+' deep-draft vessel'+(pr.ahead_deep===1?'':'s'):'')+'.';
   var along=p.vessels.filter(function(v){return v.status==='alongside'&&v.relevant!==false}).length,exp=p.vessels.filter(function(v){return v.status==='expected'&&v.relevant!==false&&v.ready_off!=null&&v.ready_off<=7}).length,w=waiting(p).length;
   var d=(p.avg_wait!=null&&p.avg_wait_prev!=null)?p.avg_wait-p.avg_wait_prev:null;
   el.innerHTML='<div class="eyebrow c-'+lv[0]+'"><i class="dot"></i>'+esc(p.full)+' · '+lv[1]+'</div><h2>'+esc(head)+'</h2><p>'+esc(why(p))+'</p>'+
    '<div class="facts"><div><b class="num">'+w+'</b><span>at anchor</span></div><div><b class="num">'+along+'</b><span>alongside</span></div><div><b class="num">'+exp+'</b><span>arriving this week</span></div>'+
    (p.avg_wait!=null?'<div><b class="num">'+p.avg_wait.toFixed(1)+' d</b><span>average wait, last 14 days</span></div>':'')+
-   (d!=null?'<div><b class="num" style="color:'+(d>0?'var(--bad)':'var(--ok)')+'">'+(d>0?'+':'−')+Math.abs(d).toFixed(1)+' d</b><span>vs the two weeks before</span></div>':'')+'</div>'+
+   '</div>'+
    '<div class="ohead"><b>Vessels waiting, next 7 days</b><span>'+(U.some(function(x){return x>0})?'striped: likely arrivals not on the line-up yet':'from the latest line-up')+'</span></div><div class="outlook">'+o.map(function(v,i){var dd=offDay(i),u=U[i]||0,c=(i===0?col:'color-mix(in srgb,'+col+' 45%,transparent)');
      return '<div title="'+(v-u)+' on the line-up'+(u?' + '+u+' likely arrival'+(u===1?'':'s')+' not listed yet':'')+'"><span class="'+(i===0?'today':'')+'">'+(i===0?'Today':DOW[dd.getDay()])+'</span><span class="col"><span class="stk" style="height:'+Math.max(6,v/mx*100)+'%">'+(u?'<i class="u" style="flex:'+u+';background-color:color-mix(in srgb,'+col+' 30%,transparent)"></i>':'')+(v-u>0||!u?'<i style="flex:'+Math.max(v-u,1)+';background:'+c+'"></i>':'')+'</span></span><b class="num">'+v+'</b></div>'}).join('')+'</div>'}
 function drawAlerts(p){
@@ -17309,13 +17448,13 @@ function drawOpps(p){
   var el=$('opps'),S=p.suggestions||[];
   if(!S.length){el.hidden=true;el.innerHTML='';PV=null;return}
   el.hidden=false;
-  el.innerHTML='<div class="card-h"><h2><i></i>Berthing opportunities</h2><span>berth changes the terminal can make without anyone losing their turn</span></div>'+S.map(function(s,i){
+  el.innerHTML='<div class="card-h"><h2><i></i>Berthing opportunities</h2><span>berth changes the terminal can make without any earlier arrival losing her turn</span></div>'+S.map(function(s,i){
     var od=s.other_draft?' ('+s.other_draft.toFixed(1)+' m)':'';
     var ask=s.kind==='move'?'Ask for her to be allocated <b>'+esc(s.to_berth)+'</b>, free on '+day(s.o_to)+', instead of '+(s.o_alloc?'Berth '+esc(s.o_alloc)+(s.o_slot?' ('+ord(s.o_slot)+' in line)':''):esc(s.other_from))+'.'
       :s.kind==='reallocate'?'Ask for <b>'+esc(s.other)+'</b>'+od+' to take <b>'+esc(s.to_berth)+'</b> instead of '+esc(s.other_from)+'.'
       :'Ask for <b>'+esc(s.other)+'</b>'+od+' to shift from '+esc(s.other_from)+' to <b>'+esc(s.to_berth)+'</b> when it frees on '+day(s.when)+'.';
     if(s.kind!=='move'&&s.o_fits&&s.o_fits.length===1&&s.o_fits[0]===s.other_from)ask+=' '+esc(s.other_from)+' is the only berth that takes '+esc(short(s.vessel))+'.';
-    var fx=s.delays.length?s.delays.map(function(d){return esc(short(d[0]))+(d[0]===s.other&&s.kind==='shift'?' loses ~'+hrs(d[1])+' to the shift':' berths ~'+hrs(d[1])+' later')}).join(' · ')+' · the order stays first come, first served':'No other vessel is delayed';
+    var fx=s.delays.length?s.delays.map(function(d){return esc(short(d[0]))+(d[0]===s.other&&s.kind==='shift'?' loses ~'+hrs(d[1])+' to the shift':' berths ~'+hrs(d[1])+' later')}).join(' · ')+' · nobody who arrived before ours is delayed':'No other vessel is delayed';
     return '<div class="op"><div><div class="op-t">'+esc(s.vessel)+' could berth <em>'+gainTxt(s.gain)+' earlier</em></div><div class="op-ask">'+ask+'</div><div class="op-fx">'+fx+'</div></div>'+
      '<div class="op-when"><b>'+day(s.o_to)+'</b><span>instead of '+day(s.o_from)+'</span></div>'+
      '<div class="b"><button class="btn pri sm" data-req="'+i+'">Request to terminal</button><button class="btn sm" data-prev="'+i+'" aria-pressed="'+(PV===i)+'">'+(PV===i?'Back to current plan':'Preview on berth plan')+'</button></div></div>'}).join('')}
