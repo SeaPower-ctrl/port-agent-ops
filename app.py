@@ -138,9 +138,9 @@ const I18N = {
     attach_documents: "Attach documents",
     attach_results_title: "Attaching documents",
     attach_batch_done: "Documents: {summary}",
-    attach_docs_help: "Drop Invoice / Delivery Order PDFs here - each one is read and matched to its BL automatically, same as the manifest upload above.",
+    attach_docs_help: "Drop invoices, paid receipts, Delivery Orders and B/L copies here - each one is read and matched to its BL automatically. A paid receipt marks the BL paid.",
     attach_docs_help2: "chips next to a BL number below show what's already attached.",
-    or_drag_drop_docs: "or drag & drop Invoice/DO PDFs",
+    or_drag_drop_docs: "or drag & drop invoices, paid receipts, DOs and B/L copies",
     auto_match_dropzone_sub: "Drop as many at once as you like - each is matched to its BL automatically",
     // Toolbar / search
     search_bl_placeholder: "Search BL number...",
@@ -374,6 +374,27 @@ const I18N = {
     action_link_reset: "replaced the tracking link",
     history_notified_email: "emailed the DO to {value}",
     history_notified_whatsapp: "opened WhatsApp to {value}",
+    // Paid / DO sent / B/L copy
+    th_paid: "Paid", th_do_sent: "DO sent",
+    mark_paid: "Mark paid", paid_tag: "Paid", paid_by_receipt: "Paid receipt attached", paid_by_hand: "Marked paid", paid_before: "Paid",
+    send_tag: "Send", sent_tag: "Sent", sent_emailed: "Emailed {time}", sent_by_hand: "Sent by hand {time}",
+    sent_to_title: "Emailed to {to} · {time}", sent_hand_title: "Marked sent · {time}",
+    doc_chip_bl: "B/L", doc_bl_copy: "B/L copy", doc_receipt: "Paid receipt",
+    bl_copy_page: "B/L copy · front page", open_full_bl: "Open full B/L", no_bl_copy: "No B/L copy yet.",
+    upload_bl_copy: "Upload B/L copy", bl_uploaded_by: "Uploaded by {user} · {time}",
+    send_do_title: "Send Delivery Order", do_sent_title: "Delivery Order sent", sd_to: "To", sd_cc: "Cc", sd_subject: "Subject",
+    sd_add_email: "Add email", sd_no_email: "No email on file for this consignee. Type it above - Compass will keep it.",
+    sd_no_do: "The Delivery Order PDF is not attached yet.", sd_attach_do: "Attach DO PDF",
+    sd_no_smtp: "Email is not set up on this server yet, so sending is off. You can still mark it as sent.",
+    sd_already: "Already sent it - mark as sent", sd_send: "Send", sd_sending: "Sending...", sd_send_again: "Send again",
+    sd_mark_unsent: "Mark as not sent", sd_cancel: "Cancel", sd_close: "Close",
+    sd_sent_info: "Emailed to {to} on {time}.", sd_sent_hand_info: "Marked as sent by {user} on {time}.", sd_sent_before: "Sent before these steps were added.",
+    do_sent_toast: "Delivery Order sent to {to}", marked_sent_toast: "Marked as sent", marked_unsent_toast: "Marked as not sent",
+    send_n_dos: "Send {n} DO{p}", batch_title: "Send {n} Delivery Order{p}", batch_note: "One email per consignee, with their Delivery Orders attached.",
+    batch_skip_no_email: "no email on file", batch_skip_no_do: "DO PDF not attached", batch_send_all: "Send all",
+    batch_done: "{n} Delivery Order{p} sent", batch_none: "Nothing to send yet - add the missing emails or DO PDFs first.",
+    bl_attached_toast: "B/L copy attached - front page kept ({size})", receipt_attached_toast: "Paid receipt attached - marked paid",
+    images_or_pdf: "Drop PDFs or scanned images only.",
   },
   ar: {
     app_tagline: "متتبع أوامر التسليم",
@@ -404,9 +425,9 @@ const I18N = {
     attach_documents: "إرفاق المستندات",
     attach_results_title: "نتائج إرفاق المستندات",
     attach_batch_done: "المستندات: {summary}",
-    attach_docs_help: "أسقط ملفات الفاتورة / أمر التسليم (PDF) هنا - تتم قراءة كل ملف ومطابقته تلقائيًا مع رقم البوليصة، بنفس طريقة رفع بيان الشحن أعلاه.",
+    attach_docs_help: "أسقط الفواتير وإيصالات السداد وأوامر التسليم ونسخ البوالص هنا - تتم قراءة كل ملف ومطابقته تلقائيًا مع رقم البوليصة. إيصال السداد يحدد البوليصة كمسددة.",
     attach_docs_help2: "الشارات الظاهرة بجانب رقم البوليصة أدناه توضح المستندات المرفقة بالفعل.",
-    or_drag_drop_docs: "أو اسحب وأفلت ملفات الفاتورة / أمر التسليم",
+    or_drag_drop_docs: "أو اسحب وأفلت الفواتير وإيصالات السداد وأوامر التسليم ونسخ البوالص",
     auto_match_dropzone_sub: "أسقط أي عدد من الملفات دفعة واحدة - تتم مطابقة كل ملف تلقائيًا مع رقم البوليصة الخاص به",
     search_bl_placeholder: "ابحث برقم البوليصة...",
     search_shortcut_title: "اختصار: اضغط / من أي مكان للبحث. Enter للانتقال إلى البوليصة، وEsc للمسح.",
@@ -627,6 +648,27 @@ const I18N = {
     action_link_reset: "استبدل رابط التتبع",
     history_notified_email: "أرسل أمر التسليم بالبريد إلى {value}",
     history_notified_whatsapp: "فتح واتساب إلى {value}",
+    // Paid / DO sent / B/L copy
+    th_paid: "تم السداد", th_do_sent: "إرسال أمر التسليم",
+    mark_paid: "تحديد كمسدد", paid_tag: "مسدد", paid_by_receipt: "إيصال السداد مرفق", paid_by_hand: "حُدد كمسدد", paid_before: "مسدد",
+    send_tag: "إرسال", sent_tag: "أُرسل", sent_emailed: "أُرسل بالبريد {time}", sent_by_hand: "أُرسل يدويًا {time}",
+    sent_to_title: "أُرسل بالبريد إلى {to} · {time}", sent_hand_title: "حُدد كمُرسل · {time}",
+    doc_chip_bl: "بوليصة", doc_bl_copy: "نسخة البوليصة", doc_receipt: "إيصال السداد",
+    bl_copy_page: "نسخة البوليصة · الصفحة الأولى", open_full_bl: "فتح البوليصة", no_bl_copy: "لا توجد نسخة من البوليصة بعد.",
+    upload_bl_copy: "رفع نسخة البوليصة", bl_uploaded_by: "رفعها {user} · {time}",
+    send_do_title: "إرسال أمر التسليم", do_sent_title: "تم إرسال أمر التسليم", sd_to: "إلى", sd_cc: "نسخة", sd_subject: "الموضوع",
+    sd_add_email: "أضف بريدًا", sd_no_email: "لا يوجد بريد إلكتروني لهذا المستلم. اكتبه أعلاه وسيحتفظ به Compass.",
+    sd_no_do: "لم يُرفق ملف أمر التسليم بعد.", sd_attach_do: "إرفاق أمر التسليم",
+    sd_no_smtp: "البريد الإلكتروني غير مُعد على الخادم بعد، لذا الإرسال متوقف. يمكنك تحديده كمُرسل.",
+    sd_already: "أرسلته بالفعل - تحديد كمُرسل", sd_send: "إرسال", sd_sending: "جارٍ الإرسال...", sd_send_again: "إرسال مرة أخرى",
+    sd_mark_unsent: "تحديد كغير مُرسل", sd_cancel: "إلغاء", sd_close: "إغلاق",
+    sd_sent_info: "أُرسل بالبريد إلى {to} في {time}.", sd_sent_hand_info: "حدده {user} كمُرسل في {time}.", sd_sent_before: "أُرسل قبل إضافة هذه الخطوات.",
+    do_sent_toast: "تم إرسال أمر التسليم إلى {to}", marked_sent_toast: "تم التحديد كمُرسل", marked_unsent_toast: "تم التحديد كغير مُرسل",
+    send_n_dos: "إرسال {n} أمر تسليم", batch_title: "إرسال {n} أمر تسليم", batch_note: "رسالة واحدة لكل مستلم مرفق بها أوامر التسليم الخاصة به.",
+    batch_skip_no_email: "لا يوجد بريد إلكتروني", batch_skip_no_do: "ملف أمر التسليم غير مرفق", batch_send_all: "إرسال الكل",
+    batch_done: "تم إرسال {n} أمر تسليم", batch_none: "لا يوجد ما يُرسل بعد - أضف البريد أو ملفات أوامر التسليم الناقصة أولًا.",
+    bl_attached_toast: "تم إرفاق نسخة البوليصة - حُفظت الصفحة الأولى ({size})", receipt_attached_toast: "تم إرفاق إيصال السداد - حُدد كمسدد",
+    images_or_pdf: "يرجى إسقاط ملفات PDF أو صور ممسوحة فقط.",
   },
 };
 
@@ -731,7 +773,7 @@ SOF_TIMELINE_PAIRS = [
 
 # Invoice / DO file attachments on a DO Tracker record - kind -> display
 # label, shared between the upload/download routes and the UI.
-ATTACHMENT_KINDS = {"invoice": "Invoice", "do": "Delivery Order"}
+ATTACHMENT_KINDS = {"invoice": "Invoice", "do": "Delivery Order", "receipt": "Paid receipt", "bl": "B/L copy"}
 app.config["MAX_CONTENT_LENGTH"] = 40 * 1024 * 1024   # nothing legitimate here is bigger; stops giant uploads early
 
 
@@ -929,6 +971,18 @@ def init_db():
         cur.execute(f"ALTER TABLE records ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
     for col in ("consignee_email", "consignee_phone", "broker_email", "broker_phone", "track_token"):
         cur.execute(f"ALTER TABLE records ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
+    # Paid (the DO charges) and DO sent (the Delivery Order has reached the consignee): who,
+    # when, and how - 'receipt' (a paid receipt was attached), 'email' (sent from Compass),
+    # 'manual' (ticked by hand), 'before' (already done before these steps existed).
+    cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name = 'records' AND column_name = 'do_sent'")
+    _had_sent = cur.fetchone() is not None
+    for col in ("paid", "do_sent"):
+        cur.execute(f"ALTER TABLE records ADD COLUMN IF NOT EXISTS {col} INTEGER DEFAULT 0")
+    for col in ("paid_by", "paid_at", "paid_via", "do_sent_by", "do_sent_at", "do_sent_via", "do_sent_to"):
+        cur.execute(f"ALTER TABLE records ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
+    if not _had_sent:
+        # B/Ls whose DO was already issued before these two steps existed stay complete.
+        cur.execute("UPDATE records SET paid = 1, paid_via = 'before', do_sent = 1, do_sent_via = 'before' WHERE do_issued = 1")
     cur.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_records_track_token ON records (track_token) "
         "WHERE track_token IS NOT NULL AND track_token <> ''"
@@ -1021,6 +1075,8 @@ def init_db():
         )"""
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_attachments_trash_bl ON record_attachments_trash (bl_number)")
+    # small picture of a B/L copy's front page, for the hover preview on the board
+    cur.execute("ALTER TABLE record_attachments ADD COLUMN IF NOT EXISTS preview BYTEA")
 
     # PDA / FDA (Proforma / Final Disbursement Account) - a per-port charge
     # template (port dues, pilotage, towage, agency fee, ...) that pre-fills
@@ -1889,7 +1945,7 @@ def find_overdue_vessel_groups():
         key = (r["port"], r["vessel"])
         g_ = groups.setdefault(key, {"port": r["port"], "vessel": r["vessel"], "eta": r["eta"], "total": 0, "left": 0})
         g_["total"] += 1
-        if not (r["invoice_issued"] and r["approval_received"] and r["do_issued"]):
+        if not _bl_done(r):
             g_["left"] += 1
     return [g_ for g_ in groups.values() if g_["left"] > 0]
 
@@ -2000,7 +2056,7 @@ def _features():
 _FEATURE_GATES = [
     ("/manifest-desk", ("manifest",)), ("/api/desk", ("manifest",)),
     ("/do-tracker", ("do",)), ("/api/records", ("do",)), ("/api/manifest", ("do", "direct")), ("/api/groups", ("do",)),
-    ("/api/export", ("do",)), ("/api/attachments", ("do",)), ("/api/vessel", ("do",)),
+    ("/api/export", ("do",)), ("/api/attachments", ("do",)), ("/api/vessel", ("do",)), ("/api/do/", ("do",)),
     ("/vessel-tracker", ("vessel",)), ("/api/vessels", ("vessel",)),
     ("/kpi", ("kpi",)), ("/api/kpi", ("kpi",)),
     ("/direct-delivery", ("direct",)), ("/api/direct-delivery", ("direct",)),
@@ -2835,7 +2891,16 @@ def delete_user(user_id):
 
 ATTACHMENT_FLAGS_SQL = """,
     EXISTS(SELECT 1 FROM record_attachments a WHERE a.bl_number = r.bl_number AND a.kind = 'invoice') AS has_invoice_file,
-    EXISTS(SELECT 1 FROM record_attachments a WHERE a.bl_number = r.bl_number AND a.kind = 'do') AS has_do_file"""
+    EXISTS(SELECT 1 FROM record_attachments a WHERE a.bl_number = r.bl_number AND a.kind = 'do') AS has_do_file,
+    EXISTS(SELECT 1 FROM record_attachments a WHERE a.bl_number = r.bl_number AND a.kind = 'receipt') AS has_receipt_file,
+    EXISTS(SELECT 1 FROM record_attachments a WHERE a.bl_number = r.bl_number AND a.kind = 'bl') AS has_bl_file,
+    (SELECT a.uploaded_at FROM record_attachments a WHERE a.bl_number = r.bl_number AND a.kind = 'bl') AS bl_ver"""
+
+
+def _bl_done(r):
+    """A B/L is finished once its invoice is issued, the DO charges are paid, the principal's
+    approval is in, and the Delivery Order has been issued and sent to the consignee."""
+    return bool(r["invoice_issued"] and r["paid"] and r["approval_received"] and r["do_issued"] and r["do_sent"])
 
 
 @app.route("/api/records", methods=["GET"])
@@ -2912,7 +2977,7 @@ def kpi_data():
         bucket = per_agent.setdefault(agent, {"total": 0, "complete": 0, "pending": 0, "turnarounds": []})
         bucket["total"] += 1
 
-        complete = bool(r.get("invoice_issued") and r.get("approval_received") and r.get("do_issued"))
+        complete = _bl_done(r)
         if complete:
             bucket["complete"] += 1
         else:
@@ -6182,6 +6247,19 @@ def restore_direct_delivery():
     return jsonify({"ok": True})
 
 
+def _step_how(db, bls, field, value):
+    """Paid / DO sent ticked by hand say so; unticked, the 'how' is cleared too."""
+    if not bls:
+        return
+    if field == "paid":
+        db.execute("UPDATE records SET paid_via = ? WHERE bl_number = ANY(?)", ("manual" if value else "", list(bls)))
+    elif field == "do_sent":
+        db.execute("UPDATE records SET do_sent_via = ?, do_sent_to = ? WHERE bl_number = ANY(?)", ("manual" if value else "", "", list(bls)))
+    elif field == "do_issued" and not value:      # a DO taken back has not been sent either
+        db.execute("UPDATE records SET do_sent = 0, do_sent_by = '', do_sent_at = '', do_sent_via = '', do_sent_to = '' "
+                   "WHERE bl_number = ANY(?) AND do_sent_via <> 'before'", (list(bls),))
+
+
 @app.route("/api/records/<path:bl_number>/toggle", methods=["POST"])
 @login_required
 def toggle_status(bl_number):
@@ -6196,6 +6274,8 @@ def toggle_status(bl_number):
         "invoice_issued": ("invoice_by", "invoice_at"),
         "approval_received": ("approval_by", "approval_at"),
         "do_issued": ("do_by", "do_at"),
+        "paid": ("paid_by", "paid_at"),
+        "do_sent": ("do_sent_by", "do_sent_at"),
     }
     if field not in allowed:
         return jsonify({"error": "invalid field"}), 400
@@ -6209,6 +6289,7 @@ def toggle_status(bl_number):
         f"UPDATE records SET {field} = ?, {by_field} = ?, {at_field} = ? WHERE bl_number = ?",
         (value, by_val, now, bl_number.upper()),
     )
+    _step_how(db, [bl_number.upper()], field, value)
     _log_audit(bl_number.upper(), "toggle", field, "" if value else "1", "1" if value else "")
     db.commit()
     return jsonify({"ok": True})
@@ -6319,8 +6400,9 @@ def _restore_one_record(db, data):
             approval_received, approval_by, approval_at, do_issued, do_by, do_at,
             remarks, created_at, created_by, eta, archived,
             consignee_email, consignee_phone, broker_email, broker_phone, track_token,
-            vessel_status, etb, berth_no, etcd)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            vessel_status, etb, berth_no, etcd,
+            paid, paid_by, paid_at, paid_via, do_sent, do_sent_by, do_sent_at, do_sent_via, do_sent_to)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             bl_number,
             data.get("consignee", ""),
@@ -6349,6 +6431,10 @@ def _restore_one_record(db, data):
             str(data.get("etb") or ""),
             str(data.get("berth_no") or ""),
             str(data.get("etcd") or ""),
+            1 if data.get("paid") else 0, str(data.get("paid_by") or ""), str(data.get("paid_at") or ""),
+            str(data.get("paid_via") or ""),
+            1 if data.get("do_sent") else 0, str(data.get("do_sent_by") or ""), str(data.get("do_sent_at") or ""),
+            str(data.get("do_sent_via") or ""), str(data.get("do_sent_to") or ""),
         ),
     )
     _unstash_attachments(db, bl_number)
@@ -6494,6 +6580,8 @@ def bulk_toggle_records():
         "invoice_issued": ("invoice_by", "invoice_at"),
         "approval_received": ("approval_by", "approval_at"),
         "do_issued": ("do_by", "do_at"),
+        "paid": ("paid_by", "paid_at"),
+        "do_sent": ("do_sent_by", "do_sent_at"),
     }
     if field not in allowed or not bl_numbers:
         return jsonify({"error": "invalid request"}), 400
@@ -6519,6 +6607,7 @@ def bulk_toggle_records():
         params.append(_team())
     sql += " RETURNING bl_number"
     updated = [r["bl_number"] for r in db.execute(sql, tuple(params)).fetchall()]
+    _step_how(db, updated, field, value)
     for bl_number in updated:
         _log_audit(bl_number, "toggle", field, "" if value else "1", "1" if value else "")
     db.commit()
@@ -6663,6 +6752,100 @@ def _extract_pdf_text(data):
     return "\n".join(parts)
 
 
+_ATT_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff")
+MAX_BL_UPLOAD_BYTES = 30 * 1024 * 1024        # a B/L scan can be big; it is cut down to its front page on arrival
+
+
+def _bl_front_page(raw, dpi=200, quality=85):
+    """A B/L copy as Compass keeps it: the FRONT PAGE only (the back is the carrier's terms),
+    and light. A typed PDF keeps page 1 exactly as it is; a scan or a photo is re-saved at
+    200 dpi in high-quality JPEG - as sharp to read, a fraction of the size (a 10 MB two-page
+    scan comes out under 0.5 MB). Returns (pdf_bytes, preview_jpeg_bytes)."""
+    from PIL import Image, ImageOps
+    Image.init()
+    out, img = None, None
+    if raw[:4] == b"%PDF":
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(raw)
+        page = pdf[0]
+        text = page.get_textpage().get_text_range() or ""
+        if len(text.strip()) > 200:
+            new = pdfium.PdfDocument.new()
+            new.import_pages(pdf, [0])
+            b = io.BytesIO()
+            new.save(b)
+            out = b.getvalue()
+            if len(out) > 1_500_000:              # typed, but carrying a heavy scan: treat it as a scan
+                out = None
+        img = page.render(scale=dpi / 72).to_pil().convert("RGB")
+    else:
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+        long_side = max(img.size)
+        if long_side > 2400:
+            img.thumbnail((2400, 2400), Image.LANCZOS)
+    if out is None:
+        b = io.BytesIO()
+        img.save(b, "PDF", resolution=dpi, quality=quality, optimize=True)
+        out = b.getvalue()
+    prev = img.copy()
+    prev.thumbnail((1100, 1600), Image.LANCZOS)
+    pb = io.BytesIO()
+    prev.save(pb, "JPEG", quality=82, optimize=True, progressive=True)
+    return out, pb.getvalue()
+
+
+def _image_to_pdf(raw):
+    """A photo or scanned image (e.g. a receipt) as a one-page PDF, so every document opens the same way."""
+    from PIL import Image, ImageOps
+    Image.init()
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+    if max(img.size) > 2400:
+        img.thumbnail((2400, 2400), Image.LANCZOS)
+    b = io.BytesIO()
+    img.save(b, "PDF", resolution=200, quality=85, optimize=True)
+    return b.getvalue()
+
+
+def _scan_text(raw):
+    """Best-effort text of a scanned page (the built-in OCR), to recognise a B/L copy and its number."""
+    try:
+        from PIL import Image
+        if raw[:4] == b"%PDF":
+            import pypdfium2 as pdfium
+            img = pdfium.PdfDocument(raw)[0].render(scale=200 / 72).to_pil()
+        else:
+            img = Image.open(io.BytesIO(raw))
+            img.load()
+        tables, title = _ocr_tables_from_image(img)
+        return "\n".join([title or ""] + [" ".join(str(c) for c in row) for t in tables for row in t])
+    except Exception:
+        return ""
+
+
+_RECEIPT_RE = re.compile(r"\bRECEIPT\b|PAYMENT\s+(?:SUCCESSFUL|CONFIRM|COMPLETED)|(?:PAYMENT\s+)?STATUS\s*[:：]?\s*PAID\b|\bPAID\s+SUCCESSFULLY\b")
+_BL_DOC_RE = re.compile(r"BILL\s+OF\s+LADING|\bB\s*/\s*L\s+NO\b|SHIPPED\s+ON\s+BOARD|PORT\s+OF\s+LOADING.*PORT\s+OF\s+DISCHARGE", re.S)
+
+
+def _detect_doc_kind(text, filename=""):
+    """Invoice, paid receipt, Delivery Order or B/L copy - from the document's own wording,
+    and for a scan with no readable text from its file name."""
+    upper = (text or "").upper()
+    if _RECEIPT_RE.search(upper) and ("PAID" in upper or "PAYMENT" in upper or "RECEIPT" in upper):
+        if "DELIVERY ORDER NUMBER" not in upper and "DELIVERY ORDER SERIAL NUMBER" not in upper:
+            return "receipt"
+    kind = _detect_fasah_doc_kind(text or "")
+    if kind:
+        return kind
+    if _BL_DOC_RE.search(upper):
+        return "bl"
+    name = re.sub(r"[^A-Z0-9]+", " ", (filename or "").upper())
+    if re.search(r"\bRECEIPT\b|\bPAID\b|\bPAYMENT\b", name):
+        return "receipt"
+    if re.search(r"\bB ?L\b|\bBILL\b|\bLADING\b|\bOBL\b", name):
+        return "bl"
+    return None
+
+
 def _detect_fasah_doc_kind(text):
     """Fasah's Invoice and Delivery Order documents are both fixed
     templates - the user confirmed only the BL number/vessel/amounts
@@ -6721,20 +6904,27 @@ def detect_attachment():
     file = request.files.get("file")
     if not file or not file.filename:
         return jsonify({"error": "No file received."}), 400
-    if not file.filename.lower().endswith(".pdf"):
-        return jsonify({"error": "Only PDF files are supported."}), 400
+    low = file.filename.lower()
+    if not (low.endswith(".pdf") or low.endswith(_ATT_IMAGE_EXTS)):
+        return jsonify({"error": "Only PDF files or scanned images are supported."}), 400
     data = file.read()
     if not data:
         return jsonify({"error": "That file is empty."}), 400
-    if len(data) > MAX_ATTACHMENT_BYTES:
+    if len(data) > MAX_BL_UPLOAD_BYTES:
+        return jsonify({"error": "That file is larger than 30MB."}), 400
+
+    text = ""
+    if data[:4] == b"%PDF":
+        try:
+            text = _extract_pdf_text(data)
+        except Exception:
+            text = ""
+    if len(text.strip()) < 40:                  # a scan or a photo: read what we can
+        text = (text + "\n" + _scan_text(data)).strip()
+    kind = _detect_doc_kind(text, file.filename)
+    if kind != "bl" and len(data) > MAX_ATTACHMENT_BYTES:
         return jsonify({"error": "That file is larger than 10MB."}), 400
-
-    try:
-        text = _extract_pdf_text(data)
-    except Exception:
-        return jsonify({"error": "Could not read this PDF - it may be a scanned image rather than a text document."}), 400
-
-    kind = _detect_fasah_doc_kind(text)
+    text = text + "\n" + re.sub(r"[_]+", " ", os.path.splitext(file.filename)[0])   # B/L numbers in the file name count too
 
     # Only match against BLs this user could actually upload to anyway
     # (same scope _owns_record would allow) - no point surfacing a match
@@ -6781,26 +6971,44 @@ def upload_attachment(bl_number, kind):
     file = request.files.get("file")
     if not file or not file.filename:
         return jsonify({"error": "No file was selected."}), 400
-    if not file.filename.lower().endswith(".pdf"):
-        return jsonify({"error": "Only PDF files are accepted."}), 400
+    low = file.filename.lower()
+    is_image = low.endswith(_ATT_IMAGE_EXTS)
+    if not (low.endswith(".pdf") or (is_image and kind in ("bl", "receipt"))):
+        return jsonify({"error": "Only PDF files are accepted." if kind in ("invoice", "do") else "Only PDF files or scanned images are accepted."}), 400
     data = file.read()
     if not data:
         return jsonify({"error": "That file is empty."}), 400
-    if len(data) > MAX_ATTACHMENT_BYTES:
-        return jsonify({"error": "That file is larger than 10MB."}), 400
+    if len(data) > (MAX_BL_UPLOAD_BYTES if kind == "bl" else MAX_ATTACHMENT_BYTES):
+        return jsonify({"error": "That file is larger than 30MB." if kind == "bl" else "That file is larger than 10MB."}), 400
+
+    preview = None
+    filename = file.filename
+    original_size = len(data)
+    if kind == "bl":
+        try:
+            data, preview = _bl_front_page(data)
+        except Exception:
+            return jsonify({"error": "Could not read this B/L copy. Try a PDF or a clear photo."}), 400
+        filename = os.path.splitext(file.filename)[0] + ".pdf"
+    elif is_image:
+        try:
+            data = _image_to_pdf(data)
+        except Exception:
+            return jsonify({"error": "Could not read this image."}), 400
+        filename = os.path.splitext(file.filename)[0] + ".pdf"
 
     db = get_db()
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     user = session.get("username", "Unknown")
     db.execute(
-        """INSERT INTO record_attachments (bl_number, kind, filename, content_type, data, file_size, uploaded_by, uploaded_at)
-           VALUES (?, ?, ?, 'application/pdf', ?, ?, ?, ?)
+        """INSERT INTO record_attachments (bl_number, kind, filename, content_type, data, file_size, uploaded_by, uploaded_at, preview)
+           VALUES (?, ?, ?, 'application/pdf', ?, ?, ?, ?, ?)
            ON CONFLICT (bl_number, kind) DO UPDATE SET
              filename = EXCLUDED.filename, data = EXCLUDED.data, file_size = EXCLUDED.file_size,
-             uploaded_by = EXCLUDED.uploaded_by, uploaded_at = EXCLUDED.uploaded_at""",
-        (bl_number, kind, file.filename, psycopg2.Binary(data), len(data), user, now),
+             uploaded_by = EXCLUDED.uploaded_by, uploaded_at = EXCLUDED.uploaded_at, preview = EXCLUDED.preview""",
+        (bl_number, kind, filename, psycopg2.Binary(data), len(data), user, now, psycopg2.Binary(preview) if preview else None),
     )
-    _log_audit(bl_number, "attachment", kind, "", file.filename)
+    _log_audit(bl_number, "attachment", kind, "", filename)
 
     # Attaching the file *is* the real-world signal that the invoice/DO was
     # actually issued - no reason to also make someone flip the slider by
@@ -6808,8 +7016,8 @@ def upload_attachment(bl_number, kind):
     # marked issued and this upload is just a Replace (a corrected file),
     # that's not a fresh issuance, so the original by/at stays as-is rather
     # than being silently rewritten to whoever happened to replace the file.
-    status_field = {"invoice": "invoice_issued", "do": "do_issued"}.get(kind)
-    status_by_at = {"invoice_issued": ("invoice_by", "invoice_at"), "do_issued": ("do_by", "do_at")}
+    status_field = {"invoice": "invoice_issued", "do": "do_issued", "receipt": "paid"}.get(kind)
+    status_by_at = {"invoice_issued": ("invoice_by", "invoice_at"), "do_issued": ("do_by", "do_at"), "paid": ("paid_by", "paid_at")}
     auto_issued = False
     if status_field:
         by_field, at_field = status_by_at[status_field]
@@ -6821,12 +7029,36 @@ def upload_attachment(bl_number, kind):
             )
             _log_audit(bl_number, "toggle", status_field, "", "1")
             auto_issued = True
+        if kind == "receipt":                     # paid, and the receipt is the proof
+            db.execute("UPDATE records SET paid_via = 'receipt' WHERE bl_number = ?", (bl_number,))
 
     db.commit()
     return jsonify({
-        "ok": True, "filename": file.filename, "uploaded_by": user, "uploaded_at": now,
+        "ok": True, "filename": filename, "uploaded_by": user, "uploaded_at": now,
         "auto_issued_field": status_field if auto_issued else None,
+        "size": len(data), "original_size": original_size,
     })
+
+
+@app.route("/api/records/<path:bl_number>/bl-preview", methods=["GET"])
+@login_required
+def bl_preview(bl_number):
+    """The small picture of a B/L copy's front page, for the hover card on the board.
+    Same access as downloading the file (any signed-in user who has the B/L number)."""
+    bl_number = bl_number.upper()
+    db = get_db()
+    row = db.execute("SELECT data, preview FROM record_attachments WHERE bl_number = ? AND kind = 'bl'", (bl_number,)).fetchone()
+    if not row:
+        return "No B/L copy yet.", 404
+    pv = bytes(row["preview"]) if row["preview"] else None
+    if not pv:                                    # e.g. restored with Undo: make it again
+        try:
+            _, pv = _bl_front_page(bytes(row["data"]))
+            db.execute("UPDATE record_attachments SET preview = ? WHERE bl_number = ? AND kind = 'bl'", (psycopg2.Binary(pv), bl_number))
+            db.commit()
+        except Exception:
+            return "Preview not available.", 404
+    return Response(pv, mimetype="image/jpeg", headers={"Cache-Control": "private, max-age=300"})
 
 
 @app.route("/api/records/<path:bl_number>/attachment/<kind>", methods=["GET"])
@@ -6887,7 +7119,8 @@ def lookup_record(bl_number):
     db = get_db()
     row = db.execute(
         f"""SELECT bl_number, port, vessel, created_by, invoice_issued, invoice_by, invoice_at,
-                   do_issued, do_by, do_at, consignee, consignee_email, consignee_phone,
+                   do_issued, do_by, do_at, paid, paid_via, do_sent, do_sent_via, do_sent_to, do_sent_at,
+                   consignee, consignee_email, consignee_phone,
                    broker_email, broker_phone, track_token{ATTACHMENT_FLAGS_SQL}
             FROM records r WHERE bl_number = ?""",
         (bl_number,),
@@ -7038,7 +7271,7 @@ def _notify_texts(rec, url):
     bl, vessel = rec["bl_number"], (rec["vessel"] or "-")
     port_en = (rec["port"] or "-").title()
     port_ar = PORT_NAMES_AR.get((rec["port"] or "").upper(), rec["port"] or "-")
-    name = (rec["consignee"] or "").strip()
+    name = (rec["consignee"] or rec["notify_name"] or "").strip()
     subject = f"Delivery Order Issued - B/L {bl} - {vessel} | تم إصدار أمر التسليم - بوليصة {bl}"
     body = (
         f"Dear {name or 'Valued Customer'},\n\n"
@@ -7100,8 +7333,164 @@ def notify_email(bl_number):
         code = {"unreachable": "email_unreachable", "auth": "email_auth", "recipient": "email_recipient"}.get(err, "send_failed")
         return jsonify({"error": f"The email could not be sent: {err}", "error_code": code}), 502
     _log_audit(bl_number, "notified", "email", "", ", ".join(addrs))
+    _mark_do_sent(db, [bl_number], ", ".join(addrs))
     db.commit()
     return jsonify({"ok": True, "sent_to": addrs})
+
+
+def _mark_do_sent(db, bls, to, via="email"):
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    for bl in bls:
+        db.execute("UPDATE records SET do_sent = 1, do_sent_by = ?, do_sent_at = ?, do_sent_via = ?, do_sent_to = ? WHERE bl_number = ?",
+                   (session.get("username", ""), now, via, to[:500], bl))
+        _log_audit(bl, "toggle", "do_sent", "", "1")
+
+
+def _my_email():
+    row = get_db().execute("SELECT email FROM users WHERE username = ?", (session.get("username", ""),)).fetchone()
+    return _clean_email(row["email"]) if row and row["email"] else ""
+
+
+def _emails_from(value):
+    out = []
+    for part in re.split(r"[,;\s]+", str(value or "")):
+        e = _clean_email(part)
+        if e and e.lower() not in (x.lower() for x in out):
+            out.append(e)
+    return out
+
+
+@app.route("/api/records/<path:bl_number>/send-do/draft", methods=["GET"])
+@login_required
+def send_do_draft(bl_number):
+    """What the Send window shows: recipients on file, the message, the DO file."""
+    bl_number = bl_number.upper()
+    if not _owns_record(bl_number):
+        return jsonify({"error": "Not your record.", "error_code": "not_owner"}), 403
+    db = get_db()
+    rec = db.execute("SELECT * FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
+    if not rec:
+        return jsonify({"error": "BL not found."}), 404
+    att = db.execute("SELECT filename, file_size FROM record_attachments WHERE bl_number = ? AND kind = 'do'", (bl_number,)).fetchone()
+    token = _ensure_track_token(db, bl_number)
+    subject, body, _ = _notify_texts(rec, f"{_public_base_url()}/t/{token}")
+    to = []
+    for w in ("consignee", "broker"):
+        e = _clean_email(rec[f"{w}_email"])
+        if e and e.lower() not in (x["email"].lower() for x in to):
+            to.append({"email": e, "who": w, "name": (rec["consignee"] or "") if w == "consignee" else ""})
+    return jsonify({"bl": bl_number, "to": to, "cc": [_my_email()] if _my_email() else [], "subject": subject, "body": body,
+                    "file": {"name": att["filename"], "size": att["file_size"]} if att else None,
+                    "consignee": rec["consignee"] or rec["notify_name"] or "",
+                    "email_configured": email_configured(), "sent": bool(rec["do_sent"]), "sent_to": rec["do_sent_to"] or ""})
+
+
+@app.route("/api/records/<path:bl_number>/send-do", methods=["POST"])
+@login_required
+def send_do(bl_number):
+    """Emails the Delivery Order to the addresses in the Send window and marks the B/L 'DO sent'.
+    A new consignee address typed there is kept on the B/L (and in the address book)."""
+    bl_number = bl_number.upper()
+    if not _owns_record(bl_number):
+        return jsonify({"error": "Not your record.", "error_code": "not_owner"}), 403
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    rec = db.execute("SELECT * FROM records WHERE bl_number = ?", (bl_number,)).fetchone()
+    if not rec:
+        return jsonify({"error": "BL not found."}), 404
+    if data.get("manual"):                        # sent outside Compass (WhatsApp, by hand)
+        _mark_do_sent(db, [bl_number], "", via="manual")
+        db.commit()
+        return jsonify({"ok": True, "manual": True})
+    to = _emails_from(" ".join(data.get("to") or []))
+    cc = [e for e in _emails_from(" ".join(data.get("cc") or [])) if e.lower() not in (x.lower() for x in to)]
+    if not to:
+        return jsonify({"error": "Add the consignee's email address.", "error_code": "no_recipient"}), 400
+    att = db.execute("SELECT filename, data FROM record_attachments WHERE bl_number = ? AND kind = 'do'", (bl_number,)).fetchone()
+    if not att:
+        return jsonify({"error": "Attach the Delivery Order PDF first.", "error_code": "no_do"}), 400
+    if not email_configured():
+        return jsonify({"error": "Email isn't set up yet.", "error_code": "email_not_configured"}), 400
+    token = _ensure_track_token(db, bl_number)
+    d_subject, d_body, _ = _notify_texts(rec, f"{_public_base_url()}/t/{token}")
+    subject = re.sub(r"[\r\n]+", " ", str(data.get("subject") or "").strip())[:300] or d_subject
+    body = str(data.get("body") or "").strip()[:20000] or d_body
+    ok, err = send_email(to, subject, body, attachments=[(att["filename"] or f"DO_{bl_number}.pdf", bytes(att["data"]), "application/pdf")], cc=cc or None)
+    if not ok:
+        code = {"unreachable": "email_unreachable", "auth": "email_auth", "recipient": "email_recipient"}.get(err, "send_failed")
+        return jsonify({"error": f"The email could not be sent: {err}", "error_code": code}), 502
+    if not _clean_email(rec["consignee_email"]) and not _clean_email(rec["broker_email"]):
+        db.execute("UPDATE records SET consignee_email = ? WHERE bl_number = ?", (to[0], bl_number))
+        name = rec["consignee"] or rec["notify_name"]
+        if name:
+            try:
+                _book_save(db, name, email=to[0], only_fill=True)
+            except Exception:
+                pass
+    _log_audit(bl_number, "notified", "email", "", ", ".join(to))
+    _mark_do_sent(db, [bl_number], ", ".join(to))
+    db.commit()
+    return jsonify({"ok": True, "sent_to": to})
+
+
+@app.route("/api/do/send-batch", methods=["POST"])
+@login_required
+def send_do_batch():
+    """'Send N DOs' on a vessel: every issued, not-yet-sent DO that has its PDF and an email on
+    file goes out - one email per consignee, carrying all of that consignee's DOs."""
+    data = request.get_json(force=True) or {}
+    bls = [str(b).strip().upper() for b in (data.get("bl_numbers") or []) if str(b).strip()]
+    if not email_configured():
+        return jsonify({"error": "Email isn't set up yet.", "error_code": "email_not_configured"}), 400
+    db = get_db()
+    groups, skipped = {}, []
+    for bl in bls:
+        if not _owns_record(bl):
+            continue
+        rec = db.execute("SELECT * FROM records WHERE bl_number = ?", (bl,)).fetchone()
+        if not rec or not rec["do_issued"] or rec["do_sent"]:
+            continue
+        att = db.execute("SELECT filename, data FROM record_attachments WHERE bl_number = ? AND kind = 'do'", (bl,)).fetchone()
+        to = [e for e in (_clean_email(rec["consignee_email"]), _clean_email(rec["broker_email"])) if e]
+        if not att:
+            skipped.append({"bl": bl, "reason": "no_do"})
+            continue
+        if not to:
+            skipped.append({"bl": bl, "reason": "no_email"})
+            continue
+        groups.setdefault(tuple(sorted({e.lower() for e in to})), []).append((rec, att, to))
+    cc = [_my_email()] if _my_email() else None
+    sent, failed = [], []
+    for key, items in groups.items():
+        recs = [r for r, _, _ in items]
+        to = items[0][2]
+        if len(items) == 1:
+            rec = recs[0]
+            token = _ensure_track_token(db, rec["bl_number"])
+            subject, body, _ = _notify_texts(rec, f"{_public_base_url()}/t/{token}")
+        else:
+            vessel = recs[0]["vessel"] or "-"
+            lines = "\n".join(f"  - {r['bl_number']}: {_public_base_url()}/t/{_ensure_track_token(db, r['bl_number'])}" for r in recs)
+            subject = f"Delivery Orders Issued - {len(recs)} B/Ls - {vessel} | تم إصدار أوامر التسليم"
+            name = (recs[0]["consignee"] or recs[0]["notify_name"] or "").strip()
+            body = (f"Dear {name or 'Valued Customer'},\n\n"
+                    f"The Delivery Orders for the shipments below, ex {vessel}, have been issued and are attached to this email.\n\n"
+                    f"{lines}\n\nRegards,\n{COMPANY_NAME_EN}\n\n"
+                    f"------------------------------------------------------------\n\n"
+                    f"{('السادة ' + name) if name else 'عميلنا العزيز'}،\n\n"
+                    f"نفيدكم بأنه تم إصدار أوامر التسليم للشحنات الموضحة أعلاه، وتجدونها مرفقة بهذه الرسالة.\n\n"
+                    f"مع أطيب التحيات،\n{COMPANY_NAME_AR}\n")
+        files = [(a["filename"] or f"DO_{r['bl_number']}.pdf", bytes(a["data"]), "application/pdf") for r, a, _ in items]
+        ok, err = send_email(to, subject, body, attachments=files, cc=cc)
+        if ok:
+            for r in recs:
+                _log_audit(r["bl_number"], "notified", "email", "", ", ".join(to))
+            _mark_do_sent(db, [r["bl_number"] for r in recs], ", ".join(to))
+            sent += [r["bl_number"] for r in recs]
+        else:
+            failed += [{"bl": r["bl_number"], "reason": err or "send_failed"} for r in recs]
+    db.commit()
+    return jsonify({"ok": True, "sent": sent, "skipped": skipped, "failed": failed, "emails": len([1 for k in groups])})
 
 
 @app.route("/api/records/<path:bl_number>/notify/whatsapp", methods=["POST"])
@@ -19050,6 +19439,76 @@ PAGE_HTML = """
   }
   .doc-chip:hover { filter: brightness(0.95); }
 
+  /* Paid / Send / Sent: small status tags beside the Invoice and DO switches */
+  .sw-line { display: flex; align-items: center; gap: 8px; max-width: 100%; }
+  .stag { display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 9px; border-radius: 999px;
+          font-size: 11.5px; font-weight: 600; line-height: 1; white-space: nowrap; cursor: pointer; font-family: inherit;
+          border: 1px solid transparent; background: none; transition: background .15s ease, transform .1s ease, filter .15s ease; }
+  .stag:active { transform: scale(.96); }
+  .stag.ok { background: var(--success-bg); color: var(--success); }
+  .stag.ok::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--success); }
+  .stag.todo { color: var(--muted); border-color: var(--border); }
+  .stag.todo:hover { background: var(--bg); color: var(--navy); }
+  .stag.act { background: linear-gradient(180deg, var(--navy-light), var(--navy)); color: #fff; box-shadow: 0 1px 2px rgba(18,58,86,.25); }
+  .stag.act:hover { filter: brightness(1.08); }
+  .stag svg { width: 11px; height: 11px; }
+  .bl-hover { cursor: default; transition: color .15s ease; }
+  .bl-hover:hover { color: var(--navy-light); }
+  .group-send { border: 0; border-radius: 999px; padding: 6px 12px; font-size: 12px; font-weight: 600; font-family: inherit; cursor: pointer;
+                color: #fff; background: linear-gradient(180deg, var(--navy-light), var(--navy)); white-space: nowrap; }
+  .group-send:hover { filter: brightness(1.08); }
+
+  /* B/L copy preview card (hover the B/L number; tap on a phone) */
+  .blpop { position: fixed; z-index: 3000; width: 380px; max-width: calc(100vw - 24px); padding: 12px; border-radius: 18px;
+           background: color-mix(in srgb, var(--card) 88%, transparent); -webkit-backdrop-filter: saturate(180%) blur(24px); backdrop-filter: saturate(180%) blur(24px);
+           border: 1px solid var(--border); box-shadow: 0 24px 60px rgba(11,39,64,.22), 0 2px 6px rgba(11,39,64,.08);
+           opacity: 0; transform: translateY(6px) scale(.98); transition: opacity .16s ease, transform .16s ease; pointer-events: none; }
+  .blpop.on { opacity: 1; transform: none; pointer-events: auto; }
+  .blpop .ph { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 2px 4px 10px; }
+  .blpop .ph b { font-size: 13px; letter-spacing: -.01em; }
+  .blpop .ph span, .blpop .pf { font-size: 11.5px; color: var(--muted); }
+  .blpop .pg { border-radius: 10px; overflow: hidden; border: 1px solid var(--border); background: #fff; min-height: 120px; }
+  .blpop .pg img { display: block; width: 100%; height: auto; }
+  .blpop .pf { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 4px 2px; }
+  .blpop .pf a { color: var(--navy-light); font-weight: 600; text-decoration: none; }
+  .blpop .none { padding: 18px 8px 10px; text-align: center; font-size: 13px; color: var(--muted); display: grid; gap: 10px; justify-items: center; }
+
+  /* Send Delivery Order sheet */
+  .sd-scrim { position: fixed; inset: 0; z-index: 3500; display: flex; align-items: center; justify-content: center; padding: 16px;
+              background: rgba(11,39,64,.28); -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px); opacity: 0; pointer-events: none; transition: opacity .2s ease; }
+  .sd-scrim.on { opacity: 1; pointer-events: auto; }
+  .sd-sheet { width: 580px; max-width: 100%; max-height: calc(100vh - 32px); overflow: auto; background: var(--card); color: var(--text); border-radius: 22px;
+              box-shadow: 0 30px 80px rgba(11,39,64,.30); transform: translateY(14px) scale(.98); transition: transform .22s cubic-bezier(.2,.8,.2,1); }
+  .sd-scrim.on .sd-sheet { transform: none; }
+  .sd-head { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; padding: 15px 20px 12px; border-bottom: 1px solid var(--border); }
+  .sd-head h3 { margin: 0; font-size: 16px; letter-spacing: -.01em; text-align: center; }
+  .sd-head button { justify-self: start; border: 0; background: none; color: var(--navy-light); font-size: 14px; font-weight: 600; font-family: inherit; cursor: pointer; padding: 0; }
+  .sd-fields { display: grid; grid-template-columns: 64px minmax(0,1fr); gap: 8px 10px; align-items: center; padding: 12px 20px; border-bottom: 1px solid var(--border); font-size: 13.5px; }
+  .sd-fields > label { color: var(--muted); font-size: 13px; }
+  .sd-toks { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
+  .sd-tok { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; background: color-mix(in srgb, var(--navy-light) 12%, transparent); color: var(--text);
+            border-radius: 999px; padding: 4px 6px 4px 10px; font-size: 12.5px; }
+  .sd-tok span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sd-tok button { border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px; font-family: inherit; }
+  .sd-toks input, .sd-fields .sd-subj { border: 0; outline: 0; font: inherit; color: var(--text); background: transparent; min-width: 140px; flex: 1; padding: 3px 0; }
+  .sd-fields .sd-subj { font-weight: 600; width: 100%; }
+  .sd-body { display: block; width: 100%; box-sizing: border-box; min-height: 230px; border: 0; outline: 0; resize: vertical; padding: 14px 20px;
+             font: 13.5px/1.55 inherit; font-family: inherit; color: var(--text); background: transparent; }
+  .sd-file { display: flex; gap: 10px; align-items: center; margin: 0 20px 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px; font-size: 13px; }
+  .sd-file .ic { width: 32px; height: 38px; border-radius: 6px; background: var(--danger-bg); color: var(--danger); display: flex; align-items: center; justify-content: center; font-size: 9.5px; font-weight: 800; flex-shrink: 0; }
+  .sd-file small { display: block; color: var(--muted); }
+  .sd-note { margin: 0 20px 12px; padding: 9px 12px; border-radius: 10px; background: color-mix(in srgb, var(--gold) 14%, transparent); font-size: 12.5px; }
+  .sd-info { padding: 16px 20px 6px; font-size: 13.5px; color: var(--muted); }
+  .sd-list { padding: 4px 20px 12px; display: grid; gap: 6px; font-size: 13px; }
+  .sd-list div { display: flex; justify-content: space-between; gap: 10px; padding: 8px 12px; border-radius: 10px; background: var(--bg); }
+  .sd-list em { font-style: normal; color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .sd-foot { display: flex; align-items: center; gap: 10px; padding: 12px 20px 18px; flex-wrap: wrap; }
+  .sd-foot .sd-alt { margin-inline-end: auto; border: 0; background: none; color: var(--navy-light); font-size: 13px; font-weight: 500; font-family: inherit; cursor: pointer; padding: 8px 2px; }
+  .sd-btn { border: 1px solid var(--border); background: var(--card); color: var(--text); border-radius: 999px; padding: 9px 16px; font-size: 13px; font-weight: 600; font-family: inherit; cursor: pointer; }
+  .sd-btn.pri { border: 0; background: linear-gradient(180deg, var(--navy-light), var(--navy)); color: #fff; padding: 9px 20px; }
+  .sd-btn:disabled { opacity: .5; cursor: default; }
+  @media (max-width: 600px) { .sd-fields { grid-template-columns: 52px minmax(0,1fr); } .sd-foot .sd-alt { width: 100%; text-align: start; } }
+
   .docs-section { padding: 12px 0; border-bottom: 1px solid var(--border); }
   .docs-section:last-child { border-bottom: none; }
   .docs-section .docs-section-title { font-weight: 700; font-size: 13px; margin-bottom: 6px; }
@@ -19381,7 +19840,7 @@ PAGE_HTML = """
         <div class="dropzone-text"><b data-i18n="click_to_upload">Click to upload</b> <span data-i18n="or_drag_drop_docs">or drag &amp; drop Invoice/DO PDFs</span></div>
         <div class="dropzone-sub" data-i18n="auto_match_dropzone_sub">Drop as many at once as you like - each is matched to its BL automatically</div>
       </div>
-      <input type="file" id="autoMatchFile" accept=".pdf" multiple style="display:none" onchange="handleAutoMatchFiles(this.files)">
+      <input type="file" id="autoMatchFile" accept=".pdf,.jpg,.jpeg,.png,.webp,.tif,.tiff" multiple style="display:none" onchange="handleAutoMatchFiles(this.files)">
     </label>
   </div>
 
@@ -19760,6 +20219,13 @@ function formatLocalTime(raw) {
 function updateToggleUI(bl, field, checked, by, at) {
   const input = document.getElementById(bl + '_' + field);
   if (!input) { render(); return; }
+  if (field === 'invoice_issued' || field === 'do_issued') {     // the Paid / Send tag beside it changes too
+    const rec = records.find(r => r.bl_number === bl);
+    const cell = input.closest('td');
+    if (rec && cell) cell.innerHTML = field === 'invoice_issued' ? invoiceCell(rec) : doCell(rec);
+    updateCompleteBadge(bl);
+    return;
+  }
   const wrap = input.closest('.checkwrap');
   let meta = wrap.querySelector('.meta');
   if (checked) {
@@ -19783,17 +20249,9 @@ function updateCompleteBadge(bl) {
   if (!row) return;
   const cell = row.querySelector('.bl-cell');
   const chips = cell.querySelector('.bl-cell-chips') || cell;
-  let badge = cell.querySelector('.badge-complete');
-  const complete = !!(rec.invoice_issued && rec.approval_received && rec.do_issued);
-  if (complete && !badge) {
-    badge = document.createElement('span');
-    badge.className = 'badge-complete';
-    badge.innerHTML = '&check; ' + t('complete_badge');
-    chips.appendChild(badge);
-  } else if (!complete && badge) {
-    badge.remove();
-  }
+  const complete = isDone(rec);
   row.classList.toggle('row-complete', complete);
+  updateSummaryOnly();
 }
 
 function cssEscape(s) {
@@ -19822,8 +20280,12 @@ function toggle(bl, field, value) {
   const rec = records.find(r => r.bl_number === bl);
   if (rec) {
     rec[field] = value ? 1 : 0;
-    const byField = field.replace('_issued', '_by').replace('_received', '_by');
-    const atField = field.replace('_issued', '_at').replace('_received', '_at');
+    const WHO = {invoice_issued: ['invoice_by', 'invoice_at'], approval_received: ['approval_by', 'approval_at'], do_issued: ['do_by', 'do_at'],
+                 paid: ['paid_by', 'paid_at'], do_sent: ['do_sent_by', 'do_sent_at']};
+    const byField = WHO[field][0], atField = WHO[field][1];
+    if (field === 'paid') rec.paid_via = value ? 'manual' : '';
+    if (field === 'do_sent') { rec.do_sent_via = value ? 'manual' : ''; rec.do_sent_to = ''; }
+    if (field === 'do_issued' && !value && rec.do_sent_via !== 'before') { rec.do_sent = 0; rec.do_sent_via = ''; rec.do_sent_to = ''; }
     if (value) {
       rec[byField] = CURRENT_USER;
       rec[atField] = nowLabel();
@@ -19883,7 +20345,8 @@ function auditActionLabel(action) {
 }
 
 function historyFieldLabel(field) {
-  return {invoice_issued: t('th_invoice_issued'), approval_received: t('th_approval_received'), do_issued: t('th_do_issued'), remarks: t('th_remarks')}[field] || field;
+  return {invoice_issued: t('th_invoice_issued'), approval_received: t('th_approval_received'), do_issued: t('th_do_issued'), remarks: t('th_remarks'),
+          paid: t('th_paid'), do_sent: t('th_do_sent'), receipt: t('doc_receipt'), bl: t('doc_bl_copy'), invoice: t('doc_invoice'), do: t('doc_delivery_order')}[field] || field;
 }
 
 async function showHistory(bl) {
@@ -19934,11 +20397,17 @@ function closeHistory() {
    replace/remove still are - but note this only helps someone who can
    already see the row: the board itself (and search) stays scoped to each
    staff member's own BLs. */
-const DOC_KINDS = ['invoice', 'do'];
+const DOC_KINDS = ['invoice', 'receipt', 'do', 'bl'];
+const DOC_IMAGE_RE = /[.](jpe?g|png|webp|tiff?)$/i;
+function docLabel(kind) {
+  return kind === 'invoice' ? t('doc_invoice') : kind === 'do' ? t('doc_delivery_order') : kind === 'bl' ? t('doc_bl_copy') : kind === 'receipt' ? t('doc_receipt') : t('unrecognized_document');
+}
+function isDone(r) { return !!(r.invoice_issued && r.paid && r.approval_received && r.do_issued && r.do_sent); }
+function fmtSize(b) { return b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB'; }
 
 function docChip(bl, kind, hasFile) {
-  const label = kind === 'invoice' ? t('doc_chip_inv') : t('doc_chip_do');
-  const full = kind === 'invoice' ? t('doc_invoice') : t('doc_delivery_order');
+  const label = kind === 'invoice' ? t('doc_chip_inv') : kind === 'bl' ? t('doc_chip_bl') : t('doc_chip_do');
+  const full = docLabel(kind);
   const title = hasFile ? t('attached_tooltip', {full}) : t('not_attached_tooltip', {full});
   return `<span class="doc-chip ${hasFile ? 'has-file' : 'no-file'}" title="${esc(title)}"
             onclick="event.stopPropagation(); showDocs(${jsq(bl)})">${esc(label)}</span>`;
@@ -19947,7 +20416,8 @@ function docChip(bl, kind, hasFile) {
 function renderDocsSections(data, canManage) {
   const atts = data.attachments || {};
   return DOC_KINDS.map(kind => {
-    const label = kind === 'invoice' ? t('doc_invoice') : t('doc_delivery_order');
+    const label = docLabel(kind);
+    const accept = (kind === 'bl' || kind === 'receipt') ? '.pdf,application/pdf,.jpg,.jpeg,.png,.webp,.tif,.tiff' : '.pdf,application/pdf';
     const att = atts[kind];
     let status, actions;
     if (att) {
@@ -19957,13 +20427,13 @@ function renderDocsSections(data, canManage) {
           <button type="button">${t('download')}</button>
         </a>
         ${canManage ? `
-          <label class="btn-upload">${t('replace')}<input type="file" accept=".pdf,application/pdf" onchange="uploadAttachment(${jsq(data.bl_number)}, '${kind}', this)"></label>
+          <label class="btn-upload">${t('replace')}<input type="file" accept="${accept}" onchange="uploadAttachment(${jsq(data.bl_number)}, '${kind}', this)"></label>
           <button type="button" class="btn-danger" onclick="removeAttachment(${jsq(data.bl_number)}, '${kind}')">${t('remove')}</button>
         ` : ''}`;
     } else {
       status = canManage ? t('not_attached_yet') : t('not_attached_waiting');
       actions = canManage ? `
-        <label class="btn-upload">${t('upload_pdf')}<input type="file" accept=".pdf,application/pdf" onchange="uploadAttachment(${jsq(data.bl_number)}, '${kind}', this)"></label>
+        <label class="btn-upload">${t('upload_pdf')}<input type="file" accept="${accept}" onchange="uploadAttachment(${jsq(data.bl_number)}, '${kind}', this)"></label>
       ` : '';
     }
     return `
@@ -20165,6 +20635,228 @@ function closeDocs() {
   document.getElementById('docsOverlay').style.display = 'none';
 }
 
+/* ---------- B/L copy preview: hover the B/L number (tap it on a phone) ---------- */
+let blPopTimer = null, blPopFor = null;
+function blPopEl() {
+  let el = document.getElementById('blPop');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'blPop'; el.className = 'blpop';
+    el.addEventListener('mouseenter', () => clearTimeout(blPopTimer));
+    el.addEventListener('mouseleave', hideBlPop);
+    document.body.appendChild(el);
+  }
+  return el;
+}
+function showBlPop(anchor, now) {
+  clearTimeout(blPopTimer);
+  blPopTimer = setTimeout(() => {
+    const bl = anchor.dataset.bl;
+    const rec = records.find(r => r.bl_number === bl);
+    if (!rec) return;
+    const el = blPopEl();
+    blPopFor = bl;
+    const canManage = IS_ADMIN || rec.created_by === CURRENT_USER;
+    const url = `/api/records/${encodeURIComponent(bl)}/attachment/bl`;
+    el.innerHTML = rec.has_bl_file
+      ? `<div class="ph"><b>${esc(bl)}</b><span>${t('bl_copy_page')}</span></div>
+         <div class="pg"><img alt="" src="/api/records/${encodeURIComponent(bl)}/bl-preview?v=${encodeURIComponent(rec.bl_ver || '')}"></div>
+         <div class="pf"><span></span><a href="${url}" target="_blank" rel="noopener">${t('open_full_bl')}</a></div>`
+      : `<div class="ph"><b>${esc(bl)}</b><span>${t('doc_bl_copy')}</span></div>
+         <div class="none">${t('no_bl_copy')}${canManage ? `<label class="sd-btn pri" style="display:inline-block">${t('upload_bl_copy')}<input type="file" accept=".pdf,.jpg,.jpeg,.png,.webp,.tif,.tiff" style="display:none" onchange="hideBlPop(true); uploadAttachment(${jsq(bl)}, 'bl', this)"></label>` : ''}</div>`;
+    const r = anchor.getBoundingClientRect();
+    const w = Math.min(380, window.innerWidth - 24);
+    const h = rec.has_bl_file ? 560 : 150;
+    const rtl = document.documentElement.dir === 'rtl';
+    let x = rtl ? r.right - w : r.left;
+    x = Math.max(12, Math.min(x, window.innerWidth - w - 12));
+    let y = r.bottom + 8;
+    if (y + h > window.innerHeight - 8) y = Math.max(8, r.top - h - 8);
+    el.style.left = x + 'px'; el.style.top = y + 'px';
+    el.classList.add('on');
+  }, now ? 0 : 220);
+}
+function hideBlPop(nowFlag) {
+  clearTimeout(blPopTimer);
+  const go = () => { const el = document.getElementById('blPop'); if (el && !(nowFlag !== true && el.matches(':hover'))) { el.classList.remove('on'); blPopFor = null; } };
+  if (nowFlag === true) go(); else blPopTimer = setTimeout(go, 180);
+}
+document.addEventListener('mouseover', e => {
+  const a = e.target.closest && e.target.closest('.bl-hover');
+  if (a && window.matchMedia('(hover: hover)').matches) showBlPop(a);
+});
+document.addEventListener('mouseout', e => {
+  const a = e.target.closest && e.target.closest('.bl-hover');
+  if (a && !(e.relatedTarget && a.contains(e.relatedTarget))) hideBlPop();
+});
+document.addEventListener('click', e => {
+  const a = e.target.closest && e.target.closest('.bl-hover');
+  if (a) { if (blPopFor === a.dataset.bl) hideBlPop(true); else showBlPop(a, true); return; }
+  if (!(e.target.closest && e.target.closest('#blPop'))) hideBlPop(true);
+});
+window.addEventListener('scroll', () => hideBlPop(true), {passive: true});
+
+/* ---------- Send the Delivery Order to the consignee ---------- */
+let sendDo = null;   // {bl, to:[], cc:[], draft}
+function sdScrim() {
+  let el = document.getElementById('sdScrim');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'sdScrim'; el.className = 'sd-scrim';
+    el.innerHTML = '<div class="sd-sheet" role="dialog" aria-modal="true" id="sdSheet"></div>';
+    el.addEventListener('click', e => { if (e.target === el) closeSendDo(); });
+    document.body.appendChild(el);
+  }
+  return el;
+}
+function closeSendDo() { const el = document.getElementById('sdScrim'); if (el) el.classList.remove('on'); sendDo = null; }
+
+async function openSendDo(bl) {
+  hideBlPop(true);
+  const scrim = sdScrim();
+  const sheet = document.getElementById('sdSheet');
+  sheet.innerHTML = `<div class="sd-info">${t('loading')}</div>`;
+  scrim.classList.add('on');
+  let d;
+  try {
+    const res = await fetch(`/api/records/${encodeURIComponent(bl)}/send-do/draft`);
+    d = await res.json();
+    if (!res.ok) throw new Error(apiErrorText(d));
+  } catch (err) { sheet.innerHTML = `<div class="sd-info">${esc(err.message || t('could_not_load_bl'))}</div>`; return; }
+  const rec = records.find(r => r.bl_number === bl) || {};
+  sendDo = {bl, to: d.to.map(x => x.email), cc: d.cc.slice(), draft: d, resend: false};
+  if (rec.do_sent) renderSentSheet(rec); else renderSendSheet();
+}
+function renderSentSheet(rec) {
+  const sheet = document.getElementById('sdSheet');
+  const info = rec.do_sent_via === 'email' ? t('sd_sent_info', {to: rec.do_sent_to || '', time: formatLocalTime(rec.do_sent_at)})
+    : rec.do_sent_via === 'before' ? t('sd_sent_before') : t('sd_sent_hand_info', {user: rec.do_sent_by || '', time: formatLocalTime(rec.do_sent_at)});
+  sheet.innerHTML = `<div class="sd-head"><button type="button" onclick="closeSendDo()">${t('sd_close')}</button><h3>${t('do_sent_title')}</h3><span></span></div>
+    <div class="sd-info"><b style="color:var(--text)">${esc(rec.bl_number)}</b><br>${esc(info)}</div>
+    <div class="sd-foot"><button type="button" class="sd-alt" onclick="markDoSent(false)">${t('sd_mark_unsent')}</button>
+      <button type="button" class="sd-btn" onclick="closeSendDo()">${t('sd_close')}</button>
+      <button type="button" class="sd-btn pri" onclick="sendDo.resend = true; renderSendSheet()">${t('sd_send_again')}</button></div>`;
+}
+function sdToks(list, kind) {
+  return list.map((e, i) => `<span class="sd-tok"><span>${esc(e)}</span><button type="button" aria-label="Remove" onclick="sdRemove('${kind}', ${i})">&times;</button></span>`).join('');
+}
+function sdRemove(kind, i) { sdKeep(); sendDo[kind].splice(i, 1); renderSendSheet(); }
+function sdKeep() {           // what was typed survives a redraw
+  const s = document.getElementById('sdSubj'), b = document.getElementById('sdBody');
+  if (s) sendDo.draft.subject = s.value;
+  if (b) sendDo.draft.body = b.value;
+  ['to', 'cc'].forEach(k => { const inp = document.getElementById('sdAdd_' + k); if (inp && inp.value.trim()) sdAddEmail(k, inp.value, true); });
+}
+function sdAddEmail(kind, value, quiet) {
+  const parts = String(value || '').split(/[ ,;]+/).map(x => x.trim()).filter(x => /^[^@ ]+@[^@ ]+[.][^@ ]+$/.test(x));
+  parts.forEach(e => { if (!sendDo[kind].some(x => x.toLowerCase() === e.toLowerCase())) sendDo[kind].push(e); });
+  if (!quiet) renderSendSheet();
+  return parts.length;
+}
+function sdKey(e, kind) {
+  if (e.key === 'Enter' || e.key === ',' || e.key === ';') { e.preventDefault(); sdKeep(); sdAddEmail(kind, e.target.value); }
+}
+function renderSendSheet() {
+  const d = sendDo.draft, sheet = document.getElementById('sdSheet');
+  const noTo = !sendDo.to.length;
+  const canSend = d.email_configured && d.file && !noTo;
+  sheet.innerHTML = `<div class="sd-head"><button type="button" onclick="closeSendDo()">${t('sd_cancel')}</button><h3>${t('send_do_title')}</h3><span></span></div>
+    <div class="sd-fields">
+      <label>${t('sd_to')}</label><div class="sd-toks">${sdToks(sendDo.to, 'to')}<input id="sdAdd_to" type="email" placeholder="${esc(sendDo.to.length ? t('sd_add_email') : 'consignee@email.com')}" onkeydown="sdKey(event, 'to')" onblur="if (this.value.trim()) { sdKeep(); renderSendSheet(); }"></div>
+      <label>${t('sd_cc')}</label><div class="sd-toks">${sdToks(sendDo.cc, 'cc')}<input id="sdAdd_cc" type="email" placeholder="${t('sd_add_email')}" onkeydown="sdKey(event, 'cc')" onblur="if (this.value.trim()) { sdKeep(); renderSendSheet(); }"></div>
+      <label>${t('sd_subject')}</label><input id="sdSubj" class="sd-subj" dir="auto" value="${esc(d.subject)}">
+    </div>
+    <textarea id="sdBody" class="sd-body" dir="auto">${esc(d.body)}</textarea>
+    ${d.file ? `<div class="sd-file"><div class="ic">PDF</div><div>${esc(d.file.name)}<small>${t('doc_delivery_order')} · ${fmtSize(d.file.size || 0)}</small></div></div>`
+             : `<div class="sd-note">${t('sd_no_do')} <label class="stag act" style="display:inline-flex;margin-inline-start:6px">${t('sd_attach_do')}<input type="file" accept=".pdf,application/pdf" style="display:none" onchange="sdAttachDo(this)"></label></div>`}
+    ${noTo ? `<div class="sd-note">${t('sd_no_email')}</div>` : ''}
+    ${d.email_configured ? '' : `<div class="sd-note">${t('sd_no_smtp')}</div>`}
+    <div class="sd-foot">
+      ${sendDo.resend ? '<span style="margin-inline-end:auto"></span>' : `<button type="button" class="sd-alt" onclick="markDoSent(true)">${t('sd_already')}</button>`}
+      <button type="button" class="sd-btn" onclick="closeSendDo()">${t('sd_cancel')}</button>
+      <button type="button" class="sd-btn pri" id="sdSendBtn" ${canSend ? '' : 'disabled'} onclick="doSendDo()">${t('sd_send')}</button>
+    </div>`;
+}
+async function sdAttachDo(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  sdKeep();
+  const {ok, data} = await submitAttachmentFile(sendDo.bl, 'do', file);
+  if (!ok) { showToast(data.error || t('upload_failed')); return; }
+  sendDo.draft.file = {name: data.filename, size: data.size || file.size};
+  await fetchRecords(true);
+  renderSendSheet();
+}
+async function doSendDo() {
+  sdKeep();
+  if (!sendDo.to.length) { renderSendSheet(); return; }
+  const btn = document.getElementById('sdSendBtn');
+  btn.disabled = true; btn.textContent = t('sd_sending');
+  const bl = sendDo.bl;
+  try {
+    const res = await apiWrite(`/api/records/${encodeURIComponent(bl)}/send-do`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({to: sendDo.to, cc: sendDo.cc, subject: document.getElementById('sdSubj').value, body: document.getElementById('sdBody').value})
+    });
+    const data = await res.json();
+    if (!res.ok) { showToast(apiErrorText(data)); btn.disabled = false; btn.textContent = t('sd_send'); return; }
+    closeSendDo();
+    showToast(t('do_sent_toast', {to: (data.sent_to || []).join(', ')}));
+    await fetchRecords(true);
+  } catch (e) { showToast(t('could_not_save_retry')); btn.disabled = false; btn.textContent = t('sd_send'); }
+}
+async function markDoSent(on) {
+  const bl = sendDo && sendDo.bl;
+  if (!bl) return;
+  closeSendDo();
+  if (on) {
+    const res = await apiWrite(`/api/records/${encodeURIComponent(bl)}/send-do`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({manual: true})
+    });
+    if (!res.ok) { showToast(t('could_not_save_retry')); return; }
+    showToast(t('marked_sent_toast'));
+    await fetchRecords(true);
+  } else {
+    toggle(bl, 'do_sent', false);
+    showToast(t('marked_unsent_toast'));
+  }
+}
+
+/* 'Send N DOs' on a vessel: one email per consignee with their DOs attached */
+let sendBatchBls = [];
+function openSendBatch(bls) {
+  hideBlPop(true);
+  const list = records.filter(r => bls.includes(r.bl_number) && r.do_issued && !r.do_sent);
+  const ready = list.filter(r => r.has_do_file && (r.consignee_email || r.broker_email));
+  sendBatchBls = ready.map(r => r.bl_number);
+  const scrim = sdScrim(), sheet = document.getElementById('sdSheet');
+  sendDo = {batch: true};
+  const rows = list.map(r => {
+    const why = !r.has_do_file ? t('batch_skip_no_do') : !(r.consignee_email || r.broker_email) ? t('batch_skip_no_email') : (r.consignee_email || r.broker_email);
+    const okRow = r.has_do_file && (r.consignee_email || r.broker_email);
+    return `<div style="${okRow ? '' : 'opacity:.6'}"><span>${esc(r.bl_number)}</span><em>${esc(why)}</em></div>`;
+  }).join('');
+  sheet.innerHTML = `<div class="sd-head"><button type="button" onclick="closeSendDo()">${t('sd_cancel')}</button><h3>${t('batch_title', {n: ready.length, p: ready.length === 1 ? '' : 's'})}</h3><span></span></div>
+    <div class="sd-info">${t('batch_note')}</div><div class="sd-list">${rows}</div>
+    ${ready.length ? '' : `<div class="sd-note">${t('batch_none')}</div>`}
+    <div class="sd-foot"><span style="margin-inline-end:auto"></span><button type="button" class="sd-btn" onclick="closeSendDo()">${t('sd_cancel')}</button>
+      <button type="button" class="sd-btn pri" id="sdBatchBtn" ${ready.length ? '' : 'disabled'} onclick="doSendBatch()">${t('batch_send_all')}</button></div>`;
+  scrim.classList.add('on');
+}
+async function doSendBatch() {
+  const btn = document.getElementById('sdBatchBtn');
+  btn.disabled = true; btn.textContent = t('sd_sending');
+  try {
+    const res = await apiWrite('/api/do/send-batch', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({bl_numbers: sendBatchBls})});
+    const data = await res.json();
+    if (!res.ok) { showToast(apiErrorText(data)); btn.disabled = false; btn.textContent = t('batch_send_all'); return; }
+    closeSendDo();
+    const n = (data.sent || []).length;
+    showToast(t('batch_done', {n, p: n === 1 ? '' : 's'}));
+    await fetchRecords(true);
+  } catch (e) { showToast(t('could_not_save_retry')); btn.disabled = false; btn.textContent = t('batch_send_all'); }
+}
+
 async function submitAttachmentFile(bl, kind, file) {
   // Shared by the single-file Documents-modal upload and the batch
   // auto-match flow below - just the raw POST, no UI side effects, so
@@ -20184,12 +20876,19 @@ async function submitAttachmentFile(bl, kind, file) {
 async function uploadAttachment(bl, kind, input) {
   const file = input.files && input.files[0];
   if (!file) return;
-  if (!file.name.toLowerCase().endsWith('.pdf')) { showToast(t('only_pdf_accepted')); input.value = ''; return; }
-  if (file.size > 10 * 1024 * 1024) { showToast(t('file_too_large')); input.value = ''; return; }
+  const imgOk = (kind === 'bl' || kind === 'receipt') && DOC_IMAGE_RE.test(file.name);
+  if (!file.name.toLowerCase().endsWith('.pdf') && !imgOk) { showToast(t('only_pdf_accepted')); input.value = ''; return; }
+  if (file.size > (kind === 'bl' ? 30 : 10) * 1024 * 1024) { showToast(t('file_too_large')); input.value = ''; return; }
 
   const {ok, data} = await submitAttachmentFile(bl, kind, file);
   if (!ok) { showToast(data.error || t('upload_failed')); return; }
-  const label = kind === 'invoice' ? t('doc_invoice') : t('doc_delivery_order');
+  const label = docLabel(kind);
+  if (kind === 'bl' || kind === 'receipt') {
+    showToast(kind === 'bl' ? t('bl_attached_toast', {size: fmtSize(data.size || 0)}) : t('receipt_attached_toast'));
+    await fetchRecords(true);
+    if (document.getElementById('docsOverlay').style.display !== 'none') await showDocs(bl);
+    return;
+  }
   // Attaching the file auto-flips the matching Issued slider server-side
   // (see upload_attachment) - say so, so it's obvious the status change
   // wasn't a separate click someone forgot to make.
@@ -20218,7 +20917,7 @@ autoMatchDropzone.addEventListener('drop', e => {
 });
 
 function autoMatchKindLabel(kind) {
-  return kind === 'invoice' ? t('doc_invoice') : kind === 'do' ? t('doc_delivery_order') : t('unrecognized_document');
+  return docLabel(kind);
 }
 
 /* The results popup. Opening it when it's closed starts a fresh list;
@@ -20251,10 +20950,10 @@ function autoMatchIsOpen() {
 }
 
 async function handleAutoMatchFiles(fileList) {
-  const files = Array.from(fileList || []).filter(f => f.name.toLowerCase().endsWith('.pdf'));
+  const files = Array.from(fileList || []).filter(f => f.name.toLowerCase().endsWith('.pdf') || DOC_IMAGE_RE.test(f.name));
   const input = document.getElementById('autoMatchFile');
   if (input) input.value = '';  // so the same file can be picked again later
-  if (!files.length) { showToast(t('drop_pdf_only')); return; }
+  if (!files.length) { showToast(t('images_or_pdf')); return; }
 
   openAutoMatch();
   autoMatchRunning++;
@@ -20277,7 +20976,7 @@ async function handleAutoMatchFiles(fileList) {
     const file = files[i];
     const row = rows[i];
 
-    if (file.size > 10 * 1024 * 1024) {
+    if (file.size > 30 * 1024 * 1024) {
       row.querySelector('.match-status').textContent = t('too_large_skipped');
       updateSummary();
       continue;
@@ -20301,7 +21000,7 @@ async function handleAutoMatchFiles(fileList) {
       const {ok, data} = await submitAttachmentFile(detect.matched_bl, detect.kind, file);
       if (ok) {
         row.className = 'match-row ok';
-        const issuedNote = data.auto_issued_field ? t('marked_issued_suffix') : '';
+        const issuedNote = detect.kind === 'receipt' ? ' - ' + t('paid_tag') : detect.kind === 'bl' ? ' (' + fmtSize(data.size || 0) + ')' : data.auto_issued_field ? t('marked_issued_suffix') : '';
         row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">&check; ${esc(detect.matched_bl)} - ${esc(autoMatchKindLabel(detect.kind))}${esc(issuedNote)}</div>`;
         updateSummary();
         continue;
@@ -20350,7 +21049,9 @@ function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
       <select class="review-kind">
         <option value="">${t('kind_ellipsis')}</option>
         <option value="invoice" ${detect.kind === 'invoice' ? 'selected' : ''}>${t('doc_invoice')}</option>
+        <option value="receipt" ${detect.kind === 'receipt' ? 'selected' : ''}>${t('doc_receipt')}</option>
         <option value="do" ${detect.kind === 'do' ? 'selected' : ''}>${t('doc_delivery_order')}</option>
+        <option value="bl" ${detect.kind === 'bl' ? 'selected' : ''}>${t('doc_bl_copy')}</option>
       </select>
       <button type="button" class="review-attach-btn">${t('attach_btn')}</button>
     </div>`;
@@ -20375,7 +21076,7 @@ function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
 async function removeAttachment(bl, kind) {
   const res = await apiWrite(`/api/records/${encodeURIComponent(bl)}/attachment/${kind}`, {method: 'DELETE'});
   if (!res.ok) { showToast(t('could_not_remove_file')); return; }
-  showToast(t('doc_removed', {kind: kind === 'invoice' ? t('doc_invoice') : t('doc_delivery_order')}));
+  showToast(t('doc_removed', {kind: docLabel(kind)}));
   await fetchRecords(true);
   if (document.getElementById('docsOverlay').style.display !== 'none') await showDocs(bl);
 }
@@ -20480,22 +21181,54 @@ function toggleGroup(key) {
   render();
 }
 
-function checkbox(bl, field, checked, by, at) {
+// The Invoice cell carries the Paid tag; the DO cell carries Send / Sent.
+function invoiceCell(r) {
+  let tag = '';
+  if (r.invoice_issued) {
+    if (r.paid) {
+      const how = r.paid_via === 'receipt' ? t('paid_by_receipt') : r.paid_via === 'before' ? t('paid_before') : t('paid_by_hand');
+      const when = r.paid_at ? ' · ' + formatLocalTime(r.paid_at) : '';
+      tag = `<button type="button" class="stag ok" title="${esc(how + when)}" onclick="toggle(${jsq(r.bl_number)}, 'paid', false)">${t('paid_tag')}</button>`;
+    } else {
+      tag = `<button type="button" class="stag todo" onclick="toggle(${jsq(r.bl_number)}, 'paid', true)">${t('mark_paid')}</button>`;
+    }
+  }
+  return checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at, tag);
+}
+function doCell(r) {
+  let tag = '', meta = null;
+  if (r.do_issued) {
+    if (r.do_sent) {
+      const tt = r.do_sent_via === 'email' ? t('sent_to_title', {to: r.do_sent_to || '', time: formatLocalTime(r.do_sent_at)})
+        : r.do_sent_via === 'before' ? t('sd_sent_before') : t('sent_hand_title', {time: formatLocalTime(r.do_sent_at)});
+      tag = `<button type="button" class="stag ok" title="${esc(tt)}" onclick="openSendDo(${jsq(r.bl_number)})">${t('sent_tag')}</button>`;
+      if (r.do_sent_via === 'email') meta = t('sent_emailed', {time: formatLocalTime(r.do_sent_at)});
+      else if (r.do_sent_via === 'manual') meta = t('sent_by_hand', {time: formatLocalTime(r.do_sent_at)});
+    } else {
+      tag = `<button type="button" class="stag act" onclick="openSendDo(${jsq(r.bl_number)})"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>${t('send_tag')}</button>`;
+    }
+  }
+  return checkbox(r.bl_number, 'do_issued', !!r.do_issued, r.do_by, r.do_at, tag, meta);
+}
+
+function checkbox(bl, field, checked, by, at, tag, metaText) {
   const id = bl + '_' + field;
-  return `
-    <div class="checkwrap">
-      <label class="switch">
+  const sw = `<label class="switch">
         <input type="checkbox" id="${esc(id)}" ${checked ? 'checked' : ''}
           onchange="toggle(${jsq(bl)}, '${field}', this.checked)">
         <span class="slider"></span>
-      </label>
-      ${checked ? `<span class="meta" title="${esc((by || '') + ' - ' + formatLocalTime(at))}">${esc((by || '') + ' - ' + formatLocalTime(at))}</span>` : ''}
+      </label>`;
+  const metaStr = metaText || ((by || '') + ' - ' + formatLocalTime(at));
+  return `
+    <div class="checkwrap">
+      ${tag ? `<div class="sw-line">${sw}${tag}</div>` : sw}
+      ${checked ? `<span class="meta" title="${esc(metaStr)}">${esc(metaStr)}</span>` : ''}
     </div>`;
 }
 
 function summaryHtml() {
   const total = records.length;
-  const complete = records.filter(r => r.invoice_issued && r.approval_received && r.do_issued).length;
+  const complete = records.filter(isDone).length;
 
   const icons = {
     total: '<svg viewBox="0 0 24 24"><path d="M7 3h7l5 5v13a1 1 0 01-1 1H7a1 1 0 01-1-1V4a1 1 0 011-1z"/><path d="M14 3v5h5"/></svg>',
@@ -20517,24 +21250,24 @@ let selectedBLs = new Set();
 
 function rowsHtml(list) {
   return list.map(r => {
-    const complete = !!(r.invoice_issued && r.approval_received && r.do_issued);
+    const complete = isDone(r);
     return `
     <tr id="row_${cssEscape(r.bl_number)}" class="${complete ? 'row-complete' : ''}">
       <td class="select-col"><input type="checkbox" class="row-select" ${selectedBLs.has(r.bl_number) ? 'checked' : ''}
             onchange="toggleRowSelect(${jsq(r.bl_number)}, this.checked)"></td>
       <td>
         <div class="bl-cell">
-          <b>${esc(r.bl_number)}</b>
+          <b class="bl-hover" data-bl="${esc(r.bl_number)}">${esc(r.bl_number)}</b>
           <div class="bl-cell-chips">
             ${docChip(r.bl_number, 'invoice', r.has_invoice_file)}
             ${docChip(r.bl_number, 'do', r.has_do_file)}
-            ${complete ? `<span class="badge-complete">&check; ${t('complete_badge')}</span>` : ''}
+            ${docChip(r.bl_number, 'bl', r.has_bl_file)}
           </div>
         </div>
       </td>
-      <td data-label="${t('th_invoice_issued')}">${checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at)}</td>
+      <td data-label="${t('th_invoice_issued')}">${invoiceCell(r)}</td>
       <td data-label="${t('th_approval_received')}">${checkbox(r.bl_number, 'approval_received', !!r.approval_received, r.approval_by, r.approval_at)}</td>
-      <td data-label="${t('th_do_issued')}">${checkbox(r.bl_number, 'do_issued', !!r.do_issued, r.do_by, r.do_at)}</td>
+      <td data-label="${t('th_do_issued')}">${doCell(r)}</td>
       <td data-label="${t('th_remarks')}"><input class="remarks-input" type="text" dir="${autoDir(r.remarks)}" value="${esc(r.remarks || '')}"
             oninput="this.dir = autoDir(this.value); onRemarksInput(${jsq(r.bl_number)}, this.value)"
             onfocus="markEditing(1)" onblur="markEditing(-1)" placeholder="${t('notes_placeholder')}"></td>
@@ -20752,7 +21485,8 @@ function vesselGroupHtml(portName, vesselName, list, archivedView) {
   const vesselKey = 'vessel:' + portName + ':' + vesselName;
   const collapseKey = archivedView ? vesselKey + ':archived' : vesselKey;
   const sortedList = list.slice().sort((a, b) => naturalCompare(a.bl_number, b.bl_number));
-  const left = sortedList.filter(r => !(r.invoice_issued && r.approval_received && r.do_issued)).length;
+  const left = sortedList.filter(r => !isDone(r)).length;
+  const toSend = sortedList.filter(r => r.do_issued && !r.do_sent).length;
   const pct = sortedList.length ? Math.round(((sortedList.length - left) / sortedList.length) * 100) : 0;
   const vesselCollapsed = collapseKey in collapsedGroups ? !!collapsedGroups[collapseKey] : (archivedView ? true : left === 0);
   const eta = (sortedList[0] && sortedList[0].eta) || '';
@@ -20778,6 +21512,7 @@ function vesselGroupHtml(portName, vesselName, list, archivedView) {
         <span class="group-count">${t('bl_count', {n: sortedList.length, p: sortedList.length === 1 ? '' : 's'})}${left ? t('left_suffix', {n: left}) : t('done_suffix')}</span>
         <span class="vessel-progress ${pct >= 100 ? 'done' : ''}" title="${t('pct_complete', {pct})}"><span class="vessel-progress-fill" style="width:${pct}%"></span></span>
         <span class="group-actions">
+          ${(!archivedView && toSend) ? `<button type="button" class="group-send" onclick="event.stopPropagation(); openSendBatch(JSON.parse(this.dataset.bls))" data-bls="${blsJson}">${t('send_n_dos', {n: toSend, p: toSend === 1 ? '' : 's'})}</button>` : ''}
           <a onclick="event.stopPropagation()" href="/api/export?port=${encodeURIComponent(rawPort)}&vessel=${encodeURIComponent(rawVessel)}" class="group-export" title="${t('export_vessel_title')}">${t('export')}</a>
           <button type="button" class="group-neutral" onclick="event.stopPropagation(); setVesselArchived(${blsJson}, ${archivedView ? 'false' : 'true'})">${archivedView ? t('unarchive') : t('archive')}</button>
           <button type="button" class="group-remove" onclick="event.stopPropagation(); removeVesselGroup(${jsq(portName)}, ${jsq(vesselName)})">${t('remove_all')}</button>
@@ -20804,7 +21539,7 @@ function portGroupHtml(portName, vesselNames, vessels, archivedView, suppressHea
     return `<div class="port-group port-group-flat">${vesselsHtml}</div>`;
   }
   const portTotal = vesselNames.reduce((sum, v) => sum + vessels[v].length, 0);
-  const portLeft = vesselNames.reduce((sum, v) => sum + vessels[v].filter(r => !(r.invoice_issued && r.approval_received && r.do_issued)).length, 0);
+  const portLeft = vesselNames.reduce((sum, v) => sum + vessels[v].filter(r => !isDone(r)).length, 0);
   // Default state (only applies the first time a group is seen - once a
   // person manually expands/collapses it, collapsedGroups remembers their
   // choice and this default is never forced back on them): a port group
@@ -20899,7 +21634,7 @@ function render() {
         const vesselCount = Object.keys(vessels).length;
         const portRecords = Object.values(vessels).reduce((all, list) => all.concat(list), []);
         const blCount = portRecords.length;
-        const completeCount = portRecords.filter(r => r.invoice_issued && r.approval_received && r.do_issued).length;
+        const completeCount = portRecords.filter(isDone).length;
         const pct = blCount ? Math.round(completeCount / blCount * 100) : 0;
         const done = pct >= 100;
         const label = esc(portName === 'Unassigned' ? t('unassigned_port_ph') : portName);
@@ -21352,6 +22087,10 @@ document.addEventListener('keydown', (e) => {
   }
 
   if (e.key === 'Escape') {
+    const sdOpen = document.getElementById('sdScrim');
+    if (sdOpen && sdOpen.classList.contains('on')) { closeSendDo(); return; }     // even while typing in it
+    const pop = document.getElementById('blPop');
+    if (pop && pop.classList.contains('on')) { hideBlPop(true); return; }
     if (isTyping) return;
     // A glass-select panel being open means its own trigger keydown
     // handler (onGlassTriggerKeydown) already closed it and stopped this
