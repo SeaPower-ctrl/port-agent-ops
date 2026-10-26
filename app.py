@@ -231,7 +231,7 @@ const I18N = {
     too_large_skipped: "Too large (over 10MB) - skipped.",
     could_not_read_file: "Could not read this file.",
     matches_multiple: "Matches more than one BL - pick the right one",
-    could_not_tell_kind: "Couldn't tell Invoice from Delivery Order",
+    could_not_tell_kind: "Couldn't read this document - pick the BL and the document type",
     no_bl_matched: "No BL on your board matched this document",
     unrecognized_document: "Unrecognized document",
     marked_issued_suffix: " · marked issued",
@@ -301,6 +301,8 @@ const I18N = {
     mp_contact_title: "E-mail: {email} · Phone: {phone}",
     already_has_file_confirm: "Matches {bl}, which already has a {kind} attached - pick it below to replace it",
     member_match_confirm: "Names one of the BLs in the combined entry {bl} - check it and attach",
+    scan_read_confirm: "Read as {bl} from the scan - check it and attach",
+    preview_unavailable: "Preview not available - open the full B/L.",
     mp_status_taken: "Already on the board (another user's)",
     mp_status_fills: "Already on the board - adds missing contact details",
     mp_save_contacts_n: "Save contact details for {n} BL(s)",
@@ -509,7 +511,7 @@ const I18N = {
     too_large_skipped: "الحجم كبير جدًا (أكثر من 10 ميجابايت) - تم التخطي.",
     could_not_read_file: "تعذرت قراءة هذا الملف.",
     matches_multiple: "يطابق أكثر من بوليصة - يرجى اختيار الصحيحة",
-    could_not_tell_kind: "تعذر تحديد ما إذا كان فاتورة أو أمر تسليم",
+    could_not_tell_kind: "تعذّرت قراءة هذا المستند - اختر البوليصة ونوع المستند",
     no_bl_matched: "لا توجد بوليصة على لوحتك تطابق هذا المستند",
     unrecognized_document: "مستند غير معروف",
     marked_issued_suffix: " · تم التمييز كصادرة",
@@ -576,6 +578,8 @@ const I18N = {
     mp_contact_title: "البريد: {email} · الهاتف: {phone}",
     already_has_file_confirm: "يطابق {bl}، ومرفق بها {kind} مسبقًا - اخترها أدناه لاستبداله",
     member_match_confirm: "يذكر إحدى البوالص ضمن الإدخال المجمّع {bl} - تحقّق ثم أرفِق",
+    scan_read_confirm: "قُرئ الرقم {bl} من المستند الممسوح - تحقّق منه ثم أرفِقه",
+    preview_unavailable: "المعاينة غير متاحة - افتح البوليصة كاملة.",
     mp_status_taken: "موجودة على اللوحة لدى مستخدم آخر",
     mp_status_fills: "موجودة - تُضاف بيانات الاتصال الناقصة",
     mp_save_contacts_n: "حفظ بيانات الاتصال لـ {n} بوليصة",
@@ -2894,7 +2898,7 @@ ATTACHMENT_FLAGS_SQL = """,
     EXISTS(SELECT 1 FROM record_attachments a WHERE a.bl_number = r.bl_number AND a.kind = 'do') AS has_do_file,
     EXISTS(SELECT 1 FROM record_attachments a WHERE a.bl_number = r.bl_number AND a.kind = 'receipt') AS has_receipt_file,
     EXISTS(SELECT 1 FROM record_attachments a WHERE a.bl_number = r.bl_number AND a.kind = 'bl') AS has_bl_file,
-    (SELECT a.uploaded_at FROM record_attachments a WHERE a.bl_number = r.bl_number AND a.kind = 'bl') AS bl_ver"""
+    (SELECT a.uploaded_at || '.' || a.file_size FROM record_attachments a WHERE a.bl_number = r.bl_number AND a.kind = 'bl') AS bl_ver"""
 
 
 def _bl_done(r):
@@ -6756,42 +6760,59 @@ _ATT_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff")
 MAX_BL_UPLOAD_BYTES = 30 * 1024 * 1024        # a B/L scan can be big; it is cut down to its front page on arrival
 
 
+_BL_PREVIEW_W = 820        # the hover card is 380 px wide: sharp on a high-density screen, light to load
+
+
+def _bl_preview_jpeg(img):
+    """The small picture of a B/L front page shown when hovering the B/L number."""
+    from PIL import Image
+    prev = img.convert("RGB")
+    if prev.width > _BL_PREVIEW_W:
+        prev = prev.resize((_BL_PREVIEW_W, max(1, round(prev.height * _BL_PREVIEW_W / prev.width))), Image.LANCZOS)
+    pb = io.BytesIO()
+    prev.save(pb, "JPEG", quality=80, optimize=True, progressive=True)
+    return pb.getvalue()
+
+
+def _bl_preview_of_pdf(raw):
+    """Preview picture straight from a stored B/L copy (always a PDF)."""
+    import pypdfium2 as pdfium
+    page = pdfium.PdfDocument(raw)[0]
+    return _bl_preview_jpeg(page.render(scale=_BL_PREVIEW_W / (page.get_width() or 595)).to_pil())
+
+
 def _bl_front_page(raw, dpi=200, quality=85):
     """A B/L copy as Compass keeps it: the FRONT PAGE only (the back is the carrier's terms),
-    and light. A typed PDF keeps page 1 exactly as it is; a scan or a photo is re-saved at
-    200 dpi in high-quality JPEG - as sharp to read, a fraction of the size (a 10 MB two-page
-    scan comes out under 0.5 MB). Returns (pdf_bytes, preview_jpeg_bytes)."""
+    and light. Page 1 is kept exactly as scanned or typed - full original quality - unless it
+    is heavy (a high-resolution scan); then it is re-saved at 200 dpi in high-quality JPEG,
+    as sharp to read and a fraction of the size (a 10 MB two-page scan comes out under 0.5 MB).
+    A small scan is never made bigger. Returns (pdf_bytes, preview_jpeg_bytes)."""
     from PIL import Image, ImageOps
     Image.init()
-    out, img = None, None
     if raw[:4] == b"%PDF":
         import pypdfium2 as pdfium
         pdf = pdfium.PdfDocument(raw)
         page = pdf[0]
-        text = page.get_textpage().get_text_range() or ""
-        if len(text.strip()) > 200:
-            new = pdfium.PdfDocument.new()
-            new.import_pages(pdf, [0])
-            b = io.BytesIO()
-            new.save(b)
-            out = b.getvalue()
-            if len(out) > 1_500_000:              # typed, but carrying a heavy scan: treat it as a scan
-                out = None
-        img = page.render(scale=dpi / 72).to_pil().convert("RGB")
-    else:
-        img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
-        long_side = max(img.size)
-        if long_side > 2400:
-            img.thumbnail((2400, 2400), Image.LANCZOS)
-    if out is None:
+        typed = len((page.get_textpage().get_text_range() or "").strip()) > 200
+        new = pdfium.PdfDocument.new()
+        new.import_pages(pdf, [0])
         b = io.BytesIO()
-        img.save(b, "PDF", resolution=dpi, quality=quality, optimize=True)
+        new.save(b)
         out = b.getvalue()
-    prev = img.copy()
-    prev.thumbnail((1100, 1600), Image.LANCZOS)
-    pb = io.BytesIO()
-    prev.save(pb, "JPEG", quality=82, optimize=True, progressive=True)
-    return out, pb.getvalue()
+        preview = _bl_preview_jpeg(page.render(scale=_BL_PREVIEW_W / (page.get_width() or 595)).to_pil())
+        if len(out) > (1_500_000 if typed else 600_000):
+            img = page.render(scale=dpi / 72).to_pil().convert("RGB")
+            rb = io.BytesIO()
+            img.save(rb, "PDF", resolution=dpi, quality=quality, optimize=True)
+            if len(rb.getvalue()) < len(out):
+                out = rb.getvalue()
+        return out, preview
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+    if max(img.size) > 2400:
+        img.thumbnail((2400, 2400), Image.LANCZOS)
+    b = io.BytesIO()
+    img.save(b, "PDF", resolution=dpi, quality=quality, optimize=True)
+    return b.getvalue(), _bl_preview_jpeg(img)
 
 
 def _image_to_pdf(raw):
@@ -6820,6 +6841,82 @@ def _scan_text(raw):
         return "\n".join([title or ""] + [" ".join(str(c) for c in row) for t in tables for row in t])
     except Exception:
         return ""
+
+
+def _pdf_text_head(data, pages=3):
+    """Text of the first few pages only. Recognising a document and its B/L number never needs
+    more, and a long multi-page scan bundle then reads in a moment instead of seconds."""
+    import pdfplumber
+    parts = []
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        for page in pdf.pages[:pages]:
+            parts.append(page.extract_text() or "")
+    return "\n".join(parts)
+
+
+def _pdf_text_fast(data, pages=3):
+    """Same idea as _pdf_text_head, through the PDF engine's own text layer: about twenty
+    times quicker on a long typed bundle. Detection tries this first and only falls back to
+    the careful reader when it cannot settle the document."""
+    import pypdfium2 as pdfium
+    pdf = pdfium.PdfDocument(data)
+    return "\n".join(pdf[i].get_textpage().get_text_range() or "" for i in range(min(pages, len(pdf))))
+
+
+def _scan_top_text(raw):
+    """Reads only the top-right corner of a scanned page - where a bill of lading prints
+    "BILL OF LADING" and its B/L number - with the built-in text reader. A few lines, so it
+    takes a fraction of a second instead of reading the whole page. Faint grey print counts."""
+    try:
+        import numpy as np
+        from PIL import Image, ImageOps
+        if raw[:4] == b"%PDF":
+            import pypdfium2 as pdfium
+            img = pdfium.PdfDocument(raw)[0].render(scale=200 / 72).to_pil()
+        else:
+            img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw)))
+            if max(img.size) > 3000:
+                img.thumbnail((3000, 3000))
+        gray = img.convert("L")
+        W, H = gray.size
+        G = np.asarray(gray.crop((int(W * 0.42), 0, W, max(1, int(H * 0.13)))))
+        paper, dark = float(np.percentile(G, 90)), float(np.percentile(G, 1))
+        if paper - dark < 40:
+            return ""
+        ink = G < dark + (paper - dark) * 0.55
+        ink &= ~(ink.mean(axis=1) > 0.35)[:, None]          # ruled lines are not text
+        ink &= ~(ink.mean(axis=0) > 0.5)[None, :]
+        jobs, gaps = [], []
+        _ocr_line_jobs(ink, G, jobs, gaps)
+        return "\n".join(_ocr_read_lines(jobs, gaps)) if jobs else ""
+    except Exception:
+        return ""
+
+
+_OCR_LOOKALIKE = str.maketrans("OQDILSBZG", "000115826")
+# A B/L's title as the scan reader returns it: words often run together ("BILLOFLADING", "B/LNo").
+# Used on scanned text only - typed documents keep the stricter _BL_DOC_RE.
+_BL_SCAN_RE = re.compile(r"OF\s*LADING|BILL\s*OF\s*L|\bB\s*/?\s*L\s*N[O0]\b")
+
+
+def _find_bl_in_scan(text, known_bls):
+    """B/L numbers read off a scan. The reader can mistake look-alike characters (O for 0,
+    Q for O, I for 1...), so a number counts when it equals one of the caller's own B/Ls with
+    those characters treated alike. Same [(bl, exact)] shape as _find_bl_in_text."""
+    toks = {t.translate(_OCR_LOOKALIKE) for t in re.findall(r"[A-Z0-9]+", _mf_norm(text)) if len(t) >= 5}
+    if not toks:
+        return []
+    found = []
+    for bl in known_bls:
+        bl_u = (bl or "").strip().upper()
+        if not bl_u:
+            continue
+        members = bl_members(bl_u)
+        if bl_u.translate(_OCR_LOOKALIKE) in toks or members[0].translate(_OCR_LOOKALIKE) in toks:
+            found.append((bl, True))
+        elif any(m.translate(_OCR_LOOKALIKE) in toks for m in members[1:]):
+            found.append((bl, False))
+    return found
 
 
 _RECEIPT_RE = re.compile(r"\bRECEIPT\b|PAYMENT\s+(?:SUCCESSFUL|CONFIRM|COMPLETED)|(?:PAYMENT\s+)?STATUS\s*[:：]?\s*PAID\b|\bPAID\s+SUCCESSFULLY\b")
@@ -6916,15 +7013,11 @@ def detect_attachment():
     text = ""
     if data[:4] == b"%PDF":
         try:
-            text = _extract_pdf_text(data)
+            text = _pdf_text_fast(data)
         except Exception:
             text = ""
-    if len(text.strip()) < 40:                  # a scan or a photo: read what we can
-        text = (text + "\n" + _scan_text(data)).strip()
-    kind = _detect_doc_kind(text, file.filename)
-    if kind != "bl" and len(data) > MAX_ATTACHMENT_BYTES:
-        return jsonify({"error": "That file is larger than 10MB."}), 400
-    text = text + "\n" + re.sub(r"[_]+", " ", os.path.splitext(file.filename)[0])   # B/L numbers in the file name count too
+    scanned = len(text.strip()) < 40            # a scan or a photo: no text to read
+    name_text = re.sub(r"[_#]+", " ", os.path.splitext(file.filename)[0])   # "SURR BL# QCLYGJD14" names its B/L
 
     # Only match against BLs this user could actually upload to anyway
     # (same scope _owns_record would allow) - no point surfacing a match
@@ -6937,10 +7030,51 @@ def detect_attachment():
             "SELECT bl_number FROM records WHERE created_by = ANY(?)", (_team(),)
         ).fetchall()
     known_bls = [r["bl_number"] for r in bl_rows]
-    found = _find_bl_in_text(text, known_bls)
+
+    # The document's own text and its file name come first - instant. A scan is only read
+    # (the slow part) when those two leave the kind or the B/L open, and then just its
+    # top-right corner, where a B/L prints its number.
+    kind = _detect_doc_kind(text, file.filename)
+    found = _find_bl_in_text(text + "\n" + name_text, known_bls)
+    if data[:4] == b"%PDF" and not (kind and len(found) == 1):
+        try:                                    # an unusual layout: read it the careful way as well
+            careful = _pdf_text_head(data)
+        except Exception:
+            careful = ""
+        if careful.strip():
+            text = (text + "\n" + careful).strip()
+            scanned = len(text.strip()) < 40
+            kind = _detect_doc_kind(text, file.filename)
+            found = _find_bl_in_text(text + "\n" + name_text, known_bls)
+    from_scan = set()
+    if scanned and not (kind and len(found) == 1):
+        top = _scan_top_text(data)
+        if top:
+            kind = _detect_doc_kind(text + "\n" + top, file.filename)
+            if not kind and _BL_SCAN_RE.search(_mf_norm(top)):
+                kind = "bl"
+            have = {bl for bl, _ in found}
+            for bl, exact in _find_bl_in_scan(top, known_bls):
+                if bl not in have:
+                    found.append((bl, exact))
+                    from_scan.add(bl)
+        if not kind:                            # still unknown (e.g. a photo of a receipt): read the whole page
+            whole = _scan_text(data)
+            kind = _detect_doc_kind(text + "\n" + top + "\n" + whole, file.filename)
+            have = {bl for bl, _ in found}
+            for bl, exact in _find_bl_in_text(whole, known_bls):
+                if bl not in have:
+                    found.append((bl, exact))
+                    from_scan.add(bl)
+    if kind != "bl" and len(data) > MAX_ATTACHMENT_BYTES:
+        return jsonify({"error": "That file is larger than 10MB."}), 400
     matches = [bl for bl, _ in found]
     reason = None
-    if len(found) == 1 and not found[0][1]:
+    if len(found) == 1 and found[0][0] in from_scan:
+        # Read off the scan itself, not from text or the file name: a misread digit could
+        # point at a neighbouring B/L, so a person checks it (one click - it is pre-selected).
+        reason = "scan_read"
+    elif len(found) == 1 and not found[0][1]:
         # Matched only through a combined entry (the document names ONE of
         # the B/Ls it covers, e.g. 001 of "001-003"). Attaching it marks the
         # whole entry issued, so a person confirms instead of it happening
@@ -6952,12 +7086,25 @@ def detect_attachment():
         ).fetchone():
             reason = "already_attached"
 
-    return jsonify({
+    matched = matches[0] if len(matches) == 1 and not reason else None
+    out = {
         "kind": kind,
-        "matched_bl": matches[0] if len(matches) == 1 and not reason else None,
+        "matched_bl": matched,
         "candidates": matches if len(matches) > 1 or reason else [],
         "reason": reason,
-    })
+    }
+    # The batch drop asks to attach a clean match right here, so each file travels once
+    # (it used to be sent twice: once to be read, again to be saved).
+    if request.form.get("auto") == "1" and kind and matched:
+        if not _owns_record(matched):
+            out["attach_error"] = "Not your record."
+        else:
+            payload, status = _store_attachment(db, matched, kind, file.filename, data)
+            if status == 200:
+                out["attached"] = payload
+            else:
+                out["attach_error"] = payload.get("error")
+    return jsonify(out)
 
 
 @app.route("/api/records/<path:bl_number>/attachment/<kind>", methods=["POST"])
@@ -6971,33 +7118,38 @@ def upload_attachment(bl_number, kind):
     file = request.files.get("file")
     if not file or not file.filename:
         return jsonify({"error": "No file was selected."}), 400
-    low = file.filename.lower()
+    payload, status = _store_attachment(get_db(), bl_number, kind, file.filename, file.read())
+    return jsonify(payload), status
+
+
+def _store_attachment(db, bl_number, kind, file_name, data):
+    """Saves one document onto a B/L - shared by the Documents upload and the batch drop
+    (which attaches a clean match in the same request it was read in). Returns (payload, status)."""
+    low = file_name.lower()
     is_image = low.endswith(_ATT_IMAGE_EXTS)
     if not (low.endswith(".pdf") or (is_image and kind in ("bl", "receipt"))):
-        return jsonify({"error": "Only PDF files are accepted." if kind in ("invoice", "do") else "Only PDF files or scanned images are accepted."}), 400
-    data = file.read()
+        return {"error": "Only PDF files are accepted." if kind in ("invoice", "do") else "Only PDF files or scanned images are accepted."}, 400
     if not data:
-        return jsonify({"error": "That file is empty."}), 400
+        return {"error": "That file is empty."}, 400
     if len(data) > (MAX_BL_UPLOAD_BYTES if kind == "bl" else MAX_ATTACHMENT_BYTES):
-        return jsonify({"error": "That file is larger than 30MB." if kind == "bl" else "That file is larger than 10MB."}), 400
+        return {"error": "That file is larger than 30MB." if kind == "bl" else "That file is larger than 10MB."}, 400
 
     preview = None
-    filename = file.filename
+    filename = file_name
     original_size = len(data)
     if kind == "bl":
         try:
             data, preview = _bl_front_page(data)
         except Exception:
-            return jsonify({"error": "Could not read this B/L copy. Try a PDF or a clear photo."}), 400
-        filename = os.path.splitext(file.filename)[0] + ".pdf"
+            return {"error": "Could not read this B/L copy. Try a PDF or a clear photo."}, 400
+        filename = os.path.splitext(file_name)[0] + ".pdf"
     elif is_image:
         try:
             data = _image_to_pdf(data)
         except Exception:
-            return jsonify({"error": "Could not read this image."}), 400
-        filename = os.path.splitext(file.filename)[0] + ".pdf"
+            return {"error": "Could not read this image."}, 400
+        filename = os.path.splitext(file_name)[0] + ".pdf"
 
-    db = get_db()
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     user = session.get("username", "Unknown")
     db.execute(
@@ -7033,11 +7185,11 @@ def upload_attachment(bl_number, kind):
             db.execute("UPDATE records SET paid_via = 'receipt' WHERE bl_number = ?", (bl_number,))
 
     db.commit()
-    return jsonify({
+    return {
         "ok": True, "filename": filename, "uploaded_by": user, "uploaded_at": now,
         "auto_issued_field": status_field if auto_issued else None,
         "size": len(data), "original_size": original_size,
-    })
+    }, 200
 
 
 @app.route("/api/records/<path:bl_number>/bl-preview", methods=["GET"])
@@ -7047,18 +7199,22 @@ def bl_preview(bl_number):
     Same access as downloading the file (any signed-in user who has the B/L number)."""
     bl_number = bl_number.upper()
     db = get_db()
-    row = db.execute("SELECT data, preview FROM record_attachments WHERE bl_number = ? AND kind = 'bl'", (bl_number,)).fetchone()
+    # Only the small picture is read - the stored PDF is pulled only when a picture has to be made again.
+    row = db.execute("SELECT preview FROM record_attachments WHERE bl_number = ? AND kind = 'bl'", (bl_number,)).fetchone()
     if not row:
         return "No B/L copy yet.", 404
     pv = bytes(row["preview"]) if row["preview"] else None
     if not pv:                                    # e.g. restored with Undo: make it again
         try:
-            _, pv = _bl_front_page(bytes(row["data"]))
+            full = db.execute("SELECT data FROM record_attachments WHERE bl_number = ? AND kind = 'bl'", (bl_number,)).fetchone()
+            pv = _bl_preview_of_pdf(bytes(full["data"]))
             db.execute("UPDATE record_attachments SET preview = ? WHERE bl_number = ? AND kind = 'bl'", (psycopg2.Binary(pv), bl_number))
             db.commit()
         except Exception:
             return "Preview not available.", 404
-    return Response(pv, mimetype="image/jpeg", headers={"Cache-Control": "private, max-age=300"})
+    # The board asks for it with ?v=<upload time.size>, so a replaced copy gets a new address:
+    # the browser can keep this one for a day and re-hovering is instant.
+    return Response(pv, mimetype="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
 
 @app.route("/api/records/<path:bl_number>/attachment/<kind>", methods=["GET"])
@@ -19468,7 +19624,12 @@ PAGE_HTML = """
   .blpop .ph b { font-size: 13px; letter-spacing: -.01em; }
   .blpop .ph span, .blpop .pf { font-size: 11.5px; color: var(--muted); }
   .blpop .pg { border-radius: 10px; overflow: hidden; border: 1px solid var(--border); background: #fff; min-height: 120px; }
-  .blpop .pg img { display: block; width: 100%; height: auto; }
+  .blpop .pg img { display: block; width: 100%; height: auto; transition: opacity .18s ease; }
+  .blpop .pg.ld { aspect-ratio: 1 / 1.414; background: linear-gradient(100deg, rgba(128,128,128,.07) 30%, rgba(128,128,128,.16) 50%, rgba(128,128,128,.07) 70%) 0 0 / 220% 100%; animation: blpvShimmer 1.1s ease-in-out infinite; }
+  .blpop .pg.ld img { opacity: 0; }
+  .blpop .pg.err { aspect-ratio: auto; animation: none; background: transparent; padding: 28px 12px; text-align: center; font-size: 12.5px; color: var(--muted); }
+  @keyframes blpvShimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+  @media (prefers-reduced-motion: reduce) { .blpop .pg.ld { animation: none; } }
   .blpop .pf { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 4px 2px; }
   .blpop .pf a { color: var(--navy-light); font-weight: 600; text-decoration: none; }
   .blpop .none { padding: 18px 8px 10px; text-align: center; font-size: 13px; color: var(--muted); display: grid; gap: 10px; justify-items: center; }
@@ -20637,13 +20798,49 @@ function closeDocs() {
 
 /* ---------- B/L copy preview: hover the B/L number (tap it on a phone) ---------- */
 let blPopTimer = null, blPopFor = null;
+// Pictures already asked for, by B/L -> address. The address carries the copy's version, so a
+// replaced B/L copy is fetched fresh; everything else comes straight from the browser's cache.
+const blPvAsked = new Map();
+function blPreviewUrl(rec) {
+  return `/api/records/${encodeURIComponent(rec.bl_number)}/bl-preview?v=${encodeURIComponent(rec.bl_ver || '')}`;
+}
+function blPreload(bl) {
+  const rec = records.find(r => r.bl_number === bl);
+  if (!rec || !rec.has_bl_file) return Promise.resolve();
+  const url = blPreviewUrl(rec);
+  if (blPvAsked.get(bl) === url) return Promise.resolve();
+  blPvAsked.set(bl, url);
+  return new Promise(done => { const im = new Image(); im.onload = im.onerror = () => done(); im.src = url; });
+}
+// Once the board settles, quietly fetch the pictures of the B/Ls on screen, one at a time,
+// so hovering shows the B/L straight away. Desktop only - a phone opens it on tap instead.
+let blPrefetchTimer = null;
+function scheduleBlPrefetch() {
+  if (!window.matchMedia('(hover: hover)').matches) return;
+  clearTimeout(blPrefetchTimer);
+  blPrefetchTimer = setTimeout(async () => {
+    const seen = new Set();
+    const bls = [];
+    document.querySelectorAll('.bl-hover[data-bl]').forEach(a => {
+      const bl = a.dataset.bl;
+      if (seen.has(bl) || !a.offsetParent) return;
+      seen.add(bl);
+      const rec = records.find(r => r.bl_number === bl);
+      if (rec && rec.has_bl_file && blPvAsked.get(bl) !== blPreviewUrl(rec)) bls.push(bl);
+    });
+    for (const bl of bls.slice(0, 40)) {
+      if (document.hidden) break;
+      await blPreload(bl);
+    }
+  }, 1500);
+}
 function blPopEl() {
   let el = document.getElementById('blPop');
   if (!el) {
     el = document.createElement('div');
     el.id = 'blPop'; el.className = 'blpop';
     el.addEventListener('mouseenter', () => clearTimeout(blPopTimer));
-    el.addEventListener('mouseleave', hideBlPop);
+    el.addEventListener('mouseleave', e => { if (window.matchMedia('(hover: hover)').matches) hideBlPop(e); });
     document.body.appendChild(el);
   }
   return el;
@@ -20660,7 +20857,7 @@ function showBlPop(anchor, now) {
     const url = `/api/records/${encodeURIComponent(bl)}/attachment/bl`;
     el.innerHTML = rec.has_bl_file
       ? `<div class="ph"><b>${esc(bl)}</b><span>${t('bl_copy_page')}</span></div>
-         <div class="pg"><img alt="" src="/api/records/${encodeURIComponent(bl)}/bl-preview?v=${encodeURIComponent(rec.bl_ver || '')}"></div>
+         <div class="pg ld"><img alt="" decoding="async" src="${blPreviewUrl(rec)}"></div>
          <div class="pf"><span></span><a href="${url}" target="_blank" rel="noopener">${t('open_full_bl')}</a></div>`
       : `<div class="ph"><b>${esc(bl)}</b><span>${t('doc_bl_copy')}</span></div>
          <div class="none">${t('no_bl_copy')}${canManage ? `<label class="sd-btn pri" style="display:inline-block">${t('upload_bl_copy')}<input type="file" accept=".pdf,.jpg,.jpeg,.png,.webp,.tif,.tiff" style="display:none" onchange="hideBlPop(true); uploadAttachment(${jsq(bl)}, 'bl', this)"></label>` : ''}</div>`;
@@ -20673,6 +20870,16 @@ function showBlPop(anchor, now) {
     let y = r.bottom + 8;
     if (y + h > window.innerHeight - 8) y = Math.max(8, r.top - h - 8);
     el.style.left = x + 'px'; el.style.top = y + 'px';
+    const pg = el.querySelector('.pg.ld'), img = pg && pg.querySelector('img');
+    if (img) {
+      blPvAsked.set(bl, img.getAttribute('src'));
+      const ready = () => pg.classList.remove('ld');
+      if (img.complete && img.naturalWidth) ready();
+      else {
+        img.onload = ready;
+        img.onerror = () => { pg.className = 'pg err'; pg.textContent = t('preview_unavailable'); blPvAsked.delete(bl); };
+      }
+    }
     el.classList.add('on');
   }, now ? 0 : 220);
 }
@@ -20683,9 +20890,12 @@ function hideBlPop(nowFlag) {
 }
 document.addEventListener('mouseover', e => {
   const a = e.target.closest && e.target.closest('.bl-hover');
-  if (a && window.matchMedia('(hover: hover)').matches) showBlPop(a);
+  if (a && window.matchMedia('(hover: hover)').matches) { blPreload(a.dataset.bl); showBlPop(a); }
 });
 document.addEventListener('mouseout', e => {
+  // Pointer-only: on a phone the card can open over the tapped number, which the browser
+  // reports as the pointer "leaving" it - there, only a tap elsewhere or a scroll closes it.
+  if (!window.matchMedia('(hover: hover)').matches) return;
   const a = e.target.closest && e.target.closest('.bl-hover');
   if (a && !(e.relatedTarget && a.contains(e.relatedTarget))) hideBlPop();
 });
@@ -20986,8 +21196,9 @@ async function handleAutoMatchFiles(fileList) {
     try {
       const form = new FormData();
       form.append('file', file);
-      const res = await fetch('/api/attachments/detect', {method: 'POST', body: form});
-      detect = await res.json();
+      form.append('auto', '1');           // a clean match is attached in this same request
+      const res = await apiWrite('/api/attachments/detect', {method: 'POST', body: form});
+      try { detect = await res.json(); } catch (e) { throw new Error(t('could_not_read_file')); }
       if (!res.ok) throw new Error(detect.error || t('could_not_read_file'));
     } catch (err) {
       row.className = 'match-row review';
@@ -20996,12 +21207,15 @@ async function handleAutoMatchFiles(fileList) {
       continue;
     }
 
-    if (detect.kind && detect.matched_bl) {
+    if (detect.attached) {
+      autoMatchRowOk(row, file, detect.matched_bl, detect.kind, detect.attached);
+      updateSummary();
+      continue;
+    }
+    if (detect.kind && detect.matched_bl && !detect.attach_error) {
       const {ok, data} = await submitAttachmentFile(detect.matched_bl, detect.kind, file);
       if (ok) {
-        row.className = 'match-row ok';
-        const issuedNote = detect.kind === 'receipt' ? ' - ' + t('paid_tag') : detect.kind === 'bl' ? ' (' + fmtSize(data.size || 0) + ')' : data.auto_issued_field ? t('marked_issued_suffix') : '';
-        row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">&check; ${esc(detect.matched_bl)} - ${esc(autoMatchKindLabel(detect.kind))}${esc(issuedNote)}</div>`;
+        autoMatchRowOk(row, file, detect.matched_bl, detect.kind, data);
         updateSummary();
         continue;
       }
@@ -21016,7 +21230,7 @@ async function handleAutoMatchFiles(fileList) {
     }
 
     row.className = 'match-row review';
-    renderAutoMatchReviewRow(row, file, detect, null);
+    renderAutoMatchReviewRow(row, file, detect, detect.attach_error || null);
     updateSummary();
   }
 
@@ -21026,10 +21240,20 @@ async function handleAutoMatchFiles(fileList) {
   if (!autoMatchIsOpen() && !autoMatchRunning) showToast(t('attach_batch_done', {summary: autoMatchSummaryText()}), {duration: 7000});
 }
 
+function autoMatchRowOk(row, file, bl, kind, data) {
+  row.className = 'match-row ok';
+  const issuedNote = kind === 'receipt' ? ' - ' + t('paid_tag') : kind === 'bl' ? ' (' + fmtSize(data.size || 0) + ')' : data.auto_issued_field ? t('marked_issued_suffix') : '';
+  row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">&check; ${esc(bl)} - ${esc(autoMatchKindLabel(kind))}${esc(issuedNote)}</div>`;
+}
+
 function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
   const blOptions = records.map(r => r.bl_number).sort();
-  const candidates = (detect.candidates && detect.candidates.length) ? detect.candidates : blOptions;
+  // A number read off a scan is pre-selected, but every B/L stays in the list in case it was misread.
+  const scanGuess = detect.reason === 'scan_read' && detect.candidates && detect.candidates.length === 1 ? detect.candidates[0] : '';
+  const candidates = scanGuess ? [scanGuess, ...blOptions.filter(b => b !== scanGuess)]
+    : (detect.candidates && detect.candidates.length) ? detect.candidates : blOptions;
   const statusText = errorMsg ? errorMsg
+    : scanGuess ? t('scan_read_confirm', {bl: scanGuess})
     : detect.reason === 'already_attached' && detect.candidates && detect.candidates.length === 1
       ? t('already_has_file_confirm', {bl: detect.candidates[0], kind: autoMatchKindLabel(detect.kind)})
     : detect.reason === 'member_match' && detect.candidates && detect.candidates.length === 1
@@ -21044,7 +21268,7 @@ function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
     <div class="match-review-controls">
       <select class="review-bl">
         <option value="">${t('select_bl_ellipsis')}</option>
-        ${candidates.map(bl => `<option value="${esc(bl)}" ${(bl === detect.matched_bl || (detect.reason === 'member_match' && candidates.length === 1)) && detect.reason !== 'already_attached' ? 'selected' : ''}>${esc(bl)}</option>`).join('')}
+        ${candidates.map(bl => `<option value="${esc(bl)}" ${(bl === detect.matched_bl || bl === scanGuess || (detect.reason === 'member_match' && candidates.length === 1)) && detect.reason !== 'already_attached' ? 'selected' : ''}>${esc(bl)}</option>`).join('')}
       </select>
       <select class="review-kind">
         <option value="">${t('kind_ellipsis')}</option>
@@ -21065,9 +21289,7 @@ function renderAutoMatchReviewRow(row, file, detect, errorMsg) {
     btn.textContent = t('attaching_ellipsis');
     const {ok, data} = await submitAttachmentFile(bl, kind, file);
     if (!ok) { showToast(data.error || t('attach_failed')); btn.disabled = false; btn.textContent = t('attach_btn'); return; }
-    row.className = 'match-row ok';
-    const issuedNote = data.auto_issued_field ? t('marked_issued_suffix') : '';
-    row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">&check; ${esc(bl)} - ${esc(autoMatchKindLabel(kind))}${esc(issuedNote)}</div>`;
+    autoMatchRowOk(row, file, bl, kind, data);
     updateAutoMatchSummary();
     await fetchRecords(true);
   };
@@ -21718,6 +21940,7 @@ function render() {
   restoreListScroll(savedListScroll);
   updateSummaryOnly();
   updateBulkBars();
+  scheduleBlPrefetch();
 }
 
 // Where the vessel is (anchorage / berth) plus ETB, berth number and ETC/D.
