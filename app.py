@@ -739,6 +739,9 @@ class DBWrapper:
     def commit(self):
         self.conn.commit()
 
+    def rollback(self):
+        self.conn.rollback()
+
     def close(self):
         self.conn.close()
 
@@ -851,6 +854,17 @@ def init_db():
         id SERIAL PRIMARY KEY, port TEXT DEFAULT '', vessel TEXT DEFAULT '', ckey TEXT DEFAULT '', consignee TEXT DEFAULT '',
         sent_to TEXT DEFAULT '', bls TEXT DEFAULT '', kind TEXT DEFAULT '', sent_by TEXT DEFAULT '', sent_at TEXT DEFAULT '', test INTEGER DEFAULT 0)""")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_notice_log_vessel ON notice_log (port, vessel, ckey)")
+    # What each notice said about the vessel (NULL on notices sent before this was kept), further addresses for a consignee,
+    # whether a person has confirmed an address, and one row per manifest added in the Manifest Desk (for its report and Undo).
+    cur.execute("ALTER TABLE notice_log ADD COLUMN IF NOT EXISTS eta TEXT")
+    cur.execute("ALTER TABLE notice_log ADD COLUMN IF NOT EXISTS berth TEXT")
+    cur.execute("ALTER TABLE consignee_book ADD COLUMN IF NOT EXISTS more_emails TEXT DEFAULT ''")
+    cur.execute("ALTER TABLE consignee_book ADD COLUMN IF NOT EXISTS verified INTEGER DEFAULT 0")
+    cur.execute("""CREATE TABLE IF NOT EXISTS desk_uploads (
+        id SERIAL PRIMARY KEY, port TEXT DEFAULT '', vessel TEXT DEFAULT '', filename TEXT DEFAULT '', by_user TEXT DEFAULT '',
+        at TEXT DEFAULT '', added INTEGER DEFAULT 0, skipped INTEGER DEFAULT 0, left_out INTEGER DEFAULT 0,
+        report TEXT DEFAULT '', bls TEXT DEFAULT '', undone INTEGER DEFAULT 0, ack INTEGER DEFAULT 0)""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_desk_uploads_vessel ON desk_uploads (port, vessel)")
     cur.execute("SELECT 1 FROM users WHERE role = 'owner' LIMIT 1")
     if not cur.fetchone():
         cur.execute("UPDATE users SET role = 'owner' WHERE id = (SELECT MIN(id) FROM users WHERE role = 'admin')")
@@ -2573,7 +2587,7 @@ def _add_idle_script(resp):
 def _add_deskbar(resp):
     try:
         if ("user_id" in session and resp.status_code == 200 and resp.mimetype == "text/html"
-                and not resp.direct_passthrough and _desk_of_path(request.path)):
+                and not resp.direct_passthrough and _desk_of_path(request.path) and request.path != "/manifest-desk"):
             body = resp.get_data(as_text=True)
             m = re.search(r"<body[^>]*>", body)
             bar = _deskbar_html(_features(), request.path)
@@ -5604,7 +5618,14 @@ def read_manifest(raw, filename, use_ai=True):
         remembered = _mf_apply_memory(entries, count=use_ai)
     except Exception:
         remembered = 0
+    ai_failed = ai_off = False
+    try:
+        if use_ai and not ai_used and not from_cache and not trusted_skip and ai_tables and _mf_needs_ai(entries):
+            ai_failed, ai_off = ai_available(), not ai_available()
+    except Exception:
+        pass
     return {"entries": entries, "truncated": any(t.get("truncated") for t in tables), "ai_used": ai_used, "info": info,
+            "ai_failed": ai_failed, "ai_off": ai_off,
             "checks": checks, "layout": lay or _mf_layout_fp(tables), "remembered": remembered,
             "learn": learn, "trusted_skip": trusted_skip, "untrust": untrust, "from_cache": from_cache, "cache_ai": cache_ai,
             "fhash": fhash}
@@ -5699,8 +5720,9 @@ def _manifest_add(port, vessel, items):
     me = session.get("username")
     is_admin = session.get("role") == "admin"
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-    added = skipped = contacts_filled = 0
+    added = skipped = contacts_filled = taken = 0
     duplicate_elsewhere = []
+    added_bls = []
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -5732,6 +5754,7 @@ def _manifest_add(port, vessel, items):
                     contacts_filled += 1
                 _log_audit(bl, "added", "", "", f"{port} / {vessel}")
                 added += 1
+                added_bls.append(bl)
                 continue
             # Someone else added it a moment ago - treat like any existing B/L.
             existing = dict(db.execute(
@@ -5741,7 +5764,10 @@ def _manifest_add(port, vessel, items):
             index[bl] = existing
         skipped += 1
         mine = _sees(existing["created_by"])
-        if mine and ((existing["vessel"] or "") != vessel or (existing["port"] or "") != port):
+        if not mine:
+            taken += 1
+        same_port = (existing["port"] or "") == port or (bool(_canon_port(port)) and _canon_port(existing["port"]) == _canon_port(port))
+        if mine and ((existing["vessel"] or "") != vessel or not same_port):
             duplicate_elsewhere.append({"bl_number": existing["bl_number"],
                                         "existing_port": existing["port"], "existing_vessel": existing["vessel"]})
         if mine:
@@ -5755,7 +5781,7 @@ def _manifest_add(port, vessel, items):
                 contacts_filled += 1
     db.commit()
     return {"added": added, "skipped": skipped, "duplicate_elsewhere": duplicate_elsewhere,
-            "contacts_found": contacts_filled}
+            "contacts_found": contacts_filled, "taken": taken, "added_bls": added_bls}
 
 
 def _manifest_read_upload(file, with_truncation=False, meta=None):
@@ -5784,6 +5810,7 @@ def _manifest_read_upload(file, with_truncation=False, meta=None):
         except Exception:
             meta["layout_new"] = False
         meta["remembered"] = result.get("remembered", 0)
+        meta["ai_failed"], meta["ai_off"] = bool(result.get("ai_failed")), bool(result.get("ai_off"))
         try:
             n_bl = len(result["entries"])
             chk_ = result.get("checks") or {}
@@ -5801,7 +5828,7 @@ def _board_port_name(port):
     """A port as the manifest writes it -> the port name used on the board ('' when it isn't one of ours)."""
     pn = (port or "").upper()
     return next((b for k, b in (("JEDDAH", "JEDDAH PORT"), ("YANBU", "YANBU COMMERCIAL PORT"), ("DAMMAM", "DAMMAM PORT"),
-                                ("JUBAIL", "JUBAIL COMMERCIAL PORT")) if k in pn), "")
+                                ("JUBAIL", "JUBAIL COMMERCIAL PORT"), ("KING ABDULLAH", "KAP")) if k in pn), "")
 
 
 def _manifest_peek_payload(r):
@@ -5939,6 +5966,13 @@ def upload_manifest_excel():
 
 # ---------- Manifest Desk: one manifest -> DO Tracker B/Ls + arrival notices ----------
 
+# The six ports of the DO Tracker's port list, in its order. The Desk offers exactly these.
+DESK_PORTS = ["DAMMAM PORT", "JUBAIL COMMERCIAL PORT", "JEDDAH PORT", "YANBU COMMERCIAL PORT", "YANBU INDUSTRIAL PORT", "KAP"]
+DESK_PORT_LABELS = {"DAMMAM PORT": "Dammam Port", "JUBAIL COMMERCIAL PORT": "Jubail Commercial Port", "JEDDAH PORT": "Jeddah Port",
+                    "YANBU COMMERCIAL PORT": "Yanbu Commercial Port", "YANBU INDUSTRIAL PORT": "Yanbu Industrial Port", "KAP": "KAP"}
+# The office a notice names in "TO: consignee - CITY" and "submit the original BL to OUR CITY OFFICE".
+# KAP (King Abdullah Port) is left blank until the city of the office that serves it is known.
+NOTICE_KAP_CITY = os.environ.get("NOTICE_KAP_CITY", "").strip().upper()
 _NOTICE_PORTS = [   # (text found in the board's port name, name used in the notice, city for "our ... office")
     ("JEDDAH", "JEDDAH ISLAMIC PORT", "JEDDAH"),
     ("YANBU COMMERCIAL", "YANBU COMMERCIAL PORT", "YANBU"),
@@ -5946,6 +5980,7 @@ _NOTICE_PORTS = [   # (text found in the board's port name, name used in the not
     ("YANBU", "YANBU PORT", "YANBU"),
     ("DAMMAM", "KING ABDULAZIZ PORT, DAMMAM", "DAMMAM"),
     ("JUBAIL", "JUBAIL COMMERCIAL PORT", "JUBAIL"),
+    ("KAP", "KING ABDULLAH PORT", NOTICE_KAP_CITY),
 ]
 NOTICE_COMPANY_LINES = [
     "Sea Power For Marine Services Ltd Co.",
@@ -5959,8 +5994,35 @@ NOTICE_COMPANY_LINES = [
 NOTICE_KINDS = ("arriving", "anchorage", "berthed")
 
 
+def _canon_port(raw):
+    """A port as typed, saved or printed on a manifest -> the DO Tracker's name for it ('' when it is none of the six)."""
+    p = re.sub(r"\s+", " ", str(raw or "").upper()).strip()
+    if not p:
+        return ""
+    if p in DESK_PORTS:
+        return p
+    words = set(re.findall(r"[A-Z]+", p))
+    if "KAP" in words or "KING ABDULLAH" in p or "RABIGH" in words:
+        return "KAP"
+    if "YANBU" in words or "YNB" in words:
+        return "YANBU INDUSTRIAL PORT" if ("INDUSTRIAL" in words or "YIP" in words) else "YANBU COMMERCIAL PORT"
+    if "JEDDAH" in words or "JEDDA" in words or "JED" in words:
+        return "JEDDAH PORT"
+    if "DAMMAM" in words or "DMM" in words or "ABDULAZIZ" in words:
+        return "DAMMAM PORT"
+    if "JUBAIL" in words or "JUBAYL" in words:
+        return "JUBAIL COMMERCIAL PORT"
+    return ""
+
+
+def _port_family(raw):
+    """The place a port is in (both Yanbu ports are 'YANBU'), for deciding whether two spellings name the same place."""
+    c = _canon_port(raw)
+    return "YANBU" if c.startswith("YANBU") else c.split()[0] if c else ""
+
+
 def _notice_port(port):
-    p = (port or "").upper()
+    p = _canon_port(port) or (port or "").upper()
     for key, official, city in _NOTICE_PORTS:
         if key in p:
             return official, city
@@ -5973,8 +6035,80 @@ def _ckey(name):
     return re.sub(r"[^A-Z0-9]", "", _mf_norm(name))
 
 
+def _riyadh_now():
+    return datetime.utcnow() + timedelta(hours=3)
+
+
 def _desk_today():
-    return (datetime.utcnow() + timedelta(hours=3)).strftime("%d.%m.%Y")
+    return _riyadh_now().strftime("%d.%m.%Y")
+
+
+def _desk_local(ts):
+    """A stored UTC stamp 'YYYY-MM-DD HH:MM' -> 'dd.mm.yyyy HH:MM' in Riyadh time."""
+    try:
+        return (datetime.strptime(str(ts or ""), "%Y-%m-%d %H:%M") + timedelta(hours=3)).strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        return str(ts or "")
+
+
+def _parse_eta(raw):
+    """dd.mm.yyyy (also dd/mm/yyyy, dd-mm-yyyy, d.m.yy or yyyy-mm-dd [hh:mm]) -> a date, or None."""
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    m = re.match(r"^(\d{1,2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{4}|\d{2})$", s)
+    if m:
+        d_, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        y += 2000 if y < 100 else 0
+    else:
+        m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?$", s)
+        if not m:
+            return None
+        y, mo, d_ = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return date(y, mo, d_)
+    except ValueError:
+        return None
+
+
+def _eta_text(d):
+    return d.strftime("%d.%m.%Y") if d else ""
+
+
+def _desk_vessel(raw):
+    return re.sub(r"\s+", " ", str(raw or "")).strip().upper()[:80]
+
+
+def _vessel_base(name):
+    n = re.sub(r"\s+", " ", str(name or "").upper()).strip()
+    n = re.sub(r"^M\.?\s?[VT]\.?\s+", "", n)
+    n = re.sub(r"\s+V(?:OY)?[-. ]*[A-Z0-9]*\d[A-Z0-9./-]*$", "", n)
+    return re.sub(r"[^A-Z0-9]", "", n)
+
+
+def _vessel_same(a, b):
+    x, y = _vessel_base(a), _vessel_base(b)
+    return bool(x and y and (x == y or (min(len(x), len(y)) >= 4 and (x.startswith(y) or y.startswith(x)))))
+
+
+def _vessel_voyage(name):
+    m = re.search(r"\sV(?:OY)?[-. ]*([A-Z0-9]*\d[A-Z0-9./-]*)$", re.sub(r"\s+", " ", str(name or "").upper()).strip())
+    return re.sub(r"[^A-Z0-9]", "", m.group(1)) if m else ""
+
+
+def _split_emails(raw):
+    """'a@x.com; b@y.com, c' -> (valid addresses, unreadable pieces)."""
+    good, bad = [], []
+    for tok in re.split(r"[;,\s]+", str(raw or "")):
+        tok = tok.strip().strip("<>()[]\"'")
+        if not tok:
+            continue
+        e = _clean_email(tok)
+        if not e:
+            bad.append(tok)
+        elif e.lower() not in good:
+            good.append(e.lower())
+    return good, bad
 
 
 def _desk_scope_sql():
@@ -5983,58 +6117,88 @@ def _desk_scope_sql():
     return ("", ()) if team is None else (" AND created_by = ANY(?)", (team,))
 
 
+def _desk_port_variants(db, port):
+    """Every spelling of this port that B/Ls were filed under ('JEDDAH' and 'JEDDAH PORT' are one port)."""
+    canon = _canon_port(port)
+    out = {str(port or "").strip().upper()}
+    if canon:
+        out.add(canon)
+        for r in db.execute("SELECT DISTINCT port FROM records WHERE port <> ''").fetchall():
+            if _canon_port(r["port"]) == canon:
+                out.add(r["port"])
+    return sorted(x for x in out if x)
+
+
 def _desk_rows(db, port, vessel):
     extra, params = _desk_scope_sql()
     return [dict(r) for r in db.execute(
-        "SELECT * FROM records WHERE port = ? AND vessel = ?" + extra + " ORDER BY bl_number", (port, vessel, *params)).fetchall()]
+        "SELECT * FROM records WHERE port = ANY(?) AND vessel = ?" + extra + " ORDER BY bl_number",
+        (_desk_port_variants(db, port), vessel, *params)).fetchall()]
 
 
 def _book_get(db, key):
     return db.execute("SELECT * FROM consignee_book WHERE ckey = ?", (key,)).fetchone() if key else None
 
 
-def _book_save(db, name, email=None, attn=None, only_fill=False):
+def _book_save(db, name, email=None, attn=None, only_fill=False, more=None, verified=None):
     key = _ckey(name)
     if not key:
         return
     row = _book_get(db, key)
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     if row is None:
-        db.execute("INSERT INTO consignee_book (ckey, name, email, attn, updated_at) VALUES (?, ?, ?, ?, ?)",
-                   (key, str(name).strip()[:120], email or "", attn or "", now))
+        db.execute("INSERT INTO consignee_book (ckey, name, email, attn, updated_at, more_emails, verified) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                   (key, str(name).strip()[:120], email or "", attn or "", now, more or "", 1 if verified else 0))
         return
     new_email = row["email"] if (only_fill and row["email"]) or email is None else email
     new_attn = row["attn"] if (only_fill and row["attn"]) or attn is None else attn
-    db.execute("UPDATE consignee_book SET email = ?, attn = ?, updated_at = ? WHERE ckey = ?", (new_email or "", new_attn or "", now, key))
+    new_more = row["more_emails"] if more is None else more
+    new_ver = row["verified"] if verified is None else (1 if verified else 0)
+    db.execute("UPDATE consignee_book SET email = ?, attn = ?, updated_at = ?, more_emails = ?, verified = ? WHERE ckey = ?",
+               (new_email or "", new_attn or "", now, new_more or "", new_ver or 0, key))
+
+
+def _status_sig(kind, eta, berth):
+    """What a notice says about the vessel, reduced to what matters: two notices with the same sig say the same thing."""
+    d = _parse_eta(eta) if kind == "arriving" else None
+    return (kind, d.isoformat() if d else "", re.sub(r"\s+", " ", str(berth or "")).strip().upper() if kind == "berthed" else "")
 
 
 def _desk_groups(db, port, vessel):
     """The vessel's B/Ls grouped by consignee, with what is known about each: email, contact person, cargo, whether a notice went out."""
+    variants = _desk_port_variants(db, port)
     groups = {}
     for r in _desk_rows(db, port, vessel):
         name = re.sub(r"\s+", " ", r.get("consignee") or r.get("notify_name") or "").strip()
         k = _ckey(name)
-        g_ = groups.setdefault(k, {"key": k, "name": name, "email": "", "attn": "", "bls": []})
+        g_ = groups.setdefault(k, {"key": k or "~none", "name": name, "email": "", "attn": "", "bls": []})
         if not g_["email"]:
-            g_["email"] = _clean_email(r.get("consignee_email"))
+            g_["email"] = _clean_email(r.get("consignee_email")).lower()
         g_["bls"].append({"bl": r["bl_number"], "pol": r.get("loading_port") or "", "pkgs": r.get("packages") or "",
                           "desc": r.get("cargo_desc") or ""})
     out = []
     for k, g_ in groups.items():
         book = _book_get(db, k)
+        verified, more = False, []
         if book:
-            g_["email"] = g_["email"] or _clean_email(book["email"])
+            g_["email"] = g_["email"] or _clean_email(book["email"]).lower()
             g_["attn"] = book["attn"] or ""
-        sent = db.execute("SELECT * FROM notice_log WHERE port = ? AND vessel = ? AND ckey = ? AND test = 0 ORDER BY id DESC LIMIT 1",
-                          (port, vessel, k)).fetchone()
+            more = _split_emails(book["more_emails"])[0]
+            verified = bool(book["verified"])
+        g_["more"] = [e for e in more if e.lower() != (g_["email"] or "").lower()]
+        sent = db.execute("SELECT * FROM notice_log WHERE port = ANY(?) AND vessel = ? AND ckey = ? AND test = 0 ORDER BY id DESC LIMIT 1",
+                          (variants, vessel, k)).fetchone()
         g_["sent"] = None
         if sent:
             try:
                 sent_bls = set(json.loads(sent["bls"] or "[]"))
             except ValueError:
                 sent_bls = set()
-            g_["sent"] = {"at": sent["sent_at"], "by": sent["sent_by"], "to": sent["sent_to"],
-                          "new_bls": len({b["bl"] for b in g_["bls"]} - sent_bls)}
+            fresh = [b["bl"] for b in g_["bls"] if b["bl"] not in sent_bls]
+            g_["sent"] = {"at": sent["sent_at"], "at_local": _desk_local(sent["sent_at"]), "by": sent["sent_by"], "to": sent["sent_to"],
+                          "kind": sent["kind"] or "", "eta": sent["eta"], "berth": sent["berth"] or "",
+                          "new_bls": len(fresh), "new_list": fresh}
+        g_["email_ok"] = bool(g_["email"]) and (verified or bool(sent))
         g_["gaps"] = sum(1 for b in g_["bls"] if not (b["pkgs"] and b["desc"]))
         if not g_["name"]:
             g_["state"] = "needs_name"
@@ -6051,22 +6215,20 @@ def _desk_groups(db, port, vessel):
     return out
 
 
-def _lu_eta_text(s):
-    try:
-        d = _lu_dt(s)
-        if d:
-            return d.strftime("%d.%m.%Y")
-    except Exception:
-        pass
-    return str(s or "").strip()
-
-
 def _desk_suggest(db, port, vessel):
-    """What to say about the vessel: taken from the latest line-up for the port when the vessel is on it."""
+    """What to say about the vessel: what the board already holds for it, then the latest line-up for the port when the vessel is on it."""
     out = {"kind": "arriving", "eta": "", "berth": "", "source": ""}
-    row = db.execute("SELECT eta FROM records WHERE port = ? AND vessel = ? AND eta <> '' LIMIT 1", (port, vessel)).fetchone()
+    variants = _desk_port_variants(db, port)
+    row = db.execute("SELECT eta, vessel_status, berth_no FROM records WHERE port = ANY(?) AND vessel = ? "
+                     "ORDER BY (eta <> '') DESC, (vessel_status <> '') DESC LIMIT 1", (variants, vessel)).fetchone()
     if row:
-        out["eta"] = _lu_eta_text(row["eta"])
+        out["eta"] = _eta_text(_parse_eta(row["eta"]))
+        if row["vessel_status"] == "berth":
+            out["kind"], out["berth"] = "berthed", (row["berth_no"] or "").strip()
+        elif row["vessel_status"] == "anch":
+            out["kind"] = "anchorage"
+        if out["eta"] or row["vessel_status"]:
+            out["source"] = "the DO Tracker"
     code = _lu_guess_port(port)
     if not code:
         return out
@@ -6082,8 +6244,12 @@ def _desk_suggest(db, port, vessel):
             out["kind"] = {"alongside": "berthed", "anchor": "anchorage", "next": "anchorage", "expected": "arriving"}.get(v["status"], "arriving")
             out["berth"] = (v.get("berth") or "").strip() if out["kind"] == "berthed" else ""
             if v.get("eta"):
-                out["eta"] = _lu_eta_text(v["eta"])
-            out["source"] = "Line-up of " + str(snap["lineup_date"])
+                out["eta"] = _eta_text(_parse_eta(v["eta"])) or out["eta"]
+            try:
+                ld = datetime.strptime(str(snap["lineup_date"])[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
+            except ValueError:
+                ld = str(snap["lineup_date"])
+            out["source"] = "the line-up of " + ld
             break
     return out
 
@@ -6094,6 +6260,43 @@ def _qr_png(url):
     return buf.getvalue()
 
 
+def _desk_check(g_, kind, eta, berth):
+    """What stops this notice going out (problems), what deserves a second look (warnings), and how it relates to the last notice."""
+    problems, warnings = [], []
+    d = _parse_eta(eta)
+    if not g_.get("name"):
+        problems.append({"code": "name", "text": "These B/Ls have no consignee name."})
+    elif not g_.get("email"):
+        problems.append({"code": "email", "text": "No email address yet."})
+    if kind == "arriving":
+        if not str(eta or "").strip():
+            problems.append({"code": "eta", "text": "Enter the ETA (dd.mm.yyyy) first."})
+        elif not d:
+            problems.append({"code": "eta", "text": "The ETA is not a valid date. Use dd.mm.yyyy."})
+        else:
+            today = _riyadh_now().date()
+            if d < today - timedelta(days=2):
+                warnings.append("The ETA is in the past. Has the vessel already arrived?")
+            elif d > today + timedelta(days=120):
+                warnings.append("The ETA is more than four months away. Check the year.")
+    if kind == "berthed" and not str(berth or "").strip():
+        warnings.append("No berth entered, so the notice only says the vessel has berthed.")
+    if g_.get("email") and not g_.get("email_ok"):
+        warnings.append("This email came from the manifest and has not been checked. Make sure it is the consignee's own.")
+    if g_.get("gaps"):
+        warnings.append("%d B/L%s without packages or description." % (g_["gaps"], "" if g_["gaps"] == 1 else "s"))
+    sent = g_.get("sent")
+    changed = False
+    if sent:
+        if sent["eta"] is None:
+            changed = sent["kind"] != kind
+        else:
+            changed = (sent["kind"], sent["eta"] or "", sent["berth"] or "") != _status_sig(kind, eta, berth)
+    new_n = sent["new_bls"] if sent else 0
+    return {"problems": problems, "warnings": warnings, "changed": bool(changed), "new_bls": new_n,
+            "repeat": bool(sent) and not changed and not new_n, "sendable": not problems}
+
+
 def _desk_notice(db, port, vessel, group, kind, eta, berth, sender, inline):
     """Builds one arrival notice. inline='cid' for an email (QR pictures travel inside it),
     inline='data' for the on-screen preview. Returns (subject, text, html, images)."""
@@ -6101,6 +6304,8 @@ def _desk_notice(db, port, vessel, group, kind, eta, berth, sender, inline):
     official, city = _notice_port(port)
     v = (vessel or "").upper().strip()
     mv = v if re.match(r"^M\.?\s?V\.?\s", v) else "M.V. " + v
+    eta_txt = _eta_text(_parse_eta(eta))
+    berth = (berth or "").strip()
     if kind == "berthed":
         status = "VESSEL HAS BERTHED AT " + official + ((", BERTH " + berth.upper()) if berth else "") + "."
         verb = "HAS ARRIVED AT"
@@ -6109,13 +6314,22 @@ def _desk_notice(db, port, vessel, group, kind, eta, berth, sender, inline):
                   "FROM THE PORT AUTHORITIES. WE WILL REVERT ONCE THE BERTHING PLAN IS RECEIVED.")
         verb = "IS ARRIVING AT"
     else:
-        status = "VESSEL IS EXPECTED TO ARRIVE AT " + official + ((" ON " + eta) if eta else "") + "."
+        status = "VESSEL IS EXPECTED TO ARRIVE AT " + official + ((" ON " + eta_txt) if eta_txt else "") + "."
         verb = "IS ARRIVING AT"
+    sent = group.get("sent")
+    fresh = set(sent["new_list"]) if sent else set()
+    status_changed = bool(sent) and _desk_check(group, kind, eta, berth)["changed"]
+    is_update = bool(sent) and (bool(fresh) or status_changed)
+    upd = ""
+    if is_update:
+        prev = (sent["at_local"] or "")[:10]
+        upd = ("UPDATED NOTICE. FURTHER TO OUR EARLIER ADVICE OF " + prev + "."
+               + (" THE B/LS MARKED NEW HAVE BEEN ADDED SINCE." if fresh else " PLEASE NOTE THE UPDATED STATUS OF THE VESSEL BELOW."))
     intro = "WE ARE PLEASED TO ADVISE YOU THAT THE ABOVE VESSEL " + verb + " " + official + " WITH YOUR FOLLOWING CARGO:"
     ask = ("KINDLY SUBMIT THE ORIGINAL BL TO OUR " + (city + " " if city else "") + "OFFICE, BEARING THE CORRECT CONSIGNEE STAMP TOGETHER "
            "WITH THE IMPORTER NUMBER, TO OBTAIN OUR PRINCIPAL'S APPROVAL FOR ISSUANCE OF THE DELIVERY ORDER AND CLEAR YOUR CARGO WITHOUT DELAY.")
     thanks = "THANK YOU FOR SHIPPING YOUR VALUED CARGO PER OUR AGENCY VESSEL."
-    subject = "ARRIVAL NOTICE - " + mv + " - " + official
+    subject = "ARRIVAL NOTICE" + (" (UPDATE)" if is_update else "") + " - " + mv + " - " + official
     base = _public_base_url()
     images, rows_html, rows_txt = [], [], []
     for i, b in enumerate(group["bls"]):
@@ -6131,10 +6345,11 @@ def _desk_notice(db, port, vessel, group, kind, eta, berth, sender, inline):
             else:
                 src = "data:image/png;base64," + base64.b64encode(png).decode()
             cell = '<img src="%s" width="64" height="64" alt="QR" style="display:block;">' % src
-        rows_html.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-            esc(b["bl"]), esc(b["pol"]), esc(b["pkgs"]), esc(b["desc"]), cell))
-        rows_txt.append("%-22s %-14s %-12s %s%s" % (b["bl"], b["pol"], b["pkgs"], b["desc"], ("\n    Track: " + url) if url else ""))
-    date = _desk_today()
+        is_new = b["bl"] in fresh
+        rows_html.append("<tr><td>%s%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            esc(b["bl"]), (' <b style="color:#b45309;">NEW</b>' if is_new else ""), esc(b["pol"]), esc(b["pkgs"]), esc(b["desc"]), cell))
+        rows_txt.append("%-22s %-14s %-12s %s%s" % (b["bl"] + ("  (NEW)" if is_new else ""), b["pol"], b["pkgs"], b["desc"], ("\n    Track: " + url) if url else ""))
+    date_ = _desk_today()
     head_txt = ["TO : %s%s" % (group["name"].upper(), (" - " + city) if city else "")]
     head_html = ["<b>TO :</b> %s%s" % (esc(group["name"].upper()), esc((" – " + city) if city else ""))]
     if group.get("attn"):
@@ -6143,7 +6358,7 @@ def _desk_notice(db, port, vessel, group, kind, eta, berth, sender, inline):
     head_txt.append("FM : SEA POWER FOR MARINE SERVICES LTD. CO." + ((" - " + city) if city else ""))
     head_html.append("<b>FM :</b> SEA POWER FOR MARINE SERVICES LTD. CO." + esc((" – " + city) if city else ""))
     sig_name = sender or "Agency Operations"
-    text = "\n".join(head_txt) + "\n\n" + date + "\n\n" + mv + "\n" + status + "\n\n" + intro + "\n\n" + \
+    text = "\n".join(head_txt) + "\n\n" + date_ + "\n\n" + mv + "\n" + (upd + "\n" if upd else "") + status + "\n\n" + intro + "\n\n" + \
         "%-22s %-14s %-12s %s" % ("BL #", "LOADING PORT", "PKGS", "DESCRIPTION OF CARGO") + "\n" + "\n".join(rows_txt) + \
         "\n\n" + ask + "\n\n" + thanks + "\n\nKind regards,\n" + sig_name + "\n" + "\n".join(NOTICE_COMPANY_LINES) + "\n"
     th = "border:1px solid #c9d1d9;padding:6px 9px;background:#eef2f6;text-align:left;font-size:12.5px;"
@@ -6153,15 +6368,17 @@ def _desk_notice(db, port, vessel, group, kind, eta, berth, sender, inline):
                                  for r in rows_html) + "</table>")
     sig_html = "<br>".join(esc(l) for l in NOTICE_COMPANY_LINES)
     html_body = ('<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.55;color:#111;">'
-                 + "<br>".join(head_html) + "<br><br>" + date + "<br><br><b>" + esc(mv) + "</b><br>" + esc(status) + "<br><br>"
+                 + "<br>".join(head_html) + "<br><br>" + date_ + "<br><br><b>" + esc(mv) + "</b><br>"
+                 + (("<b>" + esc(upd) + "</b><br>") if upd else "") + esc(status) + "<br><br>"
                  + esc(intro) + table + "<br>" + esc(ask) + "<br><br>" + esc(thanks) + "<br><br>Kind regards,<br><b>"
                  + esc(sig_name) + "</b><br>" + sig_html + "</div>")
     return subject, text, html_body, images
 
 
 def _desk_args(data):
-    port = str(data.get("port") or "").strip().upper()
-    vessel = str(data.get("vessel") or "").strip().upper()
+    raw_port = str(data.get("port") or "").strip().upper()
+    port = _canon_port(raw_port) or raw_port
+    vessel = _desk_vessel(data.get("vessel"))
     kind = data.get("kind") if data.get("kind") in NOTICE_KINDS else "arriving"
     return port, vessel, kind, str(data.get("eta") or "").strip()[:40], str(data.get("berth") or "").strip()[:20]
 
@@ -6173,77 +6390,219 @@ def _desk_group(db, port, vessel, key):
     return None
 
 
+def _desk_save_status(db, port, vessel, kind, eta, berth):
+    """A sent notice states the vessel's position; the same words go onto the board so the customer's tracking page agrees with the email."""
+    sets, params = [], []
+    d = _parse_eta(eta)
+    if d:
+        sets.append("eta = ?"); params.append(d.strftime("%Y-%m-%d"))
+    if kind == "anchorage":
+        sets.append("vessel_status = 'anch'")
+    elif kind == "berthed":
+        sets.append("vessel_status = 'berth'")
+        if berth:
+            sets.append("berth_no = ?"); params.append(re.sub(r"\s+", " ", berth).strip().upper()[:12])
+    if not sets:
+        return
+    extra, scope = _desk_scope_sql()
+    db.execute("UPDATE records SET " + ", ".join(sets) + " WHERE port = ANY(?) AND vessel = ?" + extra,
+               (*params, _desk_port_variants(db, port), vessel, *scope))
+
+
+# ----- what a dropped manifest says about itself, against what was chosen -----
+
+def _desk_manifest_issues(port, vessel, info, chk):
+    """Problems between a manifest's own heading and the port and vessel chosen on screen.
+    hard = Compass will not add it without the person saying so; soft = worth knowing."""
+    out = []
+    typed_fam = _port_family(port)
+    head_raw = (info.get("port") or "").strip()
+    head_fam = _port_family(head_raw)
+    codes_fam = _port_family(chk.get("codes_say")) if chk.get("codes_say") else ""
+    says_fam = head_fam or codes_fam
+    if typed_fam and says_fam and typed_fam != says_fam:
+        says = (_canon_port(head_raw) if head_fam else _canon_port(chk.get("codes_say"))) or head_raw
+        out.append({"kind": "port", "hard": True, "says": says, "typed": port,
+                    "text": "This manifest is for %s, but you chose %s." % (DESK_PORT_LABELS.get(says, says.title()), DESK_PORT_LABELS.get(port, port.title()))})
+    elif head_fam and codes_fam and head_fam != codes_fam:
+        out.append({"kind": "clash", "hard": False, "says": _canon_port(chk.get("codes_say")), "typed": port,
+                    "text": "The heading says %s, but the B/L numbers (for example %s) point to %s." % (
+                        head_raw.title(), chk.get("clash_sample") or "the first ones", str(chk.get("codes_say")).title())})
+    m_vessel = (info.get("vessel") or "").strip()
+    if vessel and m_vessel and not _vessel_same(vessel, m_vessel):
+        out.append({"kind": "vessel", "hard": True, "says": m_vessel.upper(), "typed": vessel,
+                    "text": "This manifest is for %s, but you typed %s." % (m_vessel.title(), vessel.title())})
+    else:
+        tv, mv_ = _vessel_voyage(vessel), re.sub(r"[^A-Z0-9]", "", str(info.get("voyage") or "").upper())
+        if tv and mv_ and tv != mv_:
+            out.append({"kind": "voyage", "hard": False, "says": mv_, "typed": tv,
+                        "text": "The voyage on the manifest is %s, but you typed %s." % (mv_, tv)})
+    return out
+
+
+def _desk_upload_view(row):
+    try:
+        rep = json.loads(row["report"] or "{}")
+    except ValueError:
+        rep = {}
+    warnings = rep.get("warnings") or []
+    return {"id": row["id"], "file": row["filename"], "at": row["at"], "at_local": _desk_local(row["at"]), "by": row["by_user"],
+            "added": row["added"], "skipped": row["skipped"], "left_out": row["left_out"], "undone": bool(row["undone"]),
+            "notes": rep.get("notes") or [], "warnings": [] if row["ack"] else warnings, "ack": bool(row["ack"]),
+            "can_undo": (not row["undone"]) and row["added"] > 0}
+
+
 @app.route("/manifest-desk")
 @login_required
 def manifest_desk_page():
+    feats = _features()
+    desks = _desks_for(feats)
+    nav = {"desks": [{"name": d["name"], "url": d["tools"][0]["url"], "on": d["key"] == "manifest"} for d in desks],
+           "tools": next(([{"name": t["name"], "url": t["url"], "on": t["url"] == "/manifest-desk"} for t in d["tools"]] for d in desks if d["key"] == "manifest"), [])}
     page = DESK_HTML.replace("__NAME__", html.escape(session.get("display_name") or session.get("username") or "", quote=True))
-    page = page.replace("__LEARNED__", '<a href="/learned">What Compass learned</a>' if _is_owner() else "")
-    return Response(page, mimetype="text/html")
+    page = page.replace("__NAV__", html.escape(json.dumps(nav), quote=True))
+    page = page.replace("__PORTS__", html.escape(json.dumps([{"v": p, "t": DESK_PORT_LABELS[p]} for p in DESK_PORTS]), quote=True))
+    page = page.replace("__LEARNED__", "1" if _is_owner() else "0")
+    page = page.replace("__LOGO__", LOGO_B64)
+    resp = Response(page, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/api/desk/vessels")
 @login_required
 def desk_vessels():
+    q = re.sub(r"\s+", " ", request.args.get("q", "")).strip().upper()
+    try:
+        limit = max(1, min(300, int(request.args.get("limit", "40"))))
+    except ValueError:
+        limit = 40
     extra, params = _desk_scope_sql()
     rows = get_db().execute(
         "SELECT port, vessel, COUNT(*) AS n, MAX(created_at) AS last FROM records WHERE vessel <> ''" + extra +
-        " GROUP BY port, vessel ORDER BY MAX(created_at) DESC LIMIT 12", params).fetchall()
-    return jsonify([{"port": r["port"], "vessel": r["vessel"], "n": r["n"]} for r in rows])
+        " GROUP BY port, vessel ORDER BY MAX(created_at) DESC LIMIT 600", params).fetchall()
+    merged = {}
+    for r in rows:
+        port = _canon_port(r["port"]) or r["port"]
+        m = merged.setdefault((port, r["vessel"]), {"port": port, "vessel": r["vessel"], "n": 0, "last": ""})
+        m["n"] += r["n"]
+        m["last"] = max(m["last"], r["last"] or "")
+    out = sorted(merged.values(), key=lambda x: x["last"], reverse=True)
+    if q:
+        out = [v for v in out if q in v["vessel"] or q in v["port"]]
+    return jsonify({"vessels": [{"port": v["port"], "vessel": v["vessel"], "n": v["n"], "last": _desk_local(v["last"])[:10]} for v in out[:limit]],
+                    "total": len(out)})
 
 
 @app.route("/api/desk/upload", methods=["POST"])
 @login_required
 def desk_upload():
-    port = request.form.get("port", "").strip().upper()
-    vessel = request.form.get("vessel", "").strip().upper()
-    if not port or not vessel:
-        return jsonify({"error": "Type the port and the vessel first."}), 400
+    port = _canon_port(request.form.get("port", ""))
+    vessel = _desk_vessel(request.form.get("vessel", ""))
+    force = request.form.get("force") == "1"
+    if port not in DESK_PORTS:
+        return jsonify({"error": "Choose the port from the list first."}), 400
+    if not vessel:
+        return jsonify({"error": "Type the vessel first."}), 400
     files = [f for f in request.files.getlist("file") if f and f.filename]
     if not files:
         return jsonify({"error": "Choose a manifest file."}), 400
     db = get_db()
-    added = skipped = 0
-    failed, elsewhere, warnings, notices = [], [], [], []
+    reports = []
     for f in files:
+        rep = {"file": f.filename, "status": "", "added": 0, "skipped": 0, "taken": 0, "left_out": 0, "lines": 0, "notes": [], "warnings": []}
+        reports.append(rep)
+        # First a quiet read (no Gemini, nothing counted or saved) to compare the manifest's own heading with what was chosen.
+        peek = None
+        raw = f.read(_MANIFEST_MAX_BYTES + 1)
+        f.stream.seek(0)
+        if raw and len(raw) <= _MANIFEST_MAX_BYTES and (f.filename or "").lower().endswith(_MANIFEST_EXTS):
+            try:
+                peek = read_manifest(raw, f.filename, use_ai=False)
+            except Exception:
+                peek = None
+        issues = _desk_manifest_issues(port, vessel, peek.get("info") or {}, dict(peek.get("checks") or {}, clash_sample=next(
+            (e["bl"] for e in peek["entries"] if e["note"] is None), ""))) if peek else []
+        hard = [i for i in issues if i["hard"]]
+        if hard and not force:
+            rep.update(status="held", held=hard, lines=len([e for e in peek["entries"] if e["note"] is None]))
+            continue
         meta = {}
         entries, err = _manifest_read_upload(f, meta=meta)
         if err and err != "no_bls":
-            failed.append(f.filename + ": " + _MANIFEST_ERROR_TEXT[err])
+            rep.update(status="failed", error=_MANIFEST_ERROR_TEXT[err])
             continue
         live = [e for e in entries if e["note"] is None]
         if not live:
-            failed.append(f.filename + ": " + _MANIFEST_ERROR_TEXT["no_bls"])
+            rep.update(status="failed", error=_MANIFEST_ERROR_TEXT["no_bls"])
             continue
+        chk = meta.get("checks") or {}
+        rep["lines"] = len(live)
+        for i in issues:
+            rep["warnings"].append({"kind": i["kind"], "text": i["text"] + (" Added anyway, as you asked." if i["hard"] else "")})
+        if chk.get("pkgs_ok") is False:
+            rep["warnings"].append({"kind": "pkgs", "text": "Compass counted %s packages, but the manifest's own total says %s. Check this file's B/L lines." % (
+                chk.get("pkgs_read"), chk.get("pkgs_total"))})
+        elif chk.get("pkgs_ok") is True:
+            rep["notes"].append("Package total matches the manifest (%s)." % chk.get("pkgs_total"))
+        gaps_now = sum(1 for e in live if not (e["cargo"]["desc"] and e["cargo"]["pkgs"]))
+        if meta.get("ai_failed"):
+            if gaps_now or chk.get("pkgs_ok") is False:
+                rep["warnings"].append({"kind": "ai", "text": "Gemini did not answer, so cargo names and packages may be incomplete. Add the same file again later to fill the blanks."})
+            else:
+                rep["notes"].append("Gemini did not answer. Compass read this manifest on its own and its totals check out.")
+        elif meta.get("ai_off") and gaps_now:
+            rep["warnings"].append({"kind": "ai", "text": "Gemini is not available, so %d B/L%s have no packages or description." % (gaps_now, "" if gaps_now == 1 else "s")})
         if meta.get("layout_new"):
-            notices.append(f"{f.filename}: new manifest layout recognised and saved. Compass checked it against the manifest.")
+            rep["notes"].append("First manifest in this layout. Compass will remember how to read it.")
         if meta.get("remembered"):
-            notices.append(f"{f.filename}: {meta['remembered']} cargo name{'s' if meta['remembered'] != 1 else ''} filled in from what you confirmed before.")
+            rep["notes"].append("%d cargo name%s filled in from what you confirmed before." % (meta["remembered"], "" if meta["remembered"] == 1 else "s"))
         items = [{"bl": e["bl"], **e["contact"], "loading_port": e["cargo"]["pol"], "packages": e["cargo"]["pkgs"],
                   "cargo_desc": e["cargo"]["desc"]} for e in live]
         res = _manifest_add(port, vessel, items)
-        added += res["added"]
-        skipped += res["skipped"]
-        elsewhere += res["duplicate_elsewhere"]
-        chk = meta.get("checks") or {}
-        if chk.get("pkgs_ok") is False:
-            warnings.append(f"{f.filename}: Compass read {chk.get('pkgs_read')} packages, but the manifest's total says "
-                            f"{chk.get('pkgs_total')}. Check its B/L lines.")
+        rep.update(status="added", added=res["added"], skipped=res["skipped"], taken=res.get("taken", 0),
+                   left_out=len(entries) - len(live))
+        if res.get("taken"):
+            rep["warnings"].append({"kind": "taken", "text": "%d B/L%s already on the board under another account, so they do not show here." % (
+                res["taken"], " is" if res["taken"] == 1 else "s are")})
+        for d_ in res["duplicate_elsewhere"][:5]:
+            rep["warnings"].append({"kind": "elsewhere", "text": "%s is already on the board under %s / %s." % (
+                d_["bl_number"], d_.get("existing_vessel") or "another vessel", d_.get("existing_port") or "another port")})
         for e in live:
             c = e["contact"]
             who = c.get("name") or c.get("notify")
             if who and _clean_email(c.get("email")):
                 _book_save(db, who, email=_clean_email(c["email"]), only_fill=True)
+        up = db.execute(
+            "INSERT INTO desk_uploads (port, vessel, filename, by_user, at, added, skipped, left_out, report, bls) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            (port, vessel, (f.filename or "")[:200], session.get("username") or "", datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+             res["added"], res["skipped"], rep["left_out"], json.dumps({"warnings": rep["warnings"], "notes": rep["notes"]}),
+             json.dumps(res.get("added_bls") or []))).fetchone()
+        rep["id"] = up["id"]
         db.commit()
-    return jsonify({"added": added, "skipped": skipped, "failed": failed, "duplicate_elsewhere": elsewhere[:5], "warnings": warnings,
-                    "notices": notices})
+    added = sum(r["added"] for r in reports)
+    skipped = sum(r["skipped"] for r in reports)
+    return jsonify({"files": reports, "added": added, "skipped": skipped,
+                    "failed": [r["file"] + ": " + r["error"] for r in reports if r["status"] == "failed"],
+                    "warnings": [r["file"] + ": " + w["text"] for r in reports for w in r["warnings"]],
+                    "notices": [r["file"] + ": " + n for r in reports for n in r["notes"]],
+                    "held": [r["file"] for r in reports if r["status"] == "held"]})
 
 
 @app.route("/api/desk/peek", methods=["POST"])
 @login_required
 def desk_peek():
-    """Reads the manifest's heading (vessel, discharge port) and counts its lines, without adding anything."""
+    """Reads the manifest's heading (vessel, discharge port) and counts its lines, without adding anything,
+    and says at once if it does not fit the port and vessel chosen."""
     r = _read_for_peek()
-    return jsonify(_manifest_peek_payload(r) if r else {"ok": False})
+    if not r:
+        return jsonify({"ok": False})
+    out = _manifest_peek_payload(r)
+    port = _canon_port(request.form.get("port", ""))
+    vessel = _desk_vessel(request.form.get("vessel", ""))
+    out["issues"] = _desk_manifest_issues(port, vessel, r.get("info") or {}, dict(r.get("checks") or {}, clash_sample=out.get("clash_sample"))) if (port or vessel) else []
+    out["port_canon"] = _canon_port(out.get("port")) or _canon_port(out.get("codes_port"))
+    return jsonify(out)
 
 
 @app.route("/api/desk/notices")
@@ -6251,13 +6610,50 @@ def desk_peek():
 def desk_notices():
     port, vessel, _, _, _ = _desk_args(request.args)
     if not port or not vessel:
-        return jsonify({"error": "Type the port and the vessel first."}), 400
+        return jsonify({"error": "Choose the port and the vessel first."}), 400
     db = get_db()
     groups = _desk_groups(db, port, vessel)
     official, city = _notice_port(port)
     me = db.execute("SELECT email FROM users WHERE id = ?", (session.get("user_id"),)).fetchone()
-    return jsonify({"groups": groups, "suggest": _desk_suggest(db, port, vessel), "official": official,
-                    "my_email": (me["email"] if me else "") or "", "email_ready": email_configured()})
+    variants = _desk_port_variants(db, port)
+    other = 0
+    if _team() is not None:
+        total = db.execute("SELECT COUNT(*) AS n FROM records WHERE port = ANY(?) AND vessel = ?", (variants, vessel)).fetchone()["n"]
+        mine = sum(len(g_["bls"]) for g_ in groups)
+        other = max(0, total - mine)
+    team = _team()
+    ups = db.execute("SELECT * FROM desk_uploads WHERE port = ANY(?) AND vessel = ?" + (" AND by_user = ANY(?)" if team is not None else "") +
+                     " ORDER BY id DESC LIMIT 20", (variants, vessel, *([team] if team is not None else []))).fetchall()
+    return jsonify({"groups": groups, "suggest": _desk_suggest(db, port, vessel), "official": official, "city": city,
+                    "port": port, "vessel": vessel, "port_known": port in DESK_PORTS,
+                    "my_email": (me["email"] if me else "") or "", "email_ready": email_configured(),
+                    "uploads": [_desk_upload_view(u) for u in ups], "other_count": other})
+
+
+def _desk_set_contact(db, g_, port, vessel, name, email_raw, attn):
+    """Saves a consignee's name, email address(es) and contact person. Returns (error, new key)."""
+    good, bad = _split_emails(email_raw)
+    if bad:
+        return "'%s' is not a valid email address." % bad[0][:60], g_["key"]
+    name = re.sub(r"\s+", " ", str(name if name is not None else g_["name"]) or "").strip()[:120]
+    if not name:
+        return "Type the consignee's name.", g_["key"]
+    attn = re.sub(r"\s+", " ", str(attn or "")).strip()[:80]
+    primary = good[0] if good else ""
+    more = "; ".join(good[1:])
+    variants = _desk_port_variants(db, port)
+    new_key = _ckey(name)
+    if name != g_["name"]:
+        for b in g_["bls"]:
+            db.execute("UPDATE records SET consignee = ? WHERE bl_number = ?", (name, b["bl"]))
+            _log_audit(b["bl"], "edited", "consignee", g_["name"], name)
+        if g_["key"] not in ("~none", new_key):
+            db.execute("UPDATE notice_log SET ckey = ?, consignee = ? WHERE port = ANY(?) AND vessel = ? AND ckey = ?",
+                       (new_key, name, variants, vessel, g_["key"]))
+    for b in g_["bls"]:
+        db.execute("UPDATE records SET consignee_email = ? WHERE bl_number = ?", (primary, b["bl"]))
+    _book_save(db, name, email=primary, attn=attn, more=more, verified=bool(primary))
+    return None, new_key
 
 
 @app.route("/api/desk/contact", methods=["POST"])
@@ -6265,20 +6661,38 @@ def desk_notices():
 def desk_contact():
     data = request.get_json(force=True, silent=True) or {}
     port, vessel, _, _, _ = _desk_args(data)
-    key = str(data.get("key") or "")
     db = get_db()
-    g_ = _desk_group(db, port, vessel, key)
+    g_ = _desk_group(db, port, vessel, str(data.get("key") or ""))
     if not g_:
         return jsonify({"error": "Consignee not found."}), 404
-    email = str(data.get("email") or "").strip()
-    if email and not _clean_email(email):
-        return jsonify({"error": "That doesn't look like an email address."}), 400
-    attn = re.sub(r"\s+", " ", str(data.get("attn") or "")).strip()[:80]
-    for b in g_["bls"]:
-        db.execute("UPDATE records SET consignee_email = ? WHERE bl_number = ?", (_clean_email(email), b["bl"]))
-    _book_save(db, g_["name"], email=_clean_email(email), attn=attn)
+    err, new_key = _desk_set_contact(db, g_, port, vessel, data.get("name") if "name" in data else None, data.get("email"), data.get("attn"))
+    if err:
+        db.rollback()
+        return jsonify({"error": err}), 400
     db.commit()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "key": new_key})
+
+
+def _desk_set_cargo(db, bl, loading_port, packages, cargo_desc):
+    """Saves one B/L's cargo details and logs what changed. Returns the 'remember this?' offer, if there is one."""
+    before = db.execute("SELECT consignee, notify_name, loading_port, packages, cargo_desc FROM records WHERE bl_number = ?", (bl,)).fetchone()
+    if not before:
+        return None
+    new = {"loading_port": _mf_flat(loading_port)[:80], "packages": _mf_flat(packages)[:60], "cargo_desc": _mf_flat(cargo_desc)[:300]}
+    labels = {"loading_port": "loading port", "packages": "packages", "cargo_desc": "cargo description"}
+    changed = [k for k in new if new[k] != _mf_flat(before[k])]
+    if not changed:
+        return None
+    db.execute("UPDATE records SET loading_port = ?, packages = ?, cargo_desc = ? WHERE bl_number = ?",
+               (new["loading_port"], new["packages"], new["cargo_desc"], bl))
+    for k in changed:
+        _log_audit(bl, "edited", labels[k], _mf_flat(before[k]), new[k])
+    old_desc, who = _mf_flat(before["cargo_desc"]), _mf_flat(before["consignee"] or before["notify_name"])
+    if "cargo_desc" in changed and new["cargo_desc"] and old_desc and who and _mem_desc_key(old_desc):
+        known = _mem_find(db, who, _mem_desc_key(old_desc))
+        if not known or known["new_value"] != new["cargo_desc"]:
+            return {"consignee": who, "old": old_desc, "new": new["cargo_desc"]}
+    return None
 
 
 @app.route("/api/desk/bl", methods=["POST"])
@@ -6289,21 +6703,134 @@ def desk_bl():
     if not _owns_record(bl):
         return jsonify({"error": "Not your record."}), 403
     db = get_db()
-    before = db.execute("SELECT consignee, notify_name, cargo_desc FROM records WHERE bl_number = ?", (bl,)).fetchone()
-    if not before:
+    if not db.execute("SELECT 1 FROM records WHERE bl_number = ?", (bl,)).fetchone():
         return jsonify({"error": "BL not found."}), 404
-    new_desc = _mf_flat(data.get("cargo_desc"))[:300]
-    db.execute("UPDATE records SET loading_port = ?, packages = ?, cargo_desc = ? WHERE bl_number = ?",
-               (_mf_flat(data.get("loading_port"))[:80], _mf_flat(data.get("packages"))[:60], new_desc, bl))
-    _log_audit(bl, "edited", "cargo details", "", "")
-    db.commit()
     out = {"ok": True}
-    old_desc, who = _mf_flat(before["cargo_desc"]), _mf_flat(before["consignee"] or before["notify_name"])
-    if new_desc and old_desc and who and new_desc != old_desc and _mem_desc_key(old_desc):
-        known = _mem_find(db, who, _mem_desc_key(old_desc))
-        if not known or known["new_value"] != new_desc:
-            out["learn"] = {"consignee": who, "old": old_desc, "new": new_desc}
+    offer = _desk_set_cargo(db, bl, data.get("loading_port"), data.get("packages"), data.get("cargo_desc"))
+    db.commit()
+    if offer:
+        out["learn"] = offer
     return jsonify(out)
+
+
+@app.route("/api/desk/save", methods=["POST"])
+@login_required
+def desk_save():
+    """One save for everything edited on a consignee: name, email(s), contact person and the cargo of each B/L."""
+    data = request.get_json(force=True, silent=True) or {}
+    port, vessel, _, _, _ = _desk_args(data)
+    db = get_db()
+    g_ = _desk_group(db, port, vessel, str(data.get("key") or ""))
+    if not g_:
+        return jsonify({"error": "Consignee not found."}), 404
+    err, new_key = _desk_set_contact(db, g_, port, vessel, data.get("name") if "name" in data else None, data.get("email"), data.get("attn"))
+    if err:
+        db.rollback()
+        return jsonify({"error": err}), 400
+    mine = {b["bl"] for b in g_["bls"]}
+    learn = {}
+    for row in (data.get("bls") or [])[:500]:
+        bl = str((row or {}).get("bl") or "").upper()
+        if bl not in mine:
+            continue
+        offer = _desk_set_cargo(db, bl, row.get("loading_port"), row.get("packages"), row.get("cargo_desc"))
+        if offer:
+            learn[(offer["consignee"], offer["old"], offer["new"])] = offer
+    db.commit()
+    return jsonify({"ok": True, "key": new_key, "learn": list(learn.values())})
+
+
+@app.route("/api/desk/vessel", methods=["POST"])
+@login_required
+def desk_vessel_move():
+    """Corrects a vessel's port or name for all of its B/Ls (a typo, or a manifest filed under the wrong port)."""
+    data = request.get_json(force=True, silent=True) or {}
+    port, vessel, _, _, _ = _desk_args(data)
+    to_port = _canon_port(data.get("to_port"))
+    to_vessel = _desk_vessel(data.get("to_vessel"))
+    if to_port not in DESK_PORTS:
+        return jsonify({"error": "Choose the port from the list."}), 400
+    if not to_vessel:
+        return jsonify({"error": "Type the vessel name."}), 400
+    if (to_port, to_vessel) == (port, vessel):
+        return jsonify({"ok": True, "moved": 0})
+    db = get_db()
+    rows = _desk_rows(db, port, vessel)
+    if not rows:
+        return jsonify({"error": "No B/Ls found for that vessel."}), 404
+    variants = _desk_port_variants(db, port)
+    for r in rows:
+        db.execute("UPDATE records SET port = ?, vessel = ? WHERE bl_number = ?", (to_port, to_vessel, r["bl_number"]))
+        _log_audit(r["bl_number"], "moved", "port / vessel", "%s / %s" % (r["port"], r["vessel"]), "%s / %s" % (to_port, to_vessel))
+    keys = sorted({_ckey(re.sub(r"\s+", " ", r.get("consignee") or r.get("notify_name") or "")) for r in rows})
+    db.execute("UPDATE notice_log SET port = ?, vessel = ? WHERE port = ANY(?) AND vessel = ? AND ckey = ANY(?)",
+               (to_port, to_vessel, variants, vessel, keys))
+    team = _team()
+    db.execute("UPDATE desk_uploads SET port = ?, vessel = ? WHERE port = ANY(?) AND vessel = ?" + (" AND by_user = ANY(?)" if team is not None else ""),
+               (to_port, to_vessel, variants, vessel, *(([team]) if team is not None else [])))
+    db.commit()
+    return jsonify({"ok": True, "moved": len(rows), "port": to_port, "vessel": to_vessel})
+
+
+@app.route("/api/desk/undo", methods=["POST"])
+@login_required
+def desk_undo():
+    """Takes back one manifest upload: removes the B/Ls it added, as long as nobody has started work on them."""
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        uid = int(data.get("id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Nothing to undo."}), 400
+    db = get_db()
+    up = db.execute("SELECT * FROM desk_uploads WHERE id = ?", (uid,)).fetchone()
+    if not up or not _sees(up["by_user"]):
+        return jsonify({"error": "Upload not found."}), 404
+    if up["undone"]:
+        return jsonify({"error": "That upload was already taken back."}), 400
+    try:
+        bls = json.loads(up["bls"] or "[]")
+    except ValueError:
+        bls = []
+    removed, kept = [], []
+    for bl in bls:
+        row = db.execute("SELECT * FROM records WHERE bl_number = ?", (bl,)).fetchone()
+        if not row:
+            continue
+        if not _owns_record(bl):
+            kept.append({"bl": bl, "why": "belongs to another account"})
+        elif _canon_port(row["port"]) != _canon_port(up["port"]) or row["vessel"] != up["vessel"]:
+            kept.append({"bl": bl, "why": "moved to another vessel"})
+        elif any(row[k] for k in ("invoice_issued", "approval_received", "do_issued", "paid", "do_sent")):
+            kept.append({"bl": bl, "why": "work has started on it"})
+        elif db.execute("SELECT 1 FROM record_attachments WHERE bl_number = ? LIMIT 1", (bl,)).fetchone():
+            kept.append({"bl": bl, "why": "has a file attached"})
+        elif db.execute("SELECT 1 FROM audit_log WHERE bl_number = ? AND action = 'notified' LIMIT 1", (bl,)).fetchone():
+            kept.append({"bl": bl, "why": "a notice has gone out"})
+        else:
+            db.execute("DELETE FROM records WHERE bl_number = ?", (bl,))
+            _log_audit(bl, "deleted", "", "", "upload taken back")
+            removed.append(bl)
+    db.execute("UPDATE desk_uploads SET undone = 1 WHERE id = ?", (uid,))
+    db.commit()
+    return jsonify({"ok": True, "removed": len(removed), "kept": kept})
+
+
+@app.route("/api/desk/ack", methods=["POST"])
+@login_required
+def desk_ack():
+    """'I have seen these warnings': they stop showing for that upload."""
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        uid = int(data.get("id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Nothing to dismiss."}), 400
+    db = get_db()
+    up = db.execute("SELECT by_user FROM desk_uploads WHERE id = ?", (uid,)).fetchone()
+    if not up or not _sees(up["by_user"]):
+        return jsonify({"error": "Upload not found."}), 404
+    db.execute("UPDATE desk_uploads SET ack = 1 WHERE id = ?", (uid,))
+    db.commit()
+    return jsonify({"ok": True})
 
 
 def _mem_find(db, consignee, key):
@@ -6432,6 +6959,10 @@ def _desk_my_email(db):
     return _clean_email(r["email"]) if r else ""
 
 
+def _desk_recipients(g_):
+    return ([g_["email"]] if g_.get("email") else []) + [e for e in g_.get("more", []) if e.lower() != (g_.get("email") or "").lower()]
+
+
 @app.route("/api/desk/preview", methods=["POST"])
 @login_required
 def desk_preview():
@@ -6443,7 +6974,30 @@ def desk_preview():
         return jsonify({"error": "Consignee not found."}), 404
     subject, text, body, _ = _desk_notice(db, port, vessel, g_, kind, eta, berth, session.get("display_name") or "", "data")
     db.commit()
-    return jsonify({"subject": subject, "to": g_["email"], "cc": _desk_my_email(db), "html": body})
+    chk = _desk_check(g_, kind, eta, berth)
+    to = _desk_recipients(g_)
+    return jsonify({"subject": subject, "to": ", ".join(to), "to_list": to, "cc": _desk_my_email(db), "html": body,
+                    "problems": chk["problems"], "warnings": chk["warnings"], "changed": chk["changed"], "new_bls": chk["new_bls"],
+                    "repeat": chk["repeat"]})
+
+
+@app.route("/api/desk/review", methods=["POST"])
+@login_required
+def desk_review():
+    """For the 'check before sending' step: every selected consignee with what would go out, what stops it, and what to look at."""
+    data = request.get_json(force=True, silent=True) or {}
+    port, vessel, kind, eta, berth = _desk_args(data)
+    want = {str(k) for k in (data.get("keys") or [])}
+    db = get_db()
+    out = []
+    for g_ in _desk_groups(db, port, vessel):
+        if want and g_["key"] not in want:
+            continue
+        chk = _desk_check(g_, kind, eta, berth)
+        out.append({"key": g_["key"], "name": g_["name"], "to": _desk_recipients(g_), "bls": len(g_["bls"]), "state": g_["state"],
+                    "problems": chk["problems"], "warnings": chk["warnings"], "changed": chk["changed"], "new_bls": chk["new_bls"],
+                    "repeat": chk["repeat"], "sent": g_["sent"] and {"at_local": g_["sent"]["at_local"], "by": g_["sent"]["by"], "to": g_["sent"]["to"]}})
+    return jsonify({"items": out, "official": _notice_port(port)[0], "cc": _desk_my_email(db)})
 
 
 @app.route("/api/desk/send", methods=["POST"])
@@ -6452,6 +7006,7 @@ def desk_send():
     data = request.get_json(force=True, silent=True) or {}
     port, vessel, kind, eta, berth = _desk_args(data)
     test = bool(data.get("test"))
+    resend = bool(data.get("resend"))
     db = get_db()
     g_ = _desk_group(db, port, vessel, str(data.get("key") or ""))
     if not g_ or not g_["name"]:
@@ -6459,15 +7014,20 @@ def desk_send():
     if not email_configured():
         return jsonify({"error": "Email isn't set up yet.", "error_code": "email_not_configured"}), 400
     mine = _desk_my_email(db)
+    chk = _desk_check(g_, kind, eta, berth)
     if test:
         if not mine:
             return jsonify({"error": "Your account has no email address, so there is nowhere to send a test copy."}), 400
         to, cc = [mine], []
     else:
-        if not g_["email"]:
-            return jsonify({"error": "This consignee has no email address yet.", "error_code": "no_recipient"}), 400
-        to = [g_["email"]]
-        cc = [mine] if mine and mine.lower() != g_["email"].lower() else []
+        for p_ in chk["problems"]:
+            code = {"eta": "eta_required", "email": "no_recipient", "name": "not_found"}.get(p_["code"], "blocked")
+            return jsonify({"error": p_["text"], "error_code": code}), 400
+        if chk["repeat"] and not resend:
+            return jsonify({"error": "This notice already went to %s on %s. Nothing has changed since." % (g_["name"], g_["sent"]["at_local"]),
+                            "error_code": "already_sent"}), 409
+        to = _desk_recipients(g_)
+        cc = [mine] if mine and mine.lower() not in [t.lower() for t in to] else []
         extra = [a for a in (os.environ.get("DESK_CC", "") or "").replace(";", ",").split(",") if _clean_email(a.strip())]
         cc += [a.strip() for a in extra if a.strip().lower() not in [c.lower() for c in cc + to]]
     subject, text, body, images = _desk_notice(db, port, vessel, g_, kind, eta, berth, session.get("display_name") or "", "cid")
@@ -6477,12 +7037,16 @@ def desk_send():
         code = {"unreachable": "email_unreachable", "auth": "email_auth", "recipient": "email_recipient"}.get(err, "send_failed")
         return jsonify({"error": "The email could not be sent: " + str(err), "error_code": code}), 502
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-    db.execute("INSERT INTO notice_log (port, vessel, ckey, consignee, sent_to, bls, kind, sent_by, sent_at, test) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    sig = _status_sig(kind, eta, berth)
+    db.execute("INSERT INTO notice_log (port, vessel, ckey, consignee, sent_to, bls, kind, sent_by, sent_at, test, eta, berth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                (port, vessel, g_["key"], g_["name"], ", ".join(to), json.dumps([b["bl"] for b in g_["bls"]]), kind,
-                session.get("display_name") or session.get("username") or "", now, 1 if test else 0))
+                session.get("display_name") or session.get("username") or "", now, 1 if test else 0, sig[1], sig[2]))
     if not test:
         for b in g_["bls"]:
             _log_audit(b["bl"], "notified", "arrival notice", "", ", ".join(to))
+        _desk_save_status(db, port, vessel, kind, eta, berth)
+        if g_["email"]:
+            _book_save(db, g_["name"], email=g_["email"], verified=True)
     db.commit()
     return jsonify({"ok": True, "sent_to": to})
 
@@ -15296,99 +15860,280 @@ async function forget(kind, id) {
 load();
 </script></body></html>"""
 
-DESK_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Compass - Manifest Desk</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + r"""">
+DESK_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Compass - Manifest Desk</title><link rel="icon" type="image/png" href="data:image/png;base64,__LOGO__">
 <style>
   :root {
-    --bg: #f2f4f7; --card: #ffffff; --text: #1c2b3a; --muted: #7a8794; --border: #e6e9ed;
-    --navy: #123a56; --navy-deep: #0b2740; --navy-light: #1f5c85; --gold: #c9a227; --gold-light: #e0bd53;
-    --danger: #d1483f; --danger-bg: #fbeceb; --ok: #2e9e6b; --warn: #b87714;
-    --shadow-sm: 0 1px 2px rgba(18,58,86,0.05);
+    --bg: #f3f5f8; --card: #ffffff; --text: #1c2b3a; --muted: #66737f; --border: #e3e7ec; --line: #eef1f4;
+    --navy: #123a56; --navy-deep: #0b2740; --navy-light: #1f5c85; --gold: #c9a227; --gold-light: #e0bd53; --gold-ink: #241c00;
+    --danger: #c23b32; --danger-bg: #fbeceb; --ok: #23865a; --warn: #a56a0c; --info: #1f5c85;
+    --shadow-sm: 0 1px 2px rgba(18,58,86,0.05); --shadow-md: 0 12px 40px rgba(11,39,64,0.16);
+    --field: #f3f5f8; --mail: #ffffff; --mail-ink: #111111;
     color-scheme: light;
   }
   :root[data-theme="dark"] {
-    --bg: #131a23; --card: #1a232f; --text: #e9eef3; --muted: #93a1b1; --border: #29323f;
-    --navy: #3f86ba; --navy-deep: #274a67; --navy-light: #5aa2d1; --gold: #e3bb4c; --gold-light: #f0cf72;
-    --danger: #e2685f; --danger-bg: #3a2220; --ok: #43c08a; --warn: #e0a640;
-    --shadow-sm: 0 1px 2px rgba(0,0,0,0.25);
+    --bg: #111821; --card: #1a232f; --text: #e9eef3; --muted: #9aa8b7; --border: #2a3441; --line: #222c39;
+    --navy: #4a93c8; --navy-deep: #274a67; --navy-light: #6bb0de; --gold: #e3bb4c; --gold-light: #f0cf72; --gold-ink: #241c00;
+    --danger: #ef7b72; --danger-bg: #3a2220; --ok: #4cc795; --warn: #e6ae4a; --info: #6bb0de;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.3); --shadow-md: 0 12px 40px rgba(0,0,0,0.5);
+    --field: #121a24; --mail: #f6f7f9; --mail-ink: #111111;
     color-scheme: dark;
   }
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0 16px 40px; transition: background-color .25s ease, color .25s ease; }
-  .topbar { position: sticky; top: 0; z-index: 50; display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 14px 16px; margin: 0 -16px 20px; background: color-mix(in srgb, var(--bg) 86%, transparent); backdrop-filter: saturate(180%) blur(14px); -webkit-backdrop-filter: saturate(180%) blur(14px); border-bottom: 1px solid var(--border); }
-  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
-  .brand img { height: 32px; width: auto; }
-  .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
-  .app-name { font-size: 14.5px; font-weight: 700; color: var(--text); }
-  .app-tag { font-size: 11px; color: var(--muted); }
-  .topbar-right { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
-  .topbar-right a { color: var(--navy); text-decoration: none; font-weight: 600; font-size: 13px; padding: 6px 12px; border-radius: 20px; }
-  :root[data-theme="dark"] .topbar-right a { color: var(--navy-light); }
-  .topbar-right a:hover { background: var(--border); }
+  html, body { height: 100%; }
+  body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif; background: var(--bg); color: var(--text);
+    display: flex; flex-direction: column; height: 100dvh; overflow: hidden; -webkit-text-size-adjust: 100%; transition: background-color .25s ease, color .25s ease; }
+  button, input, select { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--navy-light); outline-offset: 2px; }
+  .skip { position: absolute; left: -999px; top: 8px; background: var(--navy); color: #fff; padding: 8px 14px; border-radius: 8px; z-index: 300; }
+  .skip:focus { left: 8px; }
+  [hidden] { display: none !important; }
+  h1, h2, h3, h4 { margin: 0; letter-spacing: -.01em; }
+
+  /* ---- one header ---- */
+  .top { flex: none; display: flex; align-items: center; gap: 14px; height: 58px; padding: 0 20px; background: var(--card); border-bottom: 1px solid var(--border); position: relative; z-index: 60; }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--text); flex: none; }
+  .brand img { height: 30px; width: auto; display: block; }
+  :root[data-theme="dark"] .brand img { background: #fff; border-radius: 8px; padding: 3px 7px; }
+  .brand b { font-size: 15px; }
+  .crumb { display: flex; align-items: center; gap: 6px; min-width: 0; margin-left: 4px; padding-left: 14px; border-left: 1px solid var(--border); }
+  .crumb .desk { font-weight: 700; white-space: nowrap; }
+  .tabs-top { display: flex; gap: 2px; margin-left: 6px; }
+  .tabs-top a { color: var(--muted); text-decoration: none; padding: 7px 12px; border-radius: 999px; font-weight: 600; font-size: 13px; white-space: nowrap; }
+  .tabs-top a:hover { background: var(--line); }
+  .tabs-top a[aria-current="page"] { background: var(--navy); color: #fff; }
+  :root[data-theme="dark"] .tabs-top a[aria-current="page"] { color: #0b1620; }
+  .spacer { flex: 1; }
+  .top-right { display: flex; align-items: center; gap: 10px; flex: none; }
   .theme-switch { position: relative; display: inline-flex; width: 54px; height: 29px; cursor: pointer; }
   .theme-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
   .theme-track { position: absolute; inset: 0; border-radius: 999px; display: flex; align-items: center; justify-content: space-between; padding: 0 7px; background: linear-gradient(135deg,#8fcaf0,#f4d58d); }
   :root[data-theme="dark"] .theme-track { background: linear-gradient(135deg,#1f2b42,#33456a); }
+  .theme-switch input:focus-visible + .theme-track { outline: 2px solid var(--navy-light); outline-offset: 2px; }
   .theme-icon { width: 13px; height: 13px; color: #fff; opacity: .9; z-index: 1; }
-  .theme-icon svg { width: 100%; height: 100%; }
+  .theme-icon svg { width: 100%; height: 100%; display: block; }
   .theme-knob { position: absolute; top: 3px; left: 3px; width: 23px; height: 23px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.3); transition: transform .3s cubic-bezier(.4,0,.2,1); }
-  input:checked + .theme-track .theme-knob { transform: translateX(25px); background: #0b2740; }
+  .theme-switch input:checked + .theme-track .theme-knob { transform: translateX(25px); background: #0b2740; }
+  .userbtn { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); background: transparent; border-radius: 999px; padding: 4px 12px 4px 4px; cursor: pointer; font-weight: 600; font-size: 13px; }
+  .userbtn:hover { background: var(--line); }
+  .avatar { width: 28px; height: 28px; border-radius: 50%; background: var(--navy); color: #fff; display: grid; place-items: center; font-size: 12px; font-weight: 700; }
+  :root[data-theme="dark"] .avatar { color: #0b1620; }
+  .menu { position: absolute; right: 20px; top: 52px; min-width: 220px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow-md); padding: 6px; z-index: 80; }
+  .menu a, .menu button { display: block; width: 100%; text-align: left; padding: 10px 12px; border-radius: 9px; color: var(--text); text-decoration: none; background: none; border: 0; cursor: pointer; font-size: 14px; }
+  .menu a:hover, .menu button:hover { background: var(--line); }
+  .menu hr { border: 0; border-top: 1px solid var(--border); margin: 6px 4px; }
+  .menu .who { padding: 8px 12px 6px; color: var(--muted); font-size: 12px; }
 
-  .wrap { max-width: 1200px; margin: 0 auto; }
-  h1 { font-size: 22px; margin: 4px 0 4px; letter-spacing: -.01em; }
-  .sub { color: var(--muted); font-size: 13.5px; margin-bottom: 18px; }
-  .grid { display: grid; grid-template-columns: 400px minmax(0, 1fr); gap: 16px; align-items: start; }
-  @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px; margin-bottom: 16px; box-shadow: var(--shadow-sm); min-width: 0; }
-  .lab { font-size: 12px; font-weight: 600; color: var(--navy); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 10px; }
-  :root[data-theme="dark"] .lab { color: var(--navy-light); }
-  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-  input[type=text], select { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 14px; font-family: inherit; background: var(--bg); color: var(--text); min-width: 0; }
-  input[type=text]:focus, select:focus { outline: none; border-color: var(--navy-light); background: var(--card); box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 20%, transparent); }
-  button { background: var(--navy); color: #fff; border: none; border-radius: 999px; padding: 10px 18px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; transition: background .15s ease, transform .08s ease; }
-  button:hover { background: var(--navy-light); }
-  button:active { transform: scale(.97); }
-  button:disabled { opacity: .45; cursor: default; transform: none; }
-  button.sec { background: transparent; color: var(--text); border: 1px solid var(--border); }
-  button.sec:hover { background: var(--border); }
-  button.gold { background: var(--gold); color: #241c00; }
-  button.gold:hover { background: var(--gold-light); }
-  button.small { padding: 6px 12px; font-size: 12px; }
-  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
-  .vchip { border: 1px solid var(--border); background: var(--card); color: var(--text); border-radius: 99px; padding: 5px 11px; font-size: 12.5px; font-weight: 500; }
-  .vchip:hover { background: var(--border); }
-  .drop { border: 2px dashed var(--border); border-radius: 14px; padding: 16px; text-align: center; color: var(--muted); font-size: 13px; cursor: pointer; }
-  .drop.over { border-color: var(--navy-light); background: color-mix(in srgb, var(--navy-light) 8%, transparent); }
-  .pick { margin-top: 12px; padding: 12px 14px; border-radius: 14px; font-size: 13px; line-height: 1.5; color: var(--text);
-    background: color-mix(in srgb, var(--warn) 10%, var(--card)); border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent); }
-  .pick .acts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-  .pick .acts button { padding: 7px 14px; }
-  .pill { display: inline-block; padding: 2px 9px; border-radius: 99px; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
+  /* ---- workspace ---- */
+  .page { flex: 1; min-height: 0; display: flex; flex-direction: column; width: 100%; max-width: 1680px; margin: 0 auto; padding: 14px 20px 0; gap: 12px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow-sm); }
+  .vstrip { flex: none; padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
+  .vrow { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+  .fld { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .fld > span { font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+  .fld.grow { flex: 1 1 220px; }
+  input[type=text], input[type=search], select { height: 40px; border: 1px solid var(--border); border-radius: 10px; padding: 0 12px; background: var(--field); color: var(--text); min-width: 0; width: 100%; }
+  input[type=text]:focus, input[type=search]:focus, select:focus { outline: none; border-color: var(--navy-light); background: var(--card); box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 22%, transparent); }
+  input.bad, select.bad { border-color: var(--danger); background: var(--danger-bg); }
+  select { appearance: none; -webkit-appearance: none; padding-right: 32px; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%2366737f' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 12px center; }
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 40px; padding: 0 18px; border-radius: 999px; border: 1px solid transparent; background: var(--navy); color: #fff; font-weight: 600; font-size: 13.5px; cursor: pointer; white-space: nowrap; transition: background .15s ease, transform .08s ease; }
+  :root[data-theme="dark"] .btn { color: #0b1620; }
+  .btn:hover { background: var(--navy-light); }
+  .btn:active { transform: scale(.97); }
+  .btn.sec { background: transparent; color: var(--text); border-color: var(--border); }
+  :root[data-theme="dark"] .btn.sec { color: var(--text); }
+  .btn.sec:hover { background: var(--line); }
+  .btn.gold { background: var(--gold); color: var(--gold-ink); }
+  .btn.gold:hover { background: var(--gold-light); }
+  .btn.danger { background: var(--danger); color: #fff; }
+  .btn.small { height: 32px; padding: 0 13px; font-size: 12.5px; }
+  .btn:disabled { background: var(--line); color: var(--muted); border-color: var(--border); cursor: default; transform: none; }
+  :root[data-theme="dark"] .btn:disabled { color: var(--muted); }
+  .iconbtn { width: 40px; height: 40px; border-radius: 50%; border: 1px solid var(--border); background: transparent; cursor: pointer; display: grid; place-items: center; font-size: 18px; line-height: 1; }
+  .iconbtn:hover { background: var(--line); }
+  .iconbtn:disabled { opacity: .4; cursor: default; }
+  .srow { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; padding-top: 12px; border-top: 1px solid var(--line); }
+  .seg { display: inline-flex; background: var(--field); border: 1px solid var(--border); border-radius: 999px; padding: 3px; gap: 2px; }
+  .seg button { height: 32px; padding: 0 14px; border: 0; background: transparent; border-radius: 999px; cursor: pointer; font-weight: 600; font-size: 13px; color: var(--muted); }
+  .seg button[aria-checked="true"] { background: var(--card); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.15); }
+  .seg button:focus-visible { outline-offset: 0; }
+  .hint { font-size: 12.5px; color: var(--muted); align-self: center; }
+  .hint.err { color: var(--danger); font-weight: 600; }
+  .work { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(300px, 390px) minmax(0, 1fr); gap: 14px; }
+  .pane { min-height: 0; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+  .phead { flex: none; padding: 14px 14px 10px; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 10px; }
+  .trow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .trow h2 { font-size: 15px; }
+  .count { color: var(--muted); font-weight: 500; margin-left: 6px; }
+  .pscroll { flex: 1; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch; }
+  .search { position: relative; }
+  .search input { padding-left: 34px; height: 38px; }
+  .search svg { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; color: var(--muted); pointer-events: none; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .vsum { display: none; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 48px; padding: 6px 4px; background: none; border: 0; cursor: pointer; text-align: left; }
+  .vsum .vs-t { display: flex; flex-direction: column; min-width: 0; }
+  .vsum b { font-size: 15px; overflow-wrap: anywhere; }
+  .vsum small { color: var(--muted); font-size: 12.5px; }
+  .linkbtn { background: none; border: 0; padding: 0 0 0 6px; color: var(--navy-light); font-weight: 600; cursor: pointer; text-decoration: underline; }
+  .vsum .chg { color: var(--navy-light); font-weight: 600; font-size: 13px; flex: none; }
+  .chip { border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 999px; height: 30px; padding: 0 11px; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+  .chip b { color: var(--muted); font-weight: 600; margin-left: 4px; }
+  .chip[aria-pressed="true"] { background: var(--navy); border-color: var(--navy); color: #fff; }
+  :root[data-theme="dark"] .chip[aria-pressed="true"] { color: #0b1620; }
+  .chip[aria-pressed="true"] b { color: inherit; opacity: .8; }
+  .sortsel { height: 30px; font-size: 12.5px; width: auto; padding: 0 28px 0 10px; border-radius: 999px; background-color: transparent; }
+  ul.rows { list-style: none; margin: 0; padding: 6px; }
+  .row { display: flex; flex-direction: column; gap: 2px; width: 100%; text-align: left; border: 1px solid transparent; background: transparent; border-radius: 12px; padding: 10px 12px; cursor: pointer; }
+  .row:hover { background: var(--line); }
+  .row[aria-current="true"] { background: color-mix(in srgb, var(--navy-light) 11%, var(--card)); border-color: color-mix(in srgb, var(--navy-light) 45%, transparent); }
+  .rtop { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+  .rtop b { font-size: 14px; font-weight: 650; overflow-wrap: anywhere; }
+  .rsub { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+  .rsub.warn, .rnote.warn { color: var(--warn); font-weight: 600; }
+  .rnote { color: var(--muted); font-size: 12px; }
+  .pill { display: inline-block; flex: none; padding: 2px 9px; border-radius: 99px; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; white-space: nowrap; }
   .pill.ok { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
   .pill.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
-  .pill.mut { background: var(--border); color: var(--muted); }
-  .pill.info { background: color-mix(in srgb, var(--navy-light) 16%, transparent); color: var(--navy-light); }
-  .item { padding: 12px; border: 1px solid var(--border); border-radius: 12px; margin-bottom: 8px; cursor: pointer; background: var(--card); }
-  .item.sel { border-color: var(--navy-light); background: color-mix(in srgb, var(--navy-light) 7%, var(--card)); }
-  .item b { display: block; font-size: 14px; }
-  .item small { color: var(--muted); font-size: 12px; }
-  .item .top { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
-  .edit { margin-top: 10px; display: grid; gap: 8px; }
-  .edit input { width: 100%; }
-  .bl-edit { border-top: 1px dashed var(--border); padding-top: 8px; display: grid; gap: 6px; grid-template-columns: 1fr 1fr; font-size: 12px; }
-  .bl-edit .bl-name { grid-column: 1 / -1; font-weight: 600; font-size: 12.5px; }
-  .bl-edit input { padding: 7px 9px; font-size: 12.5px; width: 100%; }
-  .bl-edit input.wide { grid-column: 1 / -1; }
-  .note { background: color-mix(in srgb, var(--gold) 14%, transparent); border: 1px solid color-mix(in srgb, var(--gold) 40%, transparent); border-radius: 12px; padding: 10px 14px; font-size: 13px; margin-bottom: 12px; }
-  .bad { background: var(--danger-bg); border-color: var(--danger); }
-  .mailwrap { border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; background: #fff; color: #111; overflow-x: auto; }
-  .mailhead { color: #6b7a89; font-size: 12px; margin-bottom: 12px; font-family: Arial, Helvetica, sans-serif; word-break: break-word; }
-  .empty { color: var(--muted); font-size: 13.5px; text-align: center; padding: 30px 10px; }
-  .actions { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; align-items: center; }
-  .actions .btns { display: flex; gap: 8px; flex-wrap: wrap; }
-  #toastHost { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; max-width: min(340px, calc(100vw - 40px)); }
-  .toast { background: var(--navy-deep); color: #fff; padding: 11px 16px; border-radius: 12px; font-size: 13px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+  .pill.info { background: color-mix(in srgb, var(--info) 16%, transparent); color: var(--info); }
+  .pill.bad { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
+  .pill.mut { background: var(--line); color: var(--muted); }
+  .banner { margin: 8px 8px 0; padding: 10px 12px; border-radius: 12px; font-size: 13px; background: color-mix(in srgb, var(--warn) 11%, var(--card)); border: 1px solid color-mix(in srgb, var(--warn) 38%, transparent); }
+  .banner ul { margin: 6px 0 0; padding-left: 18px; }
+  .banner .bfile { font-weight: 700; }
+  .banner .bacts { display: flex; gap: 8px; margin-top: 8px; }
+  .banner.info { background: color-mix(in srgb, var(--info) 9%, var(--card)); border-color: color-mix(in srgb, var(--info) 30%, transparent); }
+  .empty { color: var(--muted); text-align: center; padding: 36px 20px; font-size: 14px; }
+  .empty h3 { color: var(--text); font-size: 17px; margin-bottom: 6px; }
+
+  /* ---- detail ---- */
+  .dhead { flex: none; padding: 14px 16px 0; display: flex; flex-direction: column; gap: 6px; border-bottom: 1px solid var(--line); }
+  .who { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .who h2 { font-size: 18px; overflow-wrap: anywhere; }
+  .who .sub { color: var(--muted); font-size: 13px; margin-top: 2px; overflow-wrap: anywhere; }
+  .tabs { display: flex; gap: 22px; margin-top: 6px; }
+  .tabs button { background: none; border: 0; padding: 8px 0 10px; font-weight: 650; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; font-size: 14px; }
+  .tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--navy-light); }
+  .back { display: none; background: none; border: 0; color: var(--navy-light); font-weight: 600; padding: 0 0 4px; cursor: pointer; font-size: 14px; text-align: left; }
+  .dbody { padding: 16px; }
+  .dinner { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+  .dempty { margin: auto; max-width: 420px; }
+  .checks { list-style: none; margin: 0 0 14px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .checks li { display: flex; gap: 8px; align-items: flex-start; padding: 8px 12px; border-radius: 10px; font-size: 13px; background: color-mix(in srgb, var(--warn) 10%, var(--card)); border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent); }
+  .checks li.stop { background: var(--danger-bg); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+  .checks li.good { background: color-mix(in srgb, var(--ok) 9%, var(--card)); border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
+  .checks .ic { flex: none; font-weight: 800; width: 14px; text-align: center; }
+  .meta { color: var(--muted); font-size: 12.5px; margin-bottom: 10px; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 10px; }
+  .meta b { color: var(--text); font-weight: 600; }
+  .meta span { overflow-wrap: anywhere; }
+  .mailwrap { border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; background: var(--mail); color: var(--mail-ink); overflow-x: auto; }
+  .mailwrap.loading { opacity: .55; }
+  .form { display: grid; gap: 14px; max-width: 760px; }
+  .form label.fld > small { color: var(--muted); font-size: 12px; }
+  .blcard { border: 1px solid var(--border); border-radius: 12px; padding: 12px; display: grid; gap: 8px; grid-template-columns: 1fr 1fr; }
+  .blcard .bln { grid-column: 1 / -1; font-weight: 700; font-size: 13px; overflow-wrap: anywhere; }
+  .blcard .wide { grid-column: 1 / -1; }
+  .learnbox { margin: 12px 16px 0; padding: 12px 14px; border-radius: 12px; background: color-mix(in srgb, var(--gold) 14%, var(--card)); border: 1px solid color-mix(in srgb, var(--gold) 45%, transparent); }
+  .learnbox .acts { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+
+  /* ---- action bar ---- */
+  .actionbar { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; position: relative; isolation: isolate; padding: 12px 0 calc(12px + env(safe-area-inset-bottom, 0px)); }
+  .actionbar::before { content: ""; position: absolute; z-index: -1; top: 0; bottom: 0; left: 50%; width: 100vw; transform: translateX(-50%); background: var(--card); border-top: 1px solid var(--border); }
+  .actionbar .sum b { display: block; font-size: 14px; }
+  .actionbar .sum span { color: var(--muted); font-size: 12.5px; }
+  .actionbar .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  /* ---- sheets ---- */
+  .veil { position: fixed; inset: 0; background: rgba(8,20,32,.5); z-index: 200; display: grid; place-items: center; padding: 20px; }
+  .sheet { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 20px; box-shadow: var(--shadow-md); width: min(680px, 100%); max-height: min(780px, calc(100dvh - 40px)); display: flex; flex-direction: column; overflow: hidden; }
+  .sheet.wide { width: min(820px, 100%); }
+  .sheet header { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 18px 12px; border-bottom: 1px solid var(--line); }
+  .sheet header h3 { font-size: 17px; }
+  .sheet .sbody { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; }
+  .sheet footer { flex: none; display: flex; justify-content: flex-end; gap: 8px; padding: 12px 18px calc(14px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid var(--line); flex-wrap: wrap; }
+  .dz { border: 2px dashed var(--border); border-radius: 16px; padding: 22px 16px; text-align: center; color: var(--muted); cursor: pointer; background: transparent; width: 100%; display: block; }
+  .dz:hover, .dz.over { border-color: var(--navy-light); background: color-mix(in srgb, var(--navy-light) 7%, transparent); color: var(--text); }
+  .dz b { color: var(--text); display: block; font-size: 15px; margin-bottom: 2px; }
+  .fcard { border: 1px solid var(--border); border-radius: 14px; padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+  .fcard .ftop { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
+  .fcard .fname { font-weight: 650; overflow-wrap: anywhere; }
+  .fcard .fsub { color: var(--muted); font-size: 12.5px; }
+  .fcard.issue { border-color: color-mix(in srgb, var(--danger) 55%, transparent); background: color-mix(in srgb, var(--danger) 6%, var(--card)); }
+  .fcard.good { border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+  .fcard .facts { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+  .fcard ul { margin: 2px 0 0; padding-left: 18px; font-size: 13px; }
+  .fcard li.w { color: var(--warn); }
+  .ritem { display: flex; gap: 10px; align-items: flex-start; padding: 9px 4px; border-bottom: 1px solid var(--line); }
+  .ritem:last-child { border-bottom: 0; }
+  .ritem input[type=checkbox] { margin-top: 3px; width: 18px; height: 18px; flex: none; accent-color: var(--navy-light); }
+  .ritem .rmain { flex: 1; min-width: 0; }
+  .ritem .rmain b { overflow-wrap: anywhere; }
+  .ritem .rwarn { color: var(--warn); font-size: 12.5px; }
+  .ritem .rbad { color: var(--danger); font-size: 12.5px; font-weight: 600; }
+  .sect { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; font-weight: 700; color: var(--muted); margin-top: 6px; }
+  .vlist { list-style: none; padding: 0; margin: 0; }
+  .vlist button { width: 100%; text-align: left; display: flex; justify-content: space-between; gap: 12px; padding: 10px 12px; border-radius: 12px; border: 0; background: transparent; cursor: pointer; }
+  .vlist button:hover { background: var(--line); }
+  .vlist .vn { font-weight: 650; overflow-wrap: anywhere; }
+  .vlist .vm { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+  .recents { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; margin-top: 16px; text-align: left; }
+  .recents button { border: 1px solid var(--border); background: var(--card); border-radius: 14px; padding: 12px 14px; cursor: pointer; text-align: left; display: flex; flex-direction: column; gap: 2px; }
+  .recents button:hover { border-color: var(--navy-light); }
+  .recents b { overflow-wrap: anywhere; color: var(--text); }
+  .recents span { color: var(--muted); font-size: 12.5px; }
+  .dropveil { position: fixed; inset: 0; z-index: 250; background: color-mix(in srgb, var(--navy-deep) 70%, transparent); display: grid; place-items: center; color: #fff; font-size: 22px; font-weight: 700; pointer-events: none; }
+  .dropveil div { border: 3px dashed rgba(255,255,255,.7); border-radius: 28px; padding: 44px 60px; }
+  #toasts { position: fixed; bottom: 86px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 400; max-width: min(360px, calc(100vw - 32px)); }
+  .toast { background: var(--navy-deep); color: #fff; padding: 11px 16px; border-radius: 12px; font-size: 13.5px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
   .toast.error { background: var(--danger); }
+  .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: sp .7s linear infinite; vertical-align: -2px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+  /* ---- smaller screens ---- */
+  @media (max-width: 1100px) { .crumb .tabs-top { display: none; } }
+  @media (max-width: 900px) {
+    body { height: auto; min-height: 100dvh; overflow: auto; }
+    .top { height: 54px; padding: 0 14px; position: sticky; top: 0; }
+    .crumb { border-left: 0; padding-left: 0; margin-left: 0; }
+    .brand b { display: none; }
+    .userbtn span.nm { display: none; }
+    .userbtn { padding: 4px; }
+    .menu { right: 12px; }
+    .page { padding: 12px 14px 0; display: block; }
+    .page > * + * { margin-top: 12px; }
+    .work { display: block; }
+    .pane { overflow: visible; }
+    .pscroll { overflow: visible; }
+    .detail-pane { display: none; }
+    body.show-detail .list-pane { display: none; }
+    body.show-detail .detail-pane { display: flex; }
+    body.show-detail .vstrip { display: none; }
+    .vstrip.has .vsum { display: flex; }
+    .vstrip.has:not(.open) .vrow { display: none; }
+    .chips { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; margin: 0 -2px; padding: 2px; }
+    .chips::-webkit-scrollbar { display: none; }
+    .chip { flex: none; }
+    .back { display: block; }
+    .actionbar { position: sticky; bottom: 0; margin: 12px 0 0; padding: 10px 0 calc(10px + env(safe-area-inset-bottom, 0px)); z-index: 40; }
+    .actionbar .sum span { display: none; }
+    .btn, input[type=text], input[type=search], select { height: 44px; }
+    input[type=text], input[type=search], select { font-size: 16px; }
+    .btn.small { height: 40px; }
+    .iconbtn { width: 44px; height: 44px; }
+    .chip { height: 36px; }
+    .seg button { height: 38px; }
+    .vrow .fld { flex: 1 1 100%; }
+    .vrow .btn { flex: 1; }
+    .vrow .spacer { display: none; }
+    .blcard { grid-template-columns: 1fr; }
+    .veil { align-items: end; padding: 0; }
+    .sheet, .sheet.wide { width: 100%; max-height: 92dvh; border-radius: 20px 20px 0 0; }
+    #toasts { bottom: 90px; right: 12px; left: 12px; max-width: none; }
+    .tabs button { padding: 12px 0; }
+    .row { padding: 12px; min-height: 44px; }
+    .actionbar .btns { width: 100%; }
+    .actionbar .btns .btn { flex: 1; }
+  }
 </style>
 <script>
 (function () {
@@ -15400,277 +16145,800 @@ DESK_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="vie
 })();
 function setTheme(mode) { document.documentElement.setAttribute('data-theme', mode); try { localStorage.setItem('theme', mode); } catch (e) {} }
 </script>
-</head><body>
-<div class="topbar">
-  <a href="/" class="brand"><img src="data:image/png;base64,""" + LOGO_B64 + r"""" alt="Sea Power"><div class="brand-text"><span class="app-name">Compass</span><span class="app-tag">Manifest Desk</span></div></a>
-  <div class="topbar-right">
-    <label class="theme-switch" title="Toggle dark mode"><input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')"><span class="theme-track"><span class="theme-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg></span><span class="theme-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg></span><span class="theme-knob"></span></span></label>
-    __LEARNED__<a href="/">&larr; Back to board</a>
-    <span><b>__NAME__</b></span>
-    <a href="/logout">Log out</a>
+</head>
+<body data-nav="__NAV__" data-ports="__PORTS__" data-owner="__LEARNED__" data-name="__NAME__">
+<a class="skip" href="#list">Skip to the consignee list</a>
+<header class="top">
+  <a href="/" class="brand" aria-label="Compass, all desks"><img src="data:image/png;base64,__LOGO__" alt="Sea Power"><b>Compass</b></a>
+  <div class="crumb"><span class="desk">Manifest Desk</span><nav class="tabs-top" id="toolTabs" aria-label="Manifest Desk tools"></nav></div>
+  <span class="spacer"></span>
+  <div class="top-right">
+    <label class="theme-switch" title="Dark mode"><input type="checkbox" id="themeToggle" aria-label="Dark mode" onchange="setTheme(this.checked ? 'dark' : 'light')"><span class="theme-track"><span class="theme-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg></span><span class="theme-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg></span><span class="theme-knob"></span></span></label>
+    <button class="userbtn" id="userBtn" aria-haspopup="true" aria-expanded="false" aria-controls="userMenu"><span class="avatar" id="avatar" aria-hidden="true"></span><span class="nm" id="uname"></span></button>
   </div>
-</div>
-<div class="wrap">
-  <h1>Manifest Desk</h1>
-  <div class="sub">Add the manifest once. The B/Ls go onto the DO Tracker and an arrival notice is made for every consignee.</div>
-  <div class="grid">
-    <div>
-      <div class="card">
-        <div class="lab">1 &middot; Vessel</div>
-        <div class="row">
-          <input type="text" id="port" list="ports" placeholder="Port" autocomplete="off" style="flex:1 1 150px;">
-          <input type="text" id="vessel" placeholder="Vessel and voyage" autocomplete="off" style="flex:1.4 1 170px;">
-          <button onclick="openVessel()">Open</button>
-        </div>
-        <div class="pick" id="portPick" style="display:none"></div>
-        <datalist id="ports"><option value="JEDDAH PORT"><option value="YANBU COMMERCIAL PORT"><option value="YANBU INDUSTRIAL PORT"><option value="DAMMAM PORT"><option value="JUBAIL COMMERCIAL PORT"></datalist>
-        <div class="chips" id="recent"></div>
-      </div>
-      <div class="card">
-        <div class="lab">2 &middot; Add manifest</div>
-        <div class="drop" id="drop" onclick="document.getElementById('file').click()">Drop the manifest here or tap to choose<div id="fname" style="margin-top:6px;font-weight:600;color:var(--text);"></div></div>
-        <input type="file" id="file" multiple accept=".xlsx,.xlsm,.xls,.csv,.docx,.pdf" style="display:none" onchange="stage()">
-        <div class="row" style="margin-top:12px;"><button id="addBtn" onclick="uploadManifest()" disabled>Add manifest</button><span style="font-size:12px;color:var(--muted);">Excel, Word, PDF or CSV. Any layout.</span></div>
-      </div>
-      <div class="card">
-        <div class="lab">3 &middot; Consignees</div>
-        <div class="pick" id="learnBar" style="display:none" role="status"></div>
-        <div id="list"><div class="empty">Open a vessel to see its consignees.</div></div>
-      </div>
+  <div class="menu" id="userMenu" role="menu" hidden></div>
+</header>
+
+<main class="page">
+  <section class="card vstrip" id="vstrip" aria-label="Vessel">
+    <button class="vsum" id="vsum" type="button" aria-expanded="false" aria-controls="vrow"><span class="vs-t"><b id="vsumName"></b><small id="vsumPort"></small></span><span class="chg">Change</span></button>
+    <div class="vrow" id="vrow">
+      <label class="fld" style="flex:0 1 230px;"><span>Port</span><select id="port"></select></label>
+      <label class="fld grow"><span>Vessel and voyage</span><input type="text" id="vessel" placeholder="For example MINXIN V-26188" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="go"></label>
+      <button class="btn" id="openBtn">Open</button>
+      <button class="btn sec" id="vesselsBtn">Vessels</button>
+      <span class="spacer"></span>
+      <button class="btn sec" id="addBtn">Add manifest</button>
+      <button class="iconbtn" id="vmenuBtn" aria-label="More for this vessel" aria-haspopup="true" aria-expanded="false" disabled>&#8943;</button>
     </div>
-    <div>
-      <div class="card">
-        <div class="row" style="margin-bottom:12px;">
-          <div class="lab" style="margin:0;flex:1;">Arrival notice</div>
-          <select id="kind" onchange="refreshPreview()"><option value="arriving">Vessel arriving</option><option value="anchorage">At anchorage, awaiting berth</option><option value="berthed">Berthed</option></select>
-          <input type="text" id="eta" placeholder="ETA (dd.mm.yyyy)" style="width:150px;" oninput="debouncePreview()">
-          <input type="text" id="berth" placeholder="Berth" style="width:90px;display:none;" oninput="debouncePreview()">
+    <div class="menu" id="vMenu" role="menu" hidden style="right:auto;top:auto;position:absolute;"></div>
+    <div class="srow" id="statusRow" hidden>
+      <div class="fld"><span id="segLabel">The notice says</span>
+        <div class="seg" role="radiogroup" aria-labelledby="segLabel" id="seg">
+          <button role="radio" data-k="arriving" aria-checked="true">Arriving</button>
+          <button role="radio" data-k="anchorage" aria-checked="false">At anchorage</button>
+          <button role="radio" data-k="berthed" aria-checked="false">Berthed</button>
         </div>
-        <div id="src" class="note" style="display:none;"></div>
-        <div id="mailbox"><div class="empty">Pick a consignee to preview its notice.</div></div>
       </div>
-      <div class="card actions">
-        <div><b id="sumTitle">Nothing to send yet</b><div id="sumSub" style="color:var(--muted);font-size:12.5px;">Nothing is sent until you press a button.</div></div>
-        <div class="btns"><button class="sec" id="testBtn" onclick="sendTest()" disabled>Send me a test copy</button><button class="sec" id="oneBtn" onclick="sendSelected()" disabled>Send this one</button><button class="gold" id="allBtn" onclick="sendAll()" disabled>Send all</button></div>
+      <label class="fld" id="etaWrap" style="width:150px;"><span>ETA</span><input type="text" id="eta" placeholder="dd.mm.yyyy" inputmode="numeric" autocomplete="off" maxlength="10"></label>
+      <label class="fld" id="berthWrap" style="width:130px;" hidden><span>Berth</span><input type="text" id="berth" placeholder="For example 27" autocomplete="off" maxlength="12"></label>
+      <div class="hint" id="statusHint" role="status"></div>
+    </div>
+  </section>
+
+  <div class="work" id="work">
+    <section class="card pane list-pane" aria-labelledby="listTitle">
+      <div class="phead">
+        <div class="trow"><h2 id="listTitle">Consignees<span class="count" id="count"></span></h2>
+          <select id="sort" class="sortsel" aria-label="Sort consignees"><option value="attention">Needs attention first</option><option value="name">A to Z</option></select></div>
+        <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input type="search" id="q" placeholder="Search consignees" aria-label="Search consignees" autocomplete="off"></div>
+        <div class="chips" role="group" aria-label="Show" id="chips"></div>
       </div>
+      <div id="banner"></div>
+      <div class="pscroll"><ul class="rows" id="list" role="list" tabindex="-1"></ul></div>
+    </section>
+
+    <section class="card pane detail-pane" aria-label="Consignee">
+      <div id="detailEmpty" class="empty dempty"></div>
+      <div id="detail" class="dinner" hidden>
+        <div class="dhead">
+          <button class="back" id="backBtn">&lsaquo; Consignees</button>
+          <div class="who"><div style="min-width:0;"><h2 id="dName" dir="auto"></h2><div class="sub" id="dSub" dir="auto"></div></div><span id="dPill"></span></div>
+          <div class="tabs" role="tablist" aria-label="Consignee">
+            <button role="tab" id="tabNotice" aria-selected="true" aria-controls="panelNotice">Notice</button>
+            <button role="tab" id="tabDetails" aria-selected="false" aria-controls="panelDetails">Details</button>
+          </div>
+        </div>
+        <div id="learnBox"></div>
+        <div class="pscroll"><div class="dbody">
+          <div id="panelNotice" role="tabpanel" aria-labelledby="tabNotice"></div>
+          <div id="panelDetails" role="tabpanel" aria-labelledby="tabDetails" hidden></div>
+        </div></div>
+      </div>
+    </section>
+  </div>
+
+  <div class="actionbar" id="actionbar">
+    <div class="sum"><b id="sumTitle">Nothing to send yet</b><span id="sumSub"></span></div>
+    <div class="btns">
+      <button class="btn sec" id="testBtn" disabled>Send me a test copy</button>
+      <button class="btn sec" id="oneBtn" disabled>Send this one</button>
+      <button class="btn gold" id="allBtn" disabled>Review and send</button>
     </div>
   </div>
-</div>
-<div id="toastHost"></div>
+</main>
+
+<div class="veil" id="veil" hidden><div class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+  <header><h3 id="sheetTitle"></h3><button class="iconbtn" id="sheetClose" aria-label="Close">&#10005;</button></header>
+  <div class="sbody" id="sheetBody"></div>
+  <footer id="sheetFoot"></footer>
+</div></div>
+<div class="dropveil" id="dropVeil" hidden><div>Drop the manifest to add it</div></div>
+<input type="file" id="fileIn" multiple accept=".xlsx,.xlsm,.xls,.csv,.docx,.pdf" hidden>
+<div id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
 <script>
-var S = {port: '', vessel: '', data: null, sel: null, timer: null, arm: null, learn: []};
+var D = document.body.dataset;
+var NAV = JSON.parse(D.nav), PORTS = JSON.parse(D.ports), OWNER = D.owner === '1', ME = D.name || '';
+var S = {port: '', vessel: '', openKey: '', data: null, sel: null, tab: 'notice', filter: 'all', sort: 'attention', q: '', pseq: 0, timer: null,
+         dirty: false, learn: [], staged: [], sheet: null, lastFocus: null, view: 'list', etaTouched: false, busy: false};
+var KINDS = {arriving: 'Arriving', anchorage: 'At anchorage', berthed: 'Berthed'};
 function $(id) { return document.getElementById(id); }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
-function toast(msg, err) { var d = document.createElement('div'); d.className = 'toast' + (err ? ' error' : ''); d.textContent = msg; $('toastHost').appendChild(d); setTimeout(function () { d.remove(); }, err ? 7000 : 3500); }
+function pad(n) { return (n < 10 ? '0' : '') + n; }
+function plural(n, one, many) { return n + ' ' + (n === 1 ? one : (many || one + 's')); }
+function toast(msg, err) {
+  var d = document.createElement('div'); d.className = 'toast' + (err ? ' error' : ''); d.textContent = msg; if (err) d.setAttribute('role', 'alert');
+  $('toasts').appendChild(d); setTimeout(function () { d.remove(); }, err ? 8000 : 3500);
+}
 async function api(url, opts) {
-  var res = await fetch(url, opts); var data = {};
+  var res, data = {};
+  try { res = await fetch(url, opts); } catch (e) { throw new Error('Could not reach the server. Check the connection and try again.'); }
   try { data = await res.json(); } catch (e) {}
-  if (!res.ok || data.error) throw new Error(data.error || 'Something went wrong.');
+  if (!res.ok || data.error) { var er = new Error(data.error || 'Something went wrong (' + res.status + ').'); er.code = data.error_code; er.status = res.status; throw er; }
   return data;
 }
 function post(url, body) { return api(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}); }
-function base() { return {port: S.port, vessel: S.vessel, kind: $('kind').value, eta: $('eta').value.trim(), berth: $('berth').value.trim()}; }
 
-async function loadRecent() {
-  try {
-    var r = await api('/api/desk/vessels');
-    $('recent').innerHTML = r.map(function (v, i) { return '<button class="vchip" data-i="' + i + '">' + esc(v.vessel) + ' &middot; ' + esc(v.port) + ' (' + v.n + ')</button>'; }).join('');
-    $('recent').querySelectorAll('button').forEach(function (b) { b.onclick = function () { var v = r[+b.dataset.i]; $('port').value = v.port; $('vessel').value = v.vessel; openVessel(); }; });
-  } catch (e) {}
+/* ---------- dates ---------- */
+function parseEta(s) {
+  s = String(s || '').trim(); var m = s.match(/^(\d{1,2})\s*[.\/-]\s*(\d{1,2})\s*[.\/-]\s*(\d{4}|\d{2})$/), y, mo, d;
+  if (m) { d = +m[1]; mo = +m[2]; y = +m[3]; if (y < 100) y += 2000; }
+  else { m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/); if (!m) return null; y = +m[1]; mo = +m[2]; d = +m[3]; }
+  var dt = new Date(y, mo - 1, d);
+  return (dt.getFullYear() === y && dt.getMonth() === mo - 1 && dt.getDate() === d) ? dt : null;
 }
-function stage() {
-  var f = Array.prototype.slice.call($('file').files || []);
-  if (S.clash) { S.clash = null; $('portPick').style.display = 'none'; }
-  $('fname').textContent = f.map(function (x) { return x.name; }).join(', ');
-  $('addBtn').disabled = !f.length;
-  if (f.length) peekManifest(f[0]);
+function fmtEta(dt) { return pad(dt.getDate()) + '.' + pad(dt.getMonth() + 1) + '.' + dt.getFullYear(); }
+function isoEta(dt) { return dt.getFullYear() + '-' + pad(dt.getMonth() + 1) + '-' + pad(dt.getDate()); }
+
+/* ---------- the notice's status (one for the whole vessel) ---------- */
+function status() { return {kind: ($('seg').querySelector('[aria-checked="true"]') || {dataset: {k: 'arriving'}}).dataset.k, eta: $('eta').value.trim(), berth: $('berth').value.trim()}; }
+function setStatus(kind, eta, berth) {
+  $('seg').querySelectorAll('button').forEach(function (b) { b.setAttribute('aria-checked', b.dataset.k === kind ? 'true' : 'false'); b.tabIndex = b.dataset.k === kind ? 0 : -1; });
+  $('eta').value = eta || ''; $('berth').value = berth || '';
+  S.etaTouched = false; syncStatusUI();
 }
-async function peekManifest(file) {
-  try {
-    var fd = new FormData(); fd.append('file', file);
-    var r = await api('/api/desk/peek', {method: 'POST', body: fd});
-    if (!r.ok) return;
-    var v = (r.vessel ? r.vessel + (r.voyage ? ' V-' + r.voyage : '') : '').toUpperCase();
-    if (v && !$('vessel').value.trim()) $('vessel').value = v;
-    var typed = $('port').value.trim().toUpperCase();
-    if (r.port_clash && r.port && r.codes_port) {
-      // The heading and the B/L numbers name different ports: nothing is guessed, the user picks.
-      S.clash = r;
-      $('portPick').innerHTML = 'Check the port: the manifest heading says <b>' + esc(r.port) + '</b>, but its B/L numbers (' + esc(r.clash_sample) +
-        '&hellip;) point to <b>' + esc(r.codes_port) + '</b>. Which is right?<div class="acts">' +
-        '<button type="button" class="sec" data-p="' + esc(r.port) + '">' + esc(r.port) + '</button>' +
-        '<button type="button" class="sec" data-p="' + esc(r.codes_port) + '">' + esc(r.codes_port) + '</button></div>';
-      $('portPick').querySelectorAll('button').forEach(function (b) { b.onclick = function () { pickPort(b.dataset.p); }; });
-      $('portPick').style.display = '';
-    } else if (r.port && !typed) $('port').value = r.port;
-    else if (r.port && typed.split(' ')[0] !== r.port.split(' ')[0]) toast('This manifest says discharge port ' + r.port + ', but ' + typed + ' is selected.', true);
-    if (r.pkgs_ok === false) toast('Compass read ' + r.pkgs_read + ' packages, but the manifest total says ' + r.pkgs_total + '. Check the B/L lines after adding.', true);
-  } catch (e) {}
+function statusProblem() {
+  var st = status();
+  if (st.kind !== 'arriving') return '';
+  if (!st.eta) return 'Enter the ETA before sending.';
+  if (!parseEta(st.eta)) return 'That is not a valid date. Use dd.mm.yyyy.';
+  return '';
 }
-function pickPort(p) {
-  $('port').value = p; S.clash = null;
-  $('portPick').style.display = 'none'; $('portPick').innerHTML = '';
+function syncStatusUI() {
+  var st = status();
+  $('etaWrap').hidden = st.kind !== 'arriving'; $('berthWrap').hidden = st.kind !== 'berthed';
+  var p = statusProblem(), h = $('statusHint');
+  $('eta').classList.toggle('bad', !!p && (S.etaTouched || (st.eta && !parseEta(st.eta))));
+  $('eta').setAttribute('aria-invalid', p && st.eta ? 'true' : 'false');
+  if (p && (S.etaTouched || st.eta)) { h.textContent = p; h.className = 'hint err'; }
+  else if (st.kind === 'arriving' && !st.eta) { h.textContent = 'An ETA is needed before a notice can be sent.'; h.className = 'hint'; }
+  else if (st.kind === 'anchorage') { h.textContent = 'The notice says the vessel is at anchorage, awaiting a berth.'; h.className = 'hint'; }
+  else if (st.kind === 'berthed' && !st.berth) { h.textContent = 'No berth entered, so the notice will only say the vessel has berthed.'; h.className = 'hint'; }
+  else { h.textContent = ''; h.className = 'hint'; }
+  if (S.src && !(p && (S.etaTouched || st.eta))) { var extra = 'Filled in from ' + S.src + '. Change it if needed.'; h.textContent = h.textContent ? h.textContent + ' ' + extra : extra; }
 }
-(function () {
-  var d = $('drop');
-  ['dragenter', 'dragover'].forEach(function (e) { d.addEventListener(e, function (ev) { ev.preventDefault(); d.classList.add('over'); }); });
-  ['dragleave', 'drop'].forEach(function (e) { d.addEventListener(e, function (ev) { ev.preventDefault(); d.classList.remove('over'); }); });
-  d.addEventListener('drop', function (ev) { if (ev.dataTransfer && ev.dataTransfer.files.length) { $('file').files = ev.dataTransfer.files; stage(); } });
-})();
-async function uploadManifest() {
-  var port = $('port').value.trim().toUpperCase(), vessel = $('vessel').value.trim().toUpperCase();
-  if (S.clash) { toast('Pick the port first - the manifest heading and its B/L numbers disagree.', true); return; }
-  if (!port || !vessel) { toast('Type the port and the vessel first.', true); return; }
-  var fd = new FormData();
-  Array.prototype.forEach.call($('file').files, function (f) { fd.append('file', f); });
-  fd.append('port', port); fd.append('vessel', vessel);
-  $('addBtn').disabled = true; $('addBtn').textContent = 'Reading...';
-  try {
-    var r = await api('/api/desk/upload', {method: 'POST', body: fd});
-    (r.failed || []).forEach(function (m) { toast(m, true); });
-    (r.warnings || []).forEach(function (m) { toast(m, true); });
-    (r.notices || []).forEach(function (m) { toast(m); });
-    toast(r.added + ' B/L' + (r.added === 1 ? '' : 's') + ' added to the DO Tracker' + (r.skipped ? ', ' + r.skipped + ' already there' : '') + '.');
-    (r.duplicate_elsewhere || []).forEach(function (d) { toast(d.bl_number + ' is already on the board under ' + (d.existing_vessel || 'another vessel') + '.', true); });
-    $('file').value = ''; stage();
-    await openVessel(); loadRecent();
-  } catch (e) { toast(e.message, true); }
-  $('addBtn').textContent = 'Add manifest'; stage();
+function sigNow() { var s = status(), d = s.kind === 'arriving' ? parseEta(s.eta) : null; return [s.kind, d ? isoEta(d) : '', s.kind === 'berthed' ? s.berth.replace(/\s+/g, ' ').trim().toUpperCase() : '']; }
+function statusDiffers(sent) {
+  if (!sent) return false; var n = sigNow();
+  if (sent.eta === null || sent.eta === undefined) return sent.kind !== n[0];
+  return sent.kind !== n[0] || (sent.eta || '') !== n[1] || (sent.berth || '') !== n[2];
 }
-async function openVessel() {
-  S.port = $('port').value.trim().toUpperCase(); S.vessel = $('vessel').value.trim().toUpperCase();
-  if (!S.port || !S.vessel) { toast('Type the port and the vessel first.', true); return; }
-  try {
-    S.data = await api('/api/desk/notices?port=' + encodeURIComponent(S.port) + '&vessel=' + encodeURIComponent(S.vessel));
-  } catch (e) { toast(e.message, true); return; }
-  var sg = S.data.suggest || {};
-  if (!S.kindTouched) $('kind').value = sg.kind || 'arriving';
-  if (!$('eta').value) $('eta').value = sg.eta || '';
-  if (!$('berth').value) $('berth').value = sg.berth || '';
-  $('src').style.display = sg.source ? '' : 'none';
-  $('src').innerHTML = sg.source ? '<b>Vessel status</b> picked up from the line-up (' + esc(sg.source) + '). Change it if needed.' : '';
-  syncKind();
-  if (!S.sel || !S.data.groups.some(function (g) { return g.key === S.sel; })) {
-    var first = S.data.groups.filter(function (g) { return g.name; })[0];
-    S.sel = first ? first.key : null;
+function base() { var s = status(); return {port: S.port, vessel: S.vessel, kind: s.kind, eta: s.eta, berth: s.berth}; }
+
+/* ---------- consignee states ---------- */
+function gstate(g) {
+  if (g.state === 'needs_name') return {k: 'needs_name', t: 'No name', tone: 'warn', rank: 0};
+  if (g.state === 'needs_email') return {k: 'needs_email', t: 'Needs email', tone: 'warn', rank: 1};
+  if (g.state === 'update') return {k: 'update', t: 'New B/Ls', tone: 'warn', rank: 2};
+  if (g.sent && statusDiffers(g.sent)) return {k: 'changed', t: 'Status changed', tone: 'warn', rank: 2};
+  if (g.state === 'sent') return {k: 'sent', t: 'Sent', tone: 'info', rank: 4};
+  return {k: 'ready', t: 'Ready', tone: 'ok', rank: 3};
+}
+function sendable(g) { var s = gstate(g).k; return !!g.email && (s === 'ready' || s === 'update' || s === 'changed'); }
+function groupByKey(k) { return S.data ? S.data.groups.filter(function (g) { return g.key === k; })[0] : null; }
+function visibleGroups() {
+  var q = S.q.trim().toLowerCase(), f = S.filter;
+  var out = S.data.groups.filter(function (g) {
+    var st = gstate(g);
+    if (q && (g.name + ' ' + g.email + ' ' + (g.more || []).join(' ') + ' ' + g.bls.map(function (b) { return b.bl; }).join(' ')).toLowerCase().indexOf(q) < 0) return false;
+    if (f === 'attn') return st.rank <= 2;
+    if (f === 'ready') return st.k === 'ready';
+    if (f === 'sent') return st.k === 'sent';
+    return true;
+  });
+  out.sort(function (a, b) {
+    if (S.sort === 'attention') { var d = gstate(a).rank - gstate(b).rank; if (d) return d; }
+    if (!a.name !== !b.name) return a.name ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+  return out;
+}
+
+/* ---------- header, menus ---------- */
+function buildHeader() {
+  $('toolTabs').innerHTML = NAV.tools.map(function (t) { return '<a href="' + esc(t.url) + '"' + (t.on ? ' aria-current="page"' : '') + '>' + esc(t.name) + '</a>'; }).join('');
+  $('uname').textContent = ME; $('avatar').textContent = (ME.trim()[0] || '?').toUpperCase();
+  var others = NAV.desks.filter(function (d) { return !d.on; });
+  $('userMenu').innerHTML = '<div class="who">' + esc(ME) + '</div>' +
+    '<a role="menuitem" href="/">All desks</a>' + others.map(function (d) { return '<a role="menuitem" href="' + esc(d.url) + '">' + esc(d.name) + '</a>'; }).join('') +
+    NAV.tools.filter(function (t) { return !t.on; }).map(function (t) { return '<a role="menuitem" href="' + esc(t.url) + '">' + esc(t.name) + '</a>'; }).join('') +
+    (OWNER ? '<a role="menuitem" href="/learned">Learning room</a>' : '') + '<hr><a role="menuitem" href="/logout">Log out</a>';
+}
+function toggleMenu(id, btn, open) {
+  var m = $(id), want = open === undefined ? m.hidden : open;
+  document.querySelectorAll('.menu').forEach(function (x) { x.hidden = true; });
+  document.querySelectorAll('[aria-haspopup]').forEach(function (b) { b.setAttribute('aria-expanded', 'false'); });
+  if (want) {
+    m.hidden = false; btn.setAttribute('aria-expanded', 'true');
+    if (id === 'vMenu') { var r = btn.getBoundingClientRect(); m.style.left = Math.max(8, r.right - 240) + 'px'; m.style.top = (r.bottom + window.scrollY + 6) + 'px'; }
+    var first = m.querySelector('a,button'); if (first) first.focus();
   }
-  renderList(); refreshPreview(); renderSummary();
 }
-function syncKind() { $('berth').style.display = $('kind').value === 'berthed' ? '' : 'none'; }
-var STATE = {ready: ['Ready', 'ok'], sent: ['Sent', 'info'], update: ['New B/Ls', 'warn'], needs_email: ['Needs email', 'warn'], needs_name: ['No consignee', 'warn']};
-function renderList() {
-  var g = S.data.groups;
-  if (!g.length) { $('list').innerHTML = '<div class="empty">No B/Ls for this vessel yet. Add the manifest above.</div>'; return; }
-  $('list').innerHTML = g.map(function (x) {
-    var st = STATE[x.state], sel = x.key === S.sel;
-    var sent = x.sent ? '<div><small>Sent ' + esc(x.sent.at) + ' UTC by ' + esc(x.sent.by) + '</small></div>' : '';
-    var gaps = x.gaps ? '<div><small style="color:var(--warn);">' + x.gaps + ' B/L' + (x.gaps === 1 ? '' : 's') + ' missing packages or description</small></div>' : '';
-    var edit = '';
-    if (sel && x.name) {
-      edit = '<div class="edit" onclick="event.stopPropagation()">' +
-        '<input type="text" id="em" placeholder="Email address" value="' + esc(x.email) + '" autocapitalize="none">' +
-        '<input type="text" id="at" placeholder="Attention (contact person, optional)" value="' + esc(x.attn) + '">' +
-        '<div class="row"><button class="small" onclick="saveContact()">Save contact</button></div>' +
-        x.bls.map(function (b, i) { return '<div class="bl-edit" data-bl="' + esc(b.bl) + '"><div class="bl-name">' + esc(b.bl) + '</div>' +
-          '<input type="text" class="f-pol" placeholder="Loading port" value="' + esc(b.pol) + '">' +
-          '<input type="text" class="f-pk" placeholder="Packages" value="' + esc(b.pkgs) + '">' +
-          '<input type="text" class="f-ds wide" placeholder="Description of cargo" value="' + esc(b.desc) + '"></div>'; }).join('') +
-        '<div class="row"><button class="small sec" onclick="saveCargo()">Save cargo details</button></div></div>';
-    }
-    return '<div class="item' + (sel ? ' sel' : '') + '" onclick="pick(\'' + x.key + '\')"><div class="top"><div><b>' + esc(x.name || 'No consignee name') + '</b><small>' +
-      esc(x.email || (x.name ? 'No email yet' : 'These B/Ls have no consignee in the manifest')) + ' &middot; ' + x.bls.length + ' B/L' + (x.bls.length === 1 ? '' : 's') + '</small></div>' +
-      '<span class="pill ' + st[1] + '">' + st[0] + '</span></div>' + sent + gaps + edit + '</div>';
-  }).join('');
+document.addEventListener('click', function (e) {
+  if (!e.target.closest('.menu') && !e.target.closest('[aria-haspopup]')) document.querySelectorAll('.menu').forEach(function (x) { x.hidden = true; });
+});
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape') {
+    var open = document.querySelector('.menu:not([hidden])');
+    if (open) { open.hidden = true; var b = (open.id === 'userMenu' ? $('userBtn') : $('vmenuBtn')); b.setAttribute('aria-expanded', 'false'); b.focus(); return; }
+    if (!$('veil').hidden) closeSheet();
+  }
+});
+$('userBtn').onclick = function () { toggleMenu('userMenu', this); };
+$('vmenuBtn').onclick = function () {
+  $('vMenu').innerHTML = '<button role="menuitem" id="mvRename">Rename or move this vessel&hellip;</button><button role="menuitem" id="mvUploads">Manifests added&hellip;</button>';
+  toggleMenu('vMenu', this);
+  $('mvRename').onclick = function () { toggleMenu('vMenu', $('vmenuBtn'), false); openRenameSheet(); };
+  $('mvUploads').onclick = function () { toggleMenu('vMenu', $('vmenuBtn'), false); openAddSheet([]); };
+};
+
+/* ---------- opening a vessel ---------- */
+function fillPorts() { $('port').innerHTML = '<option value="">Choose a port</option>' + PORTS.map(function (p) { return '<option value="' + esc(p.v) + '">' + esc(p.t) + '</option>'; }).join(''); }
+async function openVessel(opts) {
+  opts = opts || {};
+  var port = $('port').value, vessel = $('vessel').value.replace(/\s+/g, ' ').trim().toUpperCase();
+  if (!port) { $('port').classList.add('bad'); $('port').focus(); toast('Choose the port first.', true); return false; }
+  $('port').classList.remove('bad');
+  if (!vessel) { $('vessel').classList.add('bad'); $('vessel').focus(); toast('Type the vessel first.', true); return false; }
+  $('vessel').classList.remove('bad'); $('vessel').value = vessel;
+  if (!opts.keep && S.dirty && !(await autosave())) return false;
+  var data;
+  try { data = await api('/api/desk/notices?port=' + encodeURIComponent(port) + '&vessel=' + encodeURIComponent(vessel)); }
+  catch (e) { toast(e.message, true); return false; }
+  var key = port + '|' + vessel, fresh = key !== S.openKey;
+  S.port = data.port || port; S.vessel = vessel; S.data = data;
+  if (fresh) {
+    S.openKey = key; S.sel = null; S.q = ''; $('q').value = ''; S.filter = 'all'; S.learn = []; S.dirty = false; S.tab = 'notice';
+    var sg = data.suggest || {}; S.src = sg.source || '';
+    setStatus(sg.kind || 'arriving', sg.eta || '', sg.berth || '');
+    try { localStorage.setItem('desk_last', JSON.stringify({port: S.port, vessel: vessel})); } catch (e) {}
+  }
+  $('port').value = S.port; $('statusRow').hidden = false; $('vmenuBtn').disabled = false;
+  if (!S.sel || !groupByKey(S.sel)) {
+    var vis = visibleGroups(), first = vis.filter(function (g) { return g.name; })[0] || vis[0];
+    S.sel = first && window.innerWidth > 900 ? first.key : null;
+    if (!S.sel) setView('list');
+  }
+  syncVsum(fresh || !opts.keep);
+  renderAll();
+  return true;
 }
-function pick(key) { if (S.sel === key) return; S.sel = key; renderList(); refreshPreview(); renderSummary(); }
+function syncVsum(collapse) {
+  var vs = $('vstrip'); vs.classList.add('has'); if (collapse) vs.classList.remove('open');
+  $('vsumName').textContent = S.vessel; $('vsumPort').textContent = portLabel(S.port);
+  $('vsum').setAttribute('aria-expanded', vs.classList.contains('open') ? 'true' : 'false');
+}
+$('vsum').onclick = function () { $('vstrip').classList.toggle('open'); syncVsum(false); if ($('vstrip').classList.contains('open')) $('vessel').focus(); };
+function setView(v) { S.view = v; document.body.classList.toggle('show-detail', v === 'detail'); if (S.data) renderActions(); }
+
+/* ---------- rendering ---------- */
+function renderAll() { renderBanner(); renderChips(); renderList(); renderDetail(); renderActions(); }
+function renderChips() {
+  var gs = S.data.groups, c = {all: gs.length, attn: 0, ready: 0, sent: 0};
+  gs.forEach(function (g) { var st = gstate(g); if (st.rank <= 2) c.attn++; if (st.k === 'ready') c.ready++; if (st.k === 'sent') c.sent++; });
+  var defs = [['all', 'All'], ['attn', 'Needs attention'], ['ready', 'Ready'], ['sent', 'Sent']];
+  $('chips').innerHTML = defs.map(function (d) { return '<button class="chip" data-f="' + d[0] + '" aria-pressed="' + (S.filter === d[0]) + '">' + d[1] + '<b>' + c[d[0]] + '</b></button>'; }).join('');
+  $('chips').querySelectorAll('button').forEach(function (b) { b.onclick = function () { S.filter = b.dataset.f; renderChips(); renderList(true); }; });
+  $('count').textContent = ' ' + gs.length;
+}
+function renderBanner() {
+  var d = S.data, html = '';
+  var ups = (d.uploads || []).filter(function (u) { return u.warnings && u.warnings.length && !u.undone; });
+  if (ups.length) {
+    html += '<div class="banner" role="region" aria-label="Things to check">';
+    ups.forEach(function (u) {
+      html += '<div class="bfile">' + esc(u.file) + '</div><ul>' + u.warnings.map(function (w) { return '<li>' + esc(w.text) + '</li>'; }).join('') + '</ul>' +
+        '<div class="bacts"><button class="btn sec small" data-ack="' + u.id + '">I have seen this</button></div>';
+    });
+    html += '</div>';
+  }
+  if (d.other_count) {
+    html += '<div class="banner info" role="note">' + plural(d.other_count, 'B/L') + ' of this vessel ' + (d.other_count === 1 ? 'was' : 'were') + ' added from another account, so ' + (d.other_count === 1 ? 'it does' : 'they do') + ' not show here. Ask the person who added ' + (d.other_count === 1 ? 'it' : 'them') + ' to send those notices.</div>';
+  }
+  $('banner').innerHTML = html;
+  $('banner').querySelectorAll('[data-ack]').forEach(function (b) { b.onclick = async function () { try { await post('/api/desk/ack', {id: +b.dataset.ack}); await openVessel({keep: true}); } catch (e) { toast(e.message, true); } }; });
+}
+function rowHTML(g) {
+  var st = gstate(g), sel = g.key === S.sel;
+  var email = g.email ? esc(g.email) + (g.more && g.more.length ? ' +' + g.more.length : '') : (g.name ? 'No email yet' : 'No consignee in the manifest');
+  var notes = '';
+  if (g.sent) notes += '<span class="rnote">Sent ' + esc(g.sent.at_local) + ' by ' + esc(g.sent.by) + '</span>';
+  if (g.gaps) notes += '<span class="rnote warn">' + plural(g.gaps, 'B/L') + ' without packages or description</span>';
+  return '<li><button class="row" data-key="' + esc(g.key) + '" aria-current="' + sel + '"><span class="rtop"><b dir="auto">' + esc(g.name || 'No consignee name') + '</b><span class="pill ' + st.tone + '">' + st.t + '</span></span>' +
+    '<span class="rsub' + (!g.email ? ' warn' : '') + '" dir="auto">' + email + ' &middot; ' + plural(g.bls.length, 'B/L') + '</span>' + notes + '</button></li>';
+}
+function renderList(top) {
+  var vis = visibleGroups(), box = $('list');
+  if (top) box.scrollTop = 0;
+  if (!S.data.groups.length) {
+    box.innerHTML = '<li class="empty"><h3>No B/Ls yet</h3>' + (S.data.other_count ? 'The B/Ls of this vessel belong to another account.' : 'Add this vessel\'s manifest to create its notices.') +
+      '<div style="margin-top:14px;"><button class="btn" id="emptyAdd">Add manifest</button></div></li>';
+    var b = $('emptyAdd'); if (b) b.onclick = function () { openAddSheet([]); };
+    return;
+  }
+  if (!vis.length) { box.innerHTML = '<li class="empty">No consignee matches.</li>'; return; }
+  box.innerHTML = vis.map(rowHTML).join('');
+  box.querySelectorAll('.row').forEach(function (b, i) {
+    b.onclick = function () { selectGroup(b.dataset.key); };
+    b.onkeydown = function (e) {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { var rows = box.querySelectorAll('.row'), n = rows[i + (e.key === 'ArrowDown' ? 1 : -1)]; if (n) { n.focus(); e.preventDefault(); } }
+    };
+  });
+}
+async function selectGroup(key) {
+  if (S.sel === key) { if (window.innerWidth <= 900) setView('detail'); return; }
+  if (S.dirty && !(await autosave())) return;
+  S.sel = key; var g = groupByKey(key), st = gstate(g);
+  S.tab = (st.k === 'needs_name' || st.k === 'needs_email') ? 'details' : (S.tab === 'details' && S.keepDetails ? 'details' : 'notice');
+  if (window.innerWidth <= 900) setView('detail');
+  renderList(); renderDetail(); renderActions();
+}
+function renderDetail() {
+  var g = S.sel ? groupByKey(S.sel) : null;
+  $('detailEmpty').hidden = !!g; $('detail').hidden = !g;
+  if (!g) {
+    $('detailEmpty').innerHTML = S.data && S.data.groups.length ? '<h3>Pick a consignee</h3>Its notice appears here, ready to check.' : '<h3>Nothing here yet</h3>Add the manifest and each consignee gets its own notice.';
+    return;
+  }
+  var st = gstate(g);
+  $('dName').textContent = g.name || 'No consignee name';
+  $('dSub').textContent = (g.email ? g.email + (g.more && g.more.length ? ', ' + g.more.join(', ') : '') : 'No email yet') + ' · ' + plural(g.bls.length, 'B/L');
+  renderPill();
+  setTab(S.tab, true);
+  renderLearn();
+}
+function renderPill() {
+  var g = S.sel ? groupByKey(S.sel) : null; if (!g) return; var st = gstate(g);
+  $('dPill').innerHTML = '<span class="pill ' + st.tone + '">' + st.t + '</span>';
+}
+function setTab(t, quiet) {
+  S.tab = t;
+  $('tabNotice').setAttribute('aria-selected', t === 'notice'); $('tabDetails').setAttribute('aria-selected', t === 'details');
+  $('panelNotice').hidden = t !== 'notice'; $('panelDetails').hidden = t !== 'details';
+  if (t === 'details') renderDetailsForm(); else refreshPreview();
+}
+$('tabNotice').onclick = function () { S.keepDetails = false; setTab('notice'); };
+$('tabDetails').onclick = function () { S.keepDetails = true; setTab('details'); };
+$('backBtn').onclick = async function () { if (S.dirty && !(await autosave())) return; setView('list'); window.scrollTo(0, 0); };
+
 function debouncePreview() { clearTimeout(S.timer); S.timer = setTimeout(refreshPreview, 350); }
 async function refreshPreview() {
-  syncKind();
-  if (!S.data || !S.sel) { $('mailbox').innerHTML = '<div class="empty">Pick a consignee to preview its notice.</div>'; return; }
+  var g = S.sel ? groupByKey(S.sel) : null, box = $('panelNotice');
+  if (!g || S.tab !== 'notice') return;
+  if (!g.name) { box.innerHTML = '<ul class="checks"><li class="stop"><span class="ic">!</span><span>These B/Ls have no consignee in the manifest. Give them a name under Details to make a notice.</span></li></ul>'; return; }
+  var seq = ++S.pseq, old = box.querySelector('.mailwrap'); if (old) old.classList.add('loading'); else box.innerHTML = '<div class="empty"><span class="spin"></span></div>';
   try {
-    var r = await post('/api/desk/preview', Object.assign(base(), {key: S.sel}));
-    $('mailbox').innerHTML = '<div class="mailwrap"><div class="mailhead">To: ' + esc(r.to || 'no email yet') + (r.cc ? ' &nbsp;&middot;&nbsp; Cc: ' + esc(r.cc) : '') + ' &nbsp;&middot;&nbsp; Subject: ' + esc(r.subject) + '</div>' + r.html + '</div>';
-  } catch (e) { $('mailbox').innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
-}
-function sendable() { return S.data.groups.filter(function (g) { return (g.state === 'ready' || g.state === 'update') && g.email; }); }
-function renderSummary() {
-  var d = S.data; if (!d) return;
-  var n = sendable().length, miss = d.groups.filter(function (g) { return g.state === 'needs_email' || g.state === 'needs_name'; }).length;
-  $('sumTitle').textContent = n ? (n + ' notice' + (n === 1 ? '' : 's') + ' ready to send') : 'Nothing ready to send';
-  var sub = [];
-  if (miss) sub.push(miss + ' need' + (miss === 1 ? 's' : '') + ' an email or consignee name.');
-  if (!d.email_ready) sub.push('Email is not set up on this server yet, so sending is switched off.');
-  if (!sub.length) sub.push('Nothing is sent until you press a button.');
-  $('sumSub').textContent = sub.join(' ');
-  var cur = d.groups.filter(function (g) { return g.key === S.sel; })[0];
-  $('allBtn').disabled = !n || !d.email_ready; $('allBtn').textContent = n ? 'Send ' + n + ' notice' + (n === 1 ? '' : 's') : 'Send all';
-  $('oneBtn').disabled = !cur || !cur.email || !d.email_ready;
-  $('testBtn').disabled = !cur || !cur.name || !d.email_ready || !d.my_email;
-  $('testBtn').title = d.my_email ? 'Sends this notice to ' + d.my_email : 'Your account has no email address';
-}
-async function saveContact() {
-  try { await post('/api/desk/contact', {port: S.port, vessel: S.vessel, key: S.sel, email: $('em').value.trim(), attn: $('at').value.trim()}); toast('Saved. It is remembered for next time.'); await openVessel(); }
-  catch (e) { toast(e.message, true); }
-}
-async function saveCargo() {
-  var rows = document.querySelectorAll('.bl-edit'), learns = {};
-  try {
-    for (var i = 0; i < rows.length; i++) {
-      var r = rows[i];
-      var res = await post('/api/desk/bl', {bl: r.dataset.bl, loading_port: r.querySelector('.f-pol').value, packages: r.querySelector('.f-pk').value, cargo_desc: r.querySelector('.f-ds').value});
-      if (res && res.learn) learns[res.learn.consignee + '|' + res.learn.old + '|' + res.learn.new] = res.learn;
+    var r = await post('/api/desk/preview', Object.assign(base(), {key: g.key}));
+    if (seq !== S.pseq) return;
+    var items = [];
+    r.problems.forEach(function (p) {
+      var fix = (p.code === 'email' || p.code === 'name') ? ' <button class="linkbtn" data-goto="details">Fix it</button>' : (p.code === 'eta' ? ' <button class="linkbtn" data-goto="eta">Enter it</button>' : '');
+      items.push('<li class="stop"><span class="ic">!</span><span>' + esc(p.text) + fix + '</span></li>'); });
+    r.warnings.forEach(function (w) { items.push('<li><span class="ic">&#9888;</span><span>' + esc(w) + '</span></li>'); });
+    if (g.sent) {
+      var msg = 'Sent to ' + esc(g.sent.to) + ' on ' + esc(g.sent.at_local) + ' by ' + esc(g.sent.by) + '.';
+      if (r.new_bls) msg += ' ' + plural(r.new_bls, 'B/L') + ' added since, marked NEW in the update.';
+      else if (r.changed) msg += ' The vessel status has changed since, so this goes out as an update.';
+      else msg += ' Nothing has changed since, so sending again repeats the same notice.';
+      items.push('<li class="good"><span class="ic">&#10003;</span><span>' + msg + '</span></li>');
     }
-    toast('Cargo details saved.');
-    S.learn = S.learn.concat(Object.keys(learns).map(function (k) { return learns[k]; }));
-    await openVessel(); showLearn();
-  } catch (e) { toast(e.message, true); }
+    box.innerHTML = (items.length ? '<ul class="checks">' + items.join('') + '</ul>' : '') +
+      '<div class="meta"><b>To</b><span>' + esc(r.to || 'no email yet') + '</span>' + (r.cc ? '<b>Copy</b><span>' + esc(r.cc) + '</span>' : '') + '<b>Subject</b><span>' + esc(r.subject) + '</span></div>' +
+      '<div class="mailwrap">' + r.html + '</div>';
+    box.querySelectorAll('[data-goto]').forEach(function (b) { b.onclick = function () {
+      if (b.dataset.goto === 'details') { S.keepDetails = true; setTab('details'); setTimeout(function () { var f = $(g.name ? 'fEmail' : 'fName'); if (f) f.focus(); }, 50); }
+      else { if (S.view === 'detail') setView('list'); $('vstrip').classList.add('open'); S.etaTouched = true; syncStatusUI(); $('eta').focus(); } }; });
+  } catch (e) { if (seq === S.pseq) box.innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
 }
-function showLearn() {
-  var bar = $('learnBar'), x = S.learn[0];
-  if (!x) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
-  bar.style.display = '';
-  bar.innerHTML = '<b>Remember this for ' + esc(x.consignee) + '?</b><div style="margin-top:4px;">When its cargo reads &ldquo;' + esc(x.old) +
-    '&rdquo; Compass will write &ldquo;' + esc(x.new) + '&rdquo; from now on.</div><div class="acts"><button id="learnYes" onclick="learnAnswer(true)">Remember</button>' +
-    '<button class="sec" onclick="learnAnswer(false)">Just this once</button></div>';
-  $('learnYes').focus();
+
+/* ---------- details form (one save) ---------- */
+function renderDetailsForm() {
+  var g = groupByKey(S.sel), box = $('panelDetails'); if (!g) return;
+  var emails = [g.email].concat(g.more || []).filter(Boolean).join('; ');
+  box.innerHTML = '<form class="form" id="dForm" autocomplete="off" novalidate>' +
+    '<label class="fld"><span>Consignee name</span><input type="text" id="fName" dir="auto" value="' + esc(g.name) + '" placeholder="' + (g.name ? '' : 'Type the consignee\'s name') + '"></label>' +
+    '<label class="fld"><span>Email addresses</span><input type="text" id="fEmail" inputmode="email" autocapitalize="none" spellcheck="false" value="' + esc(emails) + '" placeholder="name@company.com; second@company.com"><small>Separate several with a semicolon. The first one is the main address.</small></label>' +
+    '<label class="fld"><span>Attention (contact person, optional)</span><input type="text" id="fAttn" dir="auto" value="' + esc(g.attn) + '"></label>' +
+    '<h4 style="margin-top:6px;">Cargo &middot; ' + plural(g.bls.length, 'B/L') + '</h4>' +
+    g.bls.map(function (b, i) {
+      return '<div class="blcard" data-bl="' + esc(b.bl) + '"><div class="bln">' + esc(b.bl) + '</div>' +
+        '<label class="fld"><span>Loading port</span><input type="text" class="f-pol" value="' + esc(b.pol) + '"></label>' +
+        '<label class="fld"><span>Packages</span><input type="text" class="f-pk" value="' + esc(b.pkgs) + '"></label>' +
+        '<label class="fld wide"><span>Description of cargo</span><input type="text" class="f-ds" dir="auto" value="' + esc(b.desc) + '"></label></div>';
+    }).join('') +
+    '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;"><button type="submit" class="btn" id="saveBtn" disabled>Save changes</button><span class="hint" id="saveNote" role="status"></span></div></form>';
+  S.dirty = false;
+  var form = $('dForm');
+  form.addEventListener('input', function () { S.dirty = true; $('saveBtn').disabled = false; $('saveNote').textContent = ''; $('saveNote').className = 'hint'; });
+  form.addEventListener('submit', function (e) { e.preventDefault(); saveDetails(); });
+}
+function collectForm() {
+  return {port: S.port, vessel: S.vessel, key: S.sel, name: $('fName').value, email: $('fEmail').value.trim(), attn: $('fAttn').value.trim(),
+    bls: Array.prototype.map.call(document.querySelectorAll('#dForm .blcard'), function (r) { return {bl: r.dataset.bl, loading_port: r.querySelector('.f-pol').value, packages: r.querySelector('.f-pk').value, cargo_desc: r.querySelector('.f-ds').value}; })};
+}
+async function saveDetails(quiet) {
+  if (!$('dForm')) return true;
+  var payload = collectForm();
+  $('saveBtn').disabled = true;
+  try {
+    var r = await post('/api/desk/save', payload);
+    S.dirty = false; S.sel = r.key || S.sel;
+    S.learn = S.learn.concat(r.learn || []);
+    await openVessel({keep: true});
+    if (!quiet) { var n = $('saveNote'); if (n) { n.textContent = 'Saved.'; n.className = 'hint'; } toast('Saved. It is remembered for next time.'); }
+    return true;
+  } catch (e) {
+    var n2 = $('saveNote'); if (n2) { n2.textContent = e.message; n2.className = 'hint err'; }
+    if ($('saveBtn')) $('saveBtn').disabled = false;
+    return false;
+  }
+}
+async function autosave() { var ok = await saveDetails(true); if (!ok) toast('Fix the highlighted details before leaving this consignee.', true); return ok; }
+function renderLearn() {
+  var x = S.learn[0], box = $('learnBox');
+  if (!x) { box.innerHTML = ''; return; }
+  box.innerHTML = '<div class="learnbox" role="region" aria-label="Remember this?"><b>Remember this for ' + esc(x.consignee) + '?</b><div style="margin-top:4px;">When its cargo reads &ldquo;' + esc(x.old) + '&rdquo; Compass will write &ldquo;' + esc(x.new) + '&rdquo; from now on.</div>' +
+    '<div class="acts"><button class="btn small" id="learnYes">Remember</button><button class="btn sec small" id="learnNo">Just this once</button></div></div>';
+  $('learnYes').onclick = function () { learnAnswer(true); }; $('learnNo').onclick = function () { learnAnswer(false); };
 }
 async function learnAnswer(yes) {
   var x = S.learn.shift();
   try { if (yes && x) { await post('/api/memory/cargo', x); toast('Remembered for ' + x.consignee + '.'); } } catch (e) { toast(e.message, true); }
-  showLearn();
+  renderLearn();
 }
-async function sendOneKey(key, test) { return post('/api/desk/send', Object.assign(base(), {key: key, test: !!test})); }
-async function sendTest() {
-  $('testBtn').disabled = true;
-  try { var r = await sendOneKey(S.sel, true); toast('Test copy sent to ' + r.sent_to.join(', ') + '.'); } catch (e) { toast(e.message, true); }
-  renderSummary();
+
+/* ---------- action bar ---------- */
+function renderActions() {
+  var d = S.data, gs = d.groups, send = gs.filter(sendable), cur = S.sel ? groupByKey(S.sel) : null;
+  var miss = gs.filter(function (g) { var k = gstate(g).k; return k === 'needs_email' || k === 'needs_name'; }).length;
+  var done = gs.filter(function (g) { return gstate(g).k === 'sent'; }).length;
+  $('sumTitle').textContent = send.length ? plural(send.length, 'notice') + ' ready to send' : (gs.length ? 'Nothing waiting to be sent' : 'Nothing to send yet');
+  var sub = [], prob = statusProblem();
+  if (prob && send.length) sub.push(prob);
+  if (miss) sub.push(miss + ' need' + (miss === 1 ? 's' : '') + ' an email or a name');
+  if (done) sub.push(done + ' already sent');
+  if (!d.email_ready) sub.push('Email is not set up on this server, so sending is off');
+  $('sumSub').textContent = sub.join(' · ');
+  $('allBtn').textContent = send.length ? 'Review and send ' + send.length : 'Review and send';
+  $('allBtn').disabled = !send.length || !d.email_ready;
+  $('oneBtn').disabled = !cur || !cur.name || !cur.email || !d.email_ready;
+  $('testBtn').disabled = !cur || !cur.name || !d.email_ready || !d.my_email;
+  $('testBtn').title = d.my_email ? 'Sends this notice to ' + d.my_email : 'Your account has no email address';
+  $('oneBtn').title = $('allBtn').title = prob || '';
+  document.body.classList.toggle('has-vessel', true);
+  var onList = window.innerWidth <= 900 && S.view === 'list';
+  $('testBtn').hidden = onList; $('oneBtn').hidden = onList;
 }
-async function sendSelected() {
-  var g = S.data.groups.filter(function (x) { return x.key === S.sel; })[0];
-  if (!g) return;
-  $('oneBtn').disabled = true;
-  try { var r = await sendOneKey(g.key, false); toast('Sent to ' + r.sent_to.join(', ') + '.'); } catch (e) { toast(e.message, true); }
-  await openVessel();
+window.addEventListener('resize', function () { if (S.data) renderActions(); });
+
+/* ---------- status controls ---------- */
+$('seg').querySelectorAll('button').forEach(function (b) {
+  b.onclick = function () { setStatus(b.dataset.k, $('eta').value, $('berth').value); S.src = ''; onStatusChange(); };
+  b.onkeydown = function (e) {
+    var order = ['arriving', 'anchorage', 'berthed'], i = order.indexOf(b.dataset.k);
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') i = (i + 1) % 3; else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') i = (i + 2) % 3; else return;
+    e.preventDefault(); var t = $('seg').querySelector('[data-k="' + order[i] + '"]'); t.click(); t.focus();
+  };
+});
+function onStatusChange() { syncStatusUI(); if (S.data) { renderChips(); renderList(); renderPill(); renderActions(); debouncePreview(); } }
+$('eta').addEventListener('input', function () { S.src = ''; S.etaTouched = false; onStatusChange(); });
+$('eta').addEventListener('blur', function () { var d = parseEta($('eta').value); S.etaTouched = true; if (d) $('eta').value = fmtEta(d); onStatusChange(); });
+$('berth').addEventListener('input', function () { S.src = ''; onStatusChange(); });
+
+/* ---------- vessel strip ---------- */
+$('openBtn').onclick = function () { openVessel(); };
+$('vessel').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); openVessel(); } });
+$('port').addEventListener('change', function () { $('port').classList.remove('bad'); });
+$('q').addEventListener('input', function () { S.q = this.value; renderList(true); });
+$('sort').addEventListener('change', function () { S.sort = this.value; renderList(true); });
+$('vesselsBtn').onclick = function () { openVesselsSheet(); };
+$('addBtn').onclick = function () { openAddSheet([]); };
+
+/* ---------- sheets ---------- */
+function openSheet(title, wide) {
+  S.lastFocus = document.activeElement; $('toasts').innerHTML = ''; $('sheetTitle').textContent = title; $('sheet').classList.toggle('wide', !!wide);
+  $('veil').hidden = false; document.body.style.overflow = 'hidden';
 }
-async function sendAll() {
-  var list = sendable(), b = $('allBtn');
-  if (!S.arm) {
-    S.arm = setTimeout(function () { S.arm = null; renderSummary(); }, 6000);
-    b.textContent = 'Press again to send ' + list.length;
+function closeSheet() {
+  if (S.sheet === 'add') { S.staged = []; S.report = null; }
+  $('toasts').innerHTML = '';
+  $('veil').hidden = true; S.sheet = null; document.body.style.overflow = '';
+  if (window.innerWidth > 900) document.body.style.overflow = 'hidden';
+  if (S.lastFocus && S.lastFocus.focus) try { S.lastFocus.focus(); } catch (e) {}
+}
+$('sheetClose').onclick = closeSheet;
+$('veil').addEventListener('mousedown', function (e) { if (e.target === $('veil') && !S.busy) closeSheet(); });
+$('sheet').addEventListener('keydown', function (e) {
+  if (e.key !== 'Tab') return;
+  var f = Array.prototype.filter.call($('sheet').querySelectorAll('button,input,select,a[href]'), function (x) { return !x.disabled && x.offsetParent !== null; });
+  if (!f.length) return; var a = f[0], z = f[f.length - 1];
+  if (e.shiftKey && document.activeElement === a) { z.focus(); e.preventDefault(); } else if (!e.shiftKey && document.activeElement === z) { a.focus(); e.preventDefault(); }
+});
+
+async function openVesselsSheet() {
+  S.sheet = 'vessels'; openSheet('Vessels');
+  $('sheetBody').innerHTML = '<div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input type="search" id="vq" placeholder="Search by vessel or port" aria-label="Search vessels" autocomplete="off"></div><ul class="vlist" id="vl"></ul>';
+  $('sheetFoot').innerHTML = '<button class="btn sec" id="vdone">Close</button>'; $('vdone').onclick = closeSheet;
+  var tm = null;
+  async function load() {
+    try {
+      var r = await api('/api/desk/vessels?limit=60&q=' + encodeURIComponent($('vq').value));
+      $('vl').innerHTML = r.vessels.length ? r.vessels.map(function (v, i) { return '<li><button data-i="' + i + '"><span class="vn">' + esc(v.vessel) + '</span><span class="vm">' + esc(portLabel(v.port)) + ' &middot; ' + plural(v.n, 'B/L') + (v.last ? ' &middot; ' + esc(v.last) : '') + '</span></button></li>'; }).join('') : '<li class="empty">No vessel found.</li>';
+      $('vl').querySelectorAll('button').forEach(function (b) { b.onclick = function () { var v = r.vessels[+b.dataset.i]; closeSheet(); chooseVessel(v.port, v.vessel); }; });
+    } catch (e) { $('vl').innerHTML = '<li class="empty">' + esc(e.message) + '</li>'; }
+  }
+  $('vq').addEventListener('input', function () { clearTimeout(tm); tm = setTimeout(load, 200); });
+  load(); $('vq').focus();
+}
+function portLabel(p) { var x = PORTS.filter(function (q) { return q.v === p; })[0]; return x ? x.t : (p || 'No port'); }
+function chooseVessel(port, vessel) {
+  var known = PORTS.some(function (p) { return p.v === port; });
+  if (!known) { toast('That vessel is filed under "' + port + '", which is not one of the ports. Use Rename or move to correct it.', true); }
+  $('port').value = known ? port : ''; $('vessel').value = vessel; if (known) openVessel();
+}
+
+/* ---------- add a manifest ---------- */
+function stageFiles(list) {
+  var add = Array.prototype.slice.call(list || []).map(function (f) { return {file: f, state: 'checking', peek: null, force: false, id: Math.random().toString(36).slice(2)}; });
+  S.staged = S.staged.concat(add); return add;
+}
+function openAddSheet(files) {
+  S.sheet = 'add'; if (files && files.length) stageFiles(files);
+  openSheet('Add a manifest', true); renderAddSheet();
+  S.staged.filter(function (x) { return x.state === 'checking'; }).forEach(peekOne);
+}
+function chosen() { return {port: $('port').value, vessel: $('vessel').value.replace(/\s+/g, ' ').trim().toUpperCase()}; }
+async function peekOne(it) {
+  var fd = new FormData(), c = chosen(); fd.append('file', it.file); fd.append('port', c.port); fd.append('vessel', c.vessel);
+  try {
+    var r = await api('/api/desk/peek', {method: 'POST', body: fd});
+    it.peek = r.ok ? r : null; it.state = r.ok ? 'done' : 'unknown';
+  } catch (e) { it.state = 'unknown'; it.peek = null; }
+  if (it.peek && !it.autofilled) {
+    it.autofilled = true;
+    if (!$('port').value && it.peek.port_canon) $('port').value = it.peek.port_canon;
+    var v = peekVessel(it);
+    if (!$('vessel').value.trim() && v) $('vessel').value = v;
+    if ((!c.port && $('port').value) || (!c.vessel && $('vessel').value.trim())) { recheck(); return; }
+  }
+  if (S.sheet === 'add') renderAddSheet();
+}
+function peekVessel(it) { var p = it.peek || {}; return (p.vessel ? p.vessel + (p.voyage ? ' V-' + p.voyage : '') : '').toUpperCase(); }
+function recheck() { S.staged.forEach(function (x) { if (x.state !== 'checking') { x.state = 'checking'; x.force = false; peekOne(x); } }); renderAddSheet(); }
+function issuesOf(it) { return (it.peek && it.peek.issues) || []; }
+function unresolved(it) { return !it.force && issuesOf(it).some(function (i) { return i.hard; }); }
+function renderAddSheet() {
+  var body = $('sheetBody'), foot = $('sheetFoot'), html = '';
+  var c = chosen(), have = !!(c.port && c.vessel);
+  if (S.report) {
+    html += S.report.map(reportCard).join('');
+    body.innerHTML = html;
+    foot.innerHTML = '<button class="btn" id="rdone">Done</button>'; $('rdone').onclick = function () { S.report = null; closeSheet(); };
+    body.querySelectorAll('[data-undo]').forEach(function (b) { b.onclick = function () { undoUpload(+b.dataset.undo, b); }; });
+    body.querySelectorAll('[data-fixport]').forEach(function (b) { b.onclick = function () { S.report = null; useFix('port', b.dataset.fixport); }; });
     return;
   }
-  clearTimeout(S.arm); S.arm = null; b.disabled = true;
-  var ok = 0, fail = [];
-  for (var i = 0; i < list.length; i++) {
-    b.textContent = 'Sending ' + (i + 1) + ' of ' + list.length + '...';
-    try { await sendOneKey(list[i].key, false); ok++; } catch (e) { fail.push(list[i].name + ': ' + e.message); if (/set up|reach|sign in|could not be sent/i.test(e.message)) break; }
+  html += '<button class="dz" id="dz" type="button"><b>Drop the manifest here</b>or choose a file. Excel, Word, PDF or CSV, any layout.</button>';
+  if (S.staged.length) {
+    html += '<div class="sect">Ready to add</div>' + S.staged.map(function (it) {
+      var p = it.peek, iss = issuesOf(it), cls = unresolved(it) ? ' issue' : (it.state === 'done' ? ' good' : '');
+      var facts = '';
+      if (it.state === 'checking') facts = '<span class="fsub"><span class="spin"></span> Checking&hellip;</span>';
+      else if (it.state === 'unknown') facts = '<span class="fsub">Compass could not preview this file here. It will tell you what is wrong when you add it.</span>';
+      else if (p) {
+        facts = '<div class="fsub">' + esc((p.vessel ? p.vessel + (p.voyage ? ' V-' + p.voyage : '') : 'Vessel not stated') + ' · ' + (p.port || 'port not stated') + ' · ' + plural(p.lines, 'B/L')) + '</div>' +
+          (p.pkgs_ok === false ? '<ul><li class="w">Compass counted ' + esc(p.pkgs_read) + ' packages, but the manifest total says ' + esc(p.pkgs_total) + '. Check the B/L lines after adding.</li></ul>' : (p.pkgs_ok === true ? '<div class="fsub">Package total matches (' + esc(p.pkgs_total) + ').</div>' : ''));
+      }
+      var is = iss.map(function (i) {
+        var acts = '';
+        if (i.hard && !it.force) {
+          acts = '<div class="facts"><button class="btn small" data-use="' + esc(i.kind) + '" data-says="' + esc(i.says) + '" data-id="' + it.id + '">Use ' + esc(i.kind === 'port' ? portLabel(i.says) : i.says.replace(/\s+/g, ' ')) + '</button>' +
+            '<button class="btn sec small" data-force="' + it.id + '">Add to ' + esc(i.kind === 'port' ? portLabel(i.typed) : i.typed) + ' anyway</button></div>';
+        }
+        return '<ul><li class="w">' + esc(i.text) + (it.force && i.hard ? ' (you chose to add it anyway)' : '') + '</li></ul>' + acts;
+      }).join('');
+      return '<div class="fcard' + cls + '"><div class="ftop"><span class="fname">' + esc(it.file.name) + '</span><button class="btn sec small" data-drop="' + it.id + '" aria-label="Remove ' + esc(it.file.name) + '">Remove</button></div>' + facts + is + '</div>';
+    }).join('');
   }
-  if (ok) toast(ok + ' notice' + (ok === 1 ? '' : 's') + ' sent.');
-  fail.slice(0, 3).forEach(function (m) { toast(m, true); });
-  await openVessel();
+  var ups = (S.data && S.data.uploads) || [];
+  if (ups.length && S.data) {
+    html += '<div class="sect">Already added to ' + esc(S.vessel) + '</div>' + ups.map(function (u) {
+      return '<div class="fcard"><div class="ftop"><span class="fname">' + esc(u.file) + '</span>' + (u.can_undo ? '<button class="btn sec small" data-undo="' + u.id + '">Undo</button>' : '<span class="pill mut">' + (u.undone ? 'Taken back' : 'Nothing new') + '</span>') + '</div>' +
+        '<div class="fsub">' + esc(u.at_local) + ' by ' + esc(u.by) + ' · ' + u.added + ' added, ' + u.skipped + ' already there' + (u.left_out ? ', ' + u.left_out + ' left out' : '') + '</div></div>';
+    }).join('');
+  }
+  body.innerHTML = html;
+  var ready = S.staged.length && have && S.staged.every(function (x) { return x.state !== 'checking' && !unresolved(x); });
+  var n = S.staged.length;
+  foot.innerHTML = '<button class="btn sec" id="acancel">Close</button><button class="btn gold" id="aok"' + (ready ? '' : ' disabled') + '>' + (n > 1 ? 'Add ' + n + ' manifests' : 'Add manifest') + '</button>';
+  $('acancel').onclick = closeSheet;
+  $('aok').onclick = uploadStaged;
+  if (S.staged.length && !have) body.insertAdjacentHTML('afterbegin', '<div class="banner">Choose the port and type the vessel above first. Compass fills them in from the manifest when it can.</div>');
+  var dz = $('dz');
+  dz.onclick = function () { $('fileIn').click(); };
+  ['dragenter', 'dragover'].forEach(function (ev) { dz.addEventListener(ev, function (e) { e.preventDefault(); dz.classList.add('over'); }); });
+  ['dragleave', 'drop'].forEach(function (ev) { dz.addEventListener(ev, function (e) { e.preventDefault(); dz.classList.remove('over'); }); });
+  dz.addEventListener('drop', function (e) { e.stopPropagation(); if (e.dataTransfer && e.dataTransfer.files.length) addFiles(e.dataTransfer.files); });
+  body.querySelectorAll('[data-drop]').forEach(function (b) { b.onclick = function () { S.staged = S.staged.filter(function (x) { return x.id !== b.dataset.drop; }); renderAddSheet(); }; });
+  body.querySelectorAll('[data-force]').forEach(function (b) { b.onclick = function () { S.staged.forEach(function (x) { if (x.id === b.dataset.force) x.force = true; }); renderAddSheet(); }; });
+  body.querySelectorAll('[data-use]').forEach(function (b) { b.onclick = function () {
+    var it = S.staged.filter(function (x) { return x.id === b.dataset.id; })[0], v = b.dataset.says;
+    if (b.dataset.use === 'vessel' && it && it.peek && it.peek.vessel && (it.peek.vessel + ' ').toUpperCase().indexOf(v.toUpperCase()) === 0) v = peekVessel(it);
+    useFix(b.dataset.use, v); }; });
+  body.querySelectorAll('[data-undo]').forEach(function (b) { b.onclick = function () { undoUpload(+b.dataset.undo, b); }; });
 }
-$('kind').addEventListener('change', function () { S.kindTouched = true; });
-loadRecent();
+function addFiles(list) { var add = stageFiles(list); S.report = null; if (S.sheet !== 'add') { openAddSheet([]); } renderAddSheet(); add.forEach(peekOne); }
+$('fileIn').addEventListener('change', function () { if (this.files.length) addFiles(this.files); this.value = ''; });
+function useFix(kind, says) {
+  if (kind === 'port') $('port').value = says; else $('vessel').value = says;
+  recheck(); if (S.sheet !== 'add') openAddSheet([]);
+}
+async function uploadStaged() {
+  var c = chosen(); if (!c.port || !c.vessel) return;
+  var btn = $('aok'); S.busy = true; btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Reading&hellip;';
+  var groups = [S.staged.filter(function (x) { return !x.force; }), S.staged.filter(function (x) { return x.force; })], files = [], err = null;
+  for (var gi = 0; gi < 2; gi++) {
+    if (!groups[gi].length) continue;
+    var fd = new FormData(); groups[gi].forEach(function (x) { fd.append('file', x.file); }); fd.append('port', c.port); fd.append('vessel', c.vessel); if (gi === 1) fd.append('force', '1');
+    try { var r = await api('/api/desk/upload', {method: 'POST', body: fd}); files = files.concat(r.files); }
+    catch (e) { err = e; break; }
+  }
+  S.busy = false;
+  if (err && !files.length) { toast(err.message, true); renderAddSheet(); return; }
+  S.staged = []; S.report = files;
+  $('port').value = c.port; $('vessel').value = c.vessel;
+  await openVessel({keep: true});
+  renderAddSheet();
+}
+function reportCard(f) {
+  var head, cls = '';
+  if (f.status === 'added') { head = 'Added ' + plural(f.added, 'B/L') + (f.skipped ? ', ' + f.skipped + ' already there' : '') + (f.left_out ? ', ' + f.left_out + ' left out (hidden or crossed out)' : ''); cls = ' good'; }
+  else if (f.status === 'held') { head = 'Not added'; cls = ' issue'; }
+  else { head = 'Could not add'; cls = ' issue'; }
+  var lines = '';
+  if (f.status === 'failed') lines += '<ul><li class="w">' + esc(f.error) + '</li></ul>';
+  (f.held || []).forEach(function (h) { lines += '<ul><li class="w">' + esc(h.text) + '</li></ul><div class="facts"><button class="btn small" data-fixport="' + esc(h.says) + '">Use ' + esc(h.kind === 'port' ? portLabel(h.says) : h.says) + '</button></div>'; });
+  if ((f.warnings || []).length) lines += '<ul>' + f.warnings.map(function (w) { return '<li class="w">' + esc(w.text) + '</li>'; }).join('') + '</ul>';
+  if ((f.notes || []).length) lines += '<div class="fsub">' + f.notes.map(esc).join('<br>') + '</div>';
+  var undo = f.status === 'added' && f.added > 0 && f.id ? '<button class="btn sec small" data-undo="' + f.id + '">Undo this upload</button>' : '';
+  return '<div class="fcard' + cls + '"><div class="ftop"><span class="fname">' + esc(f.file) + '</span>' + undo + '</div><div><b>' + head + '</b></div>' + lines + '</div>';
+}
+async function undoUpload(id, btn) {
+  btn.disabled = true;
+  try {
+    var r = await post('/api/desk/undo', {id: id});
+    toast(r.removed + ' B/L' + (r.removed === 1 ? '' : 's') + ' taken back' + (r.kept.length ? '; ' + r.kept.length + ' kept because work has started on them' : '') + '.');
+    if (S.report) S.report = S.report.map(function (f) { return f.id === id ? Object.assign({}, f, {status: 'failed', error: 'This upload was taken back.', warnings: [], notes: [], id: 0}) : f; });
+    await openVessel({keep: true}); if (S.sheet === 'add') renderAddSheet();
+  } catch (e) { toast(e.message, true); btn.disabled = false; }
+}
+
+/* ---------- rename or move a vessel ---------- */
+function openRenameSheet() {
+  if (!S.data) return;
+  S.sheet = 'rename'; openSheet('Rename or move this vessel');
+  $('sheetBody').innerHTML = '<p style="margin:0;color:var(--muted);">Use this to fix a wrong port or a typo. All ' + plural(S.data.groups.reduce(function (n, g) { return n + g.bls.length; }, 0), 'B/L') + ' of this vessel move with it, and the notices already sent stay linked.</p>' +
+    '<label class="fld"><span>Port</span><select id="rnPort">' + PORTS.map(function (p) { return '<option value="' + esc(p.v) + '"' + (p.v === S.port ? ' selected' : '') + '>' + esc(p.t) + '</option>'; }).join('') + '</select></label>' +
+    '<label class="fld"><span>Vessel and voyage</span><input type="text" id="rnVessel" value="' + esc(S.vessel) + '" autocomplete="off" autocapitalize="characters"></label><div class="hint err" id="rnErr" role="alert"></div>';
+  $('sheetFoot').innerHTML = '<button class="btn sec" id="rnCancel">Cancel</button><button class="btn" id="rnSave">Save</button>';
+  $('rnCancel').onclick = closeSheet;
+  $('rnSave').onclick = async function () {
+    this.disabled = true;
+    try {
+      var r = await post('/api/desk/vessel', {port: S.port, vessel: S.vessel, to_port: $('rnPort').value, to_vessel: $('rnVessel').value});
+      closeSheet(); $('port').value = r.port || $('rnPort').value; $('vessel').value = r.vessel || $('rnVessel').value.toUpperCase();
+      await openVessel({keep: true}); S.openKey = $('port').value + '|' + $('vessel').value; toast('Done. ' + plural(r.moved, 'B/L') + ' moved.');
+    } catch (e) { $('rnErr').textContent = e.message; this.disabled = false; }
+  };
+  $('rnVessel').focus();
+}
+
+/* ---------- sending ---------- */
+async function sendTest() {
+  var g = groupByKey(S.sel); if (!g) return; $('testBtn').disabled = true;
+  try { var r = await post('/api/desk/send', Object.assign(base(), {key: g.key, test: true})); toast('Test copy of ' + g.name + ' sent to ' + r.sent_to.join(', ') + '.'); }
+  catch (e) { toast(e.message, true); }
+  renderActions();
+}
+$('testBtn').onclick = sendTest;
+$('oneBtn').onclick = function () { openReview(S.sel); };
+$('allBtn').onclick = function () { openReview(null); };
+async function openReview(onlyKey) {
+  var prob = statusProblem();
+  if (prob) { if (S.view === 'detail') setView('list'); $('vstrip').classList.add('open'); S.etaTouched = true; syncStatusUI(); $('eta').focus(); toast(prob, true); return; }
+  var r;
+  try { r = await post('/api/desk/review', Object.assign(base(), {keys: onlyKey ? [onlyKey] : []})); } catch (e) { toast(e.message, true); return; }
+  var st = status(), what = KINDS[st.kind] + (st.kind === 'arriving' ? ', ETA ' + (parseEta(st.eta) ? fmtEta(parseEta(st.eta)) : st.eta) : (st.kind === 'berthed' && st.berth ? ', berth ' + st.berth : ''));
+  var items = r.items.map(function (it) { var g = groupByKey(it.key); it.group = g; return it; });
+  var go = items.filter(function (i) { return !i.problems.length && !i.repeat && (onlyKey ? true : sendable(i.group)); });
+  var again = items.filter(function (i) { return !i.problems.length && i.repeat; });
+  var blocked = items.filter(function (i) { return i.problems.length; });
+  if (!onlyKey) { go = go.filter(function (i) { return gstate(i.group).k !== 'sent'; }); }
+  S.sheet = 'review'; openSheet(onlyKey ? 'Send this notice' : 'Check before sending', true);
+  var unchecked = items.filter(function (i) { return !i.problems.length && i.warnings.some(function (w) { return /came from the manifest/.test(w); }); }).length;
+  var html = '<div><b>M.V. ' + esc(S.vessel) + '</b> &middot; ' + esc(portLabel(S.port)) + '<br><span style="color:var(--muted);">' + esc(what) + '. A copy of each notice goes to ' + esc(r.cc || 'you') + '.</span></div>';
+  function row(i, checked, note) {
+    var warns = i.warnings.filter(function (w) { return !/came from the manifest/.test(w); });
+    return '<label class="ritem"><input type="checkbox" data-k="' + esc(i.key) + '" ' + (checked ? 'checked' : '') + (i.problems.length ? ' disabled' : '') + '><span class="rmain"><b dir="auto">' + esc(i.name || 'No name') + '</b><br><span style="color:var(--muted);font-size:12.5px;">' + esc(i.to.join(', ') || 'no email') + ' &middot; ' + plural(i.bls, 'B/L') +
+      (i.new_bls ? ' &middot; ' + i.new_bls + ' new' : '') + (i.changed && !i.new_bls ? ' &middot; status update' : '') + '</span>' +
+      (note ? '<br><span class="rnote">' + note + '</span>' : '') + warns.map(function (w) { return '<br><span class="rwarn">' + esc(w) + '</span>'; }).join('') +
+      i.problems.map(function (p) { return '<br><span class="rbad">' + esc(p.text) + '</span>'; }).join('') + '</span></label>';
+  }
+  if (unchecked) html += '<div class="banner">' + plural(unchecked, 'address', 'addresses') + ' came straight from the manifest and ' + (unchecked === 1 ? 'has' : 'have') + ' not been checked. Look ' + (unchecked === 1 ? 'it' : 'them') + ' over before sending. Opening a consignee and pressing Save under Details confirms its address.</div>';
+  html += go.length ? '<div class="sect">Will be sent (' + go.length + ')</div>' + go.map(function (i) { return row(i, true); }).join('') : '<div class="empty" style="padding:16px;">Nothing new to send for this vessel.</div>';
+  if (again.length) html += '<div class="sect">Already sent, nothing has changed (' + again.length + ')</div>' + again.map(function (i) { return row(i, !!onlyKey, 'Sent ' + esc(i.sent ? i.sent.at_local : '') + (i.sent ? ' by ' + esc(i.sent.by) : '') + '. Tick to send it again.'); }).join('');
+  if (blocked.length) html += '<div class="sect">Cannot be sent yet (' + blocked.length + ')</div>' + blocked.map(function (i) { return row(i, false); }).join('');
+  $('sheetBody').innerHTML = html;
+  $('sheetFoot').innerHTML = '<button class="btn sec" id="rvCancel">Cancel</button><button class="btn gold" id="rvSend">Send</button>';
+  $('rvCancel').onclick = closeSheet;
+  var boxes = $('sheetBody').querySelectorAll('input[type=checkbox]');
+  function count() { var n = 0; boxes.forEach(function (b) { if (b.checked) n++; }); $('rvSend').textContent = n ? 'Send ' + plural(n, 'notice') : 'Send'; $('rvSend').disabled = !n; return n; }
+  boxes.forEach(function (b) { b.onchange = count; }); count();
+  $('rvSend').onclick = function () {
+    var keys = []; boxes.forEach(function (b) { if (b.checked) keys.push(b.dataset.k); });
+    runSend(keys, items);
+  };
+}
+async function runSend(keys, items) {
+  var results = [], stop = false; S.busy = true;
+  $('sheetClose').disabled = true; $('sheetTitle').textContent = 'Sending notices'; $('sheetBody').innerHTML = '<div class="sect" id="prog">Sending&hellip;</div><div id="plist"></div>';
+  $('sheetFoot').innerHTML = '';
+  for (var i = 0; i < keys.length && !stop; i++) {
+    var it = items.filter(function (x) { return x.key === keys[i]; })[0];
+    $('prog').innerHTML = '<span class="spin"></span> Sending ' + (i + 1) + ' of ' + keys.length + '&hellip;';
+    try { var r = await post('/api/desk/send', Object.assign(base(), {key: keys[i], resend: !!(it && it.repeat)})); results.push({name: it.name, ok: true, to: r.sent_to.join(', ')}); }
+    catch (e) {
+      results.push({name: it ? it.name : keys[i], ok: false, msg: e.message});
+      if (/set up|reach|sign in|could not be sent/i.test(e.message)) { stop = true; }
+    }
+    $('plist').innerHTML = results.map(resultRow).join('');
+  }
+  var ok = results.filter(function (r) { return r.ok; }).length, left = keys.length - results.length;
+  $('prog').textContent = ok + ' of ' + keys.length + ' sent' + (left ? '. Stopped, ' + left + ' not tried.' : '.');
+  $('plist').innerHTML = results.map(resultRow).join('');
+  S.busy = false; $('sheetClose').disabled = false; $('sheetTitle').textContent = left || ok < keys.length ? 'Sending finished with problems' : 'Notices sent';
+  $('sheetFoot').innerHTML = '<button class="btn" id="rvDone">Done</button>'; $('rvDone').onclick = closeSheet;
+  await openVessel({keep: true});
+}
+function resultRow(r) { return '<div class="ritem"><span style="width:18px;font-weight:800;color:' + (r.ok ? 'var(--ok)' : 'var(--danger)') + ';">' + (r.ok ? '&#10003;' : '&#10007;') + '</span><span class="rmain"><b dir="auto">' + esc(r.name) + '</b><br><span class="' + (r.ok ? 'rnote' : 'rbad') + '">' + esc(r.ok ? 'Sent to ' + r.to : r.msg) + '</span></span></div>'; }
+
+/* ---------- drop a file anywhere ---------- */
+(function () {
+  var depth = 0;
+  function hasFiles(e) { return e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], 'Files') >= 0; }
+  window.addEventListener('dragenter', function (e) { if (!hasFiles(e)) return; depth++; $('dropVeil').hidden = false; });
+  window.addEventListener('dragleave', function (e) { if (!hasFiles(e)) return; depth = Math.max(0, depth - 1); if (!depth) $('dropVeil').hidden = true; });
+  window.addEventListener('dragover', function (e) { if (hasFiles(e)) e.preventDefault(); });
+  window.addEventListener('drop', function (e) {
+    if (!hasFiles(e)) return; e.preventDefault(); depth = 0; $('dropVeil').hidden = true;
+    if (e.dataTransfer.files.length) { if ($('veil').hidden) openAddSheet([]); addFiles(e.dataTransfer.files); }
+  });
+})();
+window.addEventListener('beforeunload', function (e) { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
+
+/* ---------- start ---------- */
+async function start() {
+  buildHeader(); fillPorts();
+  if (window.innerWidth > 900) document.body.style.overflow = 'hidden';
+  $('detailEmpty').innerHTML = '';
+  var recents = [];
+  try { recents = (await api('/api/desk/vessels?limit=8')).vessels; } catch (e) {}
+  var box = $('list');
+  $('detailEmpty').hidden = false; $('detail').hidden = true;
+  if (recents.length) {
+    box.innerHTML = '<li class="empty"><h3>Open a vessel</h3>Choose a port and type the vessel above, or pick a recent one.</li>';
+    $('detailEmpty').innerHTML = '<h3>Where would you like to start?</h3>Drop a manifest anywhere on this page to add it, or open a vessel you worked on recently.<div class="recents" id="recents">' +
+      recents.map(function (v, i) { return '<button data-i="' + i + '"><b>' + esc(v.vessel) + '</b><span>' + esc(portLabel(v.port)) + ' &middot; ' + plural(v.n, 'B/L') + (v.last ? ' &middot; ' + esc(v.last) : '') + '</span></button>'; }).join('') + '</div>';
+    $('recents').querySelectorAll('button').forEach(function (b) { b.onclick = function () { var v = recents[+b.dataset.i]; chooseVessel(v.port, v.vessel); }; });
+  } else {
+    box.innerHTML = '<li class="empty"><h3>No vessels yet</h3>Choose the port, type the vessel and add its manifest.</li>';
+    $('detailEmpty').innerHTML = '<h3>Add your first manifest</h3>Drop the file anywhere on this page. Compass reads it, files the B/Ls on the DO Tracker and prepares a notice for every consignee.<div style="margin-top:16px;"><button class="btn" id="firstAdd">Add manifest</button></div>';
+    $('firstAdd').onclick = function () { openAddSheet([]); };
+  }
+  $('count').textContent = '';
+  $('actionbar').querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+}
+start();
 </script>
 </body></html>
 """
