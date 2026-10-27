@@ -928,6 +928,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_lu_vessels_snap ON lu_vessels (snapshot_id)")
     cur.execute("ALTER TABLE lu_vessels ADD COLUMN IF NOT EXISTS vtype TEXT DEFAULT ''")
     cur.execute("ALTER TABLE lu_vessels ADD COLUMN IF NOT EXISTS rob DOUBLE PRECISION")
+    cur.execute("ALTER TABLE lu_vessels ADD COLUMN IF NOT EXISTS transit DOUBLE PRECISION")
     cur.execute("ALTER TABLE lu_berths ADD COLUMN IF NOT EXISTS cargo_use TEXT DEFAULT ''")
     cur.execute("ALTER TABLE lu_berths ADD COLUMN IF NOT EXISTS kind TEXT DEFAULT ''")
     cur.execute(
@@ -11288,8 +11289,14 @@ _LU_SHOWN = [x for x in LINEUP_PORTS if x[0] in ("JED", "YNB")]       # Sea Powe
 # the Red Sea ports to Dammam go round the Arabian Peninsula, ~2,500-2,650 nm).
 _LU_TRANSIT_DAYS = {("JED", "YNB"): 0.7, ("JED", "DMM"): 8.7, ("YNB", "DMM"): 9.2}
 # Discharge rates used to estimate days alongside (MT per day), by cargo family.
-_LU_RATES = {"steel": 4000, "bagged": 3500, "bulk": 6000, "project": 1200, "general": 2500}
-_LU_RATE_LABEL = {"steel": "Steel", "bagged": "Bagged cargo", "bulk": "Bulk", "project": "Project cargo", "general": "General cargo"}
+_LU_RATES = {"steel": 4000, "bagged": 3500, "bulk": 6000, "project": 1200, "pulp": 3000, "wood": 1500, "general": 2500}
+_LU_RATE_LABEL = {"steel": "Steel", "bagged": "Bagged cargo", "bulk": "Bulk", "project": "Project cargo", "pulp": "Wood pulp and paper",
+                  "wood": "MDF and timber", "general": "General cargo"}
+# Where a port's real pace is known it starts from that instead of the general figures above (tonnes a day, read from the
+# ROB falling on the Jeddah line-ups of October 2026); learning from later line-ups takes over from there.
+_LU_PORT_RATES = {"JED": {"steel": 1700, "bagged": 2000, "bulk": 3500, "project": 800, "pulp": 2800, "wood": 800, "general": 1500}}
+_LU_TURNAROUND = timedelta(hours=6)     # one ship sails, the next is piloted in and made fast
+_LU_CAT_STAY = {"roro": 1.5, "livestock": 1.0, "liquid": 2.0, "container": 1.5}   # days alongside when the line-up gives no tonnage
 _LU_DRAFT_TIGHT = 0.3   # metres of margin under the berth limit that we call "tight"
 
 
@@ -11307,6 +11314,10 @@ def _lu_cargo_family(text):
     t = (text or "").upper()
     if re.search(r"STEEL|COIL|PIPE|BILLET|PLATE|REBAR|BEAM|WIRE ROD|H-?BEAM|SLAB|TUBE|ANGLE|CHANNEL|IRON", t):
         return "steel"
+    if re.search(r"PULP|PAPER|NEWSPRINT|TISSUE", t):
+        return "pulp"
+    if re.search(r"\bMDF\b|\bHDF\b|PLY\s*WOOD|\bPLY\b|TIMBER|LUMBER|\bWOOD\b|CHIPBOARD|PARTICLE\s*BOARD", t):
+        return "wood"
     if re.search(r"BAG|RICE|SUGAR|FLOUR|FERTILI[SZ]ER|CEMENT IN|SACK", t):
         return "bagged"
     if re.search(r"PROJECT|HEAVY|MACHIN|EQUIPMENT|TRANSFORMER|VEHICLE|RO-?RO|UNIT", t):
@@ -11325,6 +11336,7 @@ def _lu_parse_dt(s, ref):
     s = re.sub(r"\s+", " ", str(s or "").replace("\n", " ")).strip().upper()
     s = re.sub(r"(\d)\s*([-/.])\s*(\d)", r"\1\2\3", s)                      # '22 -10' -> '22-10'
     s = re.sub(r"\b(\d{1,2}[-/.]\d{1,2}[-/.]\d{2})(\d{2}:\d{2})", r"\1 \2", s)   # '28-10-2600:00' (scan) -> '28-10-26 00:00'
+    s = re.sub(r"(?<!\d)(\d{1,2}):(\d{1,2}):(20\d{2})(?!\d)", r"\1/\2/\3", s)   # '24:10:2026 16:30' (RSGT) -> '24/10/2026 16:30'
     s = s.replace(".", "/")
     if not s or s in ("-", "--", "N/A", "NA", "TBA", "TBC", "NIL"):
         return None
@@ -11377,7 +11389,7 @@ def _lu_num(s):
 
 _LU_HEADERS = [
     ("vessel", r"^(?:M\.?V\.?\s*)?(?:VESSEL|VSL|SHIP)(?:'?S)?(?:\s*NAME)?$|^NAME\s*OF\s*(?:THE\s+)?(?:VESSEL|SHIP)$|^VESSEL\s*/\s*VOY"),
-    ("vtype", r"^(?:VESSEL|VSL|SHIP)\s*TYPE$|^TYPE\s*OF\s*(?:VESSEL|SHIP)$"),
+    ("vtype", r"^O?\s*(?:VESSEL|VSL|SHIP)\s*TYPE$|^TYPE\s*OF\s*(?:VESSEL|SHIP)$"),
     ("agent", r"AGEN(?:T|TS|CY)(?:\s*NAME)?$|^LOCAL\s+AGENT$"),
     ("manifest", r"^MANIFEST\s*VOL|^CARGO\s*(?:&|AND)\s*(?:QTY|QUANTITY)$"),
     ("cargo", r"^(?:CARGO|COMMODITY|CARGO\s*TYPE|TYPE\s*OF\s*CARGO|CARGO\s*DESC(?:RIPTION)?|DESCRIPTION)$"),
@@ -11389,7 +11401,7 @@ _LU_HEADERS = [
     ("arrived", r"^E\.?T\.?A\.?\s*/\s*A\.?T\.?A\.?$|^A\.?T\.?A\.?\s*/\s*E\.?T\.?A\.?$|^(?:ARRIVED|ARRIVAL|A\.?T\.?A\.?|ARRIVAL\s+DATE|DATE\s+OF\s+ARRIVAL|ANCHORED|ARR(?:IVAL)?\s*(?:DATE|TIME)?|N\.?O\.?R\.?(?:\s+TENDERED)?)$"),
     ("eta", r"^E\.?T\.?A\.?(?:\s*DATE)?$|^EXPECTED(?:\s+ARRIVAL)?$"),
     ("etb", r"^E\.?T\.?B\.?$|EXPECTED\s+BERTH"),
-    ("berth", r"^(?:BERTH|BERTH\s*NO\.?|B\.?\s*NO\.?|BTH\.?|QUAY|JETTY)$"),
+    ("berth", r"^(?:BERTH|BERTH\s*N(?:O\.?)?|B\.?\s*NO\.?|BTH\.?|QUAY|JETTY)$"),
     ("berthed", r"^(?:BERTHED|BERTHING(?:\s+DATE)?|A\.?T\.?B\.?|ALONGSIDE(?:\s+DATE)?|ALL\s*FAST)$"),
     ("first_line", r"^FIRST\s*LINE"),
     ("etd", r"^(?:E\.?T\.?D\.?|E\.?T\.?S\.?|E\.?T\.?C\.?|EXPECTED\s+(?:SAILING|DEPARTURE|COMPLETION)|SAILING|COMPLETION)$"),
@@ -11447,6 +11459,16 @@ def _lu_name_key(name):
     return re.sub(r"[^A-Z0-9]", "", re.sub(r"^MV\s+", "", str(name or "").upper()))
 
 
+def _lu_transit_mt(text):
+    """'( 2,910 mt transit )' / '( 1,033 mt , 461 pkgs transit )' -> tonnes of transit cargo that stay on board (None when none)."""
+    t = re.sub(r"\s+", " ", str(text or "").replace("\n", " "))
+    tot = 0.0
+    for m in re.finditer(r"\(\s*([\d,]+(?:\.\d+)?)\s*M\.?T\.?S?\b[^()]*TRANSIT[^()]*\)", t, re.I):
+        n = _lu_num(m.group(1))
+        tot += n or 0.0
+    return tot or None
+
+
 def _lu_manifest(text):
     """'60,659 mt / 13,443 pkgs ( steel , coils , units ) DOC' -> (60659.0, 'steel, coils, units').
     '18150.000mt Bulk SILICA SAND ( export )' -> (18150.0, 'Bulk SILICA SAND')."""
@@ -11481,6 +11503,9 @@ def _lu_berth_slot(berth):
     t = re.sub(r"\s+", "", str(berth or "").upper())
     if not t or _LU_VACANT.match(t):
         return "", 0
+    m2 = re.match(r"^(\d+[A-Z]?)\(\d+[A-Z]?\)$", t)         # '3(34)': lying at 3 (she was at 34 before)
+    if m2:
+        return m2.group(1), 0
     m = re.search(r"\(([A-H])\)$", t)
     slot = (ord(m.group(1)) - 64) if m else 0
     if m:
@@ -11566,8 +11591,10 @@ def _lu_rows_from_tables(tables, ref):
             if _LU_VACANT.match(berth.replace(" ", "")):
                 berth = ""
             cargo, qty = txt("cargo"), _lu_num(g("qty"))
+            transit = None
             if "manifest" in hmap:
                 mq, mc = _lu_manifest(g("manifest"))
+                transit = _lu_transit_mt(g("manifest"))
                 qty = qty if qty is not None else mq
                 cargo = cargo or mc
             draft, loa = _lu_num(g("draft")), _lu_num(g("loa"))
@@ -11615,7 +11642,7 @@ def _lu_rows_from_tables(tables, ref):
                 eta, arrived = arrived, None
             out.append({
                 "vessel": name[:80], "agent": txt("agent")[:80], "cargo": cargo[:80], "vtype": txt("vtype")[:40],
-                "qty": qty, "loa": loa, "draft": draft, "rob": _lu_num(g("rob")) if "rob" in hmap else None,
+                "qty": qty, "loa": loa, "draft": draft, "rob": _lu_num(g("rob")) if "rob" in hmap else None, "transit": transit,
                 "arrived": arrived.strftime("%Y-%m-%d %H:%M") if arrived else "",
                 "eta": eta.strftime("%Y-%m-%d %H:%M") if eta else "",
                 "etb": etb.strftime("%Y-%m-%d %H:%M") if etb else "",
@@ -12042,7 +12069,7 @@ def _lu_is_ours(agent):
 # Berth 3 is the one high-draft berth; Berth 11 is mostly livestock, sometimes general cargo.
 _LU_PORT_HINTS = {"JED": {"fixed": {"3": 13.5, "10": 12.0, "11": 7.7, "21": 10.4, "27": 10.4, "34": 11.7,
                                     "35": 11.8, "36": 10.8, "37": 11.8, "38": 11.8},
-                          "high": {"3"}, "occasional": {"11"}}}
+                          "high": {"3"}, "occasional": {"11"}, "deep_alt": {"1", "2"}}}
 
 
 def _lu_berths_raw(db, port):
@@ -12123,7 +12150,7 @@ def _lu_berths(db, port, now=None):
         e = dict(b)
         e["_seen_any"] = st.get("deep_any")
         e.update({"key": k, "set_draft": b.get("max_draft"), "max_draft": md, "draft_from": why, "general": general, "fixed": bool(fixed),
-                  "high": k in (hint.get("high") or ()), "occasional": k in (hint.get("occasional") or ()),
+                  "high": k in (hint.get("high") or ()), "occasional": k in (hint.get("occasional") or ()), "deep_alt": k in (hint.get("deep_alt") or ()),
                   "use": use, "kind": kind, "cats": sorted(set(st["cats"]) | ({kind} if kind else set()), key=lambda c: -st["cats"].get(c, 0)), "seen_deep": st["deep"],
                   "seen_general": st["n_general"]})
         out.append(e)
@@ -12143,10 +12170,46 @@ def _lu_latest(db, port, before_id=None):
     return db.execute("SELECT * FROM lu_snapshots WHERE port = ? ORDER BY lineup_date DESC, id DESC LIMIT 1", (port,)).fetchone()
 
 
+def _lu_attach_pace(db, snap_id, vessels):
+    """Gives each vessel alongside her recent discharge pace (cargo off per day), worked out from
+    the cargo left on board (ROB) on the line-ups of the last nine days. A ship's own recent pace
+    says more about when she will sail than any average for her kind of cargo."""
+    try:
+        snap = db.execute("SELECT port, lineup_date FROM lu_snapshots WHERE id = ?", (snap_id,)).fetchone()
+        if not snap or not any(v.get("status") == "alongside" and v.get("rob") is not None for v in vessels):
+            return
+        last_day = date.fromisoformat(snap["lineup_date"])
+        rows = db.execute(
+            "SELECT s.lineup_date AS d, v.vessel, v.rob FROM lu_vessels v JOIN lu_snapshots s ON s.id = v.snapshot_id "
+            "WHERE s.port = ? AND s.lineup_date >= ? AND s.lineup_date <= ? AND v.rob IS NOT NULL AND v.status = 'alongside' "
+            "ORDER BY s.lineup_date, s.id", (snap["port"], (last_day - timedelta(days=9)).isoformat(), snap["lineup_date"])).fetchall()
+        by = {}
+        for r in rows:
+            by.setdefault(r["vessel"], {})[r["d"]] = float(r["rob"])
+        for v in vessels:
+            pts = sorted(by.get(v["vessel"], {}).items())
+            if len(pts) < 2 or pts[-1][0] != snap["lineup_date"]:
+                continue
+            chain = [pts[-1]]
+            for d, rb in reversed(pts[:-1]):
+                if rb >= chain[0][1]:                       # cargo only goes down; a rise means she was loaded or re-berthed
+                    chain.insert(0, (d, rb))
+                else:
+                    break
+            days = (last_day - date.fromisoformat(chain[0][0])).days
+            drop = chain[0][1] - chain[-1][1]
+            if days >= 1 and drop > 0 and 100 <= drop / days <= 20000:
+                v["pace"] = round(drop / days)
+    except Exception:
+        app.logger.exception("line-up pace failed")
+
+
 def _lu_vessels(db, snap_id):
-    return [dict(r) for r in db.execute(
+    out = [dict(r) for r in db.execute(
         "SELECT v.*, s.lineup_date AS lu_date FROM lu_vessels v JOIN lu_snapshots s ON s.id = v.snapshot_id "
         "WHERE v.snapshot_id = ? ORDER BY v.seq, v.id", (snap_id,)).fetchall()]
+    _lu_attach_pace(db, snap_id, out)
+    return out
 
 
 def _lu_dt(s):
@@ -12205,6 +12268,8 @@ def _lu_simulate(berths, vessels, now, extra=None, learn=None, force=None, shift
             q = 0
         if q <= 0:
             q = med_qty.get(_lu_vcat(v)) or 0
+        if q <= 0 and _lu_vcat(v) in _LU_CAT_STAY:
+            return _LU_CAT_STAY[_lu_vcat(v)]
         return _lu_days_alongside(v.get("cargo"), q, rates)
     bmap = {(b.get("key") or _lu_norm_berth(b["name"])): b for b in berths}
     free = {k: now for k in bmap}
@@ -12226,18 +12291,22 @@ def _lu_simulate(berths, vessels, now, extra=None, learn=None, force=None, shift
             end = now + timedelta(hours=6)              # stated sailing time has passed (older line-up): about to sail
         if not end:
             if v.get("rob") is not None:
+                rob_left = max(0.0, float(v["rob"]) - float(v.get("transit") or 0))     # transit cargo stays on board
                 # her own pace so far (manifest - ROB since all fast), else the port's learned rate;
                 # counted from the line-up's date, so an older line-up is not read as today's ROB
                 asof = (datetime.strptime(v["lu_date"], "%Y-%m-%d") + timedelta(hours=7)) if v.get("lu_date") else now
-                rate = rate_for(v)
+                base = rate = rate_for(v)
                 b0 = _lu_dt(v["berthed"])
                 if b0 and v.get("qty") and _lu_days(asof, b0) >= 1 and float(v["qty"]) > float(v["rob"]):
                     done = float(v["qty"]) - float(v["rob"])
                     own = done / _lu_days(asof, b0)
                     if 100 <= own <= 20000:
                         w = min(1.0, done / float(v["qty"]) / 0.3)    # trust her own pace more as more cargo is worked
-                        rate = max(0.5 * rate, w * own + (1 - w) * rate)
-                end = max(now + timedelta(hours=6), asof + timedelta(days=float(v["rob"]) / rate))
+                        rate = max(0.5 * base, w * own + (1 - w) * base)
+                recent = v.get("pace")                       # what she really discharged between the last line-ups
+                if recent and 100 <= recent <= 20000:
+                    rate = max(0.4 * base, 0.65 * recent + 0.35 * rate)
+                end = max(now + timedelta(hours=6), asof + timedelta(days=rob_left / rate))
             else:
                 end = max(now + timedelta(hours=6), start + timedelta(days=stay(v)))
         if v["id"] in shift:
@@ -12246,17 +12315,25 @@ def _lu_simulate(berths, vessels, now, extra=None, learn=None, force=None, shift
         res[v["id"]] = {"berth": bmap[k]["name"] if k in bmap else (v["berth"] or ""), "berth_key": k, "start": start, "end": end,
                         "ready": _lu_dt(v["arrived"]) or start}
         if k in free:
-            free[k] = max(free[k], end)
+            free[k] = max(free[k], end + _LU_TURNAROUND)
     for v, k, start, end in later:
         to, when = shift[v["id"]]
         when = max(when, now)
+        s2 = max(free.get(to, now), when)                      # she cannot leave until the berth she is moving to is free
+        if end <= s2 + timedelta(hours=6):                     # she finishes before that: no shift happens
+            res[v["id"]] = {"berth": bmap[k]["name"] if k in bmap else (v["berth"] or ""), "berth_key": k, "start": start, "end": end,
+                            "ready": _lu_dt(v["arrived"]) or start}
+            if k in free:
+                free[k] = max(free[k], end + _LU_TURNAROUND)
+            continue
         if k in free:
-            free[k] = max(free[k], when + timedelta(hours=2))
-        s2 = max(free.get(to, now), when)
-        end2 = s2 + (end - when) + timedelta(hours=6)          # same remaining cargo work, plus the shifting time
+            free[k] = max(free[k], s2 + timedelta(hours=2))
+        end2 = end + timedelta(hours=6)                        # same remaining cargo work, plus the shifting time
         free[to] = end2
+        fk = bmap[k]["name"] if k in bmap else v["berth"]
         res[v["id"]] = {"berth": bmap[to]["name"], "berth_key": to, "start": start, "end": end2, "ready": _lu_dt(v["arrived"]) or start,
-                        "shifted_from": bmap[k]["name"] if k in bmap else v["berth"], "shift_at": s2}
+                        "shifted_from": fk, "shift_at": s2,
+                        "segs": [{"b": k, "s": start, "e": s2}, {"b": to, "s": s2, "e": end2}]}
     # 2) waiting and expected vessels, first come first served by readiness
     queue = []
     for v in vessels:
@@ -12275,14 +12352,15 @@ def _lu_simulate(berths, vessels, now, extra=None, learn=None, force=None, shift
     queue.sort(key=lambda x: (x[0], x[1]))
     # the terminal's order at a berth (2(a) before 2(b)) overrides arrival order among those vessels
     slots = {}
+    lettered = {_lu_berth_slot(v.get("berth"))[0] for _, _, v in queue if _lu_berth_slot(v.get("berth"))[1] and v["id"] not in force}
     for pos, (_, _, v) in enumerate(queue):
         if v["id"] in force:
             continue
         k, sl = _lu_berth_slot(v.get("berth"))
-        if k in bmap and sl and not open_berths:
+        if k in bmap and (sl or k in lettered) and not open_berths:
             slots.setdefault(k, []).append(pos)
     for k, poss in slots.items():
-        items = sorted((queue[p] for p in poss), key=lambda q: _lu_berth_slot(q[2].get("berth"))[1])
+        items = sorted((queue[p] for p in poss), key=lambda q: _lu_berth_slot(q[2].get("berth"))[1] or 1)
         for p, it in zip(poss, items):
             queue[p] = it
     for ready, _, v in queue:
@@ -12295,7 +12373,8 @@ def _lu_simulate(berths, vessels, now, extra=None, learn=None, force=None, shift
         elif tk and not open_berths:
             allowed = [tk]                                 # the terminal has allocated her berth
         else:
-            kinds = [k for k, b in bmap.items() if ((b.get("general", True) and not b.get("occasional")) if cat == "general" else cat in (b.get("cats") or []))]
+            kinds = [k for k, b in bmap.items() if ((b.get("general", True) and not b.get("occasional")) if cat == "general" else cat in (b.get("cats") or []))
+                     or (cat == "general" and b.get("deep_alt") and draft and draft >= 12.0)]
             allowed = [k for k in kinds if not draft or not bmap[k].get("max_draft") or draft <= bmap[k]["max_draft"]]
             if tk and tk not in allowed:
                 allowed.append(tk)                         # her allocated berth suits her, whatever our records say
@@ -12316,7 +12395,7 @@ def _lu_simulate(berths, vessels, now, extra=None, learn=None, force=None, shift
                 best = (score, k, start)
         _, k, start = best
         dur = timedelta(days=stay(v))
-        free[k] = max(free[k], start + dur)
+        free[k] = max(free[k], start + dur + _LU_TURNAROUND)
         b = bmap[k]
         # what history says about this port: priority vessels stretch the wait, and past estimates ran early/late
         base = max(ready, now)
@@ -12354,6 +12433,7 @@ def _lu_band_step(berths, gen, vessels, learn, now, t0, draft, byid, deeper_than
     """One estimate: when a vessel of this draft, arriving now, would berth, and who is ahead of her."""
     sim, x = _lu_newcomer(berths, vessels, learn, now, t0, draft)
     fit = [b for b in gen if not b.get("occasional") and (not b.get("max_draft") or draft <= b["max_draft"])]
+    fit += [b for b in berths if b.get("deep_alt") and draft >= 12.0]
     st = {"draft": draft, "berths": [b["name"] for b in fit], "wait": None, "start": "", "berth": "", "ahead": 0, "ahead_names": []}
     if not x.get("start"):
         return st
@@ -12387,7 +12467,8 @@ def _lu_bands(berths, vessels, learn, now, t0, port=None):
     if lows and highs:
         low_l = sorted({b["max_draft"] for b in lows})
         plan = [(None, low_l[-1], low_l, [b["name"] for b in gen if b["key"] not in high]),
-                (low_l[-1], max(b["max_draft"] for b in highs), [max(b["max_draft"] for b in highs)], [b["name"] for b in highs])]
+                (low_l[-1], max(b["max_draft"] for b in highs), [max(b["max_draft"] for b in highs)],
+                 [b["name"] for b in highs] + [b["name"] for b in berths if b.get("deep_alt")])]
     else:
         lims = sorted({b["max_draft"] for b in gen if b.get("max_draft")})
         open_top = any(not b.get("max_draft") for b in gen)
@@ -12524,7 +12605,7 @@ def _lu_learn(db, port, now=None):
         per = []
         for (d0, r0), (d1, r1) in zip(pts, pts[1:]):
             gap = (d1 - d0).days
-            if 1 <= gap <= 3 and r0 > r1:
+            if 1 <= gap <= 7 and r0 > r1:
                 per.append((r0 - r1) / gap)
         if per:
             r = _lu_median(per)
@@ -12536,20 +12617,22 @@ def _lu_learn(db, port, now=None):
             samples.setdefault(fam, []).append(r)
     rates_use, rates = {}, []
     # a cargo not learned yet is worked at this port's pace: the default scaled the way the learned ones are
-    ratios = [_lu_median(samples[f]) / _LU_RATES[f] for f in _LU_RATE_LABEL if len(samples.get(f, [])) >= 3]
-    factor = min(1.5, max(0.2, _lu_median(ratios))) if ratios else 1.0
+    dflt = dict(_LU_RATES)
+    dflt.update(_LU_PORT_RATES.get(port) or {})
+    ratios = [_lu_median(samples[f]) / dflt[f] for f in _LU_RATE_LABEL if len(samples.get(f, [])) >= 3]
+    factor = min(1.5, max(0.2, _lu_median(ratios))) if (ratios and not _LU_PORT_RATES.get(port)) else 1.0
     for fam, label in _LU_RATE_LABEL.items():
         s = samples.get(fam, [])
         learned = len(s) >= 3
         if learned:
             rate = round(_lu_median(s))
         else:
-            rate = _LU_RATES[fam] * factor
+            rate = dflt[fam] * factor
             if s:                                        # one or two vessels seen: half their pace, half the port's
                 rate = (rate + _lu_median(s)) / 2
             rate = round(rate)
         rates_use[fam] = rate
-        rates.append({"fam": fam, "label": label, "rate": rate, "n": len(s), "learned": learned, "default": _LU_RATES[fam],
+        rates.append({"fam": fam, "label": label, "rate": rate, "n": len(s), "learned": learned, "default": dflt[fam],
                       "scaled": (not learned) and (factor != 1.0 or bool(s))})
     out["rates"], out["rates_use"] = rates, rates_use
 
@@ -12916,6 +12999,8 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
             "total_wait": round(max(0, _lu_days(s["start"], ready)), 1) if s.get("start") and ready and v["status"] != "alongside" else None,
             "margin": round(s["margin"], 2) if s.get("margin") is not None else None,
             "fits": fits, "position": pos.get(v["id"]),
+            "shifted_from": s.get("shifted_from") or "",
+            "segs": [{"b": x["b"], "s": round(_lu_days(x["s"], now), 2), "e": round(_lu_days(x["e"], now), 2)} for x in (s.get("segs") or [])],
         })
         out["vessels"].append(item)
 
@@ -12993,6 +13078,7 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
         old_list = _lu_vessels(db, prev["id"])
         old = {v["vessel"]: v for v in old_list}
         new = {v["vessel"]: v for v in vessels}
+        berth_moves = []
         old_sim = _lu_simulate(berths, old_list, now, learn=learn)    # yesterday's queue worked out the same way, so places compare like with like
         old_wait = [v["vessel"] for v in sorted([v for v in old_list if v["status"] == "anchor"],
                     key=lambda v: (old_sim.get(v["id"], {}).get("start") or now + timedelta(days=99), _lu_dt(v["arrived"]) or now))]
@@ -13008,6 +13094,15 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
                 out["changes"].append({"kind": "Berthed", "tone": "g", "text": f"{n}{ours}" + (f" at {v['berth'].title()}" if v["berth"] else "")})
             elif o["status"] == "expected" and v["status"] == "anchor":
                 out["changes"].append({"kind": "Arrived", "tone": "", "text": f"{n}{ours} now at anchorage"})
+            if o:
+                ob, nb = _lu_berth_slot(o["berth"])[0], _lu_berth_slot(v["berth"])[0]
+                if ob and nb and ob != nb and v["status"] != "expected":
+                    what = "moved from" if (o["status"] == "alongside" and v["status"] == "alongside") else "now allocated"
+                    txt = (f"{n}{ours} moved from Berth {ob} to Berth {nb}" if what == "moved from"
+                           else f"{n}{ours} now allocated Berth {nb} (was Berth {ob})")
+                    out["changes"].append({"kind": "Berth", "tone": "g" if v["ours"] else "", "text": txt})
+                    if v["ours"]:
+                        berth_moves.append((n, ob, nb, v["status"]))
             if v["ours"] and v["status"] == "anchor" and o and o["status"] == "anchor" and n in old_wait and n in new_pos:
                 before, after = old_wait.index(n) + 1, new_pos[n]
                 if after > before:
@@ -13021,7 +13116,10 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
             if n not in new:
                 out["changes"].append({"kind": "Sailed" if o["status"] == "alongside" else "Left", "tone": "",
                                        "text": n + (f" from {o['berth'].title()}" if o["status"] == "alongside" and o["berth"] else " (no longer on the line-up)")})
-        order = {"Slipped": 0, "Berthed": 1, "Moved up": 2, "Arrived": 3, "New": 4, "Sailed": 5, "Left": 6}
+        for n, ob, nb, st_ in berth_moves:
+            out["alerts"].append({"tone": "info", "title": f"{n} " + ("moved to" if st_ == "alongside" else "now allocated") + f" Berth {nb}",
+                                  "text": f"The previous line-up had Berth {ob}. The plan now follows the new berth."})
+        order = {"Slipped": 0, "Berth": 1, "Berthed": 1, "Moved up": 2, "Arrived": 3, "New": 4, "Sailed": 5, "Left": 6}
         out["changes"].sort(key=lambda c: order.get(c["kind"], 9))
 
     # alerts about our vessels and the line-up itself
@@ -13052,8 +13150,11 @@ def _lu_port_state(db, port, now=None, plan_extra=None):
         if v["status"] == "anchor" and (v["waited"] or 0) > limit:
             over_limit.append(v)
         if v["status"] != "alongside" and v["margin"] is not None and v["margin"] < _LU_DRAFT_TIGHT:
-            out["alerts"].append({"tone": "warn", "title": f"{v['vessel']}: tight draft at {v['est_berth']}",
-                                  "text": (f"Only {v['margin']:.2f} m under the berth limit." if v["margin"] >= 0.005 else "Her draft is at the berth's limit, with no margin.") + " Confirm with the harbour master before she shifts in.", "vessel": v["id"], "msg": True})
+            over = v["margin"] < -0.005
+            out["alerts"].append({"tone": "bad" if over else "warn", "title": f"{v['vessel']}: " + ("draft over the limit at " if over else "tight draft at ") + f"{v['est_berth']}",
+                                  "text": (f"Her draft of {v['draft']:.1f} m is {-v['margin']:.2f} m over the berth's {v['draft'] + v['margin']:.1f} m limit." if over
+                                           else f"Only {v['margin']:.2f} m under the berth limit." if v["margin"] >= 0.005 else "Her draft is at the berth's limit, with no margin.")
+                                          + " Confirm with the harbour master before she shifts in.", "vessel": v["id"], "msg": True})
         if v["status"] == "alongside" and v["end_off"] is not None and v["end_off"] <= 1.5:
             sailing.append(v)
         if v["status"] != "alongside" and v["start_off"] is not None and 0 <= v["start_off"] <= 1.5:
@@ -13237,7 +13338,7 @@ def lineups_overview():
 
 
 _LU_STATUS_RANK = {"alongside": 3, "anchor": 2, "expected": 1}
-_LU_FIELDS = ("vessel", "agent", "cargo", "qty", "loa", "draft", "arrived", "eta", "etb", "berth", "berthed", "etd", "status", "remarks", "vtype", "rob")
+_LU_FIELDS = ("vessel", "agent", "cargo", "qty", "loa", "draft", "arrived", "eta", "etb", "berth", "berthed", "etd", "status", "remarks", "vtype", "rob", "transit")
 
 
 def _lu_merge(a, b):
@@ -13378,12 +13479,17 @@ def lineups_import():
                            (*[m[k] for k in _LU_FIELDS], ours, old["id"]))
             else:
                 pv = prev_rows.get(key, {})
+                if pv and r["status"] in ("anchor", "alongside") and pv.get("status") in ("anchor", "alongside"):
+                    if not r.get("arrived") and pv.get("arrived"):
+                        r["arrived"] = pv["arrived"]
+                    if r["status"] == "alongside" and pv.get("status") == "alongside" and not r.get("berthed") and pv.get("berthed"):
+                        r["berthed"] = pv["berthed"]
                 ours = 1 if (_lu_is_ours(r["agent"]) or pv.get("ours")) else 0
                 db.execute(
-                    "INSERT INTO lu_vessels (snapshot_id, seq, vessel, agent, cargo, qty, loa, draft, arrived, eta, etb, berth, berthed, etd, status, ours, principal, remarks, vtype, rob) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO lu_vessels (snapshot_id, seq, vessel, agent, cargo, qty, loa, draft, arrived, eta, etb, berth, berthed, etd, status, ours, principal, remarks, vtype, rob, transit) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (snap_id, seq, r["vessel"], r["agent"], r["cargo"], r["qty"], r["loa"], r["draft"], r["arrived"], r["eta"], r["etb"], r["berth"],
-                     r["berthed"], r["etd"], r["status"], ours, pv.get("principal") or "", r["remarks"], r.get("vtype") or "", r.get("rob")))
+                     r["berthed"], r["etd"], r["status"], ours, pv.get("principal") or "", r["remarks"], r.get("vtype") or "", r.get("rob"), r.get("transit")))
                 seq += 1
             k = _lu_berth_slot(r["berth"])[0]
             if k and k not in known:
@@ -19042,7 +19148,7 @@ function why(p){
     else parts.push(w.length+' vessel'+(w.length===1?'':'s')+' waiting at anchor')}
   else parts.push('Nobody is waiting at anchor');
   var gb=genBerths(p),lim=(p.probe&&p.probe.deep_over)||12,deep=gb.filter(function(b){return !b.max_draft||b.max_draft>lim});
-  if(gb.length&&deep.length&&deep.length<gb.length&&deep.length<=3)parts.push('only '+names(deep)+' take'+(deep.length===1?'s':'')+' drafts over '+lim+' m');
+  if(gb.length&&deep.length&&deep.length<gb.length&&deep.length<=3){var alt=p.berths.filter(function(b){return b.deep_alt});parts.push('only '+names(deep)+' take'+(deep.length===1?'s':'')+' drafts over '+lim+' m'+(alt.length?', or '+names(alt)+' when the terminal allots them':''))}
   return parts.join(', and ')+'.'}
 function drawHero(p){
   var el=$('hero');
@@ -19103,7 +19209,7 @@ function drawPlan(p){
   function key(n){var t=String(n||'').toUpperCase().replace(/\s+/g,'').replace(/\([A-H]\)$/,'').replace(/^(BERTHNO\.?|BERTH|B\.?|BTH)/,''),m=t.match(/^(\d+[A-Z]?)/);return m?m[1]:t}
   var pv=PV!=null&&p.suggestions?p.suggestions[PV]:null,over={},segs=[];
   if(pv)pv.preview.forEach(function(x){(over[x[0]]=over[x[0]]||[]).push({b:x[1],s:x[2],e:x[3]})});
-  p.vessels.forEach(function(v){(over[v.id]||(v.end_off!=null?[{b:v.plan_key||v.est_berth||(v.status==='alongside'?v.berth:''),s:v.start_off,e:v.end_off}]:[])).forEach(function(x){segs.push({v:v,b:x.b,s:x.s,e:x.e})})});
+  p.vessels.forEach(function(v){(over[v.id]||(v.segs&&v.segs.length?v.segs:(v.end_off!=null?[{b:v.plan_key||v.est_berth||(v.status==='alongside'?v.berth:''),s:v.start_off,e:v.end_off}]:[]))).forEach(function(x){segs.push({v:v,b:x.b,s:x.s,e:x.e})})});
   var rows=PB.map(function(b){
     var blocks=segs.filter(function(x){return key(x.b)===key(b.name)&&x.e!=null}).map(function(x){var v=x.v;
       var s0=(x.s==null?-1:x.s)+FRAC,e0=x.e+FRAC;if(e0<=0||s0>=7)return '';
