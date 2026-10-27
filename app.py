@@ -1168,6 +1168,14 @@ def init_db():
         )"""
     )
 
+    # One shared log of where Compass needed help or learned something, for every feature (the Learning room reads it).
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS ai_events (
+            id SERIAL PRIMARY KEY, feature TEXT DEFAULT '', kind TEXT DEFAULT '', title TEXT DEFAULT '',
+            detail TEXT DEFAULT '', created_at TEXT DEFAULT '', created_by TEXT DEFAULT '', dismissed INTEGER DEFAULT 0
+        )"""
+    )
+
     # --- Disbursement Accounts v2: customer/voyage/vessel details, grouped rate x qty charges,
     # USD + SAR totals, automatic PDA numbers. Everything is additive, so existing PDAs stay as they were
     # (each old charge becomes rate = its amount, qty = 1).
@@ -4495,6 +4503,27 @@ def _ai_budget_left():
         return AI_MONTHLY_CALLS
 
 
+def _ai_event(feature, kind, title, detail=""):
+    """Logs one thing for the Learning room. kind: 'assist' (Gemini helped), 'learned' (Compass took something on),
+    'gap' (Compass could not manage). Never raises; a repeated open gap is counted, not listed twice."""
+    try:
+        db = get_db()
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+        who = (session.get("username") or "") if session else ""
+        if kind == "gap":
+            row = db.execute("SELECT id FROM ai_events WHERE feature = ? AND kind = 'gap' AND title = ? AND dismissed = 0 AND created_at >= ?",
+                             (feature, title[:200], (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M"))).fetchone()
+            if row:
+                db.execute("UPDATE ai_events SET created_at = ?, detail = ? WHERE id = ?", (now, detail[:400], row["id"]))
+                db.commit()
+                return
+        db.execute("INSERT INTO ai_events (feature, kind, title, detail, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?)",
+                   (feature, kind, title[:200], detail[:400], now, who))
+        db.commit()
+    except Exception:
+        pass
+
+
 def _ai_note(msg):
     """Remembers how the last AI request went, so the Owner can see why it did not work (never a key)."""
     try:
@@ -4612,6 +4641,7 @@ def _gemini_record(results, first):
     else:
         bad = results[0] if results else (None, "", "no request made", False)
         _ai_note("Gemini " + bad[2])
+        _ai_event("manifests", "gap", "Gemini could not be reached", str(bad[2])[:200])
         if any(r[3] for r in results):
             _AI_COOLDOWN["until"] = time.time() + 120
 
@@ -5409,6 +5439,18 @@ def _manifest_read_upload(file, with_truncation=False, meta=None):
         except Exception:
             meta["layout_new"] = False
         meta["remembered"] = result.get("remembered", 0)
+        try:
+            n_bl = len(result["entries"])
+            chk_ = result.get("checks") or {}
+            if result.get("ai_used"):
+                _ai_event("manifests", "assist", "Gemini helped read " + name[:80], "%d B/Ls read. Compass could not read this layout alone." % n_bl)
+            if chk_.get("pkgs_ok") is False:
+                _ai_event("manifests", "gap", "Package total did not match: " + (result.get("layout") or {}).get("label", name)[:90],
+                          "Check the packages on " + name[:80] + " before issuing DOs.")
+            if not n_bl:
+                _ai_event("manifests", "gap", "No B/Ls found in " + name[:90], "Compass and Gemini both returned nothing for this file.")
+        except Exception:
+            pass
     return done(result["entries"], None if result["entries"] else "no_bls", result.get("truncated", False))
 
 
@@ -5948,6 +5990,7 @@ def memory_cargo():
         db.execute("INSERT INTO mf_memory (kind, consignee, match_key, old_value, new_value, created_by, created_at) VALUES ('cargo', ?, ?, ?, ?, ?, ?)",
                    (who[:160], key, old[:300], new[:300], session.get("username") or "", now))
     db.commit()
+    _ai_event("manifests", "learned", who[:60] + ": cargo is \"" + new[:80] + "\"", "Remembered after " + (session.get("username") or "someone") + " confirmed it.")
     return jsonify({"ok": True})
 
 
@@ -5972,8 +6015,42 @@ def learned_data():
                                        "FROM mf_layouts ORDER BY last_seen DESC LIMIT 200").fetchall()]
     mem = [dict(r) for r in db.execute("SELECT id, consignee, old_value, new_value, created_by, created_at, uses FROM mf_memory "
                                        "WHERE kind = 'cargo' ORDER BY created_at DESC LIMIT 500").fetchall()]
-    return jsonify({"layouts": lay, "memory": mem, "ai": _ai_provider() or "none",
-                    "calls": int(get_setting(_ai_month_key(), "0") or 0)})
+    ev = [dict(r) for r in db.execute("SELECT id, feature, kind, title, detail, created_at FROM ai_events WHERE dismissed = 0 "
+                                      "ORDER BY created_at DESC, id DESC LIMIT 300").fetchall()]
+    learned, lacking = [], []
+    for m in mem:
+        learned.append({"feature": "manifests", "title": m["consignee"] + ": cargo is \"" + m["new_value"] + "\"",
+                        "detail": "Remembered after you confirmed it. Used %d time%s." % (m["uses"], "" if m["uses"] == 1 else "s"),
+                        "when": m["created_at"], "forget": {"kind": "memory", "id": m["id"]}})
+    for l in lay:
+        alone = l["seen"] - l["ai_helped"]
+        if alone > 0:
+            learned.append({"feature": "manifests", "title": "Layout: " + l["label"][:90],
+                            "detail": "Seen %d time%s, %d read without Gemini." % (l["seen"], "" if l["seen"] == 1 else "s", alone),
+                            "when": l["last_seen"], "forget": {"kind": "layout", "id": l["fingerprint"]}})
+        if l["seen"] >= 2 and l["ai_helped"] == l["seen"]:
+            lacking.append({"feature": "manifests", "title": "Layout always needs Gemini: " + l["label"][:80],
+                            "detail": "Seen %d times and read by Gemini every time." % l["seen"], "tag": "Needs Gemini", "when": l["last_seen"]})
+        if l["pkgs_bad"]:
+            lacking.append({"feature": "manifests", "title": "Package total off on layout: " + l["label"][:80],
+                            "detail": "Did not match on %d of %d checks." % (l["pkgs_bad"], l["pkgs_ok"] + l["pkgs_bad"]), "tag": "Check", "when": l["last_seen"]})
+    for e in ev:
+        if e["kind"] == "gap":
+            lacking.append({"feature": e["feature"], "title": e["title"], "detail": e["detail"], "tag": "Needs you", "when": e["created_at"],
+                            "dismiss": e["id"]})
+        elif e["kind"] == "learned" and e["feature"] != "manifests":
+            learned.append({"feature": e["feature"], "title": e["title"], "detail": e["detail"], "when": e["created_at"], "forget": {"kind": "event", "id": e["id"]}})
+    learned.sort(key=lambda x: x["when"] or "", reverse=True)
+    lacking.sort(key=lambda x: x["when"] or "", reverse=True)
+    work = {}
+    seen_total = sum(l["seen"] for l in lay)
+    helped_total = sum(l["ai_helped"] for l in lay)
+    if seen_total:
+        work["manifests"] = {"total": seen_total, "gemini": helped_total}
+    for r in db.execute("SELECT feature, COUNT(*) AS n FROM ai_events WHERE kind = 'assist' AND feature <> 'manifests' GROUP BY feature").fetchall():
+        work[r["feature"]] = {"total": None, "gemini": r["n"]}
+    return jsonify({"layouts": lay, "memory": mem, "learned": learned[:200], "lacking": lacking[:100], "work": work,
+                    "ai": _ai_provider() or "none", "calls": int(get_setting(_ai_month_key(), "0") or 0), "cap": AI_MONTHLY_CALLS})
 
 
 @app.route("/api/learned/forget", methods=["POST"])
@@ -5988,6 +6065,11 @@ def learned_forget():
     elif data.get("kind") == "memory":
         try:
             db.execute("DELETE FROM mf_memory WHERE id = ?", (int(data.get("id")),))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Bad id"}), 400
+    elif data.get("kind") in ("event", "dismiss"):
+        try:
+            db.execute("UPDATE ai_events SET dismissed = 1 WHERE id = ?", (int(data.get("id")),))
         except (TypeError, ValueError):
             return jsonify({"error": "Bad id"}), 400
     else:
@@ -13483,6 +13565,7 @@ def lineups_import():
             continue
         if not rows:
             results.append({"source": fname, "error": "No vessel table found in this file."})
+            _ai_event("lineups", "gap", "No vessel table found in " + fname[:90], "The line-up layout is not recognised yet.")
             continue
         day = ref.isoformat()
         results.append({"source": fname, "port": p, "port_name": _LU_PORT[p][0], "vessels": len(rows), "date": day, "date_from_file": bool(fday)})
@@ -14750,71 +14833,110 @@ async function delUser(id, username) {
 """
 
 LEARNED_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Compass - What Compass has learned</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + r"""">
+<title>Compass - Learning room</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + r"""">
 <style>
-  :root { --bg: #f2f4f7; --card: #ffffff; --text: #1c2b3a; --muted: #5f6d7b; --border: #e6e9ed; --navy: #123a56; --navy-light: #1f5c85; --ok: #1f7a54; --warn: #8a5a00; --danger: #d1483f; color-scheme: light; }
-  :root[data-theme="dark"] { --bg: #131a23; --card: #1a232f; --text: #e9eef3; --muted: #a3b0be; --border: #29323f; --navy: #3f86ba; --navy-light: #5aa2d1; --ok: #43c08a; --warn: #e0a640; --danger: #e2685f; color-scheme: dark; }
+  :root { --bg: #f2f4f7; --card: #ffffff; --text: #1c2b3a; --muted: #5f6d7b; --border: #e6e9ed; --navy: #123a56; --navy-light: #1f5c85; --gold: #d9b24c; --ok: #1f7a54; --warn: #8a5a00; --seg: #e6e9ed; color-scheme: light; }
+  :root[data-theme="dark"] { --bg: #131a23; --card: #1a232f; --text: #e9eef3; --muted: #a3b0be; --border: #29323f; --navy: #3f86ba; --navy-light: #5aa2d1; --gold: #e3bb4c; --ok: #43c08a; --warn: #e0a640; --seg: #29323f; color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0 16px 40px; }
-  .topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 14px 16px; margin: 0 -16px 20px; border-bottom: 1px solid var(--border); }
+  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", Inter, "Segoe UI", Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0 16px 48px; -webkit-font-smoothing: antialiased; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 14px 16px; margin: 0 -16px 24px; border-bottom: 1px solid var(--border); }
   .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--text); }
   .brand img { height: 32px; width: auto; }
   .brand b { font-size: 14.5px; display: block; } .brand small { font-size: 11px; color: var(--muted); }
-  .topbar-right { display: flex; align-items: center; gap: 12px; font-size: 13px; flex-wrap: wrap; }
-  .topbar-right a { color: var(--navy-light); text-decoration: none; font-weight: 600; }
-  .wrap { max-width: 1000px; margin: 0 auto; }
-  h1 { font-size: 22px; margin: 4px 0 4px; letter-spacing: -.01em; }
-  .sub { color: var(--muted); font-size: 13.5px; margin-bottom: 18px; }
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 16px; }
-  .stat, .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 16px 18px; }
-  .stat b { display: block; font-size: 28px; } .stat span { color: var(--muted); font-size: 13px; }
-  .card { margin-bottom: 16px; min-width: 0; }
-  .lab { font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 8px; }
-  .scroll { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; font-size: 13.5px; min-width: 560px; }
-  th { text-align: left; font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); padding: 8px 8px 8px 0; border-bottom: 1px solid var(--border); }
-  td { padding: 10px 8px 10px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
-  button { background: transparent; color: var(--text); border: 1px solid var(--border); border-radius: 999px; padding: 6px 12px; font-size: 12.5px; font-weight: 600; cursor: pointer; font-family: inherit; }
-  button:hover { background: var(--border); }
-  .ok { color: var(--ok); font-weight: 650; } .warn { color: var(--warn); font-weight: 650; }
-  .empty { color: var(--muted); font-size: 13.5px; padding: 14px 0; }
-  .muted { color: var(--muted); }
+  .topbar-right { display: flex; align-items: center; gap: 6px; font-size: 13px; flex-wrap: wrap; }
+  .topbar-right a { color: var(--navy-light); text-decoration: none; font-weight: 600; padding: 6px 12px; border-radius: 20px; }
+  .topbar-right a:hover { background: var(--border); }
+  .wrap { max-width: 1120px; margin: 0 auto; }
+  .head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }
+  h1 { font-size: 40px; margin: 0; letter-spacing: -.035em; line-height: 1.05; font-weight: 700; }
+  .sub { color: var(--muted); font-size: 16px; margin-top: 8px; max-width: 58ch; }
+  .seg { display: flex; padding: 3px; border-radius: 999px; background: var(--seg); overflow-x: auto; max-width: 100%; }
+  .seg button { height: 32px; padding: 0 15px; border: 0; border-radius: 999px; background: transparent; color: var(--muted); font: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  .seg button.on { background: var(--card); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.15); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 16px; margin-bottom: 18px; }
+  .card { background: var(--card); border-radius: 22px; box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 14px 36px rgba(0,0,0,.06); padding: 22px 26px; min-width: 0; }
+  .stat b { display: block; font-size: 38px; letter-spacing: -.03em; line-height: 1.1; font-variant-numeric: tabular-nums; }
+  .eyebrow { font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); display: block; margin-bottom: 4px; }
+  .stat small { color: var(--muted); font-size: 13px; }
+  h2 { font-size: 20px; margin: 0; letter-spacing: -.02em; }
+  .ph { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding-bottom: 8px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .barrow { display: grid; grid-template-columns: 150px 1fr 110px; gap: 14px; align-items: center; padding: 7px 0; font-size: 14px; }
+  .bar { height: 8px; border-radius: 4px; background: var(--border); overflow: hidden; display: flex; }
+  .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 18px; margin-top: 18px; }
+  .li { padding: 14px 0; border-top: 1px solid var(--border); }
+  .li:first-of-type { border-top: 0; }
+  .lit { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  .lit b { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+  .chip { display: inline-flex; align-items: center; height: 24px; padding: 0 10px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; background: color-mix(in srgb, var(--navy-light) 16%, transparent); color: var(--navy-light); }
+  .chip.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  .chip.mut { background: var(--border); color: var(--muted); }
+  button.act { height: 30px; padding: 0 13px; border-radius: 999px; border: 0; background: var(--border); color: var(--text); font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+  button.act:hover { filter: brightness(.95); }
+  .empty { color: var(--muted); font-size: 14px; padding: 20px 0 24px; }
+  .note { margin-top: 16px; color: var(--muted); font-size: 13px; }
 </style>
 <script>
 (function () { var m = 'light'; try { m = localStorage.getItem('theme') || 'light'; } catch (e) {} document.documentElement.setAttribute('data-theme', m); })();
 </script>
 </head><body>
 <div class="topbar">
-  <a href="/" class="brand"><img src="data:image/png;base64,""" + LOGO_B64 + r"""" alt="Sea Power"><span><b>Compass</b><small>What Compass has learned</small></span></a>
-  <div class="topbar-right"><a href="/manifest-desk">&larr; Manifest Desk</a><span><b>__NAME__</b></span><a href="/logout">Log out</a></div>
+  <a href="/" class="brand"><img src="data:image/png;base64,""" + LOGO_B64 + r"""" alt="Sea Power"><span><b>Compass</b><small>Learning room</small></span></a>
+  <div class="topbar-right"><a href="/">All desks</a><a href="/users">Admin</a><span><b>__NAME__</b></span><a href="/logout">Log out</a></div>
 </div>
 <div class="wrap">
-  <h1>What Compass has learned</h1>
-  <div class="sub">Owner only. Layouts are recorded automatically. Cargo names are only remembered after someone confirms them.</div>
+  <div class="head">
+    <div><h1>What Compass learned</h1><div class="sub">Every time Gemini helps, Compass takes note. Here is what stuck, and where it still needs a hand. Owner only.</div></div>
+    <div class="seg" id="tabs"></div>
+  </div>
   <div class="stats" id="stats"></div>
-  <div class="card"><div class="lab">Manifest layouts</div><div class="scroll" id="layouts"></div></div>
-  <div class="card"><div class="lab">Remembered cargo names</div><div class="scroll" id="memory"></div></div>
+  <div class="card" id="work" style="margin-bottom:18px"></div>
+  <div class="two">
+    <div class="card"><div class="ph"><h2>Learned</h2><span class="muted">Newest first</span></div><div id="learned"></div></div>
+    <div class="card"><div class="ph"><h2>Still lacking</h2><span class="muted">Where Compass needs you</span></div><div id="lacking"></div></div>
+  </div>
+  <div class="note">Gemini currently helps with manifests only. Other features show up here as soon as they use it, and line-up problems appear under Still lacking.</div>
 </div>
 <script>
+var NAMES = {manifests: 'Manifests', lineups: 'Line-ups', sof: 'SOF', notices: 'Notices'};
+var D = null, F = 'all';
 function $(id) { return document.getElementById(id); }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
+function nm(f) { return NAMES[f] || (f ? f.charAt(0).toUpperCase() + f.slice(1) : 'Other'); }
+function ok(x) { return F === 'all' || x.feature === F; }
+function render() {
+  var feats = {}; ['manifests', 'lineups'].forEach(function (f) { feats[f] = 1; });
+  D.learned.concat(D.lacking).forEach(function (x) { feats[x.feature] = 1; }); Object.keys(D.work).forEach(function (f) { feats[f] = 1; });
+  var keys = Object.keys(feats);
+  $('tabs').innerHTML = [['all', 'All features']].concat(keys.map(function (k) { return [k, nm(k)]; })).map(function (t) {
+    return '<button class="' + (F === t[0] ? 'on' : '') + '" onclick="setF(\'' + t[0] + '\')">' + esc(t[1]) + '</button>'; }).join('');
+  var L = D.learned.filter(ok), K = D.lacking.filter(ok);
+  var tot = 0, gem = 0; Object.keys(D.work).forEach(function (f) { if (D.work[f].total) { tot += D.work[f].total; gem += D.work[f].gemini; } });
+  var alone = tot ? Math.round((tot - gem) * 100 / tot) + '%' : '-';
+  $('stats').innerHTML = '<div class="card stat"><span class="eyebrow">Learned</span><b>' + L.length + '</b><small>things remembered</small></div>' +
+    '<div class="card stat"><span class="eyebrow">Handled alone</span><b style="color:var(--ok)">' + alone + '</b><small>of manifests without Gemini</small></div>' +
+    '<div class="card stat"><span class="eyebrow">Gemini reads this month</span><b>' + D.calls + '</b><small>of ' + D.cap + ' allowed (' + esc(D.ai) + ')</small></div>' +
+    '<div class="card stat"><span class="eyebrow">Needs a look</span><b style="color:var(--warn)">' + K.length + '</b><small>open items</small></div>';
+  var rows = Object.keys(D.work).filter(function (f) { return F === 'all' || F === f; }).filter(function (f) { return D.work[f].total; }).map(function (f) {
+    var w = D.work[f], a = Math.round((w.total - w.gemini) * 100 / w.total);
+    return '<div class="barrow"><span>' + esc(nm(f)) + ' reader</span><div class="bar"><div style="width:' + a + '%;background:var(--navy)"></div><div style="width:' + (100 - a) + '%;background:var(--gold)"></div></div><span class="muted">' + a + '% alone</span></div>'; }).join('');
+  $('work').innerHTML = '<div class="ph"><h2>Who did the work</h2><span class="muted">Since this was switched on</span></div>' +
+    (rows ? rows + '<div class="muted" style="display:flex;gap:18px;margin-top:8px"><span><i style="display:inline-block;width:8px;height:8px;border-radius:4px;background:var(--navy);margin-right:6px"></i>Compass alone</span><span><i style="display:inline-block;width:8px;height:8px;border-radius:4px;background:var(--gold);margin-right:6px"></i>Needed Gemini</span></div>'
+      : '<div class="empty">No manifests have been read yet. This fills in as people upload.</div>');
+  $('learned').innerHTML = L.length ? L.map(function (x) {
+    return '<div class="li"><div class="lit"><b>' + esc(x.title) + '</b><span class="chip">' + esc(nm(x.feature)) + '</span></div><div class="lit"><span class="muted">' + esc(x.detail) + '</span>' +
+      (x.forget ? '<button class="act" onclick="forget(\'' + x.forget.kind + '\',' + JSON.stringify(x.forget.id).replace(/"/g, '&quot;') + ')">Forget</button>' : '') + '</div></div>'; }).join('')
+    : '<div class="empty">Nothing learned here yet.</div>';
+  $('lacking').innerHTML = K.length ? K.map(function (x) {
+    return '<div class="li"><div class="lit"><b>' + esc(x.title) + '</b><span class="chip ' + (x.tag === 'Needs Gemini' ? 'mut' : 'warn') + '">' + esc(x.tag) + '</span></div><div class="lit"><span class="muted">' + esc(x.detail) + '</span>' +
+      (x.dismiss ? '<button class="act" onclick="forget(\'dismiss\',' + x.dismiss + ')">Done</button>' : '') + '</div></div>'; }).join('')
+    : '<div class="empty">Nothing lacking here. Compass has this covered.</div>';
+}
+function setF(f) { F = f; render(); }
 async function load() {
   var r = await fetch('/api/learned'); var d = await r.json();
-  if (!r.ok) { $('layouts').innerHTML = '<div class="empty">' + esc(d.error || 'Could not load.') + '</div>'; return; }
-  $('stats').innerHTML = '<div class="stat"><b>' + d.layouts.length + '</b><span>manifest layouts seen</span></div>' +
-    '<div class="stat"><b>' + d.memory.length + '</b><span>cargo names remembered</span></div>' +
-    '<div class="stat"><b>' + d.calls + '</b><span>AI reads this month (' + esc(d.ai) + ')</span></div>';
-  $('layouts').innerHTML = d.layouts.length ? '<table><tr><th>Layout (column headings)</th><th>Seen</th><th>Last seen</th><th>Package check</th><th></th></tr>' +
-    d.layouts.map(function (l) {
-      var chk = (l.pkgs_ok + l.pkgs_bad) ? (l.pkgs_bad ? '<span class="warn">Did not match ' + l.pkgs_bad + ' of ' + (l.pkgs_ok + l.pkgs_bad) + '</span>' : '<span class="ok">Matched every time</span>') : '<span class="muted">No total in the manifest</span>';
-      return '<tr><td>' + esc(l.label) + '</td><td>' + l.seen + (l.seen === 1 ? ' time' : ' times') + '</td><td>' + esc(l.last_seen) + '</td><td>' + chk +
-        '</td><td><button onclick="forget(\'layout\', \'' + esc(l.fingerprint) + '\')">Forget</button></td></tr>'; }).join('') + '</table>'
-    : '<div class="empty">No manifests have been read since this was switched on.</div>';
-  $('memory').innerHTML = d.memory.length ? '<table><tr><th>Consignee</th><th>When it reads</th><th>Compass writes</th><th>Used</th><th></th></tr>' +
-    d.memory.map(function (m) {
-      return '<tr><td>' + esc(m.consignee) + '</td><td class="muted">' + esc(m.old_value) + '</td><td><b>' + esc(m.new_value) + '</b></td><td>' + m.uses +
-        '</td><td><button onclick="forget(\'memory\', ' + m.id + ')">Forget</button></td></tr>'; }).join('') + '</table>'
-    : '<div class="empty">Nothing yet. When someone corrects a cargo name in Manifest Desk, Compass asks once whether to remember it.</div>';
+  if (!r.ok) { $('learned').innerHTML = '<div class="empty">' + esc(d.error || 'Could not load.') + '</div>'; return; }
+  D = d; render();
 }
 async function forget(kind, id) {
   await fetch('/api/learned/forget', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({kind: kind, id: id})});
@@ -15349,6 +15471,12 @@ HUB_HTML = """
     </a>
 {% endfor %}
   </div>
+{% if role == 'owner' %}
+  <div class="desks" style="margin-top:22px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));">
+    <a class="desk" href="/learned" style="flex-direction:row;align-items:center;justify-content:space-between;padding:22px 26px;"><span><span class="desk-name" style="font-size:17px;">Learning room</span><span class="desk-blurb" style="display:block;">What Compass learned, and where it still needs help</span></span><span class="desk-count">Owner</span></a>
+    <a class="desk" href="/users" style="flex-direction:row;align-items:center;justify-content:space-between;padding:22px 26px;"><span><span class="desk-name" style="font-size:17px;">Admin</span><span class="desk-blurb" style="display:block;">Users, desks and settings</span></span><span class="desk-count">Owner</span></a>
+  </div>
+{% endif %}
 
 <script>
 (function initTheme() {
