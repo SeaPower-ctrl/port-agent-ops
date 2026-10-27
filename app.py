@@ -110,7 +110,7 @@ const I18N = {
   en: {
     // Topbar
     app_tagline: "DO Tracker",
-    manage_users: "Manage Users",
+    manage_users: "Admin",
     signed_in_as: "Signed in as",
     log_out: "Log out",
     toggle_dark_mode: "Toggle dark mode",
@@ -408,7 +408,7 @@ const I18N = {
   },
   ar: {
     app_tagline: "متتبع أوامر التسليم",
-    manage_users: "إدارة المستخدمين",
+    manage_users: "الإدارة",
     signed_in_as: "مسجّل الدخول باسم",
     log_out: "تسجيل الخروج",
     toggle_dark_mode: "تبديل الوضع الداكن",
@@ -1160,6 +1160,14 @@ def init_db():
             ai_helped INTEGER DEFAULT 0, pkgs_ok INTEGER DEFAULT 0, pkgs_bad INTEGER DEFAULT 0
         )"""
     )
+    for _c, _d in (("colmap", "TEXT DEFAULT ''"), ("trusted", "INTEGER DEFAULT 0"), ("trusted_reads", "INTEGER DEFAULT 0"), ("learned_at", "TEXT DEFAULT ''")):
+        cur.execute(f"ALTER TABLE mf_layouts ADD COLUMN IF NOT EXISTS {_c} {_d}")
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS mf_filecache (
+            hash TEXT PRIMARY KEY, data TEXT DEFAULT '', created_at TEXT DEFAULT ''
+        )"""
+    )
+    cur.execute("ALTER TABLE mf_filecache ADD COLUMN IF NOT EXISTS claimed INTEGER DEFAULT 0")
     cur.execute(
         """CREATE TABLE IF NOT EXISTS mf_memory (
             id SERIAL PRIMARY KEY, kind TEXT DEFAULT 'cargo', consignee TEXT DEFAULT '', match_key TEXT DEFAULT '',
@@ -4330,8 +4338,9 @@ def _mf_join_pkgs(vals):
     return " + ".join(seen)
 
 
-def _mf_cargo(tables):
-    """bl_match_key -> {"pol", "pkgs", "desc"} read from the manifest's own columns."""
+def _mf_cargo(tables, colmap=None):
+    """bl_match_key -> {"pol", "pkgs", "desc"} read from the manifest's own columns.
+    colmap: columns Compass learned for this layout from Gemini; used only where the headings did not show the column."""
     out = {}
     for t in tables:
         if t.get("role") != "source" or not t.get("data_rows") or t.get("hdr", -1) is None:
@@ -4380,6 +4389,11 @@ def _mf_cargo(tables):
             d = max((j for j in cand if j != cols["pkg"]), key=lambda j: share(j, has_hs), default=None)
             if d is not None and share(d, has_hs) >= 0.5:
                 cols["desc"] = d
+        if colmap:
+            for _k in ("pol", "pkg", "desc"):
+                if cols[_k] is None and colmap.get(_k) is not None and colmap[_k] != t.get("bl_col"):
+                    cols[_k] = colmap[_k]
+            t["colmap_used"] = True
         if hdr is not None and hdr >= 0:
             # the unit written in the cell right after the count ("3587 | COILS"), under a merged header
             if cols["pkg"] is not None and cols["unit"] is None:
@@ -5162,6 +5176,266 @@ def _mf_apply_memory(entries, count=True):
     return n
 
 
+def _mf_layout_row(lay):
+    if not lay:
+        return None
+    try:
+        return get_db().execute("SELECT fingerprint, colmap, trusted, trusted_reads FROM mf_layouts WHERE fingerprint = ?", (lay["fp"],)).fetchone()
+    except Exception:
+        return None
+
+
+def _mf_gaps_ok(entries):
+    live = [e for e in entries if e["note"] is None]
+    if not live:
+        return False
+    gaps = sum(1 for e in live if not (e["cargo"]["desc"] and e["cargo"]["pkgs"]))
+    return gaps / len(live) < 0.2
+
+
+def _mf_ak(v):
+    return re.sub(r"[^A-Z0-9]", "", _mf_norm(v or ""))
+
+
+def _mf_gkey(desc):
+    """A cargo wording as Gemini saw it: the whole text, so only the identical wording is ever reworded the same way."""
+    return _mf_ak(desc)[:160]
+
+
+def _mf_desc_agree(mine, target):
+    """Compass's cargo text and Gemini's say the same thing: Gemini's words are all in Compass's text, or the other way round."""
+    a, b = _mf_ak(mine), _mf_ak(target)
+    if not b:
+        return True
+    if not a:
+        return False
+    if a in b or b in a:
+        return True
+    wa, wb = set(re.findall(r"[a-z]{3,}", str(mine).lower())), re.findall(r"[a-z]{3,}", str(target).lower())
+    return bool(wb) and sum(1 for w in wb if w in wa) >= 0.8 * len(wb)
+
+
+def _mf_apply_gemdesc(entries, fp):
+    """Cargo wordings Gemini corrected on this layout before: the same wording is corrected the same way, without asking again."""
+    db = get_db()
+    rows = db.execute("SELECT id, match_key, new_value FROM mf_memory WHERE kind = 'gemdesc' AND consignee = ?", (fp,)).fetchall()
+    if not rows:
+        return 0
+    by = {r["match_key"]: r for r in rows}
+    n, used = 0, set()
+    for e in entries:
+        if e["note"] is not None:
+            continue
+        r = by.get(_mf_gkey(e["cargo"].get("desc")))
+        if r and e["cargo"]["desc"] != r["new_value"]:
+            e["cargo"]["desc"] = r["new_value"]
+            e["learned"] = True
+            used.add(r["id"])
+            n += 1
+    for i in used:
+        db.execute("UPDATE mf_memory SET uses = uses + 1 WHERE id = ?", (i,))
+    if used:
+        db.commit()
+    return n
+
+
+def _mf_cache_save(fhash, entries, ai=False):
+    rows = []
+    for e in entries:
+        if e["note"] is not None:
+            continue
+        c, k = e.get("after_ai") or e["cargo"], e.get("after_ai_contact") or e["contact"]
+        rows.append({"bl": e["bl"], "name": k.get("name", ""), "email": k.get("email", ""), "phone": k.get("phone", ""),
+                     "pol": c.get("pol", ""), "pkgs": c.get("pkgs", ""), "desc": c.get("desc", "")})
+    if not rows:
+        return
+    db = get_db()
+    db.execute("INSERT INTO mf_filecache (hash, data, created_at) VALUES (?, ?, ?) ON CONFLICT (hash) DO UPDATE SET data = EXCLUDED.data, created_at = EXCLUDED.created_at",
+               (fhash, json.dumps({"ai": bool(ai), "rows": rows}), datetime.utcnow().strftime("%Y-%m-%d %H:%M")))
+    db.commit()
+
+
+def _mf_cache_apply(entries, fhash):
+    row = get_db().execute("SELECT data, claimed FROM mf_filecache WHERE hash = ?", (fhash,)).fetchone()
+    if not row:
+        return None
+    data = json.loads(row["data"])
+    rows, ai_flag = (data.get("rows") or [], bool(data.get("ai"))) if isinstance(data, dict) else (data, True)
+    if row["claimed"]:
+        # the upload that Gemini helped with has already been counted: this is the same file again, so Compass does it alone
+        ai_flag = False
+    by_key = {bl_match_key(e["bl"]): e for e in entries}
+    for r in rows:
+        k = bl_match_key(r["bl"])
+        e = by_key.get(k)
+        if e is None:
+            e = {"bl": k, "note": None, "contact": {"name": "", "email": "", "phone": ""}, "cargo": dict(_EMPTY_CARGO), "ai": True}
+            entries.append(e)
+            by_key[k] = e
+        for f in ("name", "email", "phone"):
+            if r.get(f) and not e["contact"].get(f):
+                e["contact"][f] = r[f]
+        for f in ("pol", "pkgs", "desc"):
+            if r.get(f):
+                e["cargo"][f] = r[f]
+        e["ai"] = ai_flag
+        e["cached"] = True
+    return {"ai": ai_flag}
+
+
+def _mf_cell_match(field, cell, v):
+    c = _mf_flat(cell)
+    if not c or not v:
+        return False
+    if field == "pkgs":
+        m = re.search(r"\d[\d,]*(?:\.\d+)?", str(v))
+        if not m:
+            return False
+        want = m.group(0).replace(",", "")
+        return want in {x.replace(",", "") for x in re.findall(r"\d[\d,]*(?:\.\d+)?", c)}
+    if field == "pol":
+        a, b = _mf_ak(c), _mf_ak(v)
+        return len(a) >= 3 and len(b) >= 3 and (a in b or b in a)
+    words = re.findall(r"[a-z]{3,}", str(v).lower())
+    if not words:
+        return False
+    low = c.lower()
+    return sum(1 for w in words if w in low) >= 0.7 * len(words)
+
+
+def _mf_learn(tables, entries, lay, checks):
+    """After Gemini has read a manifest: find the column each value came from, remember how Gemini reworded cargo,
+    and test whether Compass alone now reproduces Gemini's reading of this very file. Returns what to save on the layout."""
+    live = [e for e in entries if e["note"] is None and e.get("ai_cargo")]
+    t = next((x for x in tables if x.get("role") == "source" and x.get("data_rows")), None)
+    if not live or t is None:
+        return None
+    rows = t["rows"]
+    rows_of = {}
+    for i, _, bls in t["data_rows"]:
+        for b in bls:
+            rows_of.setdefault(bl_match_key(b), []).append(i)
+    colmap = {}
+    for field, key in (("pkgs", "pkg"), ("desc", "desc"), ("pol", "pol")):
+        votes, n = {}, 0
+        for e in live:
+            v = e["ai_cargo"].get(field)
+            if not v:
+                continue
+            n += 1
+            hit = set()
+            for i in rows_of.get(bl_match_key(e["bl"]), []):
+                for j, cell in enumerate(rows[i]):
+                    if j != t.get("bl_col") and _mf_cell_match(field, cell, v):
+                        hit.add(j)
+            for j in hit:
+                votes[j] = votes.get(j, 0) + 1
+        if votes and n:
+            j, c = max(votes.items(), key=lambda kv: (kv[1], -kv[0]))
+            if c >= max(1, 0.6 * n):
+                colmap[key] = j
+    if colmap.get("pkg") is not None and colmap.get("pkg") == colmap.get("desc"):
+        del colmap["pkg"]       # one cell holds both the count and the cargo: the reader already splits those
+    # what Compass reads with the columns it now knows, and how Gemini reworded it
+    cargo2 = _mf_cargo(tables, colmap)
+    db = get_db()
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    pairs = {}
+    for e in live:
+        c2 = cargo2.get(bl_match_key(e["bl"]))
+        d0, a = (c2 or {}).get("desc", ""), (e.get("after_ai") or {}).get("desc", "")
+        k = _mf_gkey(d0)
+        if k and a and _mf_ak(d0) != _mf_ak(a):
+            pairs[k] = (d0, a)
+    for k, (d0, a) in pairs.items():
+        row = db.execute("SELECT id FROM mf_memory WHERE kind = 'gemdesc' AND consignee = ? AND match_key = ?", (lay["fp"], k)).fetchone()
+        if row:
+            db.execute("UPDATE mf_memory SET new_value = ?, old_value = ?, created_at = ? WHERE id = ?", (a[:300], d0[:300], now, row["id"]))
+        else:
+            db.execute("INSERT INTO mf_memory (kind, consignee, match_key, old_value, new_value, created_by, created_at) VALUES ('gemdesc', ?, ?, ?, ?, 'gemini', ?)",
+                       (lay["fp"], k, d0[:300], a[:300], now))
+    db.commit()
+    # the test: can Compass alone, with what it now knows, produce what Gemini produced for this file?
+    pair_new = {k: a for k, (d0, a) in pairs.items()}
+    for r in db.execute("SELECT match_key, new_value FROM mf_memory WHERE kind = 'gemdesc' AND consignee = ?", (lay["fp"],)).fetchall():
+        pair_new.setdefault(r["match_key"], r["new_value"])
+    ok = tot = 0
+    for e in live:
+        c2 = cargo2.get(bl_match_key(e["bl"]))
+        tgt = e.get("after_ai") or {}
+        tot += 1
+        if not c2:
+            continue
+        good = _mf_desc_agree(c2["desc"], tgt.get("desc")) if tgt.get("desc") else True
+        if good and tgt.get("pkgs"):
+            good = _mf_pkg_count(c2["pkgs"]) == _mf_pkg_count(tgt["pkgs"]) and bool(c2["pkgs"])
+        if good and tgt.get("pol"):
+            good = _mf_ak(c2["pol"]) == _mf_ak(tgt["pol"])
+        ok += 1 if good else 0
+    cont_ok = 0
+    for e in live:
+        det, fin = e.get("det_contact") or {}, e.get("after_ai_contact") or {}
+        cont_ok += 1 if all(det.get(f) for f in ("name", "email", "phone") if fin.get(f)) else 0
+    trusted = bool(tot and ok / tot >= 0.95 and cont_ok / len(live) >= 0.95 and (checks or {}).get("pkgs_ok") is not False)
+    return {"colmap": colmap, "trusted": trusted, "matched": ok, "total": tot, "contacts_ok": cont_ok,
+            "why": "" if trusted else ("contacts" if cont_ok / len(live) < 0.95 else "cargo")}
+
+
+def _mf_nice_label(label):
+    """A layout's column headings as a short readable name for the Learning room."""
+    label = str(label or "")
+    if "|" not in label:
+        return label or "Manifest layout"
+    parts = []
+    for x in label.split("|"):
+        x = x.strip()
+        if not x:
+            continue
+        if len(x) >= 20:                       # the heading was cut at 20 letters: drop the cut-off word
+            x = x.rsplit(" ", 1)[0] if " " in x else x
+        x = x.rstrip(" &(,.:")
+        parts.append(x.title() if x.isupper() else x)
+    if not parts:
+        return "Manifest layout"
+    return "Manifest layout: " + " \u00b7 ".join(parts[:3]) + (" \u2026" if len(parts) > 3 else "")
+
+
+def _mf_save_learning(result, lay):
+    """Keeps what Compass learned from Gemini on this layout, and says so in the Learning room."""
+    try:
+        db = get_db()
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+        db.execute("INSERT INTO mf_layouts (fingerprint, label, header, seen, first_seen, last_seen, last_file, ai_helped, pkgs_ok, pkgs_bad) "
+                   "VALUES (?, ?, ?, 0, ?, ?, '', 0, 0, 0) ON CONFLICT (fingerprint) DO NOTHING",
+                   (lay["fp"], lay["label"][:140], lay["label"][:300], now, now))
+        db.commit()
+        row = db.execute("SELECT trusted, trusted_reads FROM mf_layouts WHERE fingerprint = ?", (lay["fp"],)).fetchone()
+        was = bool(row and row["trusted"])
+        lr = result.get("learn")
+        label = _mf_nice_label(lay.get("label") or "")[:110]
+        if lr is not None:
+            db.execute("UPDATE mf_layouts SET colmap = ?, trusted = ?, trusted_reads = 0, learned_at = ? WHERE fingerprint = ?",
+                       (json.dumps(lr["colmap"]), 1 if lr["trusted"] else 0, now, lay["fp"]))
+            db.commit()
+            if lr["trusted"] and not was:
+                _ai_event("manifests", "learned", "Learned: " + label,
+                          "Compass now reproduces Gemini's reading of this layout. Gemini is only used as a double-check every 5th upload.")
+            elif was and not lr["trusted"]:
+                _ai_event("manifests", "gap", "No longer matches Gemini. " + label, "Compass read it differently from Gemini on the last check, so Gemini is used again.")
+            elif not lr["trusted"] and lr.get("why") == "contacts":
+                _ai_event("manifests", "gap", "Cannot read the contacts alone. " + label,
+                          "Gemini finds names, emails or phones that Compass cannot find in this layout yet.")
+        elif result.get("untrust"):
+            db.execute("UPDATE mf_layouts SET trusted = 0, trusted_reads = 0 WHERE fingerprint = ?", (lay["fp"],))
+            db.commit()
+            _ai_event("manifests", "gap", "Failed the package check. " + label, "Gemini was used again for this upload.")
+        elif result.get("trusted_skip"):
+            db.execute("UPDATE mf_layouts SET trusted_reads = COALESCE(trusted_reads, 0) + 1 WHERE fingerprint = ?", (lay["fp"],))
+            db.commit()
+    except Exception:
+        pass
+
+
 def _mf_note_layout(result, filename):
     """Counts one manifest against its layout. Returns True when the layout had not been seen before."""
     lay = result.get("layout")
@@ -5171,8 +5445,19 @@ def _mf_note_layout(result, filename):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     chk = result.get("checks") or {}
     ok, bad = (1 if chk.get("pkgs_ok") else 0), (1 if chk.get("pkgs_ok") is False else 0)
-    ai = 1 if result.get("ai_used") else 0
+    ai = 1 if (result.get("ai_used") or result.get("cache_ai")) else 0
+    if ai and result.get("fhash"):
+        # this upload is counted now; the same file uploaded again is not Gemini's work
+        try:
+            db.execute("UPDATE mf_filecache SET claimed = 1 WHERE hash = ?", (result["fhash"],))
+        except Exception:
+            pass
     row = db.execute("SELECT seen FROM mf_layouts WHERE fingerprint = ?", (lay["fp"],)).fetchone()
+    if row is not None and not row["seen"]:
+        db.execute("UPDATE mf_layouts SET seen = 1, last_seen = ?, last_file = ?, ai_helped = ?, pkgs_ok = ?, pkgs_bad = ? WHERE fingerprint = ?",
+                   ((now), (filename or "")[:120], ai, ok, bad, lay["fp"]))
+        db.commit()
+        return True
     if row is None:
         db.execute("INSERT INTO mf_layouts (fingerprint, label, header, seen, first_seen, last_seen, last_file, ai_helped, pkgs_ok, pkgs_bad) "
                    "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?) ON CONFLICT (fingerprint) DO NOTHING",
@@ -5234,35 +5519,95 @@ def read_manifest(raw, filename, use_ai=True):
             if bl_match_key(b) not in known:
                 entries.append({"bl": b, "note": None})
     contacts = _mf_contacts(tables) if entries else {}
-    cargo = _mf_cargo(tables) if entries else {}
+    lay = _mf_layout_fp(tables) if entries else None
+    lrow = _mf_layout_row(lay)
+    colmap = None
+    try:
+        colmap = json.loads(lrow["colmap"]) if lrow and lrow["colmap"] else None
+    except (ValueError, TypeError):
+        colmap = None
+    cargo = _mf_cargo(tables, colmap) if entries else {}
     for e in entries:
         e["contact"] = dict(contacts.get(bl_match_key(e["bl"]), {"name": "", "email": "", "phone": ""}))
         e["cargo"] = dict(cargo.get(bl_match_key(e["bl"]), _EMPTY_CARGO))
         e["ai"] = False
     _mf_unshare_contacts(entries)
+    try:
+        if lay:
+            _mf_apply_gemdesc(entries, lay["fp"])
+    except Exception:
+        pass
+    for e in entries:
+        e["det_cargo"] = dict(e.get("cargo") or _EMPTY_CARGO)
+        e["det_contact"] = dict(e.get("contact") or {})
     ai_used = False
+    from_cache = False
+    cache_ai = False
+    trusted_skip = False
     ai_tables = tables
     if text.strip() and not any(t.get("rows") for t in tables):
         ai_tables = [{"name": "Document text", "rows": [[ln] for ln in text.splitlines() if ln.strip()], "role": None, "hdr": None}]
-    if use_ai and ai_available() and ai_tables and _mf_needs_ai(entries):
+    fhash = hashlib.sha1(raw).hexdigest()
+    if use_ai and ai_available():
+        # 1) this exact file was read with Gemini's help before: reuse that reading, no new call
+        try:
+            cached = _mf_cache_apply(entries, fhash)
+        except Exception:
+            cached = None
+        from_cache = cached is not None
+        cache_ai = bool(cached and cached.get("ai"))
+        # 2) a layout Compass has learned to read as well as Gemini did: read it alone (every 5th time Gemini double-checks)
+        if not from_cache and lrow and lrow["trusted"] and (lrow["trusted_reads"] or 0) % 5 != 4 and _mf_gaps_ok(entries):
+            trusted_skip = True
+    if use_ai and not from_cache and not trusted_skip and ai_available() and ai_tables and _mf_needs_ai(entries):
         try:
             ai_used = _mf_ai_read(ai_tables, entries)
         except Exception:
             ai_used = False
     info = _mf_header_info(tables)
     checks = _mf_checks(entries, tables, text, info)
+    untrust = False
+    if trusted_skip and checks.get("pkgs_ok") is False and ai_tables:
+        # the learned reading did not add up to the manifest's own total: ask Gemini after all, and stop trusting the layout
+        trusted_skip, untrust = False, True
+        try:
+            ai_used = _mf_ai_read(ai_tables, entries)
+        except Exception:
+            ai_used = False
+        checks = _mf_checks(entries, tables, text, info)
     if ai_used:
         try:
             checks = _mf_ai_reconcile(entries, tables, text, info, checks)
         except Exception:
             pass
+    for e in entries:
+        e["after_ai"] = dict(e.get("cargo") or _EMPTY_CARGO)
+        e["after_ai_contact"] = dict(e.get("contact") or {})
+    learn = None
+    if ai_used and lay:
+        try:
+            learn = _mf_learn(tables, entries, lay, checks)
+        except Exception:
+            learn = None
+    if ai_used or trusted_skip:
+        try:
+            _mf_cache_save(fhash, entries, ai=ai_used)
+        except Exception:
+            pass
+    if lay and (learn is not None or untrust or trusted_skip):
+        _mf_save_learning({"learn": learn, "untrust": untrust, "trusted_skip": trusted_skip}, lay)
+    if ai_used:
+        _ai_event("manifests", "assist", "Gemini helped read " + (filename or "a manifest")[:80],
+                  "%d B/Ls. %s" % (len([e for e in entries if e["note"] is None]), "Compass could not read every column alone." if not (learn and learn.get("trusted")) else "Compass has now learned this layout."))
     remembered = 0
     try:
         remembered = _mf_apply_memory(entries, count=use_ai)
     except Exception:
         remembered = 0
     return {"entries": entries, "truncated": any(t.get("truncated") for t in tables), "ai_used": ai_used, "info": info,
-            "checks": checks, "layout": _mf_layout_fp(tables), "remembered": remembered}
+            "checks": checks, "layout": lay or _mf_layout_fp(tables), "remembered": remembered,
+            "learn": learn, "trusted_skip": trusted_skip, "untrust": untrust, "from_cache": from_cache, "cache_ai": cache_ai,
+            "fhash": fhash}
 
 
 @app.route("/api/ai/status")
@@ -5442,8 +5787,6 @@ def _manifest_read_upload(file, with_truncation=False, meta=None):
         try:
             n_bl = len(result["entries"])
             chk_ = result.get("checks") or {}
-            if result.get("ai_used"):
-                _ai_event("manifests", "assist", "Gemini helped read " + name[:80], "%d B/Ls read. Compass could not read this layout alone." % n_bl)
             if chk_.get("pkgs_ok") is False:
                 _ai_event("manifests", "gap", "Package total did not match: " + (result.get("layout") or {}).get("label", name)[:90],
                           "Check the packages on " + name[:80] + " before issuing DOs.")
@@ -6011,7 +6354,8 @@ def learned_data():
     if not _is_owner():
         return jsonify({"error": "Owner only"}), 403
     db = get_db()
-    lay = [dict(r) for r in db.execute("SELECT fingerprint, label, seen, first_seen, last_seen, ai_helped, pkgs_ok, pkgs_bad "
+    lay = [dict(r) for r in db.execute("SELECT fingerprint, label, seen, first_seen, last_seen, ai_helped, pkgs_ok, pkgs_bad, "
+                                       "COALESCE(trusted, 0) AS trusted, COALESCE(trusted_reads, 0) AS trusted_reads, COALESCE(learned_at, '') AS learned_at "
                                        "FROM mf_layouts ORDER BY last_seen DESC LIMIT 200").fetchall()]
     mem = [dict(r) for r in db.execute("SELECT id, consignee, old_value, new_value, created_by, created_at, uses FROM mf_memory "
                                        "WHERE kind = 'cargo' ORDER BY created_at DESC LIMIT 500").fetchall()]
@@ -6024,15 +6368,20 @@ def learned_data():
                         "when": m["created_at"], "forget": {"kind": "memory", "id": m["id"]}})
     for l in lay:
         alone = l["seen"] - l["ai_helped"]
-        if alone > 0:
-            learned.append({"feature": "manifests", "title": "Layout: " + l["label"][:90],
+        if l["trusted"]:
+            learned.append({"feature": "manifests", "title": _mf_nice_label(l["label"])[:110],
+                            "detail": "Gemini not needed. Compass reads this layout alone and lets Gemini double-check every 5th upload. "
+                                      "Seen %d time%s, %d read without Gemini." % (l["seen"], "" if l["seen"] == 1 else "s", alone),
+                            "when": l["learned_at"] or l["last_seen"], "tag": "Gemini not needed", "forget": {"kind": "layout", "id": l["fingerprint"]}})
+        elif alone > 0:
+            learned.append({"feature": "manifests", "title": _mf_nice_label(l["label"])[:110],
                             "detail": "Seen %d time%s, %d read without Gemini." % (l["seen"], "" if l["seen"] == 1 else "s", alone),
                             "when": l["last_seen"], "forget": {"kind": "layout", "id": l["fingerprint"]}})
-        if l["seen"] >= 2 and l["ai_helped"] == l["seen"]:
-            lacking.append({"feature": "manifests", "title": "Layout always needs Gemini: " + l["label"][:80],
+        if l["seen"] >= 2 and l["ai_helped"] == l["seen"] and not l["trusted"]:
+            lacking.append({"feature": "manifests", "title": "Always needs Gemini. " + _mf_nice_label(l["label"])[:100],
                             "detail": "Seen %d times and read by Gemini every time." % l["seen"], "tag": "Needs Gemini", "when": l["last_seen"]})
         if l["pkgs_bad"]:
-            lacking.append({"feature": "manifests", "title": "Package total off on layout: " + l["label"][:80],
+            lacking.append({"feature": "manifests", "title": "Package total off. " + _mf_nice_label(l["label"])[:100],
                             "detail": "Did not match on %d of %d checks." % (l["pkgs_bad"], l["pkgs_ok"] + l["pkgs_bad"]), "tag": "Check", "when": l["last_seen"]})
     for e in ev:
         if e["kind"] == "gap":
@@ -14468,7 +14817,7 @@ SECURITY_HTML = """
 
 USERS_HTML = """
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Compass - Manage Users</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + """">
+<title>Compass - Admin</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + LOGO_B64 + """">
 <style>
   :root {
     --bg: #f2f4f7; --card: #ffffff; --text: #1c2b3a; --muted: #7a8794; --border: #e6e9ed;
@@ -14589,7 +14938,7 @@ function setTheme(mode) {
       <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
       <div class="brand-text">
         <span class="app-name">Compass</span>
-        <span class="app-tag">Manage Users</span>
+        <span class="app-tag">Admin</span>
       </div>
     </a>
     <div class="topbar-right">
@@ -14863,6 +15212,7 @@ LEARNED_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="
   .muted { color: var(--muted); font-size: 13px; }
   .barrow { display: grid; grid-template-columns: 150px 1fr 110px; gap: 14px; align-items: center; padding: 7px 0; font-size: 14px; }
   .bar { height: 8px; border-radius: 4px; background: var(--border); overflow: hidden; display: flex; }
+  @media (max-width: 600px) { .barrow { grid-template-columns: 1fr auto; row-gap: 6px; } .barrow .bar { grid-column: 1 / -1; grid-row: 2; } }
   .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 18px; margin-top: 18px; }
   .li { padding: 14px 0; border-top: 1px solid var(--border); }
   .li:first-of-type { border-top: 0; }
@@ -14870,6 +15220,7 @@ LEARNED_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="
   .lit b { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
   .chip { display: inline-flex; align-items: center; height: 24px; padding: 0 10px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; background: color-mix(in srgb, var(--navy-light) 16%, transparent); color: var(--navy-light); }
   .chip.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  .chip.good { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
   .chip.mut { background: var(--border); color: var(--muted); }
   button.act { height: 30px; padding: 0 13px; border-radius: 999px; border: 0; background: var(--border); color: var(--text); font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; }
   button.act:hover { filter: brightness(.95); }
@@ -14924,7 +15275,7 @@ function render() {
     (rows ? rows + '<div class="muted" style="display:flex;gap:18px;margin-top:8px"><span><i style="display:inline-block;width:8px;height:8px;border-radius:4px;background:var(--navy);margin-right:6px"></i>Compass alone</span><span><i style="display:inline-block;width:8px;height:8px;border-radius:4px;background:var(--gold);margin-right:6px"></i>Needed Gemini</span></div>'
       : '<div class="empty">No manifests have been read yet. This fills in as people upload.</div>');
   $('learned').innerHTML = L.length ? L.map(function (x) {
-    return '<div class="li"><div class="lit"><b>' + esc(x.title) + '</b><span class="chip">' + esc(nm(x.feature)) + '</span></div><div class="lit"><span class="muted">' + esc(x.detail) + '</span>' +
+    return '<div class="li"><div class="lit"><b>' + esc(x.title) + '</b><span class="chip ' + (x.tag ? 'good' : '') + '">' + esc(x.tag || nm(x.feature)) + '</span></div><div class="lit"><span class="muted">' + esc(x.detail) + '</span>' +
       (x.forget ? '<button class="act" onclick="forget(\'' + x.forget.kind + '\',' + JSON.stringify(x.forget.id).replace(/"/g, '&quot;') + ')">Forget</button>' : '') + '</div></div>'; }).join('')
     : '<div class="empty">Nothing learned here yet.</div>';
   $('lacking').innerHTML = K.length ? K.map(function (x) {
@@ -15408,25 +15759,48 @@ HUB_HTML = """
   .tile.soon:hover { transform: none; box-shadow: var(--shadow-sm); border-color: var(--border); }
   .tile.soon .tile-go { color: var(--muted); }
   .soon-pill { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); background: color-mix(in srgb, var(--border) 60%, transparent); padding: 2px 8px; border-radius: 999px; align-self: flex-start; }
-  .desks { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 22px; margin-top: 28px; }
-  .desk { display: flex; flex-direction: column; gap: 20px; padding: 28px; border-radius: 24px; text-decoration: none; color: var(--text);
+  html, body { height: 100%; }
+  body.hub { display: flex; flex-direction: column; min-height: 100vh; min-height: 100dvh; padding-bottom: clamp(12px, 2.4vh, 28px); }
+  .hub .hero { padding: clamp(6px, 2.4vh, 28px) 4px 0; }
+  .hub .hero h1 { font-size: clamp(24px, 4.4vh, 38px); letter-spacing: -.03em; margin-bottom: 4px; }
+  .hub .hero p { font-size: clamp(13px, 2vh, 16px); }
+  .hub .hero .eyebrow { margin-bottom: 4px; }
+  .hub .hero, .hub .hubmain { width: 100%; max-width: 1320px; margin-left: auto; margin-right: auto; }
+  .hubmain { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: clamp(10px, 2vh, 20px); padding-top: clamp(12px, 2.6vh, 28px); }
+  .desks { flex: 1 1 0; max-height: 560px; min-height: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: clamp(12px, 2vh, 22px); }
+  .desk { display: flex; flex-direction: column; gap: clamp(8px, 1.8vh, 18px); padding: clamp(16px, 3vh, 28px); border-radius: 24px; text-decoration: none; color: var(--text); min-height: 0; overflow: hidden;
     background: var(--card); border: 1px solid var(--border); box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 14px 36px rgba(0,0,0,.06);
     transition: transform .18s cubic-bezier(.16,1,.3,1), box-shadow .18s ease; animation: tile-in .5s cubic-bezier(.16,1,.3,1) both; }
   .desk:hover { transform: translateY(-3px); box-shadow: 0 2px 4px rgba(0,0,0,.05), 0 20px 44px rgba(0,0,0,.09); }
   .desk-top { display: flex; align-items: center; justify-content: space-between; }
-  .desk-icon { width: 52px; height: 52px; border-radius: 16px; display: flex; align-items: center; justify-content: center;
+  .desk-icon { width: clamp(38px, 6vh, 52px); height: clamp(38px, 6vh, 52px); border-radius: 16px; display: flex; align-items: center; justify-content: center;
     background: color-mix(in srgb, var(--navy) 10%, transparent); color: var(--navy); }
   :root[data-theme="dark"] .desk-icon { color: var(--navy-light); background: color-mix(in srgb, var(--navy-light) 18%, transparent); }
-  .desk-icon svg { width: 26px; height: 26px; }
+  .desk-icon svg { width: 50%; height: 50%; }
   .desk-count { font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); background: color-mix(in srgb, var(--border) 70%, transparent); padding: 4px 10px; border-radius: 999px; }
-  .desk-name { font-size: 24px; font-weight: 700; letter-spacing: -.025em; }
-  .desk-blurb { margin-top: 4px; font-size: 14px; color: var(--muted); }
-  .desk-tools { display: flex; flex-direction: column; }
-  .desk-tool { padding: 10px 0; border-top: 1px solid var(--border); font-size: 14px; }
-  .desk-open { align-self: flex-start; margin-top: auto; padding: 10px 20px; border-radius: 999px; background: var(--navy); color: #fff; font-size: 14px; font-weight: 600; box-shadow: 0 6px 16px rgba(15,58,92,.25); }
+  .desk-name { font-size: clamp(18px, 3.4vh, 24px); font-weight: 700; letter-spacing: -.025em; }
+  .desk-blurb { margin-top: 2px; font-size: clamp(12.5px, 1.9vh, 14px); color: var(--muted); }
+  .desk-tools { display: flex; flex-direction: column; min-height: 0; }
+  .desk-tool { padding: clamp(5px, 1.2vh, 10px) 0; border-top: 1px solid var(--border); font-size: clamp(12.5px, 1.9vh, 14px); }
+  .desk-open { align-self: flex-start; margin-top: auto; padding: clamp(7px, 1.2vh, 10px) 20px; border-radius: 999px; background: var(--navy); color: #fff; font-size: 14px; font-weight: 600; box-shadow: 0 6px 16px rgba(15,58,92,.25); }
   :root[data-theme="dark"] .desk-open { background: var(--navy-light); color: #0b2740; }
+  .extras { flex: 0 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: clamp(12px, 2vh, 22px); }
+  .extras .desk { flex-direction: row; align-items: center; justify-content: space-between; padding: clamp(12px, 2.2vh, 22px) 26px; }
+  .extras .desk-name { font-size: 17px; }
+  @media (max-height: 700px) { .desk-blurb, .hub .hero p { display: none; } }
+  @media (max-width: 700px) {
+    .desks { flex: 0 0 auto; }
+    .desk { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 14px; padding: 16px 18px; overflow: visible; }
+    .desk-top { display: contents; }
+    .desk-icon { order: 0; width: 44px; height: 44px; }
+    .desk-top + div { order: 1; min-width: 0; }
+    .desk-count { order: 2; }
+    .desk-tools, .desk-open { display: none; }
+    .extras .desk { display: flex; }
+  }
+  @media (max-width: 700px) and (max-height: 700px) { .desk { padding: 10px 16px; } .extras .desk { padding: 9px 18px; } .desk-icon { width: 38px; height: 38px; } .hub .hero { padding-top: 0; } }
 </style>
-</head><body>
+</head><body class="hub">
   <div class="topbar">
     <a href="/" class="brand" style="text-decoration:none;">
       <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
@@ -15448,7 +15822,7 @@ HUB_HTML = """
           <span class="theme-knob"></span>
         </span>
       </label>
-      {% if role == 'owner' %}<a href="/users">Manage Users</a>{% endif %}
+      
       <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
@@ -15460,6 +15834,7 @@ HUB_HTML = """
     <p>Each desk holds the tools for one team.</p>
   </div>
 
+  <div class="hubmain">
   <div class="desks">
 {% if not desks %}<p style="color:var(--muted);">Nothing is switched on for your account yet. Ask the Owner.</p>{% endif %}
 {% for d in desks %}
@@ -15472,11 +15847,12 @@ HUB_HTML = """
 {% endfor %}
   </div>
 {% if role == 'owner' %}
-  <div class="desks" style="margin-top:22px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));">
-    <a class="desk" href="/learned" style="flex-direction:row;align-items:center;justify-content:space-between;padding:22px 26px;"><span><span class="desk-name" style="font-size:17px;">Learning room</span><span class="desk-blurb" style="display:block;">What Compass learned, and where it still needs help</span></span><span class="desk-count">Owner</span></a>
-    <a class="desk" href="/users" style="flex-direction:row;align-items:center;justify-content:space-between;padding:22px 26px;"><span><span class="desk-name" style="font-size:17px;">Admin</span><span class="desk-blurb" style="display:block;">Users, desks and settings</span></span><span class="desk-count">Owner</span></a>
+  <div class="extras">
+    <a class="desk" href="/learned"><span><span class="desk-name">Learning room</span><span class="desk-blurb" style="display:block;">What Compass learned, and where it still needs help</span></span><span class="desk-count">Owner</span></a>
+    <a class="desk" href="/users"><span><span class="desk-name">Admin</span><span class="desk-blurb" style="display:block;">Users, desks and settings</span></span><span class="desk-count">Owner</span></a>
   </div>
 {% endif %}
+  </div>
 
 <script>
 (function initTheme() {
@@ -16134,7 +16510,7 @@ KPI_HTML = """
         </span>
       </label>
       <a href="/do-tracker">DO Tracker</a>
-      {% if role == 'owner' %}<a href="/users">Manage Users</a>{% endif %}
+      {% if role == 'owner' %}<a href="/users">Admin</a>{% endif %}
       <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
@@ -16401,7 +16777,7 @@ DIRECT_DELIVERY_HTML = """
         </span>
       </label>
       <a href="/do-tracker">DO Tracker</a>
-      {% if role == 'owner' %}<a href="/users">Manage Users</a>{% endif %}
+      {% if role == 'owner' %}<a href="/users">Admin</a>{% endif %}
       <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
@@ -17902,7 +18278,7 @@ PDA_HTML = """
           <span class="theme-knob"></span>
         </span>
       </label>
-      {% if role == 'owner' %}<a href="/users">Manage Users</a>{% endif %}
+      {% if role == 'owner' %}<a href="/users">Admin</a>{% endif %}
       <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
@@ -19676,7 +20052,7 @@ SOF_HTML = """
         </span>
       </label>
       {% if 'jobs' in feats %}<a href="/pda">Disbursement Accounts</a>{% endif %}
-      {% if role == 'owner' %}<a href="/users">Manage Users</a>{% endif %}
+      {% if role == 'owner' %}<a href="/users">Admin</a>{% endif %}
       <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
       <a href="/logout">Log out</a>
     </div>
@@ -21166,7 +21542,7 @@ PAGE_HTML = """
           <span class="theme-knob"></span>
         </span>
       </label>
-      {% if role == 'owner' %}<a href="/users" data-i18n="manage_users">Manage Users</a>{% endif %}
+      {% if role == 'owner' %}<a href="/users" data-i18n="manage_users">Admin</a>{% endif %}
       <span class="who"><b>{{ display_name }}</b></span>
       <a href="/logout" data-i18n="log_out">Log out</a>
     </div>
