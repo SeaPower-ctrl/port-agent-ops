@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 import csv
 import unicodedata
 import html.parser
+from html import escape as html_escape
 import io
 import time
 import threading
@@ -2057,6 +2058,67 @@ FEATURE_PRESETS = [("Everything", FEATURE_KEYS),
                    ("Operations", ["do", "manifest", "direct", "jobs", "sof", "lineup", "vessel"])]
 
 
+DESKS = [
+    ("manifest", "Manifest Desk", "From manifest to delivery order.",
+     [("manifest", "Manifest upload", "/manifest-desk"), ("do", "DO Tracker", "/do-tracker")]),
+    ("operations", "Operations Desk", "Vessels, berths and ports.",
+     [("sof", "SOF", "/sof"), ("vessel", "Vessel Tracker", "/vessel-tracker"), ("direct", "Direct Delivery", "/direct-delivery"),
+      ("lineup", "Line-ups", "/lineups"), ("kpi", "Port Agent KPI", "/kpi")]),
+    ("accounts", "Accounts Desk", "Quotations, invoices and jobs.",
+     [("jobs", "Jobs", "/jobs"), ("jobs", "PDAs", "/pda")]),
+]
+DESK_ICONS = {
+    "manifest": '<path d="M7 3h7l5 5v13H7z"/><path d="M14 3v5h5"/><path d="M10 13h6M10 17h6"/>',
+    "operations": '<circle cx="12" cy="5" r="2"/><path d="M12 7v13"/><path d="M6 12h12"/><path d="M5 15c0 3 3 5 7 5s7-2 7-5"/>',
+    "accounts": '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6"/>',
+}
+
+
+def _desks_for(feats):
+    """Desks the person can open, each with only the tools their account has. Owner passes every feature."""
+    out = []
+    for key, name, blurb, tools in DESKS:
+        mine = [{"key": k, "name": n, "url": u} for k, n, u in tools if k in feats]
+        if mine:
+            out.append({"key": key, "name": name, "blurb": blurb, "tools": mine, "icon": DESK_ICONS[key]})
+    return out
+
+
+def _desk_of_path(path):
+    for key, name, blurb, tools in DESKS:
+        for k, n, u in tools:
+            if path == u or path.startswith(u + "/"):
+                return key
+    return None
+
+
+_DESKBAR_CSS = """<style>
+.dkbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:10px 0 0;padding:8px 10px;border-radius:999px;
+ background:var(--card,#fff);border:1px solid var(--border,rgba(0,0,0,.08));box-shadow:0 1px 2px rgba(0,0,0,.04),0 8px 24px rgba(0,0,0,.05);
+ font:600 13px/1 -apple-system,BlinkMacSystemFont,'SF Pro Display','Segoe UI',Inter,sans-serif;color:var(--text,#1d1d1f)}
+.dkbar .dk-l,.dkbar .dk-r{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+.dkbar a{color:var(--muted,#6e6e73);text-decoration:none;padding:8px 14px;border-radius:999px;white-space:nowrap}
+.dkbar a:hover{background:var(--border,rgba(0,0,0,.06))}
+.dkbar a.on{background:var(--navy,#0f3a5c);color:#fff}
+.dkbar .dk-name{padding:8px 12px 8px 14px;color:var(--text,#1d1d1f)}
+.dkbar .dk-sep{width:1px;height:18px;background:var(--border,rgba(0,0,0,.1));margin:0 6px}
+:root[data-theme="dark"] .dkbar a.on{background:var(--navy-light,#4a86b5)}
+@media print{.dkbar{display:none}}
+</style>"""
+
+
+def _deskbar_html(feats, path):
+    desks = _desks_for(feats)
+    key = _desk_of_path(path)
+    cur = next((d for d in desks if d["key"] == key), None)
+    if not cur:
+        return ""
+    tools = "".join('<a href="%s"%s>%s</a>' % (t["url"], ' class="on"' if (path == t["url"] or path.startswith(t["url"] + "/")) else "", html_escape(t["name"])) for t in cur["tools"])
+    others = "".join('<a href="%s">%s</a>' % (d["tools"][0]["url"], html_escape(d["name"].replace(" Desk", ""))) for d in desks if d["key"] != key)
+    return (_DESKBAR_CSS + '<nav class="dkbar" aria-label="Desks"><div class="dk-l"><a href="/">All desks</a><span class="dk-sep"></span>'
+            '<span class="dk-name">' + html_escape(cur["name"]) + '</span>' + tools + '</div><div class="dk-r">' + others + '</div></nav>')
+
+
 def _feat_parse(raw):
     """Stored value -> set of feature keys. NULL = every feature; 'none' = nothing."""
     if raw is None:
@@ -2491,6 +2553,21 @@ def _add_idle_script(resp):
     return resp
 
 
+@app.after_request
+def _add_deskbar(resp):
+    try:
+        if ("user_id" in session and resp.status_code == 200 and resp.mimetype == "text/html"
+                and not resp.direct_passthrough and _desk_of_path(request.path)):
+            body = resp.get_data(as_text=True)
+            m = re.search(r"<body[^>]*>", body)
+            bar = _deskbar_html(_features(), request.path)
+            if m and bar:
+                resp.set_data(body[:m.end()] + bar + body[m.end():])
+    except Exception:
+        pass
+    return resp
+
+
 @app.route("/api/ping", methods=["POST"])
 @login_required
 def api_ping():
@@ -2718,7 +2795,7 @@ def logout():
 @app.route("/")
 @login_required
 def index():
-    return render_template_string(HUB_HTML, username=session.get("username"), role=session.get("role"))
+    return render_template_string(HUB_HTML, username=session.get("username"), role=session.get("role"), desks=_desks_for(_features()))
 
 
 @app.route("/do-tracker")
@@ -15209,6 +15286,23 @@ HUB_HTML = """
   .tile.soon:hover { transform: none; box-shadow: var(--shadow-sm); border-color: var(--border); }
   .tile.soon .tile-go { color: var(--muted); }
   .soon-pill { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); background: color-mix(in srgb, var(--border) 60%, transparent); padding: 2px 8px; border-radius: 999px; align-self: flex-start; }
+  .desks { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 22px; margin-top: 28px; }
+  .desk { display: flex; flex-direction: column; gap: 20px; padding: 28px; border-radius: 24px; text-decoration: none; color: var(--text);
+    background: var(--card); border: 1px solid var(--border); box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 14px 36px rgba(0,0,0,.06);
+    transition: transform .18s cubic-bezier(.16,1,.3,1), box-shadow .18s ease; animation: tile-in .5s cubic-bezier(.16,1,.3,1) both; }
+  .desk:hover { transform: translateY(-3px); box-shadow: 0 2px 4px rgba(0,0,0,.05), 0 20px 44px rgba(0,0,0,.09); }
+  .desk-top { display: flex; align-items: center; justify-content: space-between; }
+  .desk-icon { width: 52px; height: 52px; border-radius: 16px; display: flex; align-items: center; justify-content: center;
+    background: color-mix(in srgb, var(--navy) 10%, transparent); color: var(--navy); }
+  :root[data-theme="dark"] .desk-icon { color: var(--navy-light); background: color-mix(in srgb, var(--navy-light) 18%, transparent); }
+  .desk-icon svg { width: 26px; height: 26px; }
+  .desk-count { font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); background: color-mix(in srgb, var(--border) 70%, transparent); padding: 4px 10px; border-radius: 999px; }
+  .desk-name { font-size: 24px; font-weight: 700; letter-spacing: -.025em; }
+  .desk-blurb { margin-top: 4px; font-size: 14px; color: var(--muted); }
+  .desk-tools { display: flex; flex-direction: column; }
+  .desk-tool { padding: 10px 0; border-top: 1px solid var(--border); font-size: 14px; }
+  .desk-open { align-self: flex-start; margin-top: auto; padding: 10px 20px; border-radius: 999px; background: var(--navy); color: #fff; font-size: 14px; font-weight: 600; box-shadow: 0 6px 16px rgba(15,58,92,.25); }
+  :root[data-theme="dark"] .desk-open { background: var(--navy-light); color: #0b2740; }
 </style>
 </head><body>
   <div class="topbar">
@@ -15240,98 +15334,20 @@ HUB_HTML = """
 
   <div class="hero">
     <div class="eyebrow">Welcome, {{ first_name }}</div>
-    <h1>What are you working on?</h1>
-    <p>Pick a workspace below. More will show up here as they're added.</p>
+    <h1>Choose a desk</h1>
+    <p>Each desk holds the tools for one team.</p>
   </div>
 
-  <div class="grid">
-{% if not feats %}<p style="color:var(--muted);">Nothing is switched on for your account yet. Ask the Owner.</p>{% endif %}
-{% if 'do' in feats %}
-    <a class="tile" href="/do-tracker">
-      <div class="tile-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2h6a1 1 0 0 1 1 1v1h1a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h1V3a1 1 0 0 1 1-1Z"/><path d="M9 12l2 2 4-4"/></svg>
-      </div>
-      <h3>DO Tracker</h3>
-      <p>Track invoice, approval and DO status per Bill of Lading, organized by port and vessel.</p>
-      <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
+  <div class="desks">
+{% if not desks %}<p style="color:var(--muted);">Nothing is switched on for your account yet. Ask the Owner.</p>{% endif %}
+{% for d in desks %}
+    <a class="desk" href="{{ d.tools[0].url }}">
+      <div class="desk-top"><span class="desk-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">{{ d.icon|safe }}</svg></span><span class="desk-count">{{ d.tools|length }} tool{{ '' if d.tools|length == 1 else 's' }}</span></div>
+      <div><div class="desk-name">{{ d.name }}</div><div class="desk-blurb">{{ d.blurb }}</div></div>
+      <div class="desk-tools">{% for t in d.tools %}<span class="desk-tool">{{ t.name }}</span>{% endfor %}</div>
+      <span class="desk-open">Open desk</span>
     </a>
-{% endif %}
-
-{% if 'manifest' in feats %}
-    <a class="tile" href="/manifest-desk">
-      <div class="tile-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M4 9h16M9 9v11"/><path d="M13 13h4M13 16.5h4"/></svg>
-      </div>
-      <h3>Manifest Desk</h3>
-      <p>Add a manifest once: B/Ls go on the DO Tracker and arrival notices are ready to send to every consignee.</p>
-      <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
-    </a>
-{% endif %}
-{% if 'vessel' in feats %}
-    <a class="tile" href="/vessel-tracker">
-      <div class="tile-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 21c2 1 4 1 6 0s4-1 6 0 4 1 6 0M4 18l1-9 2-3h10l2 3 1 9M9 6V3h6v3"/></svg>
-      </div>
-      <h3>Vessel Tracker</h3>
-      <p>Live positions for your vessels, straight from MarineTraffic - its own list, tagged by operator.</p>
-      <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
-    </a>
-{% endif %}
-
-{% if 'kpi' in feats %}
-    <a class="tile" href="/kpi">
-      <div class="tile-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M18 17V9M13 17V5M8 17v-4"/></svg>
-      </div>
-      <h3>Port Agent KPI</h3>
-      <p>Turnaround times, pending backlog and workload, built from the DO Tracker board.</p>
-      <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
-    </a>
-{% endif %}
-
-{% if 'direct' in feats %}
-    <a class="tile" href="/direct-delivery">
-      <div class="tile-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7l9-4 9 4-9 4-9-4z"/><path d="M3 7v10l9 4 9-4V7"/><path d="M12 11v10"/></svg>
-      </div>
-      <h3>Direct Delivery Classifier</h3>
-      <p>Upload a cargo packing list and see which BLs need direct delivery, by weight and size.</p>
-      <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
-    </a>
-{% endif %}
-
-{% if 'jobs' in feats %}
-    <a class="tile" href="/jobs">
-      <div class="tile-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h8M8 17h4"/></svg>
-      </div>
-      <h3>Jobs and PDAs</h3>
-      <p>Every vessel call in one place: PDA, appointment, charges, services, invoices and history, through to the final job report.</p>
-      <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
-    </a>
-{% endif %}
-
-{% if 'sof' in feats %}
-    <a class="tile" href="/sof">
-      <div class="tile-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/><path d="M9 12l2 2 4-4"/></svg>
-      </div>
-      <h3>Statement of Facts</h3>
-      <p>Log a vessel call's event timeline field-by-field and export it as a signed-off SOF.</p>
-      <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
-    </a>
-{% endif %}
-
-{% if 'lineup' in feats %}
-    <a class="tile" href="/lineups">
-      <div class="tile-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v14M7 8h10"/><circle cx="12" cy="3" r="1"/><path d="M5 13a7 7 0 0 0 14 0"/><path d="M3 21c2 1 4 1 6 0s4-1 6 0 4 1 6 0"/></svg>
-      </div>
-      <h3>Port Line-ups</h3>
-      <p>Daily line-ups for Jeddah, Yanbu and Dammam: berth plan by draft, waiting times, and which port gets a vessel alongside first.</p>
-      <span class="tile-go">Open <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
-    </a>
-{% endif %}
+{% endfor %}
   </div>
 
 <script>
