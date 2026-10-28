@@ -2162,14 +2162,13 @@ def _deskbar_html(feats, path):
 # ==== DESK HEADER BEGIN (shared by the Manifest upload page and the DO Tracker page) ====
 _HDR_CSS = r"""
 /* ---- shared desk header: desk button + tools toggle + menus (one source for every page in a desk) ---- */
-.dh{position:relative;z-index:60;display:flex;align-items:center;gap:14px;height:58px;padding:0 20px;background:var(--card);border-bottom:1px solid var(--border);color:var(--text);font:14px/1.3 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Arial,sans-serif;box-sizing:border-box}
+.dh{position:relative;z-index:60;display:flex;align-items:center;gap:14px;height:58px;padding:0 16px;background:var(--card);border-bottom:1px solid var(--border);color:var(--text);font:14px/1.3 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Arial,sans-serif;box-sizing:border-box}
 [dir="rtl"] .dh{font-family:'Cairo','Segoe UI',Tahoma,Arial,sans-serif}
 .dh *{box-sizing:border-box}
 .dh a{text-decoration:none}
 .dh [hidden]{display:none!important}
 .dh-brand{display:flex;align-items:center;gap:10px;color:var(--text);flex:none}
-.dh-brand img{height:30px;width:auto;display:block}
-:root[data-theme="dark"] .dh-brand img{background:#fff;border-radius:8px;padding:3px 7px}
+.dh-brand img{height:36px;width:auto;display:block}
 .dh-brand b{font-size:15px;font-weight:700;letter-spacing:-.01em}
 .dh-desk{position:relative;display:flex;align-items:center;gap:12px;min-width:0;margin-inline-start:6px}
 .dh .dh-chip{display:flex;align-items:center;gap:8px;height:40px;padding:0 11px;margin:0;border-radius:10px;border:1px solid color-mix(in srgb,var(--navy) 22%,var(--border));background:color-mix(in srgb,var(--navy) 9%,var(--card));color:var(--navy);font:inherit;font-size:14px;font-weight:700;white-space:nowrap;cursor:pointer;min-width:0;transform:none;flex:none}
@@ -2215,7 +2214,7 @@ _HDR_CSS = r"""
  box-shadow:0 18px 40px -10px color-mix(in srgb,var(--navy) 45%,transparent),0 4px 14px color-mix(in srgb,var(--navy) 25%,transparent),inset 0 1.5px 0 rgba(255,255,255,0.9)}
 :root[data-theme="dark"] .dh-panel{border-color:color-mix(in srgb,#ffffff 30%,transparent);background:linear-gradient(165deg,rgba(255,255,255,0.16) 0%,rgba(255,255,255,0.02) 40%,rgba(255,255,255,0.09) 100%),linear-gradient(135deg,color-mix(in srgb,var(--navy-light) 38%,var(--card)),color-mix(in srgb,var(--card) 65%,black) 85%);box-shadow:0 20px 44px -8px rgba(0,0,0,0.65),0 4px 14px rgba(0,0,0,0.4),inset 0 1.5px 0 rgba(255,255,255,0.2)}
 .dh-dmenu{top:calc(100% + 10px);inset-inline-start:0;width:330px}
-.dh-umenu{top:calc(100% - 6px);inset-inline-end:14px;width:250px}
+.dh-umenu{top:calc(100% - 6px);inset-inline-end:12px;width:250px}
 .dh-panel a{display:flex;align-items:center;gap:12px;padding:9px 10px;border-radius:8px;color:var(--text);font-size:14px}
 .dh-panel a:hover,.dh-panel a:focus-visible{background:color-mix(in srgb,var(--navy-light) 22%,transparent);outline:none}
 :root[data-theme="dark"] .dh-panel a:hover,:root[data-theme="dark"] .dh-panel a:focus-visible{background:rgba(255,255,255,0.12)}
@@ -2238,6 +2237,11 @@ _HDR_CSS = r"""
 @media (max-width:780px){.dh-tools{display:none}.dh-sec-tools{display:block}.dh-desk{position:static}.dh-dmenu{inset-inline:12px;width:auto;top:calc(100% - 6px)}}
 @media (max-width:440px){.dh{gap:8px;padding:0 12px}.dh-right{gap:6px}.dh-desk{margin-inline-start:0}.dh-chip .lbl{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}}
 @media print{.dh{display:none}}
+@view-transition{navigation:auto}
+.dh{view-transition-name:dh}
+::view-transition-old(root),::view-transition-new(root){animation-duration:.14s}
+::view-transition-group(dh){animation-duration:.14s}
+@media (prefers-reduced-motion:reduce){::view-transition-group(*),::view-transition-old(*),::view-transition-new(*){animation:none!important}}
 """
 
 _HDR_JS = r"""
@@ -2274,6 +2278,7 @@ _HDR_JS = r"""
     if (op) { setOpen(op, false); op.b.focus(); e.stopPropagation(); }
   }, true);
   window.addEventListener('resize', function () { closeAll(null); });
+  if (document.prerendering) document.addEventListener('prerenderingchange', function () { window.dispatchEvent(new Event('compass:activated')); }, { once: true });
 })();
 """
 
@@ -2313,6 +2318,8 @@ def _desk_header_html(path, lang_switch=False):
              ('<a role="menuitem" href="/users" data-i18n="manage_users">Admin</a>' if _is_owner() else "") +
              ('<a role="menuitem" href="/learned" data-i18n="hdr_learning">Learning room</a>' if _is_owner() else "") +
              '<a role="menuitem" href="/logout" data-i18n="log_out">Log out</a>')
+    others = [t["url"] for t in cur["tools"] if not on(t["url"])]
+    spec = ('<script type="speculationrules">' + json.dumps({"prerender": [{"where": {"href_matches": others}, "eagerness": "moderate"}]}) + '</script>') if others else ""
     chev = '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>'
     return (
         '<header class="dh" id="dh">'
@@ -2330,7 +2337,7 @@ def _desk_header_html(path, lang_switch=False):
         '<div class="dh-right">' + lang + theme +
         '<button type="button" class="dh-user" id="dhUserBtn" aria-haspopup="menu" aria-expanded="false" aria-controls="dhUserMenu"><span class="av" aria-hidden="true">' + e((me.strip()[:1] or "?").upper()) + '</span><span class="nm">' + e(me) + '</span></button></div>'
         '<div class="dh-panel dh-umenu" id="dhUserMenu" role="menu" hidden>' + umenu + '</div>'
-        '</header>')
+        '</header>' + spec)
 # ==== DESK HEADER END ====
 
 
@@ -16092,7 +16099,7 @@ DESK_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta
   .menu .who { padding: 8px 12px 6px; color: var(--muted); font-size: 12px; }
 
   /* ---- workspace ---- */
-  .page { flex: 1; min-height: 0; display: flex; flex-direction: column; width: 100%; max-width: 1680px; margin: 0 auto; padding: 14px 20px 0; gap: 12px; }
+  .page { flex: 1; min-height: 0; display: flex; flex-direction: column; width: 100%; padding: 14px 16px 0; gap: 12px; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow-sm); }
   .vstrip { flex: none; padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
   .vrow { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
@@ -17083,6 +17090,7 @@ async function start() {
   $('actionbar').querySelectorAll('button').forEach(function (b) { b.disabled = true; });
 }
 start();
+window.addEventListener('compass:activated', function () { start(); });
 </script>
 </body></html>
 """
@@ -25458,6 +25466,7 @@ initGlassSelects();
 
 fetchRecords();
 setInterval(fetchRecords, 4000);
+window.addEventListener('compass:activated', () => fetchRecords(true));
 </script>
 <script>""" + _HDR_JS + """</script>
 </body>
