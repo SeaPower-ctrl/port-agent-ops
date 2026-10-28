@@ -110,6 +110,11 @@ const I18N = {
   en: {
     // Topbar
     app_tagline: "DO Tracker",
+    hdr_desk_manifest: "Manifest Desk", hdr_desk_manifest_sub: "From manifest to delivery order",
+    hdr_desk_operations: "Operations Desk", hdr_desk_operations_sub: "Vessels, berths and ports",
+    hdr_desk_accounts: "Accounts Desk", hdr_desk_accounts_sub: "Quotations, invoices and jobs",
+    hdr_tool_manifest: "Manifest upload", hdr_tool_do: "DO Tracker",
+    hdr_your_desks: "Your desks", hdr_in_desk: "In this desk", hdr_all_desks: "All desks", hdr_learning: "Learning room",
     manage_users: "Admin",
     signed_in_as: "Signed in as",
     log_out: "Log out",
@@ -408,6 +413,11 @@ const I18N = {
   },
   ar: {
     app_tagline: "متتبع أوامر التسليم",
+    hdr_desk_manifest: "مكتب المانيفست", hdr_desk_manifest_sub: "من المانيفست إلى أمر التسليم",
+    hdr_desk_operations: "مكتب العمليات", hdr_desk_operations_sub: "السفن والأرصفة والموانئ",
+    hdr_desk_accounts: "مكتب الحسابات", hdr_desk_accounts_sub: "عروض الأسعار والفواتير والأعمال",
+    hdr_tool_manifest: "رفع المانيفست", hdr_tool_do: "متتبع أوامر التسليم",
+    hdr_your_desks: "مكاتبك", hdr_in_desk: "في هذا المكتب", hdr_all_desks: "كل المكاتب", hdr_learning: "غرفة التعلّم",
     manage_users: "الإدارة",
     signed_in_as: "مسجّل الدخول باسم",
     log_out: "تسجيل الخروج",
@@ -2149,6 +2159,181 @@ def _deskbar_html(feats, path):
             '<span class="dk-name">' + html_escape(cur["name"]) + '</span>' + tools + '</div><div class="dk-r">' + others + '</div></nav>')
 
 
+# ==== DESK HEADER BEGIN (shared by the Manifest upload page and the DO Tracker page) ====
+_HDR_CSS = r"""
+/* ---- shared desk header: desk button + tools toggle + menus (one source for every page in a desk) ---- */
+.dh{position:relative;z-index:60;display:flex;align-items:center;gap:14px;height:58px;padding:0 20px;background:var(--card);border-bottom:1px solid var(--border);color:var(--text);font:14px/1.3 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Arial,sans-serif;box-sizing:border-box}
+[dir="rtl"] .dh{font-family:'Cairo','Segoe UI',Tahoma,Arial,sans-serif}
+.dh *{box-sizing:border-box}
+.dh a{text-decoration:none}
+.dh [hidden]{display:none!important}
+.dh-brand{display:flex;align-items:center;gap:10px;color:var(--text);flex:none}
+.dh-brand img{height:30px;width:auto;display:block}
+:root[data-theme="dark"] .dh-brand img{background:#fff;border-radius:8px;padding:3px 7px}
+.dh-brand b{font-size:15px;font-weight:700;letter-spacing:-.01em}
+.dh-desk{position:relative;display:flex;align-items:center;gap:12px;min-width:0;margin-inline-start:6px}
+.dh .dh-chip{display:flex;align-items:center;gap:8px;height:40px;padding:0 11px;margin:0;border-radius:10px;border:1px solid color-mix(in srgb,var(--navy) 22%,var(--border));background:color-mix(in srgb,var(--navy) 9%,var(--card));color:var(--navy);font:inherit;font-size:14px;font-weight:700;white-space:nowrap;cursor:pointer;min-width:0;transform:none;flex:none}
+:root[data-theme="dark"] .dh .dh-chip{color:var(--navy-light)}
+.dh .dh-chip:hover,.dh .dh-chip[aria-expanded="true"]{background:color-mix(in srgb,var(--navy) 16%,var(--card))}
+.dh .dh-chip:focus-visible,.dh .dh-user:focus-visible{outline:2px solid var(--navy-light);outline-offset:2px}
+.dh-chip .ico{width:18px;height:18px;flex:none}
+.dh-chip .chev{width:14px;height:14px;opacity:.7;flex:none;transition:transform .15s ease}
+.dh-chip[aria-expanded="true"] .chev{transform:rotate(180deg)}
+/* the tools toggle uses the same glass recipe as the Discharge Port dropdown */
+.dh-tools{position:relative;display:inline-flex;align-items:center;gap:3px;height:40px;padding:3px;border-radius:10px;overflow:hidden;flex:none;
+ border:1.5px solid color-mix(in srgb,var(--navy-light) 70%,transparent);
+ background:linear-gradient(160deg,color-mix(in srgb,#ffffff 65%,var(--navy-light) 10%) 0%,color-mix(in srgb,var(--navy-light) 22%,white) 55%,color-mix(in srgb,#ffffff 70%,var(--navy-light) 14%) 100%);
+ backdrop-filter:blur(14px) saturate(200%);-webkit-backdrop-filter:blur(14px) saturate(200%);
+ box-shadow:0 10px 22px -6px color-mix(in srgb,var(--navy) 42%,transparent),0 2px 6px color-mix(in srgb,var(--navy) 22%,transparent),inset 0 1.5px 0 rgba(255,255,255,0.95),inset 0 -1.5px 0 color-mix(in srgb,var(--navy) 22%,transparent);
+ transition:border-color .15s ease,background .15s ease,box-shadow .15s ease,transform .15s ease}
+.dh-tools::before{content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;background:linear-gradient(115deg,rgba(255,255,255,0.9) 0%,rgba(255,255,255,0.05) 30%,rgba(255,255,255,0.05) 60%,rgba(255,255,255,0.6) 100%);mix-blend-mode:overlay}
+.dh-tools:hover{border-color:color-mix(in srgb,var(--navy-light) 85%,transparent);transform:translateY(-1px);box-shadow:0 14px 26px -6px color-mix(in srgb,var(--navy) 50%,transparent),0 3px 8px color-mix(in srgb,var(--navy) 26%,transparent),inset 0 1.5px 0 rgba(255,255,255,0.95),inset 0 -1.5px 0 color-mix(in srgb,var(--navy) 24%,transparent)}
+.dh-tools:focus-within{border-color:var(--navy-light);box-shadow:0 0 0 3px color-mix(in srgb,var(--navy-light) 30%,transparent),0 14px 30px -8px color-mix(in srgb,var(--navy) 50%,transparent),inset 0 1.5px 0 rgba(255,255,255,1)}
+:root[data-theme="dark"] .dh-tools{border-color:color-mix(in srgb,#ffffff 30%,transparent);background:linear-gradient(165deg,rgba(255,255,255,0.22) 0%,rgba(255,255,255,0.02) 40%,rgba(255,255,255,0.10) 100%),linear-gradient(135deg,color-mix(in srgb,var(--navy-light) 42%,var(--card)),color-mix(in srgb,var(--card) 60%,black) 80%);box-shadow:0 14px 32px -6px rgba(0,0,0,0.6),0 3px 10px rgba(0,0,0,0.35),inset 0 1.5px 0 rgba(255,255,255,0.22),inset 0 -1.5px 0 rgba(0,0,0,0.35)}
+:root[data-theme="dark"] .dh-tools::before{background:linear-gradient(115deg,rgba(255,255,255,0.22) 0%,rgba(255,255,255,0) 24%,rgba(255,255,255,0) 64%,rgba(255,255,255,0.12) 100%)}
+:root[data-theme="dark"] .dh-tools:hover{border-color:color-mix(in srgb,#ffffff 42%,transparent);box-shadow:0 18px 36px -6px rgba(0,0,0,0.65),0 4px 12px rgba(0,0,0,0.4),inset 0 1.5px 0 rgba(255,255,255,0.28),inset 0 -1.5px 0 rgba(0,0,0,0.4)}
+:root[data-theme="dark"] .dh-tools:focus-within{border-color:var(--navy-light);box-shadow:0 0 0 3px color-mix(in srgb,var(--navy-light) 35%,transparent),0 14px 32px -6px rgba(0,0,0,0.6),inset 0 1.5px 0 rgba(255,255,255,0.26)}
+.dh-tools a{position:relative;z-index:1;display:flex;align-items:center;height:100%;padding:0 14px;border-radius:7px;color:var(--text);font-size:14px;font-weight:400;white-space:nowrap}
+.dh-tools a:hover{background:color-mix(in srgb,var(--navy-light) 22%,transparent)}
+:root[data-theme="dark"] .dh-tools a:hover{background:rgba(255,255,255,0.12)}
+.dh-tools a[aria-current="page"]{font-weight:600;background:color-mix(in srgb,var(--navy-light) 22%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--navy-light) 45%,transparent)}
+:root[data-theme="dark"] .dh-tools a[aria-current="page"]{background:rgba(255,255,255,0.14);box-shadow:inset 0 0 0 1px rgba(255,255,255,0.28)}
+.dh-tools a:focus-visible{outline:2px solid var(--navy-light);outline-offset:-2px}
+.dh-spacer{flex:1;min-width:0}
+.dh-right{display:flex;align-items:center;gap:10px;flex:none}
+.dh .theme-switch{direction:ltr}
+.dh .dh-user{display:flex;align-items:center;gap:8px;height:40px;margin:0;padding-block:4px;padding-inline:4px 12px;border-radius:999px;border:1px solid var(--border);background:transparent;color:var(--text);font:inherit;font-size:13px;font-weight:600;cursor:pointer;transform:none}
+.dh .dh-user:hover,.dh .dh-user[aria-expanded="true"]{background:color-mix(in srgb,var(--text) 7%,transparent)}
+.dh-user .av{width:30px;height:30px;border-radius:50%;background:var(--navy);color:#fff;display:grid;place-items:center;font-size:12px;font-weight:700;flex:none}
+:root[data-theme="dark"] .dh-user .av{color:#0b1620}
+.dh-user .nm{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* menus: the same glass panel as the Discharge Port list */
+.dh-panel{position:absolute;z-index:3000;min-width:220px;max-width:calc(100vw - 24px);padding:6px;border-radius:12px;
+ border:1.5px solid color-mix(in srgb,var(--navy-light) 70%,transparent);
+ background:linear-gradient(160deg,color-mix(in srgb,#ffffff 90%,var(--navy-light) 6%) 0%,color-mix(in srgb,var(--navy-light) 14%,white) 60%,color-mix(in srgb,#ffffff 92%,var(--navy-light) 8%) 100%);
+ backdrop-filter:blur(18px) saturate(200%);-webkit-backdrop-filter:blur(18px) saturate(200%);
+ box-shadow:0 18px 40px -10px color-mix(in srgb,var(--navy) 45%,transparent),0 4px 14px color-mix(in srgb,var(--navy) 25%,transparent),inset 0 1.5px 0 rgba(255,255,255,0.9)}
+:root[data-theme="dark"] .dh-panel{border-color:color-mix(in srgb,#ffffff 30%,transparent);background:linear-gradient(165deg,rgba(255,255,255,0.16) 0%,rgba(255,255,255,0.02) 40%,rgba(255,255,255,0.09) 100%),linear-gradient(135deg,color-mix(in srgb,var(--navy-light) 38%,var(--card)),color-mix(in srgb,var(--card) 65%,black) 85%);box-shadow:0 20px 44px -8px rgba(0,0,0,0.65),0 4px 14px rgba(0,0,0,0.4),inset 0 1.5px 0 rgba(255,255,255,0.2)}
+.dh-dmenu{top:calc(100% + 10px);inset-inline-start:0;width:330px}
+.dh-umenu{top:calc(100% - 6px);inset-inline-end:14px;width:250px}
+.dh-panel a{display:flex;align-items:center;gap:12px;padding:9px 10px;border-radius:8px;color:var(--text);font-size:14px}
+.dh-panel a:hover,.dh-panel a:focus-visible{background:color-mix(in srgb,var(--navy-light) 22%,transparent);outline:none}
+:root[data-theme="dark"] .dh-panel a:hover,:root[data-theme="dark"] .dh-panel a:focus-visible{background:rgba(255,255,255,0.12)}
+.dh-panel a.cur{background:color-mix(in srgb,var(--navy-light) 14%,transparent);font-weight:600}
+.dh-panel a svg{width:22px;height:22px;flex:none;color:var(--navy)}
+:root[data-theme="dark"] .dh-panel a svg{color:var(--navy-light)}
+.dh-panel a span{display:flex;flex-direction:column;min-width:0;flex:1}
+.dh-panel a b{font-size:14px;font-weight:600}
+.dh-panel a small{color:var(--muted);font-size:12px}
+.dh-panel a i{font-style:normal;color:var(--navy);font-weight:800;margin-inline-start:auto}
+:root[data-theme="dark"] .dh-panel a i{color:var(--navy-light)}
+.dh-h{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);padding:6px 10px 6px}
+[dir="rtl"] .dh-h{letter-spacing:0;text-transform:none;font-size:12.5px}
+.dh-panel hr{border:0;border-top:1px solid color-mix(in srgb,var(--navy-light) 25%,transparent);margin:6px 4px}
+.dh-who{padding:8px 10px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dh-sec-tools{display:none}
+@media (max-width:960px){.dh-user .nm{display:none}.dh .dh-user{padding-inline:4px}}
+@media (max-width:900px){.dh{height:54px;padding:0 14px;gap:10px}}
+@media (max-width:860px){.dh-brand b{display:none}}
+@media (max-width:780px){.dh-tools{display:none}.dh-sec-tools{display:block}.dh-desk{position:static}.dh-dmenu{inset-inline:12px;width:auto;top:calc(100% - 6px)}}
+@media (max-width:440px){.dh{gap:8px;padding:0 12px}.dh-right{gap:6px}.dh-desk{margin-inline-start:0}.dh-chip .lbl{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}}
+@media print{.dh{display:none}}
+"""
+
+_HDR_JS = r"""
+(function () {
+  var dh = document.getElementById('dh'); if (!dh) return;
+  var pairs = [['dhDeskBtn', 'dhDeskMenu'], ['dhUserBtn', 'dhUserMenu']].map(function (p) {
+    return { b: document.getElementById(p[0]), m: document.getElementById(p[1]) };
+  }).filter(function (x) { return x.b && x.m; });
+  function items(m) { return [].slice.call(m.querySelectorAll('a[role="menuitem"]')).filter(function (a) { return a.offsetParent !== null; }); }
+  function setOpen(x, on) { x.m.hidden = !on; x.b.setAttribute('aria-expanded', on ? 'true' : 'false'); }
+  function closeAll(except) { pairs.forEach(function (x) { if (x !== except) setOpen(x, false); }); }
+  function openMenu(x, focusFirst) {
+    closeAll(x); setOpen(x, true);
+    document.querySelectorAll('.menu').forEach(function (m) { m.hidden = true; });
+    if (focusFirst) { var it = items(x.m), cur = x.m.querySelector('a.cur'), t = (cur && it.indexOf(cur) >= 0) ? cur : it[0]; if (t) t.focus(); }
+  }
+  pairs.forEach(function (x) {
+    x.b.addEventListener('click', function (e) { e.stopPropagation(); if (x.m.hidden) openMenu(x, e.detail === 0); else setOpen(x, false); });
+    x.b.addEventListener('keydown', function (e) { if (e.key === 'ArrowDown') { e.preventDefault(); openMenu(x, true); } });
+    x.m.addEventListener('click', function (e) { e.stopPropagation(); });
+    x.m.addEventListener('keydown', function (e) {
+      var it = items(x.m), i = it.indexOf(document.activeElement);
+      if (e.key === 'ArrowDown') { e.preventDefault(); it[(i + 1) % it.length].focus(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); it[(i - 1 + it.length) % it.length].focus(); }
+      else if (e.key === 'Home') { e.preventDefault(); it[0].focus(); }
+      else if (e.key === 'End') { e.preventDefault(); it[it.length - 1].focus(); }
+      else if (e.key === 'Tab') { setOpen(x, false); }
+    });
+  });
+  document.addEventListener('click', function () { closeAll(null); });
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    var op = pairs.filter(function (x) { return !x.m.hidden; })[0];
+    if (op) { setOpen(op, false); op.b.focus(); e.stopPropagation(); }
+  }, true);
+  window.addEventListener('resize', function () { closeAll(null); });
+})();
+"""
+
+_DESK_ICO = '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">%s</svg>'
+_HDR_I18N_TOOL = {"manifest": "hdr_tool_manifest", "do": "hdr_tool_do"}
+
+
+def _hdr_i(key):
+    return ' data-i18n="%s"' % key if key else ""
+
+
+def _desk_header_html(path, lang_switch=False):
+    """The one header every page of a desk wears: Compass logo, the desk (a button that opens the list of desks),
+    that desk's tools as a toggle, then language / theme / account. Built from the person's own features."""
+    desks = _desks_for(_features())
+    key = _desk_of_path(path)
+    cur = next((d for d in desks if d["key"] == key), None)
+    if not cur:
+        return ""
+    e = html_escape
+    me = session.get("display_name") or session.get("username") or ""
+    on = lambda u: path == u or path.startswith(u + "/")
+    tool_key = lambda t: _HDR_I18N_TOOL.get(t["key"])
+    tools = "".join('<a href="%s"%s%s>%s</a>' % (e(t["url"]), ' aria-current="page"' if on(t["url"]) else "", _hdr_i(tool_key(t)), e(t["name"])) for t in cur["tools"])
+    mtools = "".join('<a role="menuitem" href="%s"%s><span%s>%s</span>%s</a>' % (e(t["url"]), ' class="cur"' if on(t["url"]) else "", _hdr_i(tool_key(t)), e(t["name"]), "<i>&#10003;</i>" if on(t["url"]) else "") for t in cur["tools"])
+    mdesks = "".join(
+        '<a role="menuitem" href="%s"%s><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">%s</svg>'
+        '<span><b data-i18n="hdr_desk_%s">%s</b><small data-i18n="hdr_desk_%s_sub">%s</small></span>%s</a>'
+        % (e(d["tools"][0]["url"]), ' class="cur"' if d["key"] == key else "", d["icon"], d["key"], e(d["name"]), d["key"], e(d["blurb"].rstrip(".")), "<i>&#10003;</i>" if d["key"] == key else "")
+        for d in desks)
+    lang = ('<div class="lang-switch" title="EN / &#1593;&#1585;&#1576;&#1610;"><button type="button" class="lang-opt active" data-lang-btn="en" onclick="setLang(\'en\')">EN</button>'
+            '<button type="button" class="lang-opt" data-lang-btn="ar" onclick="setLang(\'ar\')">&#1593;&#1585;&#1576;&#1610;</button></div>') if lang_switch else ""
+    theme = ('<label class="theme-switch" title="Toggle dark mode" data-i18n-title="toggle_dark_mode"><input type="checkbox" id="themeToggle" aria-label="Dark mode" onchange="setTheme(this.checked ? \'dark\' : \'light\')">'
+             '<span class="theme-track"><span class="theme-icon sun"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg></span>'
+             '<span class="theme-icon moon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg></span><span class="theme-knob"></span></span></label>')
+    umenu = ('<div class="dh-who">%s</div><hr>' % e(me) +
+             ('<a role="menuitem" href="/users" data-i18n="manage_users">Admin</a>' if _is_owner() else "") +
+             ('<a role="menuitem" href="/learned" data-i18n="hdr_learning">Learning room</a>' if _is_owner() else "") +
+             '<a role="menuitem" href="/logout" data-i18n="log_out">Log out</a>')
+    chev = '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>'
+    return (
+        '<header class="dh" id="dh">'
+        '<a href="/" class="dh-brand" aria-label="Compass, all desks"><img src="data:image/png;base64,' + LOGO_B64 + '" alt="Sea Power"><b>Compass</b></a>'
+        '<div class="dh-desk">'
+        '<button type="button" class="dh-chip" id="dhDeskBtn" aria-haspopup="menu" aria-expanded="false" aria-controls="dhDeskMenu">' + (_DESK_ICO % cur["icon"]) +
+        '<span class="lbl" data-i18n="hdr_desk_' + cur["key"] + '">' + e(cur["name"]) + '</span>' + chev + '</button>'
+        '<nav class="dh-tools" aria-label="' + e(cur["name"]) + '">' + tools + '</nav>'
+        '<div class="dh-panel dh-dmenu" id="dhDeskMenu" role="menu" hidden>'
+        '<div class="dh-sec-tools"><div class="dh-h" data-i18n="hdr_in_desk">In this desk</div>' + mtools + '<hr></div>'
+        '<div class="dh-h" data-i18n="hdr_your_desks">Your desks</div>' + mdesks +
+        '<hr><a role="menuitem" href="/" data-i18n="hdr_all_desks">All desks</a></div>'
+        '</div>'
+        '<span class="dh-spacer"></span>'
+        '<div class="dh-right">' + lang + theme +
+        '<button type="button" class="dh-user" id="dhUserBtn" aria-haspopup="menu" aria-expanded="false" aria-controls="dhUserMenu"><span class="av" aria-hidden="true">' + e((me.strip()[:1] or "?").upper()) + '</span><span class="nm">' + e(me) + '</span></button></div>'
+        '<div class="dh-panel dh-umenu" id="dhUserMenu" role="menu" hidden>' + umenu + '</div>'
+        '</header>')
+# ==== DESK HEADER END ====
+
+
 def _feat_parse(raw):
     """Stored value -> set of feature keys. NULL = every feature; 'none' = nothing."""
     if raw is None:
@@ -2587,7 +2772,7 @@ def _add_idle_script(resp):
 def _add_deskbar(resp):
     try:
         if ("user_id" in session and resp.status_code == 200 and resp.mimetype == "text/html"
-                and not resp.direct_passthrough and _desk_of_path(request.path) and request.path != "/manifest-desk"):
+                and not resp.direct_passthrough and _desk_of_path(request.path) and request.path not in ("/manifest-desk", "/do-tracker")):
             body = resp.get_data(as_text=True)
             m = re.search(r"<body[^>]*>", body)
             bar = _deskbar_html(_features(), request.path)
@@ -2831,7 +3016,7 @@ def index():
 @app.route("/do-tracker")
 @login_required
 def do_tracker_page():
-    return render_template_string(PAGE_HTML, username=session.get("username"), role=session.get("role"))
+    return render_template_string(PAGE_HTML, username=session.get("username"), role=session.get("role"), hdr_html=_desk_header_html("/do-tracker", lang_switch=True))
 
 
 @app.route("/vessel-tracker")
@@ -6455,15 +6640,12 @@ def _desk_upload_view(row):
 @app.route("/manifest-desk")
 @login_required
 def manifest_desk_page():
-    feats = _features()
-    desks = _desks_for(feats)
-    nav = {"desks": [{"name": d["name"], "url": d["tools"][0]["url"], "on": d["key"] == "manifest"} for d in desks],
-           "tools": next(([{"name": t["name"], "url": t["url"], "on": t["url"] == "/manifest-desk"} for t in d["tools"]] for d in desks if d["key"] == "manifest"), [])}
     page = DESK_HTML.replace("__NAME__", html.escape(session.get("display_name") or session.get("username") or "", quote=True))
-    page = page.replace("__NAV__", html.escape(json.dumps(nav), quote=True))
     page = page.replace("__PORTS__", html.escape(json.dumps([{"v": p, "t": DESK_PORT_LABELS[p]} for p in DESK_PORTS]), quote=True))
     page = page.replace("__LEARNED__", "1" if _is_owner() else "0")
     page = page.replace("__LOGO__", LOGO_B64)
+    # the shared header goes in last: it carries the person's name, which must never be read as a placeholder
+    page = page.replace("__HDRCSS__", _HDR_CSS).replace("__HDRJS__", _HDR_JS).replace("__HEADER__", _desk_header_html("/manifest-desk"))
     resp = Response(page, mimetype="text/html")
     resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -15891,20 +16073,9 @@ DESK_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta
   h1, h2, h3, h4 { margin: 0; letter-spacing: -.01em; }
 
   /* ---- one header ---- */
-  .top { flex: none; display: flex; align-items: center; gap: 14px; height: 58px; padding: 0 20px; background: var(--card); border-bottom: 1px solid var(--border); position: relative; z-index: 60; }
-  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--text); flex: none; }
-  .brand img { height: 30px; width: auto; display: block; }
-  :root[data-theme="dark"] .brand img { background: #fff; border-radius: 8px; padding: 3px 7px; }
-  .brand b { font-size: 15px; }
-  .crumb { display: flex; align-items: center; gap: 6px; min-width: 0; margin-left: 4px; padding-left: 14px; border-left: 1px solid var(--border); }
-  .crumb .desk { font-weight: 700; white-space: nowrap; }
-  .tabs-top { display: flex; gap: 2px; margin-left: 6px; }
-  .tabs-top a { color: var(--muted); text-decoration: none; padding: 7px 12px; border-radius: 999px; font-weight: 600; font-size: 13px; white-space: nowrap; }
-  .tabs-top a:hover { background: var(--line); }
-  .tabs-top a[aria-current="page"] { background: var(--navy); color: #fff; }
-  :root[data-theme="dark"] .tabs-top a[aria-current="page"] { color: #0b1620; }
+  __HDRCSS__
+  .dh { flex: none; }
   .spacer { flex: 1; }
-  .top-right { display: flex; align-items: center; gap: 10px; flex: none; }
   .theme-switch { position: relative; display: inline-flex; width: 54px; height: 29px; cursor: pointer; }
   .theme-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
   .theme-track { position: absolute; inset: 0; border-radius: 999px; display: flex; align-items: center; justify-content: space-between; padding: 0 7px; background: linear-gradient(135deg,#8fcaf0,#f4d58d); }
@@ -15914,10 +16085,6 @@ DESK_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta
   .theme-icon svg { width: 100%; height: 100%; display: block; }
   .theme-knob { position: absolute; top: 3px; left: 3px; width: 23px; height: 23px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.3); transition: transform .3s cubic-bezier(.4,0,.2,1); }
   .theme-switch input:checked + .theme-track .theme-knob { transform: translateX(25px); background: #0b2740; }
-  .userbtn { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); background: transparent; border-radius: 999px; padding: 4px 12px 4px 4px; cursor: pointer; font-weight: 600; font-size: 13px; }
-  .userbtn:hover { background: var(--line); }
-  .avatar { width: 28px; height: 28px; border-radius: 50%; background: var(--navy); color: #fff; display: grid; place-items: center; font-size: 12px; font-weight: 700; }
-  :root[data-theme="dark"] .avatar { color: #0b1620; }
   .menu { position: absolute; right: 20px; top: 52px; min-width: 220px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow-md); padding: 6px; z-index: 80; }
   .menu a, .menu button { display: block; width: 100%; text-align: left; padding: 10px 12px; border-radius: 9px; color: var(--text); text-decoration: none; background: none; border: 0; cursor: pointer; font-size: 14px; }
   .menu a:hover, .menu button:hover { background: var(--line); }
@@ -16090,14 +16257,9 @@ DESK_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 
   /* ---- smaller screens ---- */
-  @media (max-width: 1100px) { .crumb .tabs-top { display: none; } }
   @media (max-width: 900px) {
     body { height: auto; min-height: 100dvh; overflow: auto; }
-    .top { height: 54px; padding: 0 14px; position: sticky; top: 0; }
-    .crumb { border-left: 0; padding-left: 0; margin-left: 0; }
-    .brand b { display: none; }
-    .userbtn span.nm { display: none; }
-    .userbtn { padding: 4px; }
+    .dh { position: sticky; top: 0; }
     .menu { right: 12px; }
     .page { padding: 12px 14px 0; display: block; }
     .page > * + * { margin-top: 12px; }
@@ -16146,18 +16308,10 @@ DESK_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta
 function setTheme(mode) { document.documentElement.setAttribute('data-theme', mode); try { localStorage.setItem('theme', mode); } catch (e) {} }
 </script>
 </head>
-<body data-nav="__NAV__" data-ports="__PORTS__" data-owner="__LEARNED__" data-name="__NAME__">
+<body data-ports="__PORTS__" data-owner="__LEARNED__" data-name="__NAME__">
 <a class="skip" href="#list">Skip to the consignee list</a>
-<header class="top">
-  <a href="/" class="brand" aria-label="Compass, all desks"><img src="data:image/png;base64,__LOGO__" alt="Sea Power"><b>Compass</b></a>
-  <div class="crumb"><span class="desk">Manifest Desk</span><nav class="tabs-top" id="toolTabs" aria-label="Manifest Desk tools"></nav></div>
-  <span class="spacer"></span>
-  <div class="top-right">
-    <label class="theme-switch" title="Dark mode"><input type="checkbox" id="themeToggle" aria-label="Dark mode" onchange="setTheme(this.checked ? 'dark' : 'light')"><span class="theme-track"><span class="theme-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg></span><span class="theme-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg></span><span class="theme-knob"></span></span></label>
-    <button class="userbtn" id="userBtn" aria-haspopup="true" aria-expanded="false" aria-controls="userMenu"><span class="avatar" id="avatar" aria-hidden="true"></span><span class="nm" id="uname"></span></button>
-  </div>
-  <div class="menu" id="userMenu" role="menu" hidden></div>
-</header>
+__HEADER__
+<script>__HDRJS__</script>
 
 <main class="page">
   <section class="card vstrip" id="vstrip" aria-label="Vessel">
@@ -16238,7 +16392,7 @@ function setTheme(mode) { document.documentElement.setAttribute('data-theme', mo
 <div id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
 <script>
 var D = document.body.dataset;
-var NAV = JSON.parse(D.nav), PORTS = JSON.parse(D.ports), OWNER = D.owner === '1', ME = D.name || '';
+var PORTS = JSON.parse(D.ports), OWNER = D.owner === '1', ME = D.name || '';
 var S = {port: '', vessel: '', openKey: '', data: null, sel: null, tab: 'notice', filter: 'all', sort: 'attention', q: '', pseq: 0, timer: null,
          dirty: false, learn: [], staged: [], sheet: null, lastFocus: null, view: 'list', etaTouched: false, busy: false};
 var KINDS = {arriving: 'Arriving', anchorage: 'At anchorage', berthed: 'Berthed'};
@@ -16335,15 +16489,6 @@ function visibleGroups() {
 }
 
 /* ---------- header, menus ---------- */
-function buildHeader() {
-  $('toolTabs').innerHTML = NAV.tools.map(function (t) { return '<a href="' + esc(t.url) + '"' + (t.on ? ' aria-current="page"' : '') + '>' + esc(t.name) + '</a>'; }).join('');
-  $('uname').textContent = ME; $('avatar').textContent = (ME.trim()[0] || '?').toUpperCase();
-  var others = NAV.desks.filter(function (d) { return !d.on; });
-  $('userMenu').innerHTML = '<div class="who">' + esc(ME) + '</div>' +
-    '<a role="menuitem" href="/">All desks</a>' + others.map(function (d) { return '<a role="menuitem" href="' + esc(d.url) + '">' + esc(d.name) + '</a>'; }).join('') +
-    NAV.tools.filter(function (t) { return !t.on; }).map(function (t) { return '<a role="menuitem" href="' + esc(t.url) + '">' + esc(t.name) + '</a>'; }).join('') +
-    (OWNER ? '<a role="menuitem" href="/learned">Learning room</a>' : '') + '<hr><a role="menuitem" href="/logout">Log out</a>';
-}
 function toggleMenu(id, btn, open) {
   var m = $(id), want = open === undefined ? m.hidden : open;
   document.querySelectorAll('.menu').forEach(function (x) { x.hidden = true; });
@@ -16360,11 +16505,10 @@ document.addEventListener('click', function (e) {
 document.addEventListener('keydown', function (e) {
   if (e.key === 'Escape') {
     var open = document.querySelector('.menu:not([hidden])');
-    if (open) { open.hidden = true; var b = (open.id === 'userMenu' ? $('userBtn') : $('vmenuBtn')); b.setAttribute('aria-expanded', 'false'); b.focus(); return; }
+    if (open) { open.hidden = true; var b = $('vmenuBtn'); b.setAttribute('aria-expanded', 'false'); b.focus(); return; }
     if (!$('veil').hidden) closeSheet();
   }
 });
-$('userBtn').onclick = function () { toggleMenu('userMenu', this); };
 $('vmenuBtn').onclick = function () {
   $('vMenu').innerHTML = '<button role="menuitem" id="mvRename">Rename or move this vessel&hellip;</button><button role="menuitem" id="mvUploads">Manifests added&hellip;</button>';
   toggleMenu('vMenu', this);
@@ -16918,7 +17062,7 @@ window.addEventListener('beforeunload', function (e) { if (S.dirty) { e.preventD
 
 /* ---------- start ---------- */
 async function start() {
-  buildHeader(); fillPorts();
+  fillPorts();
   if (window.innerWidth > 900) document.body.style.overflow = 'hidden';
   $('detailEmpty').innerHTML = '';
   var recents = [];
@@ -22782,39 +22926,15 @@ PAGE_HTML = """
   [dir="rtl"] th { font-size: 12px; }
   [dir="rtl"] .eta-label, [dir="rtl"] .eta-unset-hint, [dir="rtl"] .meta { font-size: 11.5px; }
   [dir="rtl"] tbody tr td[data-label]::before { font-size: 12px; }
+
+  /* ---- DO Tracker wears the shared desk header ---- */
+  """ + _HDR_CSS + """
+  .dh { position: sticky; top: 0; margin: 0 -16px 20px; }
+  @media (max-width: 600px) { .dh { position: relative; } }
 </style>
 </head>
 <body>
-  <div class="topbar">
-    <a href="/" class="brand" style="text-decoration:none;">
-      <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
-      <div class="brand-text">
-        <span class="app-name">Compass</span>
-        <span class="app-tag" data-i18n="app_tagline">DO Tracker</span>
-      </div>
-    </a>
-    <div class="topbar-right">
-      <div class="lang-switch" title="EN / &#1593;&#1585;&#1576;&#1610;">
-        <button type="button" class="lang-opt active" data-lang-btn="en" onclick="setLang('en')">EN</button>
-        <button type="button" class="lang-opt" data-lang-btn="ar" onclick="setLang('ar')">&#1593;&#1585;&#1576;&#1610;</button>
-      </div>
-      <label class="theme-switch" title="Toggle dark mode" data-i18n-title="toggle_dark_mode">
-        <input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')">
-        <span class="theme-track">
-          <span class="theme-icon sun">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg>
-          </span>
-          <span class="theme-icon moon">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg>
-          </span>
-          <span class="theme-knob"></span>
-        </span>
-      </label>
-      {% if role == 'owner' %}<a href="/users" data-i18n="manage_users">Admin</a>{% endif %}
-      <span class="who"><b>{{ display_name }}</b></span>
-      <a href="/logout" data-i18n="log_out">Log out</a>
-    </div>
-  </div>
+  {{ hdr_html|safe }}
 
   <div class="card" id="manifestCard">
     <div class="card-label" data-i18n="add_a_manifest">Add a manifest</div>
@@ -25339,6 +25459,7 @@ initGlassSelects();
 fetchRecords();
 setInterval(fetchRecords, 4000);
 </script>
+<script>""" + _HDR_JS + """</script>
 </body>
 </html>
 """
