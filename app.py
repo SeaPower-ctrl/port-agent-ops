@@ -27,6 +27,7 @@ from html import escape as html_escape
 import io
 import time
 import threading
+import select
 import secrets
 import base64
 import hashlib
@@ -113,7 +114,7 @@ const I18N = {
     hdr_desk_manifest: "Manifest Desk", hdr_desk_manifest_sub: "From manifest to delivery order",
     hdr_desk_operations: "Operations Desk", hdr_desk_operations_sub: "Vessels, berths and ports",
     hdr_desk_accounts: "Accounts Desk", hdr_desk_accounts_sub: "Quotations, invoices and jobs",
-    hdr_tool_manifest: "Manifest upload", hdr_tool_do: "DO Tracker",
+    hdr_tool_manifest: "Arrival notices", hdr_tool_do: "DO Tracker",
     hdr_your_desks: "Your desks", hdr_in_desk: "In this desk", hdr_all_desks: "All desks", hdr_learning: "Learning room", hdr_language: "Language",
     manage_users: "Admin",
     signed_in_as: "Signed in as",
@@ -416,7 +417,7 @@ const I18N = {
     hdr_desk_manifest: "مكتب المانيفست", hdr_desk_manifest_sub: "من المانيفست إلى أمر التسليم",
     hdr_desk_operations: "مكتب العمليات", hdr_desk_operations_sub: "السفن والأرصفة والموانئ",
     hdr_desk_accounts: "مكتب الحسابات", hdr_desk_accounts_sub: "عروض الأسعار والفواتير والأعمال",
-    hdr_tool_manifest: "رفع المانيفست", hdr_tool_do: "متتبع أوامر التسليم",
+    hdr_tool_manifest: "إشعارات الوصول", hdr_tool_do: "متتبع أوامر التسليم",
     hdr_your_desks: "مكاتبك", hdr_in_desk: "في هذا المكتب", hdr_all_desks: "كل المكاتب", hdr_learning: "غرفة التعلّم", hdr_language: "اللغة",
     manage_users: "الإدارة",
     signed_in_as: "مسجّل الدخول باسم",
@@ -733,17 +734,95 @@ function setLang(lang) {
 """
 
 
+# Opening a connection to the database costs several round trips (TCP, TLS, sign-in). With the app in Oregon and
+# the database in Ohio that was about a third of a second on EVERY request, so finished connections are kept
+# and handed to the next request instead. DB_POOL=0 switches this off (every request opens its own again).
+DB_POOL_ON = os.environ.get("DB_POOL", "1") != "0"
+_POOL_IDLE = []                # [(connection, time it was put back)]
+_POOL_LOCK = threading.Lock()
+_POOL_KEEP = 4                 # connections kept ready
+_POOL_MAX_IDLE = 240           # seconds; the hosted database drops idle connections after about five minutes
+
+
+def _db_connect():
+    return psycopg2.connect(DATABASE_URL, keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
+
+
+def _conn_alive(conn):
+    """A kept connection the server has closed shows up as readable (the goodbye), with no round trip to find out."""
+    if conn.closed:
+        return False
+    try:
+        readable, _, _ = select.select([conn], [], [], 0)
+    except Exception:
+        return False
+    return not readable
+
+
+def _pool_take():
+    now = time.time()
+    while True:
+        with _POOL_LOCK:
+            item = _POOL_IDLE.pop() if _POOL_IDLE else None
+        if item is None:
+            return None
+        conn, since = item
+        if now - since > _POOL_MAX_IDLE or not _conn_alive(conn):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            continue
+        return conn
+
+
+def _pool_give(conn):
+    """Ends the request's transaction (nothing half-done may reach the next request), then keeps the connection."""
+    try:
+        if conn.closed:
+            return
+        if conn.get_transaction_status() != psycopg2.extensions.TRANSACTION_STATUS_IDLE:
+            conn.rollback()
+        with _POOL_LOCK:
+            if len(_POOL_IDLE) < _POOL_KEEP:
+                _POOL_IDLE.append((conn, time.time()))
+                return
+        conn.close()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 class DBWrapper:
     """Thin wrapper so the rest of the app can keep using SQLite-style
     '?' placeholders and db.execute(...).fetchone()/fetchall(), while
     actually talking to Postgres underneath."""
 
-    def __init__(self, conn):
+    def __init__(self, conn, reused=False):
         self.conn = conn
+        self.reused = reused       # a kept connection: it may have been closed by the server while it sat idle
+        self.ran = False
 
     def execute(self, query, params=()):
-        cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(query.replace("?", "%s"), params)
+        q = query.replace("?", "%s")
+        try:
+            cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(q, params)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            if not (self.reused and not self.ran):
+                raise
+            # nothing has run on this connection yet in this request: open a fresh one and run the statement again
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = _db_connect()
+            self.reused = False
+            cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(q, params)
+        self.ran = True
         return cur
 
     def commit(self):
@@ -755,11 +834,21 @@ class DBWrapper:
     def close(self):
         self.conn.close()
 
+    def release(self):
+        """End of the request. The connection goes back to the kept ones after the response is on its way."""
+        if not DB_POOL_ON:
+            self.conn.close()
+            return
+        threading.Thread(target=_pool_give, args=(self.conn,), daemon=True).start()
+
 
 def get_db():
     if "db" not in g:
-        conn = psycopg2.connect(DATABASE_URL)
-        g.db = DBWrapper(conn)
+        conn = _pool_take() if DB_POOL_ON else None
+        reused = conn is not None
+        if conn is None:
+            conn = _db_connect()
+        g.db = DBWrapper(conn, reused)
     return g.db
 
 
@@ -767,7 +856,7 @@ def get_db():
 def close_db(exception=None):
     db = g.pop("db", None)
     if db is not None:
-        db.close()
+        db.release()
 
 
 # Field-for-field match to the company's actual Statement of Facts Word
@@ -2026,9 +2115,17 @@ def find_overdue_vessel_groups():
     return [g_ for g_ in groups.values() if g_["left"] > 0]
 
 
+_USERS_SEEN = [0.0]
+
+
 def any_users_exist():
+    if time.time() - _USERS_SEEN[0] < 60:      # people do not disappear between two clicks: one read a minute is enough
+        return True
     db = get_db()
-    return db.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+    found = db.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+    if found:
+        _USERS_SEEN[0] = time.time()
+    return found
 
 
 def login_required(f):
@@ -2100,7 +2197,7 @@ FEATURE_PRESETS = [("Everything", FEATURE_KEYS),
 
 DESKS = [
     ("manifest", "Manifest Desk", "From manifest to delivery order.",
-     [("manifest", "Manifest upload", "/manifest-desk"), ("do", "DO Tracker", "/do-tracker")]),
+     [("manifest", "Arrival notices", "/manifest-desk"), ("do", "DO Tracker", "/do-tracker")]),
     ("operations", "Operations Desk", "Vessels, berths and ports.",
      [("sof", "SOF", "/sof"), ("vessel", "Vessel Tracker", "/vessel-tracker"), ("direct", "Direct Delivery", "/direct-delivery"),
       ("lineup", "Line-ups", "/lineups"), ("kpi", "Port Agent KPI", "/kpi")]),
@@ -2159,7 +2256,7 @@ def _deskbar_html(feats, path):
             '<span class="dk-name">' + html_escape(cur["name"]) + '</span>' + tools + '</div><div class="dk-r">' + others + '</div></nav>')
 
 
-# ==== DESK HEADER BEGIN (shared by the Manifest upload page and the DO Tracker page) ====
+# ==== DESK HEADER BEGIN (shared by the Arrival notices page and the DO Tracker page) ====
 _HDR_CSS = r"""
 /* ---- shared desk header: desk button + tools toggle + menus (one source for every page in a desk) ---- */
 .dh{position:relative;z-index:60;display:flex;align-items:center;gap:14px;height:58px;padding:0 16px;background:var(--card);border-bottom:1px solid var(--border);color:var(--text);font:14px/1.3 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Arial,sans-serif;box-sizing:border-box}
@@ -2751,6 +2848,37 @@ _IDLE_SNIPPET = """<script>
   }, 1000);
 })();
 </script>"""
+
+
+_THEME_EARLY = ("<script>(function(){var m='light';try{m=localStorage.getItem('theme')||'light'}catch(e){}"
+                "document.documentElement.setAttribute('data-theme',m)})()</script>")
+_GZIP_TYPES = ("text/html", "text/css", "application/javascript", "text/javascript", "application/json", "text/plain", "text/csv", "image/svg+xml")
+
+
+@app.after_request
+def _early_theme_and_gzip(resp):
+    """Two things that make a page appear sooner. (1) The saved light/dark choice is applied in the page's head, before anything is drawn:
+    several pages only applied it at the very end of the page, so the first picture was always light, and that was the white flash when
+    switching pages in dark mode. (2) Text answers are sent compressed when the browser accepts it."""
+    try:
+        if resp.status_code == 200 and not resp.direct_passthrough and not resp.is_streamed:
+            if resp.mimetype == "text/html":
+                body = resp.get_data(as_text=True)
+                if "localStorage.getItem('theme')" in body and "data-theme" in body and _THEME_EARLY not in body:
+                    m = re.search(r"<head[^>]*>\s*(<meta charset=[^>]*>)?", body)
+                    if m:
+                        resp.set_data(body[:m.end()] + _THEME_EARLY + body[m.end():])
+            if ("Content-Encoding" not in resp.headers and resp.mimetype in _GZIP_TYPES
+                    and "gzip" in request.headers.get("Accept-Encoding", "").lower()):
+                data = resp.get_data()
+                if len(data) > 1400:
+                    import gzip
+                    resp.set_data(gzip.compress(data, compresslevel=5))
+                    resp.headers["Content-Encoding"] = "gzip"
+                    resp.headers.add("Vary", "Accept-Encoding")
+    except Exception:
+        pass
+    return resp
 
 
 @app.after_request
@@ -5571,6 +5699,7 @@ def _mf_learn(tables, entries, lay, checks):
             db.execute("INSERT INTO mf_memory (kind, consignee, match_key, old_value, new_value, created_by, created_at) VALUES ('gemdesc', ?, ?, ?, ?, 'gemini', ?)",
                        (lay["fp"], k, d0[:300], a[:300], now))
     db.commit()
+    _MF_MEMORY_GEN[0] += 1
     # the test: can Compass alone, with what it now knows, produce what Gemini produced for this file?
     pair_new = {k: a for k, (d0, a) in pairs.items()}
     for r in db.execute("SELECT match_key, new_value FROM mf_memory WHERE kind = 'gemdesc' AND consignee = ?", (lay["fp"],)).fetchall():
@@ -6045,6 +6174,27 @@ def _manifest_peek_payload(r):
             "lines": len(live)}
 
 
+_PEEK_CACHE = {}      # (file fingerprint, name, memory generation) -> (when, what the reader found)
+_MF_MEMORY_GEN = [0]  # goes up whenever Compass learns or forgets a cargo name, so an old reading is never reused after that
+
+
+def _read_manifest_cached(raw, filename):
+    """The quick reading of a manifest (no AI), kept for a few minutes: picking the same file again, or dropping it
+    on the other page, answers at once instead of opening the file all over again."""
+    key = (hashlib.sha1(raw).hexdigest(), (filename or "").lower(), _MF_MEMORY_GEN[0])
+    now = time.time()
+    hit = _PEEK_CACHE.get(key)
+    if hit and now - hit[0] < 600:
+        return hit[1]
+    result = read_manifest(raw, filename, use_ai=False)
+    for k_ in [k_ for k_, v_ in _PEEK_CACHE.items() if now - v_[0] >= 600]:
+        _PEEK_CACHE.pop(k_, None)
+    while len(_PEEK_CACHE) >= 24:
+        _PEEK_CACHE.pop(next(iter(_PEEK_CACHE)), None)
+    _PEEK_CACHE[key] = (now, result)
+    return result
+
+
 def _read_for_peek():
     f = request.files.get("file")
     if not f or not f.filename or not f.filename.lower().endswith(_MANIFEST_EXTS):
@@ -6053,7 +6203,7 @@ def _read_for_peek():
     if not raw or len(raw) > _MANIFEST_MAX_BYTES:
         return None
     try:
-        return read_manifest(raw, f.filename, use_ai=False)
+        return _read_manifest_cached(raw, f.filename)
     except Exception:
         return None
 
@@ -6325,9 +6475,13 @@ def _desk_port_variants(db, port):
     out = {str(port or "").strip().upper()}
     if canon:
         out.add(canon)
-        for r in db.execute("SELECT DISTINCT port FROM records WHERE port <> ''").fetchall():
-            if _canon_port(r["port"]) == canon:
-                out.add(r["port"])
+        # read the filed spellings once per request: every extra read is a trip to the database
+        spelled = g.get("_desk_port_spellings")
+        if spelled is None:
+            spelled = g._desk_port_spellings = [r["port"] for r in db.execute("SELECT DISTINCT port FROM records WHERE port <> ''").fetchall()]
+        for sp in spelled:
+            if _canon_port(sp) == canon:
+                out.add(sp)
     return sorted(x for x in out if x)
 
 
@@ -6366,21 +6520,35 @@ def _status_sig(kind, eta, berth):
     return (kind, d.isoformat() if d else "", re.sub(r"\s+", " ", str(berth or "")).strip().upper() if kind == "berthed" else "")
 
 
-def _desk_groups(db, port, vessel):
-    """The vessel's B/Ls grouped by consignee, with what is known about each: email, contact person, cargo, whether a notice went out."""
+def _desk_groups(db, port, vessel, only=None):
+    """The vessel's B/Ls grouped by consignee, with what is known about each: email, contact person, cargo, whether a notice went out.
+    only = one consignee's key: just that consignee is worked out (the notice preview, a save and a send need one, not all)."""
     variants = _desk_port_variants(db, port)
     groups = {}
     for r in _desk_rows(db, port, vessel):
         name = re.sub(r"\s+", " ", r.get("consignee") or r.get("notify_name") or "").strip()
         k = _ckey(name)
+        if only is not None and (k or "~none") != only:
+            continue
         g_ = groups.setdefault(k, {"key": k or "~none", "name": name, "email": "", "attn": "", "bls": []})
         if not g_["email"]:
             g_["email"] = _clean_email(r.get("consignee_email")).lower()
         g_["bls"].append({"bl": r["bl_number"], "pol": r.get("loading_port") or "", "pkgs": r.get("packages") or "",
                           "desc": r.get("cargo_desc") or ""})
+    # everything else is read for all the consignees at once: two reads in all, not two for every consignee
+    keys = list(groups)
+    books, last_sent = {}, {}
+    book_keys = [k for k in keys if k]
+    if book_keys:
+        for b_ in db.execute("SELECT * FROM consignee_book WHERE ckey = ANY(?)", (book_keys,)).fetchall():
+            books[b_["ckey"]] = b_
+    if keys:
+        for n_ in db.execute("SELECT DISTINCT ON (ckey) * FROM notice_log WHERE port = ANY(?) AND vessel = ? AND ckey = ANY(?) AND test = 0 "
+                             "ORDER BY ckey, id DESC", (variants, vessel, keys)).fetchall():
+            last_sent[n_["ckey"]] = n_
     out = []
     for k, g_ in groups.items():
-        book = _book_get(db, k)
+        book = books.get(k)
         verified, more = False, []
         if book:
             g_["email"] = g_["email"] or _clean_email(book["email"]).lower()
@@ -6388,8 +6556,7 @@ def _desk_groups(db, port, vessel):
             more = _split_emails(book["more_emails"])[0]
             verified = bool(book["verified"])
         g_["more"] = [e for e in more if e.lower() != (g_["email"] or "").lower()]
-        sent = db.execute("SELECT * FROM notice_log WHERE port = ANY(?) AND vessel = ? AND ckey = ? AND test = 0 ORDER BY id DESC LIMIT 1",
-                          (variants, vessel, k)).fetchone()
+        sent = last_sent.get(k)
         g_["sent"] = None
         if sent:
             try:
@@ -6456,10 +6623,21 @@ def _desk_suggest(db, port, vessel):
     return out
 
 
+_QR_CACHE = {}
+
+
 def _qr_png(url):
+    """The tracking-link QR picture. A link never changes, so the picture is kept (a notice preview redraws it every time otherwise)."""
+    hit = _QR_CACHE.get(url)
+    if hit is not None:
+        return hit
     buf = io.BytesIO()
     segno.make(url, error="m").save(buf, kind="png", scale=3, border=1, dark="#123a56")
-    return buf.getvalue()
+    png = buf.getvalue()
+    if len(_QR_CACHE) > 600:
+        _QR_CACHE.clear()
+    _QR_CACHE[url] = png
+    return png
 
 
 def _desk_check(g_, kind, eta, berth):
@@ -6534,8 +6712,9 @@ def _desk_notice(db, port, vessel, group, kind, eta, berth, sender, inline):
     subject = "ARRIVAL NOTICE" + (" (UPDATE)" if is_update else "") + " - " + mv + " - " + official
     base = _public_base_url()
     images, rows_html, rows_txt = [], [], []
+    tokens = _ensure_track_tokens(db, [b["bl"] for b in group["bls"]])
     for i, b in enumerate(group["bls"]):
-        token = _ensure_track_token(db, b["bl"])
+        token = tokens.get(b["bl"])
         url = base + "/t/" + token if token else ""
         png = _qr_png(url) if url else b""
         cell = ""
@@ -6569,10 +6748,13 @@ def _desk_notice(db, port, vessel, group, kind, eta, berth, sender, inline):
              + "</tr>" + "".join(r.replace("<td>", '<td style="border:1px solid #c9d1d9;padding:6px 9px;font-size:12.5px;vertical-align:middle;">')
                                  for r in rows_html) + "</table>")
     sig_html = "<br>".join(esc(l) for l in NOTICE_COMPANY_LINES)
+    # On screen only: the two sentences that follow the vessel's status are tagged, so the page can show a change of status or ETA
+    # the moment it is made and then replace it with the server's own wording.
+    mark = (lambda tag, t: '<span data-vs="%s">%s</span>' % (tag, t)) if inline == "data" else (lambda tag, t: t)
     html_body = ('<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.55;color:#111;">'
                  + "<br>".join(head_html) + "<br><br>" + date_ + "<br><br><b>" + esc(mv) + "</b><br>"
-                 + (("<b>" + esc(upd) + "</b><br>") if upd else "") + esc(status) + "<br><br>"
-                 + esc(intro) + table + "<br>" + esc(ask) + "<br><br>" + esc(thanks) + "<br><br>Kind regards,<br><b>"
+                 + (("<b>" + esc(upd) + "</b><br>") if upd else "") + mark("status", esc(status)) + "<br><br>"
+                 + mark("intro", esc(intro)) + table + "<br>" + esc(ask) + "<br><br>" + esc(thanks) + "<br><br>Kind regards,<br><b>"
                  + esc(sig_name) + "</b><br>" + sig_html + "</div>")
     return subject, text, html_body, images
 
@@ -6586,7 +6768,7 @@ def _desk_args(data):
 
 
 def _desk_group(db, port, vessel, key):
-    for g_ in _desk_groups(db, port, vessel):
+    for g_ in _desk_groups(db, port, vessel, only=key):
         if g_["key"] == key:
             return g_
     return None
@@ -6686,7 +6868,7 @@ def desk_vessels():
         m = merged.setdefault((port, r["vessel"]), {"port": port, "vessel": r["vessel"], "n": 0, "last": ""})
         m["n"] += r["n"]
         m["last"] = max(m["last"], r["last"] or "")
-    out = sorted(merged.values(), key=lambda x: x["last"], reverse=True)
+    out = sorted(merged.values(), key=lambda x: (x["last"], x["vessel"]), reverse=True)   # same minute: always the same order
     if q:
         out = [v for v in out if q in v["vessel"] or q in v["port"]]
     return jsonify({"vessels": [{"port": v["port"], "vessel": v["vessel"], "n": v["n"], "last": _desk_local(v["last"])[:10]} for v in out[:limit]],
@@ -6842,15 +7024,15 @@ def _desk_set_contact(db, g_, port, vessel, name, email_raw, attn):
     more = "; ".join(good[1:])
     variants = _desk_port_variants(db, port)
     new_key = _ckey(name)
+    bl_list = [b["bl"] for b in g_["bls"]]
     if name != g_["name"]:
-        for b in g_["bls"]:
-            db.execute("UPDATE records SET consignee = ? WHERE bl_number = ?", (name, b["bl"]))
-            _log_audit(b["bl"], "edited", "consignee", g_["name"], name)
+        db.execute("UPDATE records SET consignee = ? WHERE bl_number = ANY(?)", (name, bl_list))
+        for bl_ in bl_list:
+            _log_audit(bl_, "edited", "consignee", g_["name"], name)
         if g_["key"] not in ("~none", new_key):
             db.execute("UPDATE notice_log SET ckey = ?, consignee = ? WHERE port = ANY(?) AND vessel = ? AND ckey = ?",
                        (new_key, name, variants, vessel, g_["key"]))
-    for b in g_["bls"]:
-        db.execute("UPDATE records SET consignee_email = ? WHERE bl_number = ?", (primary, b["bl"]))
+    db.execute("UPDATE records SET consignee_email = ? WHERE bl_number = ANY(?)", (primary, bl_list))
     _book_save(db, name, email=primary, attn=attn, more=more, verified=bool(primary))
     return None, new_key
 
@@ -6872,9 +7054,11 @@ def desk_contact():
     return jsonify({"ok": True, "key": new_key})
 
 
-def _desk_set_cargo(db, bl, loading_port, packages, cargo_desc):
-    """Saves one B/L's cargo details and logs what changed. Returns the 'remember this?' offer, if there is one."""
-    before = db.execute("SELECT consignee, notify_name, loading_port, packages, cargo_desc FROM records WHERE bl_number = ?", (bl,)).fetchone()
+def _desk_set_cargo(db, bl, loading_port, packages, cargo_desc, before=None):
+    """Saves one B/L's cargo details and logs what changed. Returns the 'remember this?' offer, if there is one.
+    before = the B/L's row as already read (a save reads all of a consignee's B/Ls in one go)."""
+    if before is None:
+        before = db.execute("SELECT consignee, notify_name, loading_port, packages, cargo_desc FROM records WHERE bl_number = ?", (bl,)).fetchone()
     if not before:
         return None
     new = {"loading_port": _mf_flat(loading_port)[:80], "packages": _mf_flat(packages)[:60], "cargo_desc": _mf_flat(cargo_desc)[:300]}
@@ -6928,15 +7112,22 @@ def desk_save():
         return jsonify({"error": err}), 400
     mine = {b["bl"] for b in g_["bls"]}
     learn = {}
-    for row in (data.get("bls") or [])[:500]:
-        bl = str((row or {}).get("bl") or "").upper()
+    rows_in = [r_ for r_ in (data.get("bls") or [])[:500] if isinstance(r_, dict)]
+    before = {}
+    if rows_in:
+        before = {r_["bl_number"]: r_ for r_ in db.execute(
+            "SELECT bl_number, consignee, notify_name, loading_port, packages, cargo_desc FROM records WHERE bl_number = ANY(?)", (sorted(mine),)).fetchall()}
+    for row in rows_in:
+        bl = str(row.get("bl") or "").upper()
         if bl not in mine:
             continue
-        offer = _desk_set_cargo(db, bl, row.get("loading_port"), row.get("packages"), row.get("cargo_desc"))
+        offer = _desk_set_cargo(db, bl, row.get("loading_port"), row.get("packages"), row.get("cargo_desc"), before=before.get(bl))
         if offer:
             learn[(offer["consignee"], offer["old"], offer["new"])] = offer
+    # The page needs the saved consignee back; read it inside the same transaction, so it costs no extra round trip to begin one.
+    group = _desk_group(db, port, vessel, new_key)
     db.commit()
-    return jsonify({"ok": True, "key": new_key, "learn": list(learn.values())})
+    return jsonify({"ok": True, "key": new_key, "learn": list(learn.values()), "group": group})
 
 
 @app.route("/api/desk/vessel", methods=["POST"])
@@ -7059,6 +7250,7 @@ def memory_cargo():
         db.execute("INSERT INTO mf_memory (kind, consignee, match_key, old_value, new_value, created_by, created_at) VALUES ('cargo', ?, ?, ?, ?, ?, ?)",
                    (who[:160], key, old[:300], new[:300], session.get("username") or "", now))
     db.commit()
+    _MF_MEMORY_GEN[0] += 1
     _ai_event("manifests", "learned", who[:60] + ": cargo is \"" + new[:80] + "\"", "Remembered after " + (session.get("username") or "someone") + " confirmed it.")
     return jsonify({"ok": True})
 
@@ -7140,6 +7332,7 @@ def learned_forget():
     elif data.get("kind") == "memory":
         try:
             db.execute("DELETE FROM mf_memory WHERE id = ?", (int(data.get("id")),))
+            _MF_MEMORY_GEN[0] += 1
         except (TypeError, ValueError):
             return jsonify({"error": "Bad id"}), 400
     elif data.get("kind") in ("event", "dismiss"):
@@ -7172,10 +7365,9 @@ def desk_preview():
     if not g_ or not g_["name"]:
         return jsonify({"error": "Consignee not found."}), 404
     subject, text, body, _ = _desk_notice(db, port, vessel, g_, kind, eta, berth, session.get("display_name") or "", "data")
-    db.commit()
     chk = _desk_check(g_, kind, eta, berth)
     to = _desk_recipients(g_)
-    return jsonify({"subject": subject, "to": ", ".join(to), "to_list": to, "cc": _desk_my_email(db), "html": body,
+    return jsonify({"subject": subject, "to": ", ".join(to), "to_list": to, "html": body,
                     "problems": chk["problems"], "warnings": chk["warnings"], "changed": chk["changed"], "new_bls": chk["new_bls"],
                     "repeat": chk["repeat"]})
 
@@ -9448,6 +9640,25 @@ def _public_base_url():
         return env
     proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "https").split(",")[0].strip()
     return f"{proto}://{request.host}"
+
+
+def _ensure_track_tokens(db, bl_numbers):
+    """{bl: tracking code} for several B/Ls at once: one read, and a write only for the ones that have no code yet."""
+    bls = [b for b in dict.fromkeys(bl_numbers) if b]
+    if not bls:
+        return {}
+    rows = db.execute("SELECT bl_number, track_token FROM records WHERE bl_number = ANY(?)", (bls,)).fetchall()
+    out, made = {}, False
+    for r in rows:
+        tok = r["track_token"]
+        if not tok:
+            tok = secrets.token_urlsafe(16)
+            db.execute("UPDATE records SET track_token = ? WHERE bl_number = ?", (tok, r["bl_number"]))
+            made = True
+        out[r["bl_number"]] = tok
+    if made:
+        db.commit()
+    return out
 
 
 def _ensure_track_token(db, bl_number, force_new=False):
@@ -16060,9 +16271,9 @@ load();
 </script></body></html>"""
 
 DESK_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Compass - Manifest Desk</title><link rel="icon" type="image/png" href="data:image/png;base64,__LOGO__">
+<title>Compass - Arrival notices</title><link rel="icon" type="image/png" href="data:image/png;base64,__LOGO__">
 <style>
-  /* The Manifest upload page wears the DO Tracker's design: the same colours, background, cards, labels, fields,
+  /* The Arrival notices page wears the DO Tracker's design: the same colours, background, cards, labels, fields,
      glass dropdowns, buttons, pills, sheets and toasts. Values below are copied from the DO Tracker's own stylesheet. */
   :root {
     --bg: #f2f4f7;
@@ -16205,18 +16416,41 @@ DESK_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta
 
   /* ---- workspace ---- */
   .page { flex: 1; min-height: 0; display: flex; flex-direction: column; width: 100%; padding: 20px 16px 0; gap: 16px; }
-  .vstrip { flex: none; display: flex; flex-direction: column; gap: 10px; }
+  .vstrip { flex: none; display: flex; flex-direction: column; gap: 10px; position: relative; }
+  .mt { display: none; flex: none; flex-direction: column; line-height: 1.25; min-width: 0; margin-inline-end: 6px; }
+  .mt b { font-size: 15px; font-weight: 700; letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px; }
+  .mt small { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  #etaWrap { width: 150px; } #berthWrap { width: 130px; }
+  .sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  /* a vessel is open: the big form folds into one slim bar (name, the notice's status, the main buttons). Change vessel brings the whole form back. */
+  @media (min-width: 901px) {
+    .vstrip.has:not(.open) { flex-direction: row; align-items: center; gap: 12px; padding: 10px 16px; }
+    .vstrip.has:not(.open) .vrow, .vstrip.has:not(.open) .srow { display: contents; }
+    .vstrip.has:not(.open) .card-label, .vstrip.has:not(.open) .portfld, .vstrip.has:not(.open) .vrow .fld.grow,
+    .vstrip.has:not(.open) #openBtn, .vstrip.has:not(.open) #vesselsBtn { display: none; }
+    .vstrip.has:not(.open) .mt { display: flex; order: 1; }
+    .vstrip.has:not(.open) .segfld { order: 2; }
+    .vstrip.has:not(.open) .segfld > span { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+    .vstrip.has:not(.open) #etaWrap { order: 3; width: 190px; flex-direction: row; align-items: center; gap: 8px; }
+    .vstrip.has:not(.open) #berthWrap { order: 3; width: 170px; flex-direction: row; align-items: center; gap: 8px; }
+    .vstrip.has:not(.open) #etaWrap > span, .vstrip.has:not(.open) #berthWrap > span { flex: none; }
+    /* a narrow window has no room for the status note beside the buttons: it stays readable to screen readers and as the field's tooltip, and an invalid date still turns the field red and says so in a message */
+    .vstrip.has:not(.open) #statusHint { order: 4; position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+    @media (min-width: 1500px) { .vstrip.has:not(.open) #statusHint { position: static; width: auto; height: auto; margin: 0; overflow: visible; clip: auto; white-space: normal; flex: 0 1 auto; min-width: 0; max-width: 340px; font-size: 12px; line-height: 1.3; } }
+    .vstrip.has:not(.open) .spacer { order: 5; }
+    .vstrip.has:not(.open) #chgBtn { order: 6; } .vstrip.has:not(.open) #addBtn { order: 7; } .vstrip.has:not(.open) #vmenuBtn { order: 8; }
+  }
   .vstrip .card-label { margin-bottom: 0; }
   .vrow { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
   .srow { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; padding-top: 14px; margin-top: 4px; border-top: 1px solid var(--border); }
   .seg { display: inline-flex; align-items: center; gap: 2px; padding: 2px; border: 1px solid var(--border); border-radius: 999px; background: var(--card); }
-  .seg button { background: none; color: var(--muted); border: 0; border-radius: 999px; padding: 10px 14px; font-size: 12.5px; font-weight: 700; line-height: 1; cursor: pointer; transition: background .15s ease; }
+  .seg button { background: none; color: var(--muted); border: 0; border-radius: 999px; padding: 10px 14px; font-size: 12.5px; font-weight: 700; line-height: 1; cursor: pointer; white-space: nowrap; transition: background .15s ease; }
   .seg button:hover:not([aria-checked="true"]) { background: var(--border); color: var(--text); }
   .seg button[aria-checked="true"] { background: var(--navy); color: #fff; }
   .seg button:focus-visible { outline-offset: 0; }
   .work { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(300px, 390px) minmax(0, 1fr); gap: 16px; }
   .card.pane { min-height: 0; min-width: 0; display: flex; flex-direction: column; overflow: hidden; padding: 0; }
-  .phead { flex: none; padding: 18px 18px 14px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 12px; }
+  .phead { flex: none; padding: 14px 16px 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
   .trow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
   .trow h2 { font-size: 12px; font-weight: 600; color: var(--navy); text-transform: uppercase; letter-spacing: .04em; }
   :root[data-theme="dark"] .trow h2 { color: var(--navy-light); }
@@ -16228,8 +16462,9 @@ DESK_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta
     border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 5px; padding: 3px 6px; background: var(--card); pointer-events: none; }
   #q:focus + .kbd-hint, #q:not(:placeholder-shown) + .kbd-hint { display: none; }
   @media (hover: none) { .kbd-hint { display: none; } }
-  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
-  .chip { background: none; color: var(--text); border: 1px solid var(--border); border-radius: 999px; padding: 6px 12px; font-size: 12px; font-weight: 600; font-family: inherit; cursor: pointer; transition: background .15s ease; }
+  .chips { display: flex; gap: 5px; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; margin: -2px; padding: 2px; }
+  .chips::-webkit-scrollbar { display: none; }
+  .chip { flex: none; white-space: nowrap; background: none; color: var(--text); border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; font-size: 12px; font-weight: 600; font-family: inherit; cursor: pointer; transition: background .15s ease; }
   .chip:hover { background: var(--border); }
   .chip b { color: var(--muted); font-weight: 700; margin-inline-start: 5px; }
   .chip[aria-pressed="true"] { background: var(--navy); border-color: var(--navy); color: #fff; }
@@ -16261,7 +16496,12 @@ DESK_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta
   /* notes: the DO Tracker's "what the manifest says" note */
   .banner, .learnbox { display: block; padding: 12px 14px; border-radius: 14px; font-size: 13px; line-height: 1.5; color: var(--text);
     background: color-mix(in srgb, var(--gold) 10%, var(--card)); border: 1px solid color-mix(in srgb, var(--gold) 38%, transparent); }
-  .banner { margin: 12px 12px 0; }
+  .banner { margin: 8px 8px 0; }
+  .banner + .banner { margin-top: 6px; }
+  .notebar { display: flex; align-items: center; gap: 8px; width: calc(100% - 16px); margin: 8px 8px 0; padding: 9px 12px; border-radius: 12px; border: 1px solid color-mix(in srgb, var(--gold) 38%, transparent);
+    background: color-mix(in srgb, var(--gold) 10%, var(--card)); color: var(--warn); font: inherit; font-size: 12.5px; font-weight: 600; line-height: 1.3; text-align: start; cursor: pointer; }
+  .notebar:hover { background: color-mix(in srgb, var(--gold) 16%, var(--card)); }
+  .notebar .go { margin-inline-start: auto; color: var(--navy-light); font-weight: 700; flex: none; }
   .banner ul { margin: 6px 0 0; padding-inline-start: 18px; }
   .banner .bfile { font-weight: 700; }
   .banner .bacts { display: flex; gap: 8px; margin-top: 10px; }
@@ -16292,6 +16532,23 @@ DESK_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta
   .meta { color: var(--muted); font-size: 12.5px; margin-bottom: 12px; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 10px; }
   .meta b { color: var(--text); font-weight: 600; }
   .meta span { overflow-wrap: anywhere; }
+  /* who the notice goes to: one chip per address, saved with the consignee */
+  .rcps { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .rcp { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 3px 4px 3px 11px; border: 1px solid var(--border); border-radius: 999px; font-size: 12.5px; color: var(--text); background: color-mix(in srgb, var(--navy-light) 8%, transparent); }
+  .rcp > span { overflow-wrap: anywhere; }
+  .rcp small { font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--navy-light); margin-inline-start: 2px; }
+  .rcp button { border: 0; background: none; padding: 0; cursor: pointer; width: 20px; height: 20px; border-radius: 50%; display: inline-grid; place-items: center; color: var(--muted); font-size: 14px; line-height: 1; flex: none; }
+  .rcp button:hover { background: color-mix(in srgb, var(--text) 12%, transparent); color: var(--text); }
+  .rcp-add { border: 1px dashed var(--navy-light); background: none; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; padding: 4px 11px; border-radius: 999px; font-size: 12.5px; font-weight: 600; color: var(--navy-light); }
+  .rcp-add:hover { background: color-mix(in srgb, var(--navy-light) 10%, transparent); }
+  .rcp-none { color: var(--warn); font-weight: 600; }
+  .rcp-in { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 2px 4px 2px 12px; border: 1.5px solid var(--navy-light); border-radius: 999px; background: var(--bg); box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 22%, transparent); }
+  .rcp-in input { border: 0; outline: 0; background: none; font: inherit; font-size: 12.5px; color: var(--text); min-width: 190px; width: 230px; max-width: 100%; padding: 3px 0; }
+  .rcp-in .go { border: 0; cursor: pointer; font: inherit; font-size: 12px; font-weight: 700; color: #fff; background: var(--navy-light); border-radius: 999px; padding: 4px 12px; }
+  .rcp-in .go:hover { filter: brightness(1.08); }
+  .rcp-hint { display: block; font-size: 11.5px; color: var(--muted); margin-top: 6px; }
+  .rcp-hint.err { color: var(--danger); font-weight: 600; }
+  .meta .rcpcell { min-width: 0; }
   .mailwrap { border: 1px solid var(--border); border-radius: 14px; padding: 16px 18px; background: var(--mail); color: var(--mail-ink); overflow-x: auto; }
   .mailwrap.loading { opacity: .55; }
   .form { display: grid; gap: 14px; max-width: 760px; }
@@ -16403,6 +16660,7 @@ DESK_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta
     .vrow .fld { flex: 1 1 100%; }
     .vrow .btn { flex: 1; }
     .vrow .spacer { display: none; }
+    #chgBtn, .mt { display: none !important; }
     .blcard { grid-template-columns: 1fr; }
     .veil { align-items: end; padding: 0; }
     .sheet, .sheet.wide { width: 100%; max-height: 92dvh; border-radius: 22px 22px 0 0; }
@@ -16436,25 +16694,27 @@ __HEADER__
     <button class="vsum" id="vsum" type="button" aria-expanded="false" aria-controls="vrow"><span class="vs-t"><b id="vsumName"></b><small id="vsumPort"></small></span><span class="chg">Change</span></button>
     <div class="card-label">Open a vessel</div>
     <div class="vrow" id="vrow">
+      <div class="mt" id="slimMt"><b id="slimName" dir="auto"></b><small id="slimPort"></small></div>
       <div class="fld portfld"><span id="portLbl">Discharge port</span><div class="glass-select-wrap"><select id="port" class="nice-select" aria-labelledby="portLbl"></select></div></div>
       <label class="fld grow"><span>Vessel and voyage</span><input type="text" id="vessel" placeholder="For example MINXIN V-26188" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="go"></label>
       <button class="btn" id="openBtn">Open</button>
       <button class="btn sec" id="vesselsBtn">Vessels</button>
       <span class="spacer"></span>
+      <button class="btn sec" id="chgBtn" type="button" aria-expanded="false" hidden>Change vessel</button>
       <button class="btn sec" id="addBtn">Add manifest</button>
       <button class="iconbtn" id="vmenuBtn" aria-label="More for this vessel" aria-haspopup="true" aria-expanded="false" disabled>&#8943;</button>
     </div>
     <div class="menu" id="vMenu" role="menu" hidden style="right:auto;top:auto;position:absolute;"></div>
     <div class="srow" id="statusRow" hidden>
-      <div class="fld"><span id="segLabel">The notice says</span>
+      <div class="fld segfld"><span id="segLabel">The notice says</span>
         <div class="seg" role="radiogroup" aria-labelledby="segLabel" id="seg">
           <button role="radio" data-k="arriving" aria-checked="true">Arriving</button>
           <button role="radio" data-k="anchorage" aria-checked="false">At anchorage</button>
           <button role="radio" data-k="berthed" aria-checked="false">Berthed</button>
         </div>
       </div>
-      <label class="fld" id="etaWrap" style="width:150px;"><span>ETA</span><input type="text" id="eta" placeholder="dd.mm.yyyy" inputmode="numeric" autocomplete="off" maxlength="10"></label>
-      <label class="fld" id="berthWrap" style="width:130px;" hidden><span>Berth</span><input type="text" id="berth" placeholder="For example 27" autocomplete="off" maxlength="12"></label>
+      <label class="fld" id="etaWrap"><span>ETA</span><input type="text" id="eta" placeholder="dd.mm.yyyy" inputmode="numeric" autocomplete="off" maxlength="10" aria-describedby="statusHint"></label>
+      <label class="fld" id="berthWrap" hidden><span>Berth</span><input type="text" id="berth" placeholder="For example 27" autocomplete="off" maxlength="12" aria-describedby="statusHint"></label>
       <div class="hint" id="statusHint" role="status"></div>
     </div>
   </section>
@@ -16467,8 +16727,7 @@ __HEADER__
         <div class="search"><input type="text" id="q" placeholder="Search consignees" aria-label="Search consignees" autocomplete="off" enterkeyhint="search" title="Shortcut: press / to search. Esc clears."><span class="kbd-hint" aria-hidden="true">/</span></div>
         <div class="chips" role="group" aria-label="Show" id="chips"></div>
       </div>
-      <div id="banner"></div>
-      <div class="pscroll"><ul class="rows" id="list" role="list" tabindex="-1"></ul></div>
+      <div class="pscroll"><div id="banner"></div><ul class="rows" id="list" role="list" tabindex="-1"></ul></div>
     </section>
 
     <section class="card pane detail-pane" aria-label="Consignee">
@@ -16513,7 +16772,8 @@ __HEADER__
 var D = document.body.dataset;
 var PORTS = JSON.parse(D.ports), OWNER = D.owner === '1', ME = D.name || '';
 var S = {port: '', vessel: '', openKey: '', data: null, sel: null, tab: 'notice', filter: 'all', sort: 'attention', q: '', pseq: 0, timer: null,
-         dirty: false, learn: [], staged: [], sheet: null, lastFocus: null, view: 'list', etaTouched: false, busy: false};
+         dirty: false, learn: [], staged: [], sheet: null, lastFocus: null, view: 'list', etaTouched: false, busy: false,
+         noteOpen: false, pcache: {}, peekc: {}, pending: 0, saveQ: Promise.resolve(), adding: false, rcpErr: ''};
 var KINDS = {arriving: 'Arriving', anchorage: 'At anchorage', berthed: 'Berthed'};
 function $(id) { return document.getElementById(id); }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
@@ -16635,6 +16895,7 @@ function syncStatusUI() {
   else if (st.kind === 'berthed' && !st.berth) { h.textContent = 'No berth entered, so the notice will only say the vessel has berthed.'; h.className = 'hint'; }
   else { h.textContent = ''; h.className = 'hint'; }
   if (S.src && !(p && (S.etaTouched || st.eta))) { var extra = 'Filled in from ' + S.src + '. Change it if needed.'; h.textContent = h.textContent ? h.textContent + ' ' + extra : extra; }
+  $('eta').title = $('berth').title = h.textContent;
 }
 function sigNow() { var s = status(), d = s.kind === 'arriving' ? parseEta(s.eta) : null; return [s.kind, d ? isoEta(d) : '', s.kind === 'berthed' ? s.berth.replace(/\s+/g, ' ').trim().toUpperCase() : '']; }
 function statusDiffers(sent) {
@@ -16718,7 +16979,7 @@ async function openVessel(opts) {
   var key = port + '|' + vessel, fresh = key !== S.openKey;
   S.port = data.port || port; S.vessel = vessel; S.data = data;
   if (fresh) {
-    S.openKey = key; S.sel = null; S.q = ''; $('q').value = ''; S.filter = 'all'; S.learn = []; S.dirty = false; S.tab = 'notice';
+    S.openKey = key; S.sel = null; S.q = ''; $('q').value = ''; S.filter = 'all'; S.learn = []; S.dirty = false; S.tab = 'notice'; S.noteOpen = false; S.pcache = {}; S.adding = false;
     var sg = data.suggest || {}; S.src = sg.source || '';
     setStatus(sg.kind || 'arriving', sg.eta || '', sg.berth || '');
     try { localStorage.setItem('desk_last', JSON.stringify({port: S.port, vessel: vessel})); } catch (e) {}
@@ -16736,9 +16997,21 @@ async function openVessel(opts) {
 function syncVsum(collapse) {
   var vs = $('vstrip'); vs.classList.add('has'); if (collapse) vs.classList.remove('open');
   $('vsumName').textContent = S.vessel; $('vsumPort').textContent = portLabel(S.port);
-  $('vsum').setAttribute('aria-expanded', vs.classList.contains('open') ? 'true' : 'false');
+  $('slimName').textContent = S.vessel; $('slimPort').textContent = portLabel(S.port); $('chgBtn').hidden = false;
+  syncChg();
 }
-$('vsum').onclick = function () { $('vstrip').classList.toggle('open'); syncVsum(false); if ($('vstrip').classList.contains('open')) $('vessel').focus(); };
+function syncChg() {
+  var open = $('vstrip').classList.contains('open');
+  $('vsum').setAttribute('aria-expanded', open ? 'true' : 'false'); $('chgBtn').setAttribute('aria-expanded', open ? 'true' : 'false');
+  $('chgBtn').textContent = open ? 'Close' : 'Change vessel';
+}
+function toggleStrip() { $('vstrip').classList.toggle('open'); syncChg(); if ($('vstrip').classList.contains('open')) $('vessel').focus(); }
+$('vsum').onclick = toggleStrip;
+$('chgBtn').onclick = function () { toggleStrip(); if (!$('vstrip').classList.contains('open')) this.focus(); };
+function focusEta() {
+  if (window.innerWidth <= 900) { if (S.view === 'detail') setView('list'); $('vstrip').classList.add('open'); syncChg(); }
+  S.etaTouched = true; syncStatusUI(); $('eta').focus();
+}
 function setView(v) { S.view = v; document.body.classList.toggle('show-detail', v === 'detail'); if (S.data) renderActions(); }
 
 /* ---------- rendering ---------- */
@@ -16752,21 +17025,36 @@ function renderChips() {
   $('count').textContent = ' ' + gs.length;
 }
 function renderBanner() {
-  var d = S.data, html = '';
+  var d = S.data, box = $('banner'), narrow = window.innerWidth <= 900;
   var ups = (d.uploads || []).filter(function (u) { return u.warnings && u.warnings.length && !u.undone; });
-  if (ups.length) {
-    html += '<div class="banner" role="region" aria-label="Things to check">';
-    ups.forEach(function (u) {
-      html += '<div class="bfile">' + esc(u.file) + '</div><ul>' + u.warnings.map(function (w) { return '<li>' + esc(w.text) + '</li>'; }).join('') + '</ul>' +
-        '<div class="bacts"><button class="btn sec small" data-ack="' + u.id + '">I have seen this</button></div>';
-    });
-    html += '</div>';
+  var n = ups.length + (d.other_count ? 1 : 0);
+  if (!n) { box.innerHTML = ''; return; }
+  if (!S.noteOpen && !narrow) {
+    box.innerHTML = '<button type="button" class="notebar" id="noteShow" aria-expanded="false"><span>' + plural(n, 'note') + ' about this vessel</span><span class="go">Show</span></button>';
+    $('noteShow').onclick = function () { S.noteOpen = true; renderBanner(); var f = box.querySelector('button'); if (f) f.focus(); };
+    return;
   }
+  var html = '', hide = narrow ? '' : '<button type="button" class="btn sec small" data-hide="1">Hide</button>';
+  ups.forEach(function (u) {
+    html += '<div class="banner" role="region" aria-label="Things to check"><div class="bfile">' + esc(u.file) + '</div><ul>' + u.warnings.map(function (w) { return '<li>' + esc(w.text) + '</li>'; }).join('') + '</ul>' +
+      '<div class="bacts"><button class="btn sec small" data-ack="' + u.id + '">I have seen this</button>' + hide + '</div></div>';
+  });
   if (d.other_count) {
-    html += '<div class="banner info" role="note">' + plural(d.other_count, 'B/L') + ' of this vessel ' + (d.other_count === 1 ? 'was' : 'were') + ' added from another account, so ' + (d.other_count === 1 ? 'it does' : 'they do') + ' not show here. Ask the person who added ' + (d.other_count === 1 ? 'it' : 'them') + ' to send those notices.</div>';
+    html += '<div class="banner info" role="note">' + plural(d.other_count, 'B/L') + ' of this vessel ' + (d.other_count === 1 ? 'was' : 'were') + ' added from another account, so ' + (d.other_count === 1 ? 'it does' : 'they do') + ' not show here. Ask the person who added ' + (d.other_count === 1 ? 'it' : 'them') + ' to send those notices.' +
+      (hide ? '<div class="bacts">' + hide + '</div>' : '') + '</div>';
   }
-  $('banner').innerHTML = html;
-  $('banner').querySelectorAll('[data-ack]').forEach(function (b) { b.onclick = async function () { try { await post('/api/desk/ack', {id: +b.dataset.ack}); await openVessel({keep: true}); } catch (e) { toast(e.message, true); } }; });
+  box.innerHTML = html;
+  box.querySelectorAll('[data-hide]').forEach(function (b) { b.onclick = function () { S.noteOpen = false; renderBanner(); var f = $('noteShow'); if (f) f.focus(); }; });
+  box.querySelectorAll('[data-ack]').forEach(function (b) {
+    b.onclick = async function () {
+      b.disabled = true;
+      try {
+        await post('/api/desk/ack', {id: +b.dataset.ack});
+        (S.data.uploads || []).forEach(function (u) { if (u.id === +b.dataset.ack) u.warnings = []; });
+        renderBanner();
+      } catch (e) { b.disabled = false; toast(e.message, true); }
+    };
+  });
 }
 function rowHTML(g) {
   var st = gstate(g), sel = g.key === S.sel;
@@ -16810,13 +17098,14 @@ function renderDetail() {
     $('detailEmpty').innerHTML = S.data && S.data.groups.length ? '<h3>Pick a consignee</h3>Its notice appears here, ready to check.' : '<h3>Nothing here yet</h3>Add the manifest and each consignee gets its own notice.';
     return;
   }
-  var st = gstate(g);
   $('dName').textContent = g.name || 'No consignee name';
-  $('dSub').textContent = (g.email ? g.email + (g.more && g.more.length ? ', ' + g.more.join(', ') : '') : 'No email yet') + ' · ' + plural(g.bls.length, 'B/L');
+  renderSub(g);
   renderPill();
   setTab(S.tab, true);
   renderLearn();
 }
+function allEmails(g) { return [g.email].concat(g.more || []).filter(Boolean); }
+function renderSub(g) { $('dSub').textContent = (allEmails(g).length ? allEmails(g).join(', ') : 'No email yet') + ' · ' + plural(g.bls.length, 'B/L'); }
 function renderPill() {
   var g = S.sel ? groupByKey(S.sel) : null; if (!g) return; var st = gstate(g);
   $('dPill').innerHTML = '<span class="pill ' + st.tone + '">' + st.t + '</span>';
@@ -16827,38 +17116,127 @@ function setTab(t, quiet) {
   $('panelNotice').hidden = t !== 'notice'; $('panelDetails').hidden = t !== 'details';
   if (t === 'details') renderDetailsForm(); else refreshPreview();
 }
-$('tabNotice').onclick = function () { S.keepDetails = false; setTab('notice'); };
+$('tabNotice').onclick = async function () { if (S.dirty && !(await autosave())) return; S.keepDetails = false; setTab('notice'); };
 $('tabDetails').onclick = function () { S.keepDetails = true; setTab('details'); };
 $('backBtn').onclick = async function () { if (S.dirty && !(await autosave())) return; setView('list'); window.scrollTo(0, 0); };
 
-function debouncePreview() { clearTimeout(S.timer); S.timer = setTimeout(refreshPreview, 350); }
-async function refreshPreview() {
+function debouncePreview(ms) { clearTimeout(S.timer); S.timer = setTimeout(function () { refreshPreview(true); }, ms || 350); }
+var ANCH_TEXT = 'VESSEL HAS ARRIVED AT OUTER ANCHORAGE AND IS AWAITING BERTHING. TO DATE, NO BERTHING PLAN HAS BEEN RECEIVED FROM THE PORT AUTHORITIES. WE WILL REVERT ONCE THE BERTHING PLAN IS RECEIVED.';
+/* The two sentences of the notice that follow the vessel's status are rewritten on screen the moment the status changes; the server's own wording replaces them a moment later. */
+function patchNotice() {
+  var w = $('panelNotice').querySelector('.mailwrap'), off = S.data && S.data.official; if (!w || !off) return;
+  var st = status(), d = st.kind === 'arriving' ? parseEta(st.eta) : null, text, verb = 'IS ARRIVING AT';
+  if (st.kind === 'berthed') { text = 'VESSEL HAS BERTHED AT ' + off + (st.berth ? ', BERTH ' + st.berth.toUpperCase() : '') + '.'; verb = 'HAS ARRIVED AT'; }
+  else if (st.kind === 'anchorage') text = ANCH_TEXT;
+  else text = 'VESSEL IS EXPECTED TO ARRIVE AT ' + off + (d ? ' ON ' + fmtEta(d) : '') + '.';
+  var a = w.querySelector('[data-vs="status"]'), i = w.querySelector('[data-vs="intro"]');
+  if (a) a.textContent = text;
+  if (i) i.textContent = 'WE ARE PLEASED TO ADVISE YOU THAT THE ABOVE VESSEL ' + verb + ' ' + off + ' WITH YOUR FOLLOWING CARGO:';
+}
+function previewKey(g) { var s_ = status(), d = s_.kind === 'arriving' ? parseEta(s_.eta) : null; return [g.key, S.port, S.vessel, s_.kind, d ? isoEta(d) : s_.eta, s_.kind === 'berthed' ? s_.berth.toUpperCase() : ''].join('|'); }
+async function refreshPreview(soft) {
   var g = S.sel ? groupByKey(S.sel) : null, box = $('panelNotice');
   if (!g || S.tab !== 'notice') return;
   if (!g.name) { box.innerHTML = '<ul class="checks"><li class="stop"><span class="ic">!</span><span>These B/Ls have no consignee in the manifest. Give them a name under Details to make a notice.</span></li></ul>'; return; }
-  var seq = ++S.pseq, old = box.querySelector('.mailwrap'); if (old) old.classList.add('loading'); else box.innerHTML = '<div class="empty"><span class="spin"></span></div>';
+  var ck = previewKey(g), hit = S.pcache[ck];
+  if (hit && hit.g === g && Date.now() - hit.t < 60000) { S.pseq++; renderPreview(g, hit.r); return; }
+  var seq = ++S.pseq, old = box.querySelector('.mailwrap');
+  if (old) { if (!soft) old.classList.add('loading'); } else box.innerHTML = '<div class="empty"><span class="spin"></span></div>';
   try {
     var r = await post('/api/desk/preview', Object.assign(base(), {key: g.key}));
     if (seq !== S.pseq) return;
-    var items = [];
-    r.problems.forEach(function (p) {
-      var fix = (p.code === 'email' || p.code === 'name') ? ' <button class="linkbtn" data-goto="details">Fix it</button>' : (p.code === 'eta' ? ' <button class="linkbtn" data-goto="eta">Enter it</button>' : '');
-      items.push('<li class="stop"><span class="ic">!</span><span>' + esc(p.text) + fix + '</span></li>'); });
-    r.warnings.forEach(function (w) { items.push('<li><span class="ic">&#9888;</span><span>' + esc(w) + '</span></li>'); });
-    if (g.sent) {
-      var msg = 'Sent to ' + esc(g.sent.to) + ' on ' + esc(g.sent.at_local) + ' by ' + esc(g.sent.by) + '.';
-      if (r.new_bls) msg += ' ' + plural(r.new_bls, 'B/L') + ' added since, marked NEW in the update.';
-      else if (r.changed) msg += ' The vessel status has changed since, so this goes out as an update.';
-      else msg += ' Nothing has changed since, so sending again repeats the same notice.';
-      items.push('<li class="good"><span class="ic">&#10003;</span><span>' + msg + '</span></li>');
-    }
-    box.innerHTML = (items.length ? '<ul class="checks">' + items.join('') + '</ul>' : '') +
-      '<div class="meta"><b>To</b><span>' + esc(r.to || 'no email yet') + '</span>' + (r.cc ? '<b>Copy</b><span>' + esc(r.cc) + '</span>' : '') + '<b>Subject</b><span>' + esc(r.subject) + '</span></div>' +
-      '<div class="mailwrap">' + r.html + '</div>';
-    box.querySelectorAll('[data-goto]').forEach(function (b) { b.onclick = function () {
-      if (b.dataset.goto === 'details') { S.keepDetails = true; setTab('details'); setTimeout(function () { var f = $(g.name ? 'fEmail' : 'fName'); if (f) f.focus(); }, 50); }
-      else { if (S.view === 'detail') setView('list'); $('vstrip').classList.add('open'); S.etaTouched = true; syncStatusUI(); $('eta').focus(); } }; });
+    S.pcache[ck] = {g: g, r: r, t: Date.now()};
+    if (S.sel !== g.key || S.tab !== 'notice' || groupByKey(g.key) !== g) return;
+    renderPreview(g, r);
   } catch (e) { if (seq === S.pseq) box.innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
+}
+function renderPreview(g, r) {
+  var box = $('panelNotice'), items = [], kept = S.adding && $('rcpIn') ? $('rcpIn').value : '', cc = (S.data && S.data.my_email) || '', hadFocus = !!$('rcpIn') && document.activeElement === $('rcpIn');
+  r.problems.forEach(function (p) {
+    var fix = (p.code === 'email' || p.code === 'name') ? ' <button class="linkbtn" data-goto="' + (p.code === 'email' ? 'email' : 'details') + '">' + (p.code === 'email' ? 'Add one' : 'Fix it') + '</button>' : (p.code === 'eta' ? ' <button class="linkbtn" data-goto="eta">Enter it</button>' : '');
+    items.push('<li class="stop"><span class="ic">!</span><span>' + esc(p.text) + fix + '</span></li>'); });
+  r.warnings.forEach(function (w) { items.push('<li><span class="ic">&#9888;</span><span>' + esc(w) + '</span></li>'); });
+  if (g.sent) {
+    var msg = 'Sent to ' + esc(g.sent.to) + ' on ' + esc(g.sent.at_local) + ' by ' + esc(g.sent.by) + '.';
+    if (r.new_bls) msg += ' ' + plural(r.new_bls, 'B/L') + ' added since, marked NEW in the update.';
+    else if (r.changed) msg += ' The vessel status has changed since, so this goes out as an update.';
+    else msg += ' Nothing has changed since, so sending again repeats the same notice.';
+    items.push('<li class="good"><span class="ic">&#10003;</span><span>' + msg + '</span></li>');
+  }
+  box.innerHTML = (items.length ? '<ul class="checks">' + items.join('') + '</ul>' : '') +
+    '<div class="meta"><b>To</b><span class="rcpcell" id="rcpCell"></span>' + (cc ? '<b>Copy</b><span>' + esc(cc) + '</span>' : '') + '<b>Subject</b><span>' + esc(r.subject) + '</span></div>' +
+    '<div class="mailwrap">' + r.html + '</div>';
+  drawRcp(g, kept);
+  if (hadFocus && $('rcpIn')) { var ri = $('rcpIn'); ri.focus(); try { ri.setSelectionRange(ri.value.length, ri.value.length); } catch (e) {} }
+  box.querySelectorAll('[data-goto]').forEach(function (b) { b.onclick = function () {
+    if (b.dataset.goto === 'email') { startAdd(g); }
+    else if (b.dataset.goto === 'details') { S.keepDetails = true; setTab('details'); setTimeout(function () { var f = $(g.name ? 'fEmail' : 'fName'); if (f) f.focus(); }, 50); }
+    else focusEta(); }; });
+}
+
+/* ---------- who the notice goes to: one chip per address ---------- */
+var EMAIL_RE = /^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/;
+function drawRcp(g, keepText) {
+  var cell = $('rcpCell'); if (!cell) return;
+  var list = allEmails(g), h = '<div class="rcps">';
+  h += list.map(function (e, i) {
+    return '<span class="rcp"><span dir="ltr">' + esc(e) + '</span>' + (i === 0 && list.length > 1 ? '<small>Main</small>' : '') +
+      '<button type="button" data-rm="' + i + '" aria-label="Remove ' + esc(e) + '">&times;</button></span>';
+  }).join('');
+  if (!list.length && !S.adding) h += '<span class="rcp-none">No email yet</span>';
+  h += S.adding
+    ? '<span class="rcp-in"><input type="text" id="rcpIn" inputmode="email" autocapitalize="none" spellcheck="false" autocomplete="off" aria-label="New email address" placeholder="name@company.com"><button type="button" class="go" id="rcpGo">Add</button></span>'
+    : '<button type="button" class="rcp-add" id="rcpAdd">+ Add email</button>';
+  h += '</div><span class="rcp-hint' + (S.rcpErr ? ' err' : '') + '" id="rcpHint" role="status">' +
+    esc(S.rcpErr || (S.adding ? 'Press Enter to add. Separate several addresses with a comma or a space.' : (list.length ? 'Every address here gets the notice. Saved for this consignee, so it is there on the next vessel too.' : 'Add the address this notice should go to.'))) + '</span>';
+  cell.innerHTML = h;
+  cell.querySelectorAll('[data-rm]').forEach(function (b) { b.onclick = function () { var l = allEmails(g); l.splice(+b.dataset.rm, 1); S.rcpErr = ''; setEmails(g, l); }; });
+  var add = $('rcpAdd'); if (add) add.onclick = function () { startAdd(g); };
+  var inp = $('rcpIn');
+  if (inp) {
+    if (keepText) inp.value = keepText;
+    inp.onkeydown = function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); addFromInput(g); }
+      else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); S.adding = false; S.rcpErr = ''; drawRcp(g); var a2 = $('rcpAdd'); if (a2) a2.focus(); }
+    };
+    $('rcpGo').onclick = function () { addFromInput(g); };
+  }
+}
+function startAdd(g) { if (S.tab !== 'notice') { S.keepDetails = false; setTab('notice'); } S.adding = true; S.rcpErr = ''; drawRcp(g); var i = $('rcpIn'); if (i) i.focus(); }
+function addFromInput(g) {
+  var inp = $('rcpIn'), parts = (inp.value || '').split(/[\s,;]+/).filter(Boolean);
+  if (!parts.length) { S.adding = false; S.rcpErr = ''; drawRcp(g); return; }
+  var bad = parts.filter(function (x) { return !EMAIL_RE.test(x); })[0];
+  if (bad) { S.rcpErr = '“' + bad.slice(0, 50) + '” is not a valid email address.'; drawRcp(g, inp.value); $('rcpIn').focus(); return; }
+  var list = allEmails(g), have = list.map(function (x) { return x.toLowerCase(); });
+  parts.forEach(function (x) { if (have.indexOf(x.toLowerCase()) < 0) { list.push(x); have.push(x.toLowerCase()); } });
+  S.adding = false; S.rcpErr = ''; setEmails(g, list);
+  var a3 = $('rcpAdd'); if (a3) a3.focus();
+}
+/* The chips change at once; the save follows in the background, one at a time, and the page takes the server's version when the last one is done. */
+function setEmails(g, list) {
+  var key = g.key, was = {email: g.email, more: g.more, state: g.state, email_ok: g.email_ok};
+  g.email = list[0] || ''; g.more = list.slice(1);
+  if (!g.email) g.state = g.name ? 'needs_email' : g.state; else if (g.state === 'needs_email') g.state = 'ready';
+  renderChips(); renderList(); renderSub(g); renderPill(); renderActions(); drawRcp(g);
+  S.pending++;
+  S.saveQ = S.saveQ.then(function () {
+    return post('/api/desk/save', {port: S.port, vessel: S.vessel, key: key, name: g.name, email: list.join('; '), attn: g.attn || ''});
+  }).then(function (r) {
+    S.pending--;
+    if (S.pending > 0) return;
+    if (r.group) { applyGroup(r.group, key, r.key); S.pcache = {}; renderChips(); renderList(); var cur = groupByKey(S.sel); if (cur) { renderSub(cur); renderPill(); drawRcp(cur); refreshPreview(true); } renderActions(); }
+  }).catch(function (e) {
+    S.pending--;
+    g.email = was.email; g.more = was.more; g.state = was.state; g.email_ok = was.email_ok;
+    toast(e.message, true);
+    if (groupByKey(S.sel) === g) { renderChips(); renderList(); renderSub(g); renderPill(); renderActions(); drawRcp(g); }
+  });
+}
+function applyGroup(g, oldKey, newKey) {
+  var gs = S.data.groups.filter(function (x) { return x.key !== oldKey && x.key !== newKey; });
+  if (g) gs.push(g);
+  S.data.groups = gs; if (g && (S.sel === oldKey || S.sel === newKey)) S.sel = g.key;
 }
 
 /* ---------- details form (one save) ---------- */
@@ -16894,7 +17272,12 @@ async function saveDetails(quiet) {
     var r = await post('/api/desk/save', payload);
     S.dirty = false; S.sel = r.key || S.sel;
     S.learn = S.learn.concat(r.learn || []);
-    await openVessel({keep: true});
+    if (r.group) {
+      applyGroup(r.group, payload.key, r.key); S.pcache = {};
+      renderChips(); renderList(); renderActions();
+      var cur = groupByKey(S.sel);
+      if (cur) { $('dName').textContent = cur.name || 'No consignee name'; renderSub(cur); renderPill(); if (!quiet) { renderDetailsForm(); renderLearn(); } }
+    } else await openVessel({keep: true});
     if (!quiet) { var n = $('saveNote'); if (n) { n.textContent = 'Saved.'; n.className = 'hint'; } toast('Saved. It is remembered for next time.'); }
     return true;
   } catch (e) {
@@ -16943,21 +17326,27 @@ window.addEventListener('resize', function () { if (S.data) renderActions(); });
 
 /* ---------- status controls ---------- */
 $('seg').querySelectorAll('button').forEach(function (b) {
-  b.onclick = function () { setStatus(b.dataset.k, $('eta').value, $('berth').value); S.src = ''; onStatusChange(); };
+  b.onclick = function () { setStatus(b.dataset.k, $('eta').value, $('berth').value); S.src = ''; onStatusChange(true); };
   b.onkeydown = function (e) {
     var order = ['arriving', 'anchorage', 'berthed'], i = order.indexOf(b.dataset.k);
     if (e.key === 'ArrowRight' || e.key === 'ArrowDown') i = (i + 1) % 3; else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') i = (i + 2) % 3; else return;
     e.preventDefault(); var t = $('seg').querySelector('[data-k="' + order[i] + '"]'); t.click(); t.focus();
   };
 });
-function onStatusChange() { syncStatusUI(); if (S.data) { renderChips(); renderList(); renderPill(); renderActions(); debouncePreview(); } }
+function onStatusChange(quick) { syncStatusUI(); if (S.data) { renderChips(); renderList(); renderPill(); renderActions(); patchNotice(); debouncePreview(quick === true ? 80 : 450); } }
 $('eta').addEventListener('input', function () { S.src = ''; S.etaTouched = false; onStatusChange(); });
-$('eta').addEventListener('blur', function () { var d = parseEta($('eta').value); S.etaTouched = true; if (d) $('eta').value = fmtEta(d); onStatusChange(); });
+$('eta').addEventListener('blur', function () {
+  var d = parseEta($('eta').value), raw = $('eta').value.trim(); S.etaTouched = true; if (d) $('eta').value = fmtEta(d); onStatusChange(true);
+  if (raw && !d && !$('vstrip').classList.contains('open') && window.innerWidth < 1500) toast('That is not a valid date. Use dd.mm.yyyy.', true);
+});
 $('berth').addEventListener('input', function () { S.src = ''; onStatusChange(); });
 
 /* ---------- vessel strip ---------- */
 $('openBtn').onclick = function () { openVessel(); };
-$('vessel').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); openVessel(); } });
+$('vessel').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter') { e.preventDefault(); openVessel(); }
+  else if (e.key === 'Escape' && S.data && $('vstrip').classList.contains('open')) { e.preventDefault(); toggleStrip(); $('chgBtn').focus(); }
+});
 $('port').addEventListener('change', function () { $('port').classList.remove('bad'); });
 $('q').addEventListener('input', function () { S.q = this.value; renderList(true); });
 $('q').addEventListener('keydown', function (e) {
@@ -17030,9 +17419,11 @@ function openAddSheet(files) {
 }
 function chosen() { return {port: $('port').value, vessel: $('vessel').value.replace(/\s+/g, ' ').trim().toUpperCase()}; }
 async function peekOne(it) {
-  var fd = new FormData(), c = chosen(); fd.append('file', it.file); fd.append('port', c.port); fd.append('vessel', c.vessel);
+  var fd = new FormData(), c = chosen(), f = it.file, ck = [f.name, f.size, f.lastModified, c.port, c.vessel].join('|'), hit = S.peekc[ck];
+  fd.append('file', f); fd.append('port', c.port); fd.append('vessel', c.vessel);
   try {
-    var r = await api('/api/desk/peek', {method: 'POST', body: fd});
+    var r = hit && Date.now() - hit.t < 600000 ? hit.r : await api('/api/desk/peek', {method: 'POST', body: fd});
+    if (r.ok && !(hit && hit.r === r)) S.peekc[ck] = {r: r, t: Date.now()};
     it.peek = r.ok ? r : null; it.state = r.ok ? 'done' : 'unknown';
   } catch (e) { it.state = 'unknown'; it.peek = null; }
   if (it.peek && !it.autofilled) {
@@ -17186,7 +17577,7 @@ $('oneBtn').onclick = function () { openReview(S.sel); };
 $('allBtn').onclick = function () { openReview(null); };
 async function openReview(onlyKey) {
   var prob = statusProblem();
-  if (prob) { if (S.view === 'detail') setView('list'); $('vstrip').classList.add('open'); S.etaTouched = true; syncStatusUI(); $('eta').focus(); toast(prob, true); return; }
+  if (prob) { focusEta(); toast(prob, true); return; }
   var r;
   try { r = await post('/api/desk/review', Object.assign(base(), {keys: onlyKey ? [onlyKey] : []})); } catch (e) { toast(e.message, true); return; }
   var st = status(), what = KINDS[st.kind] + (st.kind === 'arriving' ? ', ETA ' + (parseEta(st.eta) ? fmtEta(parseEta(st.eta)) : st.eta) : (st.kind === 'berthed' && st.berth ? ', berth ' + st.berth : ''));
@@ -21987,7 +22378,8 @@ TRACK_HTML = """<!DOCTYPE html>
 {% if lang == 'ar' %}
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" onload="this.onload=null;this.rel='stylesheet'">
+<noscript><link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet"></noscript>
 {% endif %}
 <style>
   :root {
@@ -22143,7 +22535,8 @@ PAGE_HTML = """
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&display=swap" onload="this.onload=null;this.rel='stylesheet'">
+<noscript><link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&display=swap" rel="stylesheet"></noscript>
 <style>
   :root {
     --bg: #f2f4f7;
