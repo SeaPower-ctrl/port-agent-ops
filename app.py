@@ -117,7 +117,14 @@ const I18N = {
     hdr_desk_operations: "Operations Desk", hdr_desk_operations_sub: "Vessels, berths and ports",
     hdr_desk_accounts: "Accounts Desk", hdr_desk_accounts_sub: "Quotations, invoices and jobs",
     hdr_tool_manifest: "Arrival notices", hdr_tool_do: "DO Tracker",
-    hdr_your_desks: "Your desks", hdr_in_desk: "In this desk", hdr_all_desks: "All desks", hdr_learning: "Learning room", hdr_language: "Language",
+    hdr_your_desks: "Your desks", hdr_in_desk: "In this desk", hdr_all_desks: "All desks", hdr_learning: "Learning room", hdr_language: "Language", hdr_edit_profile: "Edit profile",
+    hdr_bell: "Notifications", hdr_notifs_none: "You are all caught up.", hdr_notifs_all: "Mark all as read",
+    importer_ph: "Importer no.", importer_title: "Importer number. Once the B/L copy is attached and this is filled in, the DO team is asked for the invoice.",
+    req_tag: "Requested", req_title: "The DO team was asked for the invoice by {user} on {time}.",
+    req_sent_toast: "The DO team has been asked for the invoice.", req_no_team_toast: "Requested, but nobody is set up as the DO team yet. Ask the Owner to tick DO team in Admin.",
+    req_note: " - invoice requested", importer_saved: "Importer no. saved", operator_label: "Operator",
+    history_requested: "asked the DO team for the invoice. Importer no. {value}", action_importer: "changed the importer no.",
+    history_importer: 'set the importer no. to "{value}"', history_importer_cleared: "cleared the importer no.",
     manage_users: "Admin",
     signed_in_as: "Signed in as",
     log_out: "Log out",
@@ -420,7 +427,14 @@ const I18N = {
     hdr_desk_operations: "مكتب العمليات", hdr_desk_operations_sub: "السفن والأرصفة والموانئ",
     hdr_desk_accounts: "مكتب الحسابات", hdr_desk_accounts_sub: "عروض الأسعار والفواتير والأعمال",
     hdr_tool_manifest: "إشعارات الوصول", hdr_tool_do: "متتبع أوامر التسليم",
-    hdr_your_desks: "مكاتبك", hdr_in_desk: "في هذا المكتب", hdr_all_desks: "كل المكاتب", hdr_learning: "غرفة التعلّم", hdr_language: "اللغة",
+    hdr_your_desks: "مكاتبك", hdr_in_desk: "في هذا المكتب", hdr_all_desks: "كل المكاتب", hdr_learning: "غرفة التعلّم", hdr_language: "اللغة", hdr_edit_profile: "تعديل الملف الشخصي",
+    hdr_bell: "الإشعارات", hdr_notifs_none: "لا توجد إشعارات جديدة.", hdr_notifs_all: "تحديد الكل كمقروء",
+    importer_ph: "رقم المستورد", importer_title: "رقم المستورد. بعد إرفاق نسخة البوليصة وتعبئة هذا الحقل يُطلب من فريق أمر التسليم إصدار الفاتورة.",
+    req_tag: "مطلوبة", req_title: "طلب {user} الفاتورة من فريق أمر التسليم في {time}.",
+    req_sent_toast: "تم طلب الفاتورة من فريق أمر التسليم.", req_no_team_toast: "تم الطلب، لكن لم يُحدد فريق أمر التسليم بعد. اطلب من المالك تفعيل «فريق أمر التسليم» في الإدارة.",
+    req_note: " - تم طلب الفاتورة", importer_saved: "تم حفظ رقم المستورد", operator_label: "المشغّل",
+    history_requested: "طلب الفاتورة من فريق أمر التسليم. رقم المستورد {value}", action_importer: "غيّر رقم المستورد",
+    history_importer: 'ضبط رقم المستورد على "{value}"', history_importer_cleared: "مسح رقم المستورد",
     manage_users: "الإدارة",
     signed_in_as: "مسجّل الدخول باسم",
     log_out: "تسجيل الخروج",
@@ -949,6 +963,8 @@ def init_db():
     # the Owner (there is only one); any other admin becomes a Manager.
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS manager_id INTEGER")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS features TEXT")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_color INTEGER DEFAULT 0")   # profile picture colour (0 = Compass blue)
+    cur.execute("CREATE TABLE IF NOT EXISTS user_avatars (user_id INTEGER PRIMARY KEY, data BYTEA NOT NULL, v BIGINT NOT NULL DEFAULT 0)")
     cur.execute("""CREATE TABLE IF NOT EXISTS consignee_book (
         ckey TEXT PRIMARY KEY, name TEXT DEFAULT '', email TEXT DEFAULT '', attn TEXT DEFAULT '', updated_at TEXT DEFAULT '')""")
     cur.execute("""CREATE TABLE IF NOT EXISTS notice_log (
@@ -1135,6 +1151,16 @@ def init_db():
         )"""
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_bl ON audit_log (bl_number)")
+    # The bell (alerts between an operator and the DO team), the importer no. a B/L's invoice is raised against,
+    # and when the DO team was asked for that invoice. A DO-team account is one the Owner ticked in Admin.
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS do_team INTEGER DEFAULT 0")
+    for _col in ("importer_no", "inv_requested_at", "inv_requested_by"):
+        cur.execute(f"ALTER TABLE records ADD COLUMN IF NOT EXISTS {_col} TEXT DEFAULT ''")
+    cur.execute("""CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT DEFAULT 'info', title TEXT DEFAULT '', body TEXT DEFAULT '',
+        bl_number TEXT DEFAULT '', created_at TEXT DEFAULT '', read_at TEXT DEFAULT '')""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications (user_id, id DESC)")
+    cur.execute("DELETE FROM notifications WHERE created_at < %s", ((datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d %H:%M"),))
     cur.execute(
         """CREATE TABLE IF NOT EXISTS vessels (
             name TEXT PRIMARY KEY,
@@ -2358,12 +2384,100 @@ _HDR_CSS = r"""
 ::view-transition-old(root),::view-transition-new(root){animation-duration:.14s}
 ::view-transition-group(dh){animation-duration:.14s}
 @media (prefers-reduced-motion:reduce){::view-transition-group(*),::view-transition-old(*),::view-transition-new(*){animation:none!important}}
+/* ---- profile pictures: the little circles, and the editor opened from the account menu ---- */
+:root{--av1:#1f6fa8;--av2:#178575;--av3:#2f8a50;--av4:#a06a0c;--av5:#c4521c;--av6:#b83a54;--av7:#6a4cc0}
+.cp-av{--s:22px;width:var(--s);height:var(--s);border-radius:50%;display:inline-grid;place-items:center;flex:none;background:var(--navy);color:#fff;font-weight:700;font-size:calc(var(--s) * .44);line-height:1;background-size:cover;background-position:center;overflow:hidden;vertical-align:middle;user-select:none;font-style:normal}
+:root[data-theme="dark"] .cp-av{color:#0b1620}
+.dh-user .av{background-size:cover;background-position:center;overflow:hidden}
+.dh-who{display:flex;align-items:center;gap:12px;white-space:normal}
+.dh-who .nm{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pf-mask{position:fixed;inset:0;z-index:4000;display:grid;place-items:center;padding:16px;background:rgba(10,20,32,.58);overflow:auto}
+.pf-mask[hidden]{display:none}
+.pf-dialog{width:min(720px,100%);max-height:calc(100vh - 32px);overflow:auto;background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:20px;box-shadow:0 30px 70px -12px rgba(0,0,0,.5);font:14px/1.4 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Arial,sans-serif}
+.pf-dialog *{box-sizing:border-box}
+.pf-h{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border)}
+.pf-h b{font-size:17px}
+.pf-x{width:34px;height:34px;border-radius:50%;border:0;background:color-mix(in srgb,var(--text) 8%,transparent);color:var(--text);display:grid;place-items:center;cursor:pointer;padding:0;margin:0}
+.pf-x svg{width:16px;height:16px}
+.pf-b{display:grid;grid-template-columns:300px minmax(0,1fr);gap:24px;padding:20px}
+.pf-crop{display:grid;gap:12px;justify-items:center;align-content:start}
+#pfCanvas{width:280px;height:280px;max-width:100%;border-radius:16px;background:color-mix(in srgb,var(--text) 7%,var(--card));touch-action:none;cursor:grab;display:block}
+#pfCanvas.drag{cursor:grabbing}
+.pf-zoom{width:100%}
+.pf-zoom input{width:100%;accent-color:var(--navy-light);margin:0}
+.pf-side{display:grid;gap:16px;align-content:start;min-width:0}
+.pf-side h4{margin:0 0 8px;font-size:11.5px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.pf-btns{display:flex;gap:10px;flex-wrap:wrap}
+.pf-btn{height:40px;padding:0 16px;margin:0;border-radius:11px;border:1px solid var(--border);background:color-mix(in srgb,var(--text) 6%,transparent);color:var(--text);font:inherit;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap;transform:none}
+.pf-btn:hover{border-color:color-mix(in srgb,var(--navy-light) 55%,transparent)}
+.pf-btn.pri{background:var(--navy);color:#fff;border-color:transparent}
+:root[data-theme="dark"] .pf-btn.pri{color:#0b1620;background:var(--navy-light)}
+.pf-btn.dng{color:#b3261e}
+:root[data-theme="dark"] .pf-btn.dng{color:#ff8a80}
+.pf-btn[disabled]{opacity:.45;cursor:not-allowed}
+.pf-btn:focus-visible,.pf-x:focus-visible,#pfCanvas:focus-visible,.pf-samples button:focus-visible,.pf-sw button:focus-visible{outline:2px solid var(--navy-light);outline-offset:2px}
+.pf-samples{display:flex;gap:10px;flex-wrap:wrap}
+.pf-samples button{width:50px;height:50px;padding:0;margin:0;border-radius:50%;border:2px solid transparent;background:none;cursor:pointer;overflow:hidden;transform:none}
+.pf-samples button:hover{border-color:var(--navy-light)}
+.pf-samples svg{width:100%;height:100%;display:block}
+.pf-sw{display:flex;gap:9px;flex-wrap:wrap}
+.pf-sw button{width:30px;height:30px;padding:0;margin:0;border-radius:50%;border:2px solid var(--card);box-shadow:0 0 0 1px var(--border);cursor:pointer;transform:none}
+.pf-sw button[aria-pressed="true"]{box-shadow:0 0 0 2.5px var(--navy-light)}
+.pf-prev{display:flex;align-items:flex-end;gap:14px}
+.pf-prev canvas{border-radius:50%;display:block;background:color-mix(in srgb,var(--text) 7%,var(--card))}
+.pf-hint{font-size:12.5px;color:var(--muted);margin:0}
+.pf-hint.err{color:#b3261e}
+:root[data-theme="dark"] .pf-hint.err{color:#ff8a80}
+.pf-f{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;padding:14px 20px;border-top:1px solid var(--border);background:color-mix(in srgb,var(--text) 4%,transparent)}
+.pf-f .pf-btns{margin-inline-start:auto}
+.pf-note{font-size:12.5px;color:var(--muted)}
+@media (max-width:760px){.pf-b{grid-template-columns:minmax(0,1fr)}}
+@media print{.pf-mask{display:none}}
+/* ---- the bell: alerts between the operator and the DO team ---- */
+.dh .dh-bell{position:relative;display:grid;place-items:center;width:40px;height:40px;margin:0;padding:0;border-radius:50%;border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;transform:none;flex:none}
+.dh .dh-bell:hover,.dh .dh-bell[aria-expanded="true"]{background:color-mix(in srgb,var(--text) 7%,transparent)}
+.dh .dh-bell:focus-visible{outline:2px solid var(--navy-light);outline-offset:2px}
+.dh-bell svg{width:19px;height:19px}
+.dh-bell-n{position:absolute;top:-4px;inset-inline-end:-4px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:#d33a2c;color:#fff;font-size:11px;font-weight:700;line-height:18px;text-align:center;box-shadow:0 0 0 2px var(--card)}
+.dh-bellmenu{top:calc(100% - 6px);inset-inline-end:12px;width:390px;padding:0}
+.dh-bell-h{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px 8px}
+.dh-bell-h b{font-size:15px}
+.dh .dh-bell-h button{margin:0;padding:4px 8px;border:0;border-radius:8px;background:transparent;color:var(--navy);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer;transform:none}
+:root[data-theme="dark"] .dh .dh-bell-h button{color:var(--navy-light)}
+.dh .dh-bell-h button:hover{background:color-mix(in srgb,var(--navy-light) 18%,transparent)}
+.dh .dh-bell-h button:disabled{opacity:.4;cursor:default;background:transparent}
+.dh-bell-list{max-height:min(420px,calc(100vh - 140px));overflow:auto;padding:0 6px 6px}
+.dh-bell-empty{padding:22px 14px 24px;text-align:center;color:var(--muted);font-size:13.5px}
+.dh-panel a.nt{align-items:flex-start;gap:11px;padding:10px 10px;border-radius:10px}
+.dh-panel a.nt .nt-t{gap:2px}
+.dh-panel a.nt b{font-size:13.5px;font-weight:600}
+.dh-panel a.nt small{font-size:12.5px;line-height:1.35;overflow-wrap:anywhere;color:var(--text);opacity:.78}
+.dh-panel a.nt .nt-when{font-size:11.5px;opacity:.6}
+.dh-panel a.nt:not(.unread) b{font-weight:500}
+.dh-panel a.nt:not(.unread) .nt-t{opacity:.72}
+.dh-panel a .nt-dot,.dh-toast .nt-dot{flex:none;width:10px;height:10px;margin-top:5px;border-radius:50%;background:var(--navy-light)}
+.dh-panel a.nt.k-ask .nt-dot,.dh-toast.k-ask .nt-dot{background:#e0902a}
+.dh-panel a.nt.k-ok .nt-dot,.dh-toast.k-ok .nt-dot{background:#2e9e6b}
+.dh-panel a.nt.k-warn .nt-dot,.dh-toast.k-warn .nt-dot{background:#d33a2c}
+.dh-panel a.nt:not(.unread) .nt-dot{background:transparent;box-shadow:inset 0 0 0 1.5px color-mix(in srgb,var(--muted) 70%,transparent)}
+.dh-toasts{position:fixed;top:66px;inset-inline-end:14px;z-index:3500;display:flex;flex-direction:column;gap:10px;width:min(370px,calc(100vw - 28px));pointer-events:none}
+.dh-toast{pointer-events:auto;display:flex;align-items:flex-start;gap:11px;padding:12px 10px 12px 14px;border-radius:14px;background:var(--card);color:var(--text);border:1px solid var(--border);box-shadow:0 18px 40px -10px rgba(10,20,32,.5);font:13.5px/1.35 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Arial,sans-serif;cursor:pointer;animation:dh-toast-in .22s ease-out}
+.dh-toast.out{opacity:0;transform:translateY(-6px);transition:opacity .2s ease,transform .2s ease}
+.dh-toast .tx{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
+.dh-toast b{font-size:14px}
+.dh-toast small{color:var(--text);opacity:.74;font-size:12.5px;overflow-wrap:anywhere}
+.dh-toast button{flex:none;width:26px;height:26px;margin:0;padding:0;border:0;border-radius:50%;background:transparent;color:var(--muted);font-size:18px;line-height:1;cursor:pointer;transform:none}
+.dh-toast button:hover{background:color-mix(in srgb,var(--text) 9%,transparent)}
+@keyframes dh-toast-in{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+@media (max-width:560px){.dh-bellmenu{inset-inline:12px;width:auto}.dh-toasts{top:60px}}
+@media (prefers-reduced-motion:reduce){.dh-toast{animation:none}.dh-toast.out{transition:none}}
+@media print{.dh-toasts{display:none}}
 """
 
 _HDR_JS = r"""
 (function () {
   var dh = document.getElementById('dh'); if (!dh) return;
-  var pairs = [['dhDeskBtn', 'dhDeskMenu'], ['dhUserBtn', 'dhUserMenu']].map(function (p) {
+  var pairs = [['dhDeskBtn', 'dhDeskMenu'], ['dhBellBtn', 'dhBellMenu'], ['dhUserBtn', 'dhUserMenu']].map(function (p) {
     return { b: document.getElementById(p[0]), m: document.getElementById(p[1]) };
   }).filter(function (x) { return x.b && x.m; });
   function items(m) { return [].slice.call(m.querySelectorAll('a[role="menuitem"]')).filter(function (a) { return a.offsetParent !== null; }); }
@@ -2396,6 +2510,282 @@ _HDR_JS = r"""
   window.addEventListener('resize', function () { closeAll(null); });
   if (document.prerendering) document.addEventListener('prerenderingchange', function () { window.dispatchEvent(new Event('compass:activated')); }, { once: true });
 })();
+/* ---- profile pictures: circles next to names, and the editor ---- */
+(function () {
+  var AV = { cache: {}, me: null, asked: {}, timer: null }, ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (m) { return ESC[m]; }); }
+  function initial(n) { n = String(n || '').trim(); return n ? n.charAt(0).toUpperCase() : '?'; }
+  function look(el, p, nm) {
+    el.style.backgroundImage = ''; el.style.backgroundColor = ''; el.style.color = ''; el.textContent = initial(nm);
+    if (p) {
+      if (p.v) { el.style.backgroundImage = 'url(/avatar/' + p.id + '?v=' + p.v + ')'; el.textContent = ''; }
+      else if (p.c > 0) { el.style.backgroundColor = 'var(--av' + p.c + ')'; el.style.color = '#fff'; }
+    }
+  }
+  function paint(el) {
+    var nm = el.getAttribute('data-av-name') || '', key = nm.trim().toLowerCase();
+    if (!key) { el.setAttribute('data-painted', '1'); return; }
+    if (key in AV.cache) { look(el, AV.cache[key], nm); el.setAttribute('data-painted', '1'); return; }
+    AV.asked[key] = 1; clearTimeout(AV.timer); AV.timer = setTimeout(ask, 60);
+  }
+  function ask() {
+    var names = Object.keys(AV.asked).filter(function (k) { return !(k in AV.cache); }).slice(0, 300); AV.asked = {};
+    if (!names.length) return;
+    fetch('/api/people', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ names: names }) })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { var m = (d && d.people) || {}; names.forEach(function (k) { AV.cache[k] = m[k] || false; }); sweep(); })
+      .catch(function () { names.forEach(function (k) { AV.cache[k] = false; }); });
+  }
+  function sweep() { [].forEach.call(document.querySelectorAll('.cp-av[data-av-name]:not([data-painted])'), paint); }
+  function repaintAll() { AV.cache = {}; [].forEach.call(document.querySelectorAll('.cp-av[data-av-name]'), function (el) { el.removeAttribute('data-painted'); }); sweep(); }
+  var queued = false;
+  function later() { if (queued) return; queued = true; requestAnimationFrame(function () { queued = false; sweep(); }); }
+  window.cpAvatar = function (name, size) {
+    return '<span class="cp-av" data-av-name="' + esc(name) + '" style="--s:' + (size || 22) + 'px" aria-hidden="true">' + esc(initial(name)) + '</span>';
+  };
+  function applyMine() {
+    var p = AV.me; if (!p) return;
+    ['dhAv', 'dhAvBig'].forEach(function (id) { var el = document.getElementById(id); if (el) look(el, p, el.getAttribute('data-nm') || ''); });
+  }
+  function loadMe() {
+    return fetch('/api/profile', { credentials: 'same-origin' }).then(function (r) { return r.ok ? r.json() : null; }).then(function (d) { if (d) { AV.me = d; applyMine(); } }).catch(function () {});
+  }
+  sweep();
+  new MutationObserver(later).observe(document.documentElement, { childList: true, subtree: true });
+
+/* ---------- the editor ---------- */
+  var mask = document.getElementById('pfMask'); if (!mask) return;
+  var $ = function (id) { return document.getElementById(id); };
+  var CS = 280, R = 120, SW = ['', '#1f6fa8', '#178575', '#2f8a50', '#a06a0c', '#c4521c', '#b83a54', '#6a4cc0'];
+  var cv = $('pfCanvas'), cx = cv.getContext('2d');
+  var crop = { img: null, x: 0, y: 0, s: 1, min: 1, dirty: false }, pend = { color: 0 }, opener = null, busy = false;
+  var SAMPLES = [
+    '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240"><defs><linearGradient id="s1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f7c35a"/><stop offset="1" stop-color="#e2623a"/></linearGradient></defs><rect width="240" height="240" fill="url(#s1)"/><circle cx="120" cy="138" r="52" fill="#fff4cf"/><rect y="150" width="240" height="90" fill="#123a56"/><path d="M0 176c30-14 60-14 90 0s60 14 90 0 40-10 60-4v68H0z" fill="#1f5c85"/></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240"><rect width="240" height="240" fill="#123a56"/><g fill="none" stroke="#e3bb4c" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"><circle cx="120" cy="64" r="16"/><path d="M120 80v112M82 112h76M54 150c0 30 28 46 66 46s66-16 66-46"/></g></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240"><rect width="240" height="240" fill="#1f9a8a"/><circle cx="120" cy="120" r="84" fill="none" stroke="#ffffff55" stroke-width="6"/><path d="M120 34l22 64 64 22-64 22-22 64-22-64-64-22 64-22z" fill="#fff"/><path d="M120 34l22 64-22 22z" fill="#e3bb4c"/></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240"><defs><linearGradient id="s4" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5aa2d1"/><stop offset="1" stop-color="#123a56"/></linearGradient></defs><rect width="240" height="240" fill="url(#s4)"/><g fill="none" stroke="#fff" stroke-width="10" stroke-linecap="round" opacity=".9"><path d="M30 100c22-22 44-22 66 0s44 22 66 0 32-14 48-6"/><path d="M30 142c22-22 44-22 66 0s44 22 66 0 32-14 48-6" opacity=".7"/><path d="M30 184c22-22 44-22 66 0s44 22 66 0 32-14 48-6" opacity=".45"/></svg>'
+  ];
+  $('pfSamples').innerHTML = SAMPLES.map(function (s, i) {
+    return '<button type="button" data-i="' + i + '" aria-label="Sample picture ' + (i + 1) + '">' + s.replace(/id="s(\d)"/g, 'id="q$1"').replace(/url\(#s(\d)\)/g, 'url(#q$1)') + '</button>';
+  }).join('');
+  $('pfSw').innerHTML = SW.map(function (c, i) {
+    return '<button type="button" data-i="' + i + '" aria-label="Colour ' + (i + 1) + '" aria-pressed="false"' + (i ? ' style="background:' + c + '"' : ' style="background:var(--navy)"') + '></button>';
+  }).join('');
+  function cssv(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+  function fill(i) { return i === 0 ? cssv('--navy') || '#123a56' : SW[i]; }
+  function initialDraw(ctx, size, i) {
+    var nm = ($('pfMask').getAttribute('data-nm') || '');
+    ctx.fillStyle = fill(i); ctx.beginPath(); ctx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2); ctx.fill();
+    var dark = document.documentElement.getAttribute('data-theme') === 'dark';
+    ctx.fillStyle = (i === 0 && dark) ? '#0b1620' : '#ffffff';
+    ctx.font = '700 ' + Math.round(size * .44) + 'px -apple-system,Segoe UI,Roboto,Arial,sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(initial(nm), size / 2, size / 2 + size * .03);
+  }
+  function draw() {
+    cx.clearRect(0, 0, CS, CS);
+    cx.fillStyle = 'rgba(128,140,155,.18)'; cx.fillRect(0, 0, CS, CS);
+    if (crop.img) {
+      cx.drawImage(crop.img, crop.x, crop.y, crop.img.naturalWidth * crop.s, crop.img.naturalHeight * crop.s);
+      cx.save(); cx.beginPath(); cx.rect(0, 0, CS, CS); cx.arc(CS / 2, CS / 2, R, 0, Math.PI * 2, true); cx.fillStyle = 'rgba(8,16,26,.58)'; cx.fill('evenodd'); cx.restore();
+      cx.strokeStyle = 'rgba(255,255,255,.9)'; cx.lineWidth = 2; cx.beginPath(); cx.arc(CS / 2, CS / 2, R, 0, Math.PI * 2); cx.stroke();
+    } else {
+      cx.save(); cx.translate(CS / 2 - R, CS / 2 - R); initialDraw(cx, 2 * R, pend.color); cx.restore();
+    }
+    var big = out(192);
+    [96, 48, 30].forEach(function (n) { var c = $('pfP' + n), g = c.getContext('2d'); g.clearRect(0, 0, n, n); g.save(); g.beginPath(); g.arc(n / 2, n / 2, n / 2, 0, Math.PI * 2); g.clip(); g.drawImage(big, 0, 0, n, n); g.restore(); });
+  }
+  function out(size) {
+    var o = document.createElement('canvas'); o.width = o.height = size; var g = o.getContext('2d'); g.imageSmoothingQuality = 'high';
+    if (!crop.img) { initialDraw(g, size, pend.color); return o; }
+    g.fillStyle = '#ffffff'; g.fillRect(0, 0, size, size);
+    var sx = (CS / 2 - R - crop.x) / crop.s, sy = (CS / 2 - R - crop.y) / crop.s, sw = 2 * R / crop.s;
+    g.drawImage(crop.img, sx, sy, sw, sw, 0, 0, size, size); return o;
+  }
+  function clamp() {
+    var w = crop.img.naturalWidth * crop.s, h = crop.img.naturalHeight * crop.s;
+    crop.x = Math.min(CS / 2 - R, Math.max(CS / 2 + R - w, crop.x)); crop.y = Math.min(CS / 2 - R, Math.max(CS / 2 + R - h, crop.y));
+  }
+  function state() {
+    $('pfRm').disabled = !crop.img || busy; $('pfZoom').disabled = !crop.img;
+    $('pfSave').disabled = busy; $('pfCancel').disabled = busy;
+    [].forEach.call($('pfSw').children, function (b, i) { b.setAttribute('aria-pressed', i === pend.color ? 'true' : 'false'); });
+    $('pfHint').textContent = crop.img ? 'Drag the photo to move it. Use the slider to zoom.' : 'Upload a photo, drop one here, or try a sample.';
+    $('pfNote').textContent = crop.img ? '' : 'No photo: your initial on the chosen colour';
+  }
+  function say(t, bad) { var m = $('pfMsg'); m.textContent = t; m.className = 'pf-hint' + (bad ? ' err' : ''); }
+  function setImg(src, dirty) {
+    var im = new Image();
+    im.onload = function () {
+      crop.img = im; crop.min = Math.max(2 * R / im.naturalWidth, 2 * R / im.naturalHeight); crop.s = crop.min;
+      crop.x = CS / 2 - im.naturalWidth * crop.s / 2; crop.y = CS / 2 - im.naturalHeight * crop.s / 2; crop.dirty = dirty; $('pfZoom').value = 100; draw(); state();
+    };
+    im.onerror = function () { say('That file could not be read as a photo.', true); };
+    im.src = src;
+  }
+  function readFile(f) {
+    if (!f) return;
+    if (!/^image\/(jpeg|png|webp)$/.test(f.type)) { say('That file type is not allowed. Use a JPG, PNG or WebP photo.', true); return; }
+    if (f.size > 8 * 1024 * 1024) { say('That photo is over 8 MB. Choose a smaller one.', true); return; }
+    say('JPG, PNG or WebP, up to 8 MB.', false);
+    var fr = new FileReader(); fr.onload = function () { setImg(fr.result, true); }; fr.readAsDataURL(f);
+  }
+  $('pfUp').onclick = function () { $('pfFile').click(); };
+  $('pfFile').onchange = function (e) { readFile(e.target.files[0]); e.target.value = ''; };
+  $('pfRm').onclick = function () { crop.img = null; crop.dirty = true; draw(); state(); };
+  $('pfSamples').onclick = function (e) { var b = e.target.closest('button'); if (b) setImg('data:image/svg+xml;charset=utf-8,' + encodeURIComponent(SAMPLES[+b.getAttribute('data-i')]), true); };
+  $('pfSw').onclick = function (e) { var b = e.target.closest('button'); if (b) { pend.color = +b.getAttribute('data-i'); draw(); state(); } };
+  function zoomTo(v) {
+    if (!crop.img) return; var old = crop.s, ns = crop.min * v / 100, rx = (CS / 2 - crop.x) / old, ry = (CS / 2 - crop.y) / old;
+    crop.s = ns; crop.x = CS / 2 - rx * ns; crop.y = CS / 2 - ry * ns; crop.dirty = true; clamp(); draw();
+  }
+  $('pfZoom').oninput = function (e) { zoomTo(+e.target.value); };
+  var drag = null;
+  cv.addEventListener('pointerdown', function (e) { if (!crop.img) return; drag = { x: e.clientX, y: e.clientY, cx: crop.x, cy: crop.y }; cv.setPointerCapture(e.pointerId); cv.classList.add('drag'); });
+  cv.addEventListener('pointermove', function (e) { if (!drag) return; crop.x = drag.cx + (e.clientX - drag.x) * CS / cv.clientWidth; crop.y = drag.cy + (e.clientY - drag.y) * CS / cv.clientHeight; crop.dirty = true; clamp(); draw(); });
+  cv.addEventListener('pointerup', function () { drag = null; cv.classList.remove('drag'); });
+  cv.addEventListener('keydown', function (e) {
+    if (!crop.img) return; var d = { ArrowLeft: [-12, 0], ArrowRight: [12, 0], ArrowUp: [0, -12], ArrowDown: [0, 12] }[e.key];
+    if (d) { e.preventDefault(); crop.x += d[0]; crop.y += d[1]; crop.dirty = true; clamp(); draw(); }
+    else if (e.key === '+' || e.key === '=') { e.preventDefault(); var z = $('pfZoom'); z.value = Math.min(300, +z.value + 10); zoomTo(+z.value); }
+    else if (e.key === '-') { e.preventDefault(); var z2 = $('pfZoom'); z2.value = Math.max(100, +z2.value - 10); zoomTo(+z2.value); }
+  });
+  cv.addEventListener('dragover', function (e) { e.preventDefault(); });
+  cv.addEventListener('drop', function (e) { e.preventDefault(); readFile(e.dataTransfer.files[0]); });
+
+  function open(from) {
+    opener = from || document.activeElement;
+    var um = $('dhUserMenu'), ub = $('dhUserBtn'); if (um) um.hidden = true; if (ub) ub.setAttribute('aria-expanded', 'false');
+    say('JPG, PNG or WebP, up to 8 MB.', false); crop.img = null; crop.dirty = false; busy = false;
+    loadMe().then(function () {
+      var p = AV.me || { v: 0, c: 0, id: 0 }; pend.color = p.c || 0;
+      mask.hidden = false; document.body.style.overflow = 'hidden';
+      draw(); state(); if (p.v) setImg('/avatar/' + p.id + '?v=' + p.v, false);
+      $('pfUp').focus();
+    });
+  }
+  function close() { mask.hidden = true; document.body.style.overflow = ''; if (opener && opener.focus) { try { opener.focus(); } catch (e) {} } }
+  $('pfX').onclick = close; $('pfCancel').onclick = close;
+  mask.addEventListener('click', function (e) { if (e.target === mask && !busy) close(); });
+  document.addEventListener('keydown', function (e) {
+    if (mask.hidden) return;
+    if (e.key === 'Escape' && !busy) { e.preventDefault(); close(); }
+    else if (e.key === 'Tab') {
+      var f = [].filter.call(mask.querySelectorAll('button,[tabindex="0"],input[type=range]'), function (x) { return !x.disabled && x.offsetParent !== null; });
+      if (!f.length) return; var a = f[0], z = f[f.length - 1];
+      if (e.shiftKey && document.activeElement === a) { e.preventDefault(); z.focus(); } else if (!e.shiftKey && document.activeElement === z) { e.preventDefault(); a.focus(); }
+    }
+  }, true);
+  function post(url, method, body) {
+    return fetch(url, { method: method, credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) { if (!r.ok) throw new Error(j.error || 'Could not save. Try again.'); return j; });
+    });
+  }
+  $('pfSave').onclick = function () {
+    if (busy) return; busy = true; state(); $('pfSave').textContent = 'Saving...';
+    var p = AV.me || { v: 0, c: 0 }, jobs = Promise.resolve();
+    if (crop.img) { if (crop.dirty) { var url = out(AVATAR_PX).toDataURL('image/jpeg', .9); jobs = jobs.then(function () { return post('/api/profile/avatar', 'POST', { image: url }); }); } }
+    else if (p.v) { jobs = jobs.then(function () { return post('/api/profile/avatar', 'DELETE'); }); }
+    if (pend.color !== (p.c || 0)) { jobs = jobs.then(function () { return post('/api/profile/color', 'POST', { color: pend.color }); }); }
+    jobs.then(function () { return loadMe(); }).then(function () { repaintAll(); busy = false; $('pfSave').textContent = 'Save'; close(); })
+      .catch(function (e) { busy = false; $('pfSave').textContent = 'Save'; state(); say(e.message || 'Could not save. Try again.', true); });
+  };
+  var AVATAR_PX = 256;
+  var edit = document.getElementById('cpEdit');
+  if (edit) {
+    edit.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); open(document.getElementById('dhUserBtn')); });
+    edit.addEventListener('keydown', function (e) { if (e.key === ' ') { e.preventDefault(); open(document.getElementById('dhUserBtn')); } });
+  }
+  new MutationObserver(function () { if (!mask.hidden) draw(); }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+})();
+/* ---- the bell: alerts between the operator and the DO team ---- */
+(function () {
+  var btn = document.getElementById('dhBellBtn'), menu = document.getElementById('dhBellMenu');
+  if (!btn || !menu) return;
+  var list = document.getElementById('dhBellList'), badge = document.getElementById('dhBellN'), empty = document.getElementById('dhBellEmpty'), allBtn = document.getElementById('dhBellAll');
+  var ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  var items = [], unread = 0, last = null, sig = '', host = null, KEY = 'cpNtLast';
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (m) { return ESC[m]; }); }
+  function ago(s) {
+    var d = new Date(String(s || '').replace(' ', 'T') + ':00Z');
+    if (isNaN(d.getTime())) return '';
+    var sec = Math.round((d.getTime() - Date.now()) / 1000), a = Math.abs(sec), lang = document.documentElement.lang || 'en';
+    try {
+      var rtf = new Intl.RelativeTimeFormat(lang, { numeric: 'auto' });
+      if (a < 60) return rtf.format(0, 'second');
+      if (a < 3600) return rtf.format(Math.round(sec / 60), 'minute');
+      if (a < 86400) return rtf.format(Math.round(sec / 3600), 'hour');
+      if (a < 7 * 86400) return rtf.format(Math.round(sec / 86400), 'day');
+      return d.toLocaleDateString(lang, { day: 'numeric', month: 'short' });
+    } catch (e) { return d.toLocaleString(); }
+  }
+  function href(n) { return n.bl_number ? '/do-tracker?bl=' + encodeURIComponent(n.bl_number) : '/do-tracker'; }
+  function itemHtml(n) {
+    return '<a role="menuitem" class="nt k-' + esc(n.kind) + (n.read_at ? '' : ' unread') + '" href="' + href(n) + '" data-id="' + n.id + '" data-bl="' + esc(n.bl_number) + '">' +
+      '<span class="nt-dot" aria-hidden="true"></span><span class="nt-t"><b dir="auto">' + esc(n.title) + '</b><small dir="auto">' + esc(n.body) + '</small><small class="nt-when">' + esc(ago(n.created_at)) + '</small></span></a>';
+  }
+  function paint() {
+    var s = items.map(function (n) { return n.id + (n.read_at ? 'r' : 'u'); }).join(',');
+    badge.hidden = unread < 1; badge.textContent = unread > 9 ? '9+' : String(unread);
+    btn.setAttribute('aria-label', unread ? 'Notifications, ' + unread + ' unread' : 'Notifications');
+    allBtn.disabled = unread < 1; empty.hidden = items.length > 0;
+    if (s === sig || list.contains(document.activeElement)) return;
+    sig = s; list.innerHTML = items.map(itemHtml).join('');
+  }
+  function store(v) { try { sessionStorage.setItem(KEY, String(v)); } catch (e) {} }
+  function stored() { try { var v = sessionStorage.getItem(KEY); return v === null ? null : parseInt(v, 10); } catch (e) { return null; } }
+  function post(body) {
+    return fetch('/api/notifications/read', { method: 'POST', credentials: 'same-origin', keepalive: true, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(function () {});
+  }
+  function markRead(ids) {
+    var now = new Date().toISOString().slice(0, 16).replace('T', ' ');
+    items.forEach(function (n) { if (ids.indexOf(n.id) >= 0 && !n.read_at) { n.read_at = now; unread = Math.max(0, unread - 1); } });
+    paint(); post({ ids: ids });
+  }
+  function openItem(id, bl, ev) {
+    markRead([id]);
+    if (bl && window.cpOpenBl && window.cpOpenBl(bl)) { if (ev) ev.preventDefault(); var b = document.getElementById('dhBellBtn'); if (b && b.getAttribute('aria-expanded') === 'true') b.click(); return true; }
+    return false;
+  }
+  list.addEventListener('click', function (e) {
+    var a = e.target.closest ? e.target.closest('a.nt') : null; if (!a) return;
+    openItem(parseInt(a.getAttribute('data-id'), 10), a.getAttribute('data-bl'), e);
+  });
+  allBtn.addEventListener('click', function () {
+    var now = new Date().toISOString().slice(0, 16).replace('T', ' ');
+    items.forEach(function (n) { if (!n.read_at) n.read_at = now; }); unread = 0; paint(); post({ all: true });
+  });
+  function toast(n) {
+    if (!host) { host = document.createElement('div'); host.className = 'dh-toasts'; host.setAttribute('aria-live', 'polite'); document.body.appendChild(host); }
+    while (host.children.length >= 3) host.removeChild(host.firstChild);
+    var el = document.createElement('div'); el.className = 'dh-toast k-' + n.kind; el.setAttribute('role', 'status');
+    el.innerHTML = '<span class="nt-dot" aria-hidden="true"></span><div class="tx"><b dir="auto">' + esc(n.title) + '</b><small dir="auto">' + esc(n.body) + '</small></div><button type="button" aria-label="Dismiss">&times;</button>';
+    function gone() { clearTimeout(t); el.classList.add('out'); setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 220); }
+    var t = setTimeout(gone, 10000);
+    el.querySelector('button').addEventListener('click', function (e) { e.stopPropagation(); gone(); });
+    el.addEventListener('click', function () { gone(); if (!openItem(n.id, n.bl_number, null)) location.href = href(n); });
+    host.appendChild(el);
+  }
+  function poll() {
+    if (document.hidden || document.prerendering) return;
+    fetch('/api/notifications', { credentials: 'same-origin', headers: { 'Accept': 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d || !d.items) return;
+        var base = last !== null ? last : stored();
+        items = d.items; unread = d.unread;
+        var top = items.length ? items[0].id : 0;
+        if (base !== null) items.filter(function (n) { return n.id > base && !n.read_at; }).reverse().forEach(toast);
+        last = Math.max(last || 0, top); store(last);
+        paint();
+        if (d.items.length && base !== null && top > base) window.dispatchEvent(new CustomEvent('compass:notified'));
+      }).catch(function () {});
+  }
+  btn.addEventListener('click', function () { if (menu.hidden) return; poll(); });
+  paint(); poll();
+  setInterval(poll, 20000);
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(); });
+  window.addEventListener('compass:activated', poll);
+})();
 """
 
 _DESK_ICO = '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">%s</svg>'
@@ -2405,6 +2795,20 @@ _HDR_I18N_TOOL = {"manifest": "hdr_tool_manifest", "do": "hdr_tool_do"}
 
 def _hdr_i(key):
     return ' data-i18n="%s"' % key if key else ""
+
+
+_PF_DIALOG = (
+    '<div class="pf-mask" id="pfMask" data-nm="__NM__" hidden><div class="pf-dialog" role="dialog" aria-modal="true" aria-labelledby="pfTitle">'
+    '<div class="pf-h"><b id="pfTitle">Edit profile</b><button type="button" class="pf-x" id="pfX" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button></div>'
+    '<div class="pf-b"><div class="pf-crop"><canvas id="pfCanvas" width="280" height="280" tabindex="0" aria-label="Photo position. Drag, or use the arrow keys to move and plus and minus to zoom."></canvas>'
+    '<div class="pf-zoom"><input type="range" id="pfZoom" min="100" max="300" value="100" aria-label="Zoom"></div><p class="pf-hint" id="pfHint"></p></div>'
+    '<div class="pf-side"><div><h4>Photo</h4><div class="pf-btns"><button type="button" class="pf-btn" id="pfUp">Upload photo</button><button type="button" class="pf-btn dng" id="pfRm">Remove photo</button></div>'
+    '<input type="file" id="pfFile" accept="image/jpeg,image/png,image/webp" hidden><p class="pf-hint" id="pfMsg" style="margin-top:8px" role="status">JPG, PNG or WebP, up to 8 MB.</p></div>'
+    '<div><h4>Or try a sample</h4><div class="pf-samples" id="pfSamples"></div></div>'
+    '<div><h4>No photo? Pick a colour</h4><div class="pf-sw" id="pfSw"></div></div>'
+    '<div><h4>How it looks</h4><div class="pf-prev"><canvas id="pfP96" width="96" height="96"></canvas><canvas id="pfP48" width="48" height="48"></canvas><canvas id="pfP30" width="30" height="30"></canvas></div></div></div></div>'
+    '<div class="pf-f"><span class="pf-note" id="pfNote"></span><div class="pf-btns"><button type="button" class="pf-btn" id="pfCancel">Cancel</button><button type="button" class="pf-btn pri" id="pfSave">Save</button></div></div>'
+    '</div></div>')
 
 
 def _desk_header_html(path, lang_switch=False):
@@ -2438,10 +2842,22 @@ def _desk_header_html(path, lang_switch=False):
     langsec = ('<div class="dh-sec-lang"><div class="dh-h" data-i18n="hdr_language">Language</div>'
                '<div class="lang-switch"><button type="button" class="lang-opt active" data-lang-btn="en" onclick="setLang(\'en\')">EN</button>'
                '<button type="button" class="lang-opt" data-lang-btn="ar" onclick="setLang(\'ar\')">&#1593;&#1585;&#1576;&#1610;</button></div><hr></div>') if lang_switch else ""
-    umenu = ('<div class="dh-who">%s</div><hr>' % e(me) + langsec +
+    uid = session.get("user_id") or 0
+    av = _my_avatar()
+    av_css = _avatar_css(av, uid)
+    av_txt = "" if av["v"] else e((me.strip()[:1] or "?").upper())
+    umenu = ('<div class="dh-who"><span class="cp-av" id="dhAvBig" data-nm="%s" style="--s:40px;%s">%s</span><span class="nm">%s</span></div><hr>' % (e(me), av_css, av_txt, e(me)) + langsec +
+             '<a role="menuitem" href="#" id="cpEdit" data-i18n="hdr_edit_profile">Edit profile</a>' +
              ('<a role="menuitem" href="/users" data-i18n="manage_users">Admin</a>' if _is_owner() else "") +
              ('<a role="menuitem" href="/learned" data-i18n="hdr_learning">Learning room</a>' if _is_owner() else "") +
              '<a role="menuitem" href="/logout" data-i18n="log_out">Log out</a>')
+    bell = ('<button type="button" class="dh-bell" id="dhBellBtn" aria-haspopup="menu" aria-expanded="false" aria-controls="dhBellMenu" aria-label="Notifications" title="Notifications" data-i18n-title="hdr_bell">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0112 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 003.4 0"/></svg>'
+            '<span class="dh-bell-n" id="dhBellN" hidden>0</span></button>')
+    bellmenu = ('<div class="dh-panel dh-bellmenu" id="dhBellMenu" role="menu" hidden>'
+                '<div class="dh-bell-h"><b data-i18n="hdr_bell">Notifications</b><button type="button" id="dhBellAll" data-i18n="hdr_notifs_all" disabled>Mark all as read</button></div>'
+                '<div class="dh-bell-list" id="dhBellList"></div>'
+                '<div class="dh-bell-empty" id="dhBellEmpty" data-i18n="hdr_notifs_none">You are all caught up.</div></div>')
     others = [t["url"] for t in cur["tools"] if not on(t["url"])]
     cur_tool = next((t for t in cur["tools"] if on(t["url"])), None)
     tag_name = cur_tool["name"] if cur_tool else cur["name"]
@@ -2450,24 +2866,360 @@ def _desk_header_html(path, lang_switch=False):
         tag_name, tag_i18n = "Sea Power Marine Services Co. Ltd", ""
     spec = ('<script type="speculationrules">' + json.dumps({"prerender": [{"where": {"href_matches": others}, "eagerness": "moderate"}]}) + '</script>') if others else ""
     chev = '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>'
+    # On the home screen the three desks are already on the page, so the header carries no desk button there.
+    deskblock = "" if home else (
+        '<div class="dh-desk">'
+        '<button type="button" class="dh-chip" id="dhDeskBtn" aria-haspopup="menu" aria-expanded="false" aria-controls="dhDeskMenu">' + (_DESK_ICO % cur["icon"]) +
+        '<span class="lbl" data-i18n="hdr_desk_' + cur["key"] + '">' + e(cur["name"]) + '</span>' + chev + '</button>'
+        '<nav class="dh-tools" aria-label="' + e(cur["name"]) + '">' + tools + '</nav>'
+        '<div class="dh-panel dh-dmenu" id="dhDeskMenu" role="menu" hidden>'
+        '<div class="dh-sec-tools"><div class="dh-h" data-i18n="hdr_in_desk">In this desk</div>' + mtools + '<hr></div>'
+        '<div class="dh-h" data-i18n="hdr_your_desks">Your desks</div>' + mdesks +
+        '<hr><a role="menuitem" href="/" data-i18n="hdr_all_desks">All desks</a></div>'
+        '</div>')
     return (
         '<header class="dh' + (' dh-home' if home else '') + '" id="dh">'
         '<a href="/" class="dh-brand" aria-label="Compass, all desks"><img src="data:image/png;base64,' + LOGO_B64 + '" alt="Sea Power"><div class="dh-brand-text"><span class="app-name">Compass</span><span class="app-tag"' + tag_i18n + '>' + e(tag_name) + '</span></div></a>'
-        '<div class="dh-desk">'
-        '<button type="button" class="dh-chip" id="dhDeskBtn" aria-haspopup="menu" aria-expanded="false" aria-controls="dhDeskMenu">' + (_DESK_ICO % cur["icon"]) +
-        '<span class="lbl" data-i18n="hdr_' + ("all_desks" if home else "desk_" + cur["key"]) + '">' + e(cur["name"]) + '</span>' + chev + '</button>'
-        + ('' if home else '<nav class="dh-tools" aria-label="' + e(cur["name"]) + '">' + tools + '</nav>') +
-        '<div class="dh-panel dh-dmenu" id="dhDeskMenu" role="menu" hidden>'
-        + ('' if home else '<div class="dh-sec-tools"><div class="dh-h" data-i18n="hdr_in_desk">In this desk</div>' + mtools + '<hr></div>') +
-        '<div class="dh-h" data-i18n="hdr_your_desks">Your desks</div>' + mdesks
-        + ('</div>' if home else '<hr><a role="menuitem" href="/" data-i18n="hdr_all_desks">All desks</a></div>') +
-        '</div>'
+        + deskblock +
         '<span class="dh-spacer"></span>'
-        '<div class="dh-right">' + lang + theme +
-        '<button type="button" class="dh-user" id="dhUserBtn" aria-haspopup="menu" aria-expanded="false" aria-controls="dhUserMenu"><span class="av" aria-hidden="true">' + e((me.strip()[:1] or "?").upper()) + '</span><span class="nm">' + e(me) + '</span></button></div>'
-        '<div class="dh-panel dh-umenu" id="dhUserMenu" role="menu" hidden>' + umenu + '</div>'
-        '</header>' + spec)
+        '<div class="dh-right">' + lang + theme + bell +
+        '<button type="button" class="dh-user" id="dhUserBtn" aria-haspopup="menu" aria-expanded="false" aria-controls="dhUserMenu"><span class="av" id="dhAv" data-nm="' + e(me) + '" aria-hidden="true" style="' + av_css + '">' + av_txt + '</span><span class="nm">' + e(me) + '</span></button></div>'
+        '<div class="dh-panel dh-umenu" id="dhUserMenu" role="menu" hidden>' + umenu + '</div>' + bellmenu +
+        '</header>' + spec + _PF_DIALOG.replace("__NM__", e(me)))
 # ==== DESK HEADER END ====
+
+
+# ==== PROFILE PICTURES ====
+# Everyone may set their own picture (a photo, or their initial on a colour of their choice); the Owner may remove anyone's.
+# The browser crops the photo to a square and sends a small JPEG; the server draws it again from scratch (so nothing hidden in the
+# file survives), keeps it in its own table (so the login queries stay light) and serves it only to signed-in people.
+AVATAR_PX = 256
+AVATAR_COLOURS = 8                 # choices in the editor; 0 = the Compass blue
+AVATAR_MAX_BYTES = 1024 * 1024     # the editor sends about 15-40 KB; this only stops abuse
+
+
+def _avatar_clean(raw):
+    """Bytes of the picture the person chose -> (square 256 px JPEG bytes, None), or (None, reason)."""
+    try:
+        from PIL import Image, ImageOps
+        im = Image.open(io.BytesIO(raw))
+        if im.format not in ("JPEG", "PNG", "WEBP"):
+            return None, "Use a JPG, PNG or WebP photo."
+        if im.width < 16 or im.height < 16 or im.width * im.height > 40_000_000:
+            return None, "That photo is too small or too large."
+        im = ImageOps.exif_transpose(im)
+        if im.mode in ("RGBA", "LA", "P"):
+            im = im.convert("RGBA")
+            flat = Image.new("RGB", im.size, (255, 255, 255))
+            flat.paste(im, mask=im.split()[-1])
+            im = flat
+        else:
+            im = im.convert("RGB")
+        side = min(im.size)
+        left, top = (im.width - side) // 2, (im.height - side) // 2
+        im = im.crop((left, top, left + side, top + side)).resize((AVATAR_PX, AVATAR_PX), Image.LANCZOS)
+        out = io.BytesIO()
+        im.save(out, "JPEG", quality=88, optimize=True)
+        return out.getvalue(), None
+    except Exception:
+        return None, "That file could not be read as a photo."
+
+
+def _avatar_row(db, uid):
+    r = db.execute("SELECT u.avatar_color AS c, a.v AS v FROM users u LEFT JOIN user_avatars a ON a.user_id = u.id WHERE u.id = ?", (uid,)).fetchone()
+    return {"v": int(r["v"] or 0), "c": int(r["c"] or 0)} if r else {"v": 0, "c": 0}
+
+
+def _my_avatar():
+    c = g.get("_my_avatar")
+    if c is None:
+        c = g._my_avatar = _avatar_row(get_db(), session.get("user_id"))
+    return c
+
+
+def _avatar_css(av, uid):
+    """The inline look of an avatar circle in the server-drawn header: the photo, or the chosen colour (nothing = the default blue)."""
+    if av["v"]:
+        return "background-image:url(/avatar/%d?v=%d)" % (uid, av["v"])
+    if av["c"] > 0:
+        return "background-color:var(--av%d);color:#fff" % av["c"]
+    return ""
+
+
+@app.route("/avatar/<int:uid>")
+@login_required
+def avatar_image(uid):
+    row = get_db().execute("SELECT data, v FROM user_avatars WHERE user_id = ?", (uid,)).fetchone()
+    if not row:
+        return "", 404
+    resp = Response(bytes(row["data"]), mimetype="image/jpeg")
+    # the address carries ?v=<version>, so a changed picture is a new address and the old one can be kept for a year
+    resp.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+    return resp
+
+
+@app.route("/api/profile")
+@login_required
+def profile_get():
+    av = _avatar_row(get_db(), session["user_id"])
+    return jsonify({"id": session["user_id"], "v": av["v"], "c": av["c"]})
+
+
+@app.route("/api/people", methods=["POST"])
+@login_required
+def api_people():
+    """The pictures for the names a page is showing (as saved in the steps: the person's username or full name). Only the names asked
+    for are answered, so this never lists everyone."""
+    names = (request.get_json(silent=True) or {}).get("names") or []
+    want = {str(n).strip().lower()[:200] for n in names[:300] if str(n).strip()}
+    if not want:
+        return jsonify({"people": {}})
+    rows = get_db().execute(
+        "SELECT u.id, u.username, u.full_name, u.avatar_color AS c, a.v AS v FROM users u LEFT JOIN user_avatars a ON a.user_id = u.id "
+        "WHERE LOWER(u.username) = ANY(?) OR LOWER(u.full_name) = ANY(?)", (list(want), list(want))).fetchall()
+    out = {}
+    for r in rows:
+        ent = {"id": r["id"], "v": int(r["v"] or 0), "c": int(r["c"] or 0)}
+        for key in ((r["username"] or "").strip().lower(), (r["full_name"] or "").strip().lower()):
+            if key in want and key not in out:
+                out[key] = ent
+    return jsonify({"people": out})
+
+
+@app.route("/api/profile/avatar", methods=["POST"])
+@login_required
+def profile_avatar_set():
+    if (request.content_length or 0) > AVATAR_MAX_BYTES * 2:
+        return jsonify({"error": "That photo is too large."}), 413
+    data = request.get_json(silent=True) or {}
+    m = re.match(r"^data:image/(?:jpeg|png|webp);base64,([A-Za-z0-9+/=\s]+)$", str(data.get("image") or ""))
+    if not m:
+        return jsonify({"error": "Use a JPG, PNG or WebP photo."}), 400
+    try:
+        raw = base64.b64decode(m.group(1), validate=False)
+    except Exception:
+        return jsonify({"error": "That file could not be read as a photo."}), 400
+    if len(raw) > AVATAR_MAX_BYTES:
+        return jsonify({"error": "That photo is too large."}), 413
+    jpg, why = _avatar_clean(raw)
+    if not jpg:
+        return jsonify({"error": why}), 400
+    db = get_db()
+    v = int(time.time() * 1000)
+    db.execute("INSERT INTO user_avatars (user_id, data, v) VALUES (?, ?, ?) ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data, v = EXCLUDED.v",
+               (session["user_id"], psycopg2.Binary(jpg), v))
+    db.commit()
+    return jsonify({"ok": True, "v": v})
+
+
+@app.route("/api/profile/avatar", methods=["DELETE"])
+@login_required
+def profile_avatar_clear():
+    db = get_db()
+    db.execute("DELETE FROM user_avatars WHERE user_id = ?", (session["user_id"],))
+    db.commit()
+    return jsonify({"ok": True, "v": 0})
+
+
+@app.route("/api/profile/color", methods=["POST"])
+@login_required
+def profile_colour_set():
+    try:
+        c = int((request.get_json(silent=True) or {}).get("color"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Pick one of the colours."}), 400
+    if not 0 <= c < AVATAR_COLOURS:
+        return jsonify({"error": "Pick one of the colours."}), 400
+    db = get_db()
+    db.execute("UPDATE users SET avatar_color = ? WHERE id = ?", (c, session["user_id"]))
+    db.commit()
+    return jsonify({"ok": True, "color": c})
+
+
+@app.route("/api/users/<int:user_id>/avatar", methods=["DELETE"])
+@login_required
+@admin_required
+def user_avatar_remove(user_id):
+    """The Owner can take down anyone's photo (for example one that is not suitable). The person's colour stays."""
+    db = get_db()
+    db.execute("DELETE FROM user_avatars WHERE user_id = ?", (user_id,))
+    db.commit()
+    return jsonify({"ok": True})
+# ==== PROFILE PICTURES END ====
+
+
+# ==== NOTIFICATIONS ====
+# The bell. Short messages between the operator who owns a B/L and the DO team, so nobody has to ask "is it done yet?".
+# Who the DO team is: the accounts the Owner ticked as "DO team" in Admin (and that have the DO Tracker).
+# What the DO team may do: once an operator has asked for an invoice, that B/L shows on their board, and they may attach
+# the invoice, the paid receipt and the Delivery Order and tick Invoice issued, Paid and DO issued. Nothing else changes.
+DO_KINDS = ("invoice", "receipt", "do")
+DO_FIELDS = ("invoice_issued", "paid", "do_issued")
+
+
+def _is_do_team():
+    c = g.get("_do_team")
+    if c is None:
+        row = get_db().execute("SELECT do_team FROM users WHERE id = ?", (session.get("user_id"),)).fetchone()
+        c = g._do_team = bool(row and row["do_team"]) and "do" in _features()
+    return c
+
+
+def _do_access(bl_number):
+    """The DO team may work on a B/L once an operator has asked them for its invoice."""
+    if not _is_do_team():
+        return False
+    return get_db().execute("SELECT 1 FROM records WHERE bl_number = ? AND COALESCE(inv_requested_at, '') <> ''", (bl_number,)).fetchone() is not None
+
+
+def _may_attach(bl_number, kind):
+    return _owns_record(bl_number) or (kind in DO_KINDS and _do_access(bl_number))
+
+
+def _do_team_users(db):
+    out = []
+    for u in db.execute("SELECT id, username, full_name, email, role, features FROM users WHERE do_team = 1").fetchall():
+        if u["role"] == "owner" or "do" in _feat_parse(u["features"]):
+            out.append(u)
+    return out
+
+
+def _user_named(db, username):
+    if not (username or "").strip():
+        return None
+    return db.execute("SELECT id, username, full_name, email FROM users WHERE LOWER(username) = LOWER(?)", (username.strip(),)).fetchone()
+
+
+def _mail_alerts(addrs, subject, text):
+    for a in addrs:
+        try:
+            send_email([a], subject, text)
+        except Exception:
+            pass
+
+
+def _notify(db, people, kind, title, body, bl_number=""):
+    """One bell entry for each person (never for the one who did the thing), then a backup email when email is set up.
+    Shares the caller's transaction: it lands when the caller commits. Returns how many people were told."""
+    me = session.get("user_id")
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    done, mails = set(), []
+    for u in people:
+        if not u or u["id"] in done or u["id"] == me:
+            continue
+        done.add(u["id"])
+        db.execute("INSERT INTO notifications (user_id, kind, title, body, bl_number, created_at, read_at) VALUES (?, ?, ?, ?, ?, ?, '')",
+                   (u["id"], kind, title, body, bl_number or "", now))
+        if (u["email"] or "").strip():
+            mails.append(u["email"].strip())
+    if mails and email_configured():
+        link = _public_base_url() + "/do-tracker" + (("?bl=" + url_quote(bl_number, safe="")) if bl_number else "")
+        threading.Thread(target=_mail_alerts, args=(mails, "Compass: " + title, title + "\n\n" + body + "\n\nOpen it in Compass: " + link + "\n"), daemon=True).start()
+    return len(done)
+
+
+def _maybe_request_invoice(db, bl, how="Requested"):
+    """The B/L copy is attached AND an importer no. is filled in AND there is no invoice yet: ask the DO team for the invoice, once.
+    Returns None (nothing asked), 'sent', or 'no_team' (asked, but nobody is set up as the DO team yet)."""
+    row = db.execute("SELECT bl_number, consignee, importer_no, invoice_issued, inv_requested_at FROM records WHERE bl_number = ?", (bl,)).fetchone()
+    if not row or row["invoice_issued"] or (row["inv_requested_at"] or "").strip():
+        return None
+    imp = (row["importer_no"] or "").strip()
+    if not imp or not db.execute("SELECT 1 FROM record_attachments WHERE bl_number = ? AND kind = 'bl'", (bl,)).fetchone():
+        return None
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    got = db.execute("UPDATE records SET inv_requested_at = ?, inv_requested_by = ? WHERE bl_number = ? AND COALESCE(inv_requested_at, '') = '' RETURNING bl_number",
+                     (now, session.get("username", ""), bl)).fetchall()
+    if not got:
+        return None
+    _log_audit(bl, "request", "invoice", "", imp)
+    team = _do_team_users(db)
+    parts = [x for x in (bl, (row["consignee"] or "").strip(), "Importer no. " + imp) if x]
+    _notify(db, team, "ask", "Invoice needed", " · ".join(parts) + ". " + how + " by " + _who() + ".", bl)
+    return "sent" if team else "no_team"
+
+
+_STEP_NOTE = {
+    "invoice_issued": ("ask", "Invoice issued. Send it for payment", "invoice", "Send the QR code or the invoice to the consignee or the broker."),
+    "do_issued": ("ok", "Delivery Order issued", "Delivery Order", "You can now send it to the consignee."),
+}
+
+
+def _notify_step(db, bls, field, via="switch"):
+    """A step went from not done to done: tell the operator who owns each B/L (grouped, so a bulk tick is one message)."""
+    note = _STEP_NOTE.get(field)
+    if not note or not bls:
+        return
+    kind, title, what, tail = note
+    groups = {}
+    for r in db.execute("SELECT bl_number, created_by FROM records WHERE bl_number = ANY(?)", (list(bls),)).fetchall():
+        groups.setdefault((r["created_by"] or "").strip().lower(), []).append(r["bl_number"])
+    who = _who()
+    verb = ("attached the " + what) if via == "file" else ("marked the " + what + " as issued")
+    for name, items in groups.items():
+        u = _user_named(db, name)
+        if not u:
+            continue
+        items.sort()
+        if len(items) == 1:
+            _notify(db, [u], kind, title, items[0] + " · " + who + " " + verb + ". " + tail, items[0])
+        else:
+            shown = ", ".join(items[:3]) + ((" and %d more" % (len(items) - 3)) if len(items) > 3 else "")
+            plural = "%d %ss issued" % (len(items), what)
+            _notify(db, [u], kind, plural + ". " + ("Send them for payment" if field == "invoice_issued" else "Ready to send"), shown + " · " + who + " marked them as issued.", items[0])
+
+
+@app.route("/api/notifications", methods=["GET"])
+@login_required
+def api_notifications():
+    db = get_db()
+    uid = session.get("user_id")
+    rows = db.execute("SELECT id, kind, title, body, bl_number, created_at, read_at FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 40", (uid,)).fetchall()
+    unread = db.execute("SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND COALESCE(read_at, '') = ''", (uid,)).fetchone()["n"]
+    return jsonify({"unread": unread, "items": [dict(r) for r in rows]})
+
+
+@app.route("/api/notifications/read", methods=["POST"])
+@login_required
+def api_notifications_read():
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    uid = session.get("user_id")
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    if data.get("all"):
+        db.execute("UPDATE notifications SET read_at = ? WHERE user_id = ? AND COALESCE(read_at, '') = ''", (now, uid))
+    else:
+        ids = []
+        for i in (data.get("ids") or [])[:100]:
+            try:
+                ids.append(int(i))
+            except (TypeError, ValueError):
+                pass
+        if ids:
+            db.execute("UPDATE notifications SET read_at = ? WHERE user_id = ? AND id = ANY(?) AND COALESCE(read_at, '') = ''", (now, uid, ids))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/records/<path:bl_number>/importer", methods=["POST"])
+@login_required
+def set_importer_no(bl_number):
+    bl = bl_number.upper()
+    if not _owns_record(bl):
+        return "Not your record.", 403
+    data = request.get_json(silent=True) or {}
+    val = re.sub(r"\s+", " ", str(data.get("importer_no") or "")).strip()[:40]
+    db = get_db()
+    old = db.execute("SELECT importer_no FROM records WHERE bl_number = ?", (bl,)).fetchone()
+    if not old:
+        return jsonify({"error": "No such B/L."}), 404
+    if (old["importer_no"] or "") != val:
+        db.execute("UPDATE records SET importer_no = ? WHERE bl_number = ?", (val, bl))
+        _log_audit(bl, "importer", "importer_no", old["importer_no"] or "", val)
+    asked = _maybe_request_invoice(db, bl, "Importer no. added")
+    db.commit()
+    return jsonify({"ok": True, "importer_no": val, "requested": asked is not None, "no_team": asked == "no_team"})
+# ==== NOTIFICATIONS END ====
 
 
 def _feat_parse(raw):
@@ -2912,7 +3664,7 @@ def _security_headers(resp):
     resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     if os.environ.get("RENDER"):
         resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
-    if not request.path.startswith("/static/"):
+    if not request.path.startswith(("/static/", "/avatar/")):   # profile pictures carry their own long cache (their address changes when the picture does)
         resp.headers["Cache-Control"] = "no-store"
     if request.path.startswith("/t/"):
         resp.headers.setdefault("X-Robots-Tag", "noindex, nofollow")
@@ -3223,10 +3975,11 @@ def users_page():
     db = get_db()
     users = db.execute("SELECT id, username, full_name, email, role, created_at, totp_enabled FROM users ORDER BY created_at, id").fetchall()
     open_counts = {r["user_id"]: r["n"] for r in db.execute("SELECT user_id, COUNT(*) AS n FROM user_sessions GROUP BY user_id").fetchall()}
-    users = [dict(u) for u in db.execute("SELECT id, username, full_name, email, role, created_at, totp_enabled, manager_id, features FROM users ORDER BY created_at, id").fetchall()]
+    users = [dict(u) for u in db.execute("SELECT id, username, full_name, email, role, created_at, totp_enabled, manager_id, features, avatar_color, do_team, (SELECT v FROM user_avatars a WHERE a.user_id = users.id) AS avatar_v FROM users ORDER BY created_at, id").fetchall()]
     for u in users:
         have = _feat_parse(u["features"]) if u["role"] != "owner" else set(FEATURE_KEYS)
         u["feat_list"] = [k for k in FEATURE_KEYS if k in have]
+        u["do_inert"] = bool(u.get("do_team")) and "do" not in have       # ticked as DO team, but has no DO Tracker: gets nothing
         names = dict(FEATURES)
         u["feat_text"] = "" if len(have) == len(FEATURE_KEYS) else ("No features yet" if not have else (names[u["feat_list"][0]] + " only" if len(have) == 1 else str(len(have)) + " of " + str(len(FEATURE_KEYS)) + " features"))
     mgr_names = {u["id"]: (u["full_name"] or u["username"]) for u in users if u["role"] == "manager"}
@@ -3339,6 +4092,8 @@ def edit_user(user_id):
         sets.append("manager_id = ?"); vals.append(_valid_manager_id(db, data.get("manager_id")))
     if "features" in data and u["role"] != "owner":
         sets.append("features = ?"); vals.append(_feat_store(data.get("features")))
+    if "do_team" in data:
+        sets.append("do_team = ?"); vals.append(1 if data.get("do_team") else 0)
     if data.get("reset_2fa"):
         sets += ["totp_secret = ''", "totp_enabled = 0", "totp_last_step = 0", "recovery_codes = ''"]
     if not sets:
@@ -3376,6 +4131,7 @@ def delete_user(user_id):
         return jsonify({"error": "The Owner can't be removed."}), 400
     db.execute("UPDATE users SET manager_id = NULL WHERE manager_id = ?", (user_id,))
     db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    db.execute("DELETE FROM user_avatars WHERE user_id = ?", (user_id,))
     db.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
     db.commit()
     return jsonify({"ok": True})
@@ -3401,16 +4157,25 @@ def _bl_done(r):
 @login_required
 def list_records():
     db = get_db()
-    if _team() is None:
+    team = _team()
+    if team is None:
         rows = db.execute(f"SELECT r.*{ATTACHMENT_FLAGS_SQL} FROM records r ORDER BY created_at DESC").fetchall()
+    elif _is_do_team():
+        # the DO team also sees every B/L an operator has asked them an invoice for - to work on, not to own
+        rows = db.execute(
+            f"SELECT r.*{ATTACHMENT_FLAGS_SQL} FROM records r WHERE created_by = ANY(?) OR COALESCE(inv_requested_at, '') <> '' ORDER BY created_at DESC",
+            (team,),
+        ).fetchall()
     else:
         rows = db.execute(
             f"SELECT r.*{ATTACHMENT_FLAGS_SQL} FROM records r WHERE created_by = ANY(?) ORDER BY created_at DESC",
-            (_team(),),
+            (team,),
         ).fetchall()
     out = []
     for r in rows:
         rec = dict(r)
+        if team is not None and (rec.get("created_by") or "") not in team:
+            rec["do_only"] = True          # someone else's B/L, shown to the DO team: invoice, paid and DO only
         # The individual B/Ls a combined entry stands for, so searching the
         # board for "...002" finds "...001-003".
         members = bl_members(rec["bl_number"])[1:]
@@ -8589,10 +9354,10 @@ def _step_how(db, bls, field, value):
 @app.route("/api/records/<path:bl_number>/toggle", methods=["POST"])
 @login_required
 def toggle_status(bl_number):
-    if not _owns_record(bl_number.upper()):
-        return "Not your record.", 403
     data = request.get_json(force=True)
     field = data.get("field")
+    if not (_owns_record(bl_number.upper()) or (field in DO_FIELDS and _do_access(bl_number.upper()))):
+        return "Not your record.", 403
     value = 1 if data.get("value") else 0
     user = session.get("username", "Unknown")
 
@@ -8611,12 +9376,15 @@ def toggle_status(bl_number):
     by_val = user if value else ""
 
     db = get_db()
+    was = db.execute(f"SELECT {field} AS v FROM records WHERE bl_number = ?", (bl_number.upper(),)).fetchone()
     db.execute(
         f"UPDATE records SET {field} = ?, {by_field} = ?, {at_field} = ? WHERE bl_number = ?",
         (value, by_val, now, bl_number.upper()),
     )
     _step_how(db, [bl_number.upper()], field, value)
     _log_audit(bl_number.upper(), "toggle", field, "" if value else "1", "1" if value else "")
+    if value and was and not was["v"]:
+        _notify_step(db, [bl_number.upper()], field)
     db.commit()
     return jsonify({"ok": True})
 
@@ -8936,6 +9704,8 @@ def bulk_toggle_records():
     _step_how(db, updated, field, value)
     for bl_number in updated:
         _log_audit(bl_number, "toggle", field, "" if value else "1", "1" if value else "")
+    if value and updated:
+        _notify_step(db, updated, field)
     db.commit()
     return jsonify({"updated": updated})
 
@@ -9363,6 +10133,10 @@ def detect_attachment():
     db = get_db()
     if _team() is None:
         bl_rows = db.execute("SELECT bl_number FROM records").fetchall()
+    elif _is_do_team():
+        bl_rows = db.execute(
+            "SELECT bl_number FROM records WHERE created_by = ANY(?) OR COALESCE(inv_requested_at, '') <> ''", (_team(),)
+        ).fetchall()
     else:
         bl_rows = db.execute(
             "SELECT bl_number FROM records WHERE created_by = ANY(?)", (_team(),)
@@ -9434,7 +10208,7 @@ def detect_attachment():
     # The batch drop asks to attach a clean match right here, so each file travels once
     # (it used to be sent twice: once to be read, again to be saved).
     if request.form.get("auto") == "1" and kind and matched:
-        if not _owns_record(matched):
+        if not _may_attach(matched, kind):
             out["attach_error"] = "Not your record."
         else:
             payload, status = _store_attachment(db, matched, kind, file.filename, data)
@@ -9451,7 +10225,7 @@ def upload_attachment(bl_number, kind):
     bl_number = bl_number.upper()
     if kind not in ATTACHMENT_KINDS:
         return jsonify({"error": "Invalid attachment kind."}), 400
-    if not _owns_record(bl_number):
+    if not _may_attach(bl_number, kind):
         return jsonify({"error": "Not your record."}), 403
     file = request.files.get("file")
     if not file or not file.filename:
@@ -9522,10 +10296,14 @@ def _store_attachment(db, bl_number, kind, file_name, data):
         if kind == "receipt":                     # paid, and the receipt is the proof
             db.execute("UPDATE records SET paid_via = 'receipt' WHERE bl_number = ?", (bl_number,))
 
+    if auto_issued and status_field in ("invoice_issued", "do_issued"):
+        _notify_step(db, [bl_number], status_field, via="file")
+    asked = _maybe_request_invoice(db, bl_number, "B/L copy attached") if kind == "bl" else None
     db.commit()
     return {
         "ok": True, "filename": filename, "uploaded_by": user, "uploaded_at": now,
         "auto_issued_field": status_field if auto_issued else None,
+        "invoice_requested": asked is not None, "invoice_request_no_team": asked == "no_team",
         "size": len(data), "original_size": original_size,
     }, 200
 
@@ -9608,11 +10386,12 @@ def lookup_record(bl_number):
     # Staff only ever see their own BLs on the board (cross-staff "Find a
     # BL" was removed on purpose), so this must not hand out another
     # user's consignee contacts or tracking link either.
-    if not _owns_record(bl_number):
+    mine = _owns_record(bl_number)
+    if not (mine or _do_access(bl_number)):
         return jsonify({"error": f'No BL found matching "{bl_number}".'}), 404
     db = get_db()
     row = db.execute(
-        f"""SELECT bl_number, port, vessel, created_by, invoice_issued, invoice_by, invoice_at,
+        f"""SELECT bl_number, port, vessel, created_by, importer_no, inv_requested_at, invoice_issued, invoice_by, invoice_at,
                    do_issued, do_by, do_at, paid, paid_via, do_sent, do_sent_via, do_sent_to, do_sent_at,
                    consignee, consignee_email, consignee_phone,
                    broker_email, broker_phone, track_token{ATTACHMENT_FLAGS_SQL}
@@ -9622,6 +10401,7 @@ def lookup_record(bl_number):
     if not row:
         return jsonify({"error": f'No BL found matching "{bl_number}".'}), 404
     result = dict(row)
+    result["do_access"] = not mine           # a B/L the DO team was asked about: they may add the invoice, the receipt and the DO
     token = result.pop("track_token", "") or ""
     result["track_url"] = f"{_public_base_url()}/t/{token}" if token else ""
     result["email_configured"] = email_configured()
@@ -15879,6 +16659,10 @@ USERS_HTML = """
   .role-pill.admin, .role-pill.manager { background: color-mix(in srgb, var(--gold) 18%, transparent); color: var(--gold); }
   .role-pill.owner { background: var(--navy); color: #fff; }
   .sub-line { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+  :root { --av1:#1f6fa8; --av2:#178575; --av3:#2f8a50; --av4:#a06a0c; --av5:#c4521c; --av6:#b83a54; --av7:#6a4cc0; }
+  .uname { display: flex; align-items: center; gap: 11px; }
+  .u-av { width: 34px; height: 34px; border-radius: 50%; background: var(--navy) center / cover; color: #fff; display: inline-grid; place-items: center; font-weight: 700; font-size: 14px; flex: none; overflow: hidden; }
+  :root[data-theme="dark"] .u-av { color: #0b1620; }
   .role-pill.staff { background: color-mix(in srgb, var(--navy-light) 14%, transparent); color: var(--navy-light); }
   input[type=text], input[type=password] {
     border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 14px; font-family: inherit;
@@ -15982,12 +16766,12 @@ function setTheme(mode) {
       <tbody>
         {% for u in users %}
         <tr id="u{{ u['id'] }}">
-          <td><b>{{ u['full_name'] or u['username'] }}</b>{% if u['role'] == 'staff' and u['manager_id'] and mgr_names.get(u['manager_id']) %}<div class="sub-line">Reports to {{ mgr_names.get(u['manager_id']) }}</div>{% endif %}{% if u['feat_text'] %}<div class="sub-line">{{ u['feat_text'] }}</div>{% endif %}</td>
+          <td><div class="uname"><span class="u-av"{% if u['avatar_v'] %} style="background-image:url(/avatar/{{ u['id'] }}?v={{ u['avatar_v'] }})"{% elif u['avatar_color'] %} style="background-color:var(--av{{ u['avatar_color'] }});color:#fff"{% endif %} aria-hidden="true">{% if not u['avatar_v'] %}{{ ((u['full_name'] or u['username'] or '?')[:1])|upper }}{% endif %}</span><div><b>{{ u['full_name'] or u['username'] }}</b>{% if u['role'] == 'staff' and u['manager_id'] and mgr_names.get(u['manager_id']) %}<div class="sub-line">Reports to {{ mgr_names.get(u['manager_id']) }}</div>{% endif %}{% if u['feat_text'] %}<div class="sub-line">{{ u['feat_text'] }}</div>{% endif %}{% if u['do_team'] %}<div class="sub-line">DO team: gets invoice and DO requests{% if u['do_inert'] %} (needs the DO Tracker feature){% endif %}</div>{% endif %}</div></div></td>
           <td>{% if u['email'] %}{{ u['email'] }}<div style="font-size:11.5px;color:var(--muted);">{{ u['username'] }}</div>{% else %}{{ u['username'] }}<div style="font-size:11.5px;color:var(--muted);">no email yet</div>{% endif %}</td>
           <td><span class="role-pill {{ u['role'] }}">{{ u['role'] }}</span></td>
           <td>{% if u['totp_enabled'] %}<span class="role-pill staff" style="background:color-mix(in srgb,#2e9e6b 16%,transparent);color:#2e9e6b;">On</span>{% else %}<span class="role-pill" style="background:var(--border);color:var(--muted);">Not yet</span>{% endif %}</td>
           <td class="local-time" data-utc="{{ u['created_at'] }}">{{ u['created_at'] }}</td>
-          <td style="white-space:nowrap;"><button class="del" style="color:var(--navy-light);" onclick="toggleEdit({{ u['id'] }})">Edit</button>{% if u['role'] != 'owner' %}<button class="del" onclick='delUser({{ u["id"] }}, {{ (u["full_name"] or u["username"])|tojson }})'>Remove</button>{% endif %}</td>
+          <td style="white-space:nowrap;"><button class="del" style="color:var(--navy-light);" onclick="toggleEdit({{ u['id'] }})">Edit</button>{% if u['avatar_v'] %}<button class="del" onclick='rmPhoto({{ u["id"] }}, {{ (u["full_name"] or u["username"])|tojson }})'>Remove photo</button>{% endif %}{% if u['role'] != 'owner' %}<button class="del" onclick='delUser({{ u["id"] }}, {{ (u["full_name"] or u["username"])|tojson }})'>Remove</button>{% endif %}</td>
         </tr>
         <tr class="edit-row" id="e{{ u['id'] }}" data-username="{{ u['username'] }}" style="display:none;">
           <td colspan="6" style="background:color-mix(in srgb,var(--border) 30%,transparent);">
@@ -16007,6 +16791,10 @@ function setTheme(mode) {
               {% for f in feature_defs %}<label class="chip"><input type="checkbox" value="{{ f[0] }}"{% if f[0] in u['feat_list'] %} checked{% endif %}> {{ f[1] }}</label>{% endfor %}
               <select onchange="applyPreset(this, 'ef{{ u['id'] }}')" title="Tick a ready-made set"><option value="">Quick set...</option>{% for k in presets %}<option value="{{ k }}">{{ k }}</option>{% endfor %}</select>
             </div>{% endif %}
+            <div class="feat-line" id="edtl{{ u['id'] }}">
+              <span class="feat-title">DO team</span>
+              <label class="chip"><input type="checkbox" id="edt{{ u['id'] }}"{% if u['do_team'] %} checked{% endif %} onchange="dtTick({{ u['id'] }})"> Gets the invoice and Delivery Order requests from the operators</label>
+            </div>
             <div class="pw-meter" id="epm{{ u['id'] }}" style="display:none;max-width:420px;"><div class="bar"><i></i></div><div class="hint"></div></div>
           </td>
         </tr>
@@ -16136,6 +16924,12 @@ function toggleEdit(id) {
     pw.addEventListener('input', function () { box.style.display = pw.value ? '' : 'none'; });
   });
 })();
+function dtTick(id) {
+  // the DO team works in the DO Tracker, so ticking it also gives that feature
+  var dt = document.getElementById('edt' + id), box = document.getElementById('ef' + id);
+  if (!dt || !dt.checked || !box) return;
+  var cb = box.querySelector('input[value="do"]'); if (cb) cb.checked = true;
+}
 async function saveUser(id) {
   const body = {full_name: document.getElementById('en' + id).value.trim(), username: document.getElementById('eu' + id).value.trim(), email: document.getElementById('ee' + id).value.trim()};
   const pw = document.getElementById('ep' + id).value;
@@ -16143,6 +16937,7 @@ async function saveUser(id) {
   const er = document.getElementById('er' + id), em = document.getElementById('em' + id);
   if (er) { body.role = er.value; if (er.value === 'staff' && em) body.manager_id = em.value; }
   var fl = readFeatures('ef' + id); if (fl) body.features = fl;
+  var dt = document.getElementById('edt' + id); if (dt) body.do_team = dt.checked ? 1 : 0;
   const res = await fetch('/api/users/' + id, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.error) { showToast(data.error || 'Could not save.', {error:true}); return; }
@@ -16163,6 +16958,14 @@ async function signOutAll(id) {
   showToast(data.ended ? ('Signed out of ' + data.ended + (data.ended === 1 ? ' device.' : ' devices.')) : 'No other sign-ins were open.');
   setTimeout(() => location.reload(), 900);
 }
+async function rmPhoto(id, name) {
+  const res = await fetch('/api/users/' + id + '/avatar', {method:'DELETE'});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) { showToast(data.error || 'Could not remove that photo.', {error:true, duration: 5000}); return; }
+  showToast('Removed the photo of ' + (name || '') + '.');
+  setTimeout(() => location.reload(), 500);
+}
+
 async function delUser(id, username) {
   const res = await fetch('/api/users/' + id, {method:'DELETE'});
   const data = await res.json().catch(() => ({}));
@@ -23188,6 +23991,8 @@ PAGE_HTML = """
   .history-row { padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 12.5px; }
   .history-row:last-child { border-bottom: none; }
   .history-row .when { color: var(--muted); font-size: 11px; }
+  .history-row .cp-av { margin-inline-end: 7px; vertical-align: middle; }
+  .meta .cp-av { margin-inline-end: 5px; vertical-align: middle; }
 
   /* Doc chips next to the BL number - small pills showing whether an
      Invoice / DO file is attached. The native title attribute gives a real
@@ -23223,6 +24028,18 @@ PAGE_HTML = """
   .stag.act { background: linear-gradient(180deg, var(--navy-light), var(--navy)); color: #fff; box-shadow: 0 1px 2px rgba(18,58,86,.25); }
   .stag.act:hover { filter: brightness(1.08); }
   .stag svg { width: 11px; height: 11px; }
+  .stag.req { background: color-mix(in srgb, var(--gold) 24%, transparent); color: #7a5200; cursor: default; }
+  :root[data-theme="dark"] .stag.req { color: var(--gold); }
+  .stag.req::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .imp-wrap { display: flex; align-items: center; gap: 6px; max-width: 100%; }
+  input.imp-input { width: 132px; max-width: 100%; border: 1px solid var(--border); background: transparent; color: var(--text);
+               font-size: 11.5px; font-family: inherit; padding: 3px 7px; border-radius: 6px; font-variant-numeric: tabular-nums; box-shadow: none; }
+  input.imp-input::placeholder { color: var(--muted); }
+  input.imp-input:focus { background: var(--bg); border-color: var(--navy-light); outline: none; box-shadow: none; }
+  .imp-lbl { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .imp-val { font-size: 11.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .op-line { display: inline-flex; align-items: center; gap: 4px; }
+  input:disabled + .slider { opacity: .45; cursor: not-allowed; }
   .bl-hover { cursor: default; transition: color .15s ease; }
   .bl-hover:hover { color: var(--navy-light); }
   .group-send { border: 0; border-radius: 999px; padding: 6px 12px; font-size: 12px; font-weight: 600; font-family: inherit; cursor: pointer;
@@ -24063,7 +24880,7 @@ function updateToggleUI(bl, field, checked, by, at) {
       meta.className = 'meta';
       wrap.appendChild(meta);
     }
-    meta.textContent = label;
+    meta.innerHTML = ((by && window.cpAvatar) ? cpAvatar(by, 16) : '') + esc(label);
   } else if (meta) {
     meta.remove();
   }
@@ -24168,7 +24985,7 @@ function auditActionLabel(action) {
     added: t('action_added'), deleted: t('action_deleted'), restored: t('action_restored'),
     toggle: t('action_toggle'), remarks: t('action_remarks'),
     attachment: t('action_attachment'), attachment_removed: t('action_attachment_removed'),
-    contacts: t('action_contacts'), link_reset: t('action_link_reset'),
+    contacts: t('action_contacts'), link_reset: t('action_link_reset'), importer: t('action_importer'),
   }[action] || action;
 }
 
@@ -24200,6 +25017,10 @@ async function showHistory(bl) {
       line = `<b>${byUser}</b> ${t('history_set_field', {field: esc(historyFieldLabel(e.field)), value: e.new_value ? t('yes') : t('no')})}`;
     } else if (e.action === 'remarks') {
       line = `<b>${byUser}</b> ${e.new_value ? t('history_edited_remarks', {value: esc(e.new_value)}) : t('history_cleared_remarks')}`;
+    } else if (e.action === 'request') {
+      line = `<b>${byUser}</b> ${t('history_requested', {value: esc(e.new_value)})}`;
+    } else if (e.action === 'importer') {
+      line = `<b>${byUser}</b> ${e.new_value ? t('history_importer', {value: esc(e.new_value)}) : t('history_importer_cleared')}`;
     } else if (e.action === 'notified') {
       line = `<b>${byUser}</b> ${t(e.field === 'whatsapp' ? 'history_notified_whatsapp' : 'history_notified_email', {value: esc(e.new_value)})}`;
     } else if (e.action === 'added') {
@@ -24207,7 +25028,8 @@ async function showHistory(bl) {
     } else {
       line = `<b>${byUser}</b> ${esc(auditActionLabel(e.action))}`;
     }
-    return `<div class="history-row"><div>${line}</div><div class="when">${esc(formatLocalTime(e.at))}</div></div>`;
+    const face = (e.by_user && e.action !== 'customer_download' && window.cpAvatar) ? cpAvatar(e.by_user, 20) : '';
+    return `<div class="history-row"><div>${face}${line}</div><div class="when">${esc(formatLocalTime(e.at))}</div></div>`;
   }).join('');
 }
 
@@ -24244,6 +25066,7 @@ function docChip(bl, kind, hasFile) {
 function renderDocsSections(data, canManage) {
   const atts = data.attachments || {};
   return DOC_KINDS.map(kind => {
+    const may = canManage || (!!data.do_access && (kind === 'invoice' || kind === 'receipt' || kind === 'do'));
     const label = docLabel(kind);
     const accept = (kind === 'bl' || kind === 'receipt') ? '.pdf,application/pdf,.jpg,.jpeg,.png,.webp,.tif,.tiff' : '.pdf,application/pdf';
     const att = atts[kind];
@@ -24254,13 +25077,11 @@ function renderDocsSections(data, canManage) {
         <a href="/api/records/${encodeURIComponent(data.bl_number)}/attachment/${kind}" target="_blank" rel="noopener">
           <button type="button">${t('download')}</button>
         </a>
-        ${canManage ? `
-          <label class="btn-upload">${t('replace')}<input type="file" accept="${accept}" onchange="uploadAttachment(${jsq(data.bl_number)}, '${kind}', this)"></label>
-          <button type="button" class="btn-danger" onclick="removeAttachment(${jsq(data.bl_number)}, '${kind}')">${t('remove')}</button>
-        ` : ''}`;
+        ${may ? `<label class="btn-upload">${t('replace')}<input type="file" accept="${accept}" onchange="uploadAttachment(${jsq(data.bl_number)}, '${kind}', this)"></label>` : ''}
+        ${canManage ? `<button type="button" class="btn-danger" onclick="removeAttachment(${jsq(data.bl_number)}, '${kind}')">${t('remove')}</button>` : ''}`;
     } else {
-      status = canManage ? t('not_attached_yet') : t('not_attached_waiting');
-      actions = canManage ? `
+      status = may ? t('not_attached_yet') : t('not_attached_waiting');
+      actions = may ? `
         <label class="btn-upload">${t('upload_pdf')}<input type="file" accept="${accept}" onchange="uploadAttachment(${jsq(data.bl_number)}, '${kind}', this)"></label>
       ` : '';
     }
@@ -24762,6 +25583,7 @@ async function uploadAttachment(bl, kind, input) {
   const label = docLabel(kind);
   if (kind === 'bl' || kind === 'receipt') {
     showToast(kind === 'bl' ? t('bl_attached_toast', {size: fmtSize(data.size || 0)}) : t('receipt_attached_toast'));
+    if (data.invoice_requested) showToast(t(data.invoice_request_no_team ? 'req_no_team_toast' : 'req_sent_toast'), {duration: data.invoice_request_no_team ? 7000 : 5000});
     await fetchRecords(true);
     if (document.getElementById('docsOverlay').style.display !== 'none') await showDocs(bl);
     return;
@@ -24909,7 +25731,7 @@ async function handleAutoMatchFiles(fileList) {
 
 function autoMatchRowOk(row, file, bl, kind, data) {
   row.className = 'match-row ok';
-  const issuedNote = kind === 'receipt' ? ' - ' + t('paid_tag') : kind === 'bl' ? ' (' + fmtSize(data.size || 0) + ')' : data.auto_issued_field ? t('marked_issued_suffix') : '';
+  const issuedNote = kind === 'receipt' ? ' - ' + t('paid_tag') : kind === 'bl' ? ' (' + fmtSize(data.size || 0) + ')' + (data.invoice_requested ? t('req_note') : '') : data.auto_issued_field ? t('marked_issued_suffix') : '';
   row.innerHTML = `<div class="match-file" title="${esc(file.name)}">${esc(file.name)}</div><div class="match-status">&check; ${esc(bl)} - ${esc(autoMatchKindLabel(kind))}${esc(issuedNote)}</div>`;
 }
 
@@ -25081,6 +25903,8 @@ function invoiceCell(r) {
     } else {
       tag = `<button type="button" class="stag todo" onclick="toggle(${jsq(r.bl_number)}, 'paid', true)">${t('mark_paid')}</button>`;
     }
+  } else if (r.inv_requested_at) {
+    tag = `<span class="stag req" title="${esc(t('req_title', {user: r.inv_requested_by || '', time: formatLocalTime(r.inv_requested_at)}))}">${t('req_tag')}</span>`;
   }
   return checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at, tag);
 }
@@ -25090,20 +25914,21 @@ function doCell(r) {
     if (r.do_sent) {
       const tt = r.do_sent_via === 'email' ? t('sent_to_title', {to: r.do_sent_to || '', time: formatLocalTime(r.do_sent_at)})
         : r.do_sent_via === 'before' ? t('sd_sent_before') : t('sent_hand_title', {time: formatLocalTime(r.do_sent_at)});
-      tag = `<button type="button" class="stag ok" title="${esc(tt)}" onclick="openSendDo(${jsq(r.bl_number)})">${t('sent_tag')}</button>`;
+      tag = r.do_only ? `<span class="stag ok" title="${esc(tt)}" style="cursor:default">${t('sent_tag')}</span>`
+        : `<button type="button" class="stag ok" title="${esc(tt)}" onclick="openSendDo(${jsq(r.bl_number)})">${t('sent_tag')}</button>`;
       if (r.do_sent_via === 'email') meta = t('sent_emailed', {time: formatLocalTime(r.do_sent_at)});
       else if (r.do_sent_via === 'manual') meta = t('sent_by_hand', {time: formatLocalTime(r.do_sent_at)});
-    } else {
+    } else if (!r.do_only) {
       tag = `<button type="button" class="stag act" onclick="openSendDo(${jsq(r.bl_number)})"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>${t('send_tag')}</button>`;
     }
   }
   return checkbox(r.bl_number, 'do_issued', !!r.do_issued, r.do_by, r.do_at, tag, meta);
 }
 
-function checkbox(bl, field, checked, by, at, tag, metaText) {
+function checkbox(bl, field, checked, by, at, tag, metaText, dis) {
   const id = bl + '_' + field;
   const sw = `<label class="switch">
-        <input type="checkbox" id="${esc(id)}" ${checked ? 'checked' : ''}
+        <input type="checkbox" id="${esc(id)}" ${checked ? 'checked' : ''} ${dis ? 'disabled' : ''}
           onchange="toggle(${jsq(bl)}, '${field}', this.checked)">
         <span class="slider"></span>
       </label>`;
@@ -25111,7 +25936,7 @@ function checkbox(bl, field, checked, by, at, tag, metaText) {
   return `
     <div class="checkwrap">
       ${tag ? `<div class="sw-line">${sw}${tag}</div>` : sw}
-      ${checked ? `<span class="meta" title="${esc(metaStr)}">${esc(metaStr)}</span>` : ''}
+      ${checked ? `<span class="meta" title="${esc(metaStr)}">${(!metaText && by && window.cpAvatar) ? cpAvatar(by, 16) : ''}${esc(metaStr)}</span>` : ''}
     </div>`;
 }
 
@@ -25137,13 +25962,39 @@ const CHEVRON = '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="curre
 
 let selectedBLs = new Set();
 
+// The importer no. the invoice is raised against. Once the B/L copy is attached and this is filled in, the DO team is asked for the invoice.
+function importerHtml(r) {
+  const v = r.importer_no || '';
+  if (r.do_only) return v ? `<div class="imp-wrap"><span class="imp-lbl">${esc(t('importer_ph'))}</span><b class="imp-val">${esc(v)}</b></div>` : '';
+  return `<div class="imp-wrap"><input class="imp-input" type="text" maxlength="40" dir="ltr" value="${esc(v)}" placeholder="${esc(t('importer_ph'))}"
+            title="${esc(t('importer_title'))}" aria-label="${esc(t('importer_ph'))}" onfocus="markEditing(1)" onblur="markEditing(-1)"
+            onchange="saveImporter(${jsq(r.bl_number)}, this)" onkeydown="if (event.key === 'Enter') this.blur()"></div>`;
+}
+async function saveImporter(bl, input) {
+  const val = input.value.trim();
+  const rec = records.find(r => r.bl_number === bl);
+  if (rec && (rec.importer_no || '') === val) return;
+  if (rec) rec.importer_no = val;
+  let res = null, d = {};
+  try {
+    res = await apiWrite('/api/records/' + encodeURIComponent(bl) + '/importer', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({importer_no: val})
+    });
+    d = await res.json();
+  } catch (e) { res = null; }
+  if (!res || !res.ok) { showToast(t('could_not_save_retry')); fetchRecords(true); return; }
+  if (d.requested) showToast(t(d.no_team ? 'req_no_team_toast' : 'req_sent_toast'), {duration: d.no_team ? 7000 : 5000});
+  fetchRecords(true);
+}
+
 function rowsHtml(list) {
   return list.map(r => {
     const complete = isDone(r);
+    const only = !!r.do_only;
     return `
-    <tr id="row_${cssEscape(r.bl_number)}" class="${complete ? 'row-complete' : ''}">
-      <td class="select-col"><input type="checkbox" class="row-select" ${selectedBLs.has(r.bl_number) ? 'checked' : ''}
-            onchange="toggleRowSelect(${jsq(r.bl_number)}, this.checked)"></td>
+    <tr id="row_${cssEscape(r.bl_number)}" class="${complete ? 'row-complete' : ''}${only ? ' row-do-only' : ''}">
+      <td class="select-col">${only ? '' : `<input type="checkbox" class="row-select" ${selectedBLs.has(r.bl_number) ? 'checked' : ''}
+            onchange="toggleRowSelect(${jsq(r.bl_number)}, this.checked)">`}</td>
       <td>
         <div class="bl-cell">
           <b class="bl-hover" data-bl="${esc(r.bl_number)}">${esc(r.bl_number)}</b>
@@ -25152,16 +26003,18 @@ function rowsHtml(list) {
             ${docChip(r.bl_number, 'do', r.has_do_file)}
             ${docChip(r.bl_number, 'bl', r.has_bl_file)}
           </div>
+          ${importerHtml(r)}
+          ${only ? `<span class="meta op-line" title="${esc(t('operator_label'))}">${window.cpAvatar ? cpAvatar(r.created_by, 16) : ''}${esc(r.created_by || '')}</span>` : ''}
         </div>
       </td>
       <td data-label="${t('th_invoice_issued')}">${invoiceCell(r)}</td>
-      <td data-label="${t('th_approval_received')}">${checkbox(r.bl_number, 'approval_received', !!r.approval_received, r.approval_by, r.approval_at)}</td>
+      <td data-label="${t('th_approval_received')}">${checkbox(r.bl_number, 'approval_received', !!r.approval_received, r.approval_by, r.approval_at, '', null, only)}</td>
       <td data-label="${t('th_do_issued')}">${doCell(r)}</td>
-      <td data-label="${t('th_remarks')}"><input class="remarks-input" type="text" dir="${autoDir(r.remarks)}" value="${esc(r.remarks || '')}"
+      <td data-label="${t('th_remarks')}"><input class="remarks-input" type="text" dir="${autoDir(r.remarks)}" value="${esc(r.remarks || '')}" ${only ? 'readonly' : ''}
             oninput="this.dir = autoDir(this.value); onRemarksInput(${jsq(r.bl_number)}, this.value)"
             onfocus="markEditing(1)" onblur="markEditing(-1)" placeholder="${t('notes_placeholder')}"></td>
       <td>{% if role in ['owner', 'manager'] %}<button type="button" class="hist-btn" title="${t('history')}" onclick="showHistory(${jsq(r.bl_number)})">${t('history')}</button>{% endif %}</td>
-      <td><button class="del" onclick="deleteRecord(${jsq(r.bl_number)})">${t('remove')}</button></td>
+      <td>${only ? '' : `<button class="del" onclick="deleteRecord(${jsq(r.bl_number)})">${t('remove')}</button>`}</td>
     </tr>`;
   }).join('');
 }
@@ -25274,7 +26127,7 @@ function bulkRemoveSelected(vesselKey) {
 
 function bulkBarHtml(vesselKey, list) {
   const key = esc(vesselKey);
-  const blsAttr = list.map(r => r.bl_number).join('|');
+  const blsAttr = list.filter(r => !r.do_only).map(r => r.bl_number).join('|');
   return `
     <div class="bulk-bar" data-bar-key="${key}" data-bls="${esc(blsAttr)}">
       <span class="bulk-count"></span>
@@ -25302,7 +26155,7 @@ function tableHtml(list, vesselKey) {
       <table>
         <thead>
           <tr>
-            <th class="select-col"><input type="checkbox" class="select-all-vessel" data-bar-key="${key}" title="${t('select_deselect_vessel_title')}" onchange="list_selectAllVessel(${jsq(vesselKey)}, this.checked)"></th>
+            <th class="select-col">${list.every(r => r.do_only) ? '' : `<input type="checkbox" class="select-all-vessel" data-bar-key="${key}" title="${t('select_deselect_vessel_title')}" onchange="list_selectAllVessel(${jsq(vesselKey)}, this.checked)">`}</th>
             <th>${t('th_bl_number')}</th>
             <th>${t('th_invoice_issued')}</th>
             <th>${t('th_approval_received')}</th>
@@ -25382,30 +26235,31 @@ function vesselGroupHtml(portName, vesselName, list, archivedView) {
   const rawPort = (sortedList[0] && sortedList[0].port) || '';
   const rawVessel = (sortedList[0] && sortedList[0].vessel) || '';
   const blList = sortedList.map(r => r.bl_number);
+  const lookOnly = sortedList.length > 0 && sortedList.every(r => r.do_only);   // the DO team's view of an operator's vessel
   // HTML-escaped JSON array, safe inside a double-quoted attribute.
   const blsJson = esc(JSON.stringify(blList));
   return `
     <div class="vessel-group" id="group_${cssEscape(vesselKey)}">
       <div class="vessel-header ${vesselCollapsed ? 'collapsed' : ''}" onclick="if(event.target.tagName!=='INPUT' && event.target.tagName!=='BUTTON' && event.target.tagName!=='A') toggleGroup(${jsq(collapseKey)})">
         ${CHEVRON}
-        <input class="group-name" dir="${autoDir(vesselName === 'Unassigned' ? '' : vesselName)}" oninput="this.dir = autoDir(this.value)" value="${vesselName === 'Unassigned' ? '' : esc(vesselName)}" placeholder="${t('unassigned_vessel_ph')}"
+        <input class="group-name" dir="${autoDir(vesselName === 'Unassigned' ? '' : vesselName)}" oninput="this.dir = autoDir(this.value)" value="${vesselName === 'Unassigned' ? '' : esc(vesselName)}" placeholder="${t('unassigned_vessel_ph')}" ${lookOnly ? 'readonly' : ''}
           onclick="event.stopPropagation()"
           onchange="renameGroup('vessel', ${jsq(portName)}, ${jsq(vesselName)}, this.value, 'Unassigned')">
-        ${archivedView ? '' : `<span class="eta-wrap" onclick="event.stopPropagation()">
+        ${archivedView ? '' : lookOnly ? (eta ? `<span class="eta-wrap"><span class="eta-label">${t('eta_label')}</span> <b>${esc(eta)}</b></span>` : '') : `<span class="eta-wrap" onclick="event.stopPropagation()">
           <span class="eta-label">${t('eta_label')}</span>
           <input type="date" class="eta-input${eta ? '' : ' eta-unset'}" value="${esc(eta)}" title="${t('expected_arrival_title')}"
             onchange="this.classList.toggle('eta-unset', !this.value); setVesselEta(JSON.parse(this.dataset.bls), this.value)" data-bls="${blsJson}">
           ${eta ? '' : `<span class="eta-unset-hint">${t('not_set')}</span>`}
         </span>`}
-        ${archivedView ? '' : vesselStatusHtml(sortedList[0], blsJson)}
+        ${(archivedView || lookOnly) ? '' : vesselStatusHtml(sortedList[0], blsJson)}
         <span class="group-count">${t('bl_count', {n: sortedList.length, p: sortedList.length === 1 ? '' : 's'})}${left ? t('left_suffix', {n: left}) : t('done_suffix')}</span>
         <span class="vessel-progress ${pct >= 100 ? 'done' : ''}" title="${t('pct_complete', {pct})}"><span class="vessel-progress-fill" style="width:${pct}%"></span></span>
-        <span class="group-actions">
+        ${lookOnly ? '' : `<span class="group-actions">
           ${(!archivedView && toSend) ? `<button type="button" class="group-send" onclick="event.stopPropagation(); openSendBatch(JSON.parse(this.dataset.bls))" data-bls="${blsJson}">${t('send_n_dos', {n: toSend, p: toSend === 1 ? '' : 's'})}</button>` : ''}
           <a onclick="event.stopPropagation()" href="/api/export?port=${encodeURIComponent(rawPort)}&vessel=${encodeURIComponent(rawVessel)}" class="group-export" title="${t('export_vessel_title')}">${t('export')}</a>
           <button type="button" class="group-neutral" onclick="event.stopPropagation(); setVesselArchived(${blsJson}, ${archivedView ? 'false' : 'true'})">${archivedView ? t('unarchive') : t('archive')}</button>
           <button type="button" class="group-remove" onclick="event.stopPropagation(); removeVesselGroup(${jsq(portName)}, ${jsq(vesselName)})">${t('remove_all')}</button>
-        </span>
+        </span>`}
       </div>
       <div class="vessel-body ${vesselCollapsed ? 'collapsed' : ''}">
         ${tableHtml(sortedList, vesselKey)}
@@ -26054,7 +26908,20 @@ function jumpToBl(bl) {
 applyI18n();
 initGlassSelects();
 
-fetchRecords();
+// The bell opens a B/L on this board (or, from another page, arrives here as /do-tracker?bl=...).
+const deepBl = (new URLSearchParams(location.search).get('bl') || '').trim().toUpperCase();
+window.cpOpenBl = function (bl) {
+  bl = String(bl || '').trim().toUpperCase();
+  if (!records.some(r => r.bl_number === bl)) return false;
+  jumpToBl(bl);
+  return true;
+};
+window.addEventListener('compass:notified', () => fetchRecords(true));
+fetchRecords().then(() => {
+  if (!deepBl) return;
+  if (!window.cpOpenBl(deepBl)) showToast(t('no_bl_match', {q: deepBl}));
+  try { history.replaceState(null, '', location.pathname); } catch (e) {}
+});
 setInterval(fetchRecords, 4000);
 window.addEventListener('compass:activated', () => fetchRecords(true));
 </script>
