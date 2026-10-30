@@ -125,6 +125,15 @@ const I18N = {
     req_note: " - invoice requested", importer_saved: "Importer no. saved", operator_label: "Operator",
     history_requested: "asked the DO team for the invoice. Importer no. {value}", action_importer: "changed the importer no.",
     history_importer: 'set the importer no. to "{value}"', history_importer_cleared: "cleared the importer no.",
+    payrep_tag: "Payment reported, to verify", payrep_title: "The consignee reported on {time} that the invoice is paid. Check FASAH, then attach the paid invoice.",
+    payrep_clear: "Clear", payrep_sure: "Sure? Clear", payrep_clear_title: "Clear this report if there is no payment. The consignee's page will say we could not find it yet.",
+    payrep_cleared_toast: "Payment report cleared.",
+    hold_tag: "Awaiting payment", hold_title: "Approval is saved. The DO team will be told to issue the DO as soon as the payment is verified.",
+    ready_tag: "Ready to issue", ready_title: "Approval received and payment verified. The DO can be issued.",
+    hold_toast: "Approval saved. The DO team will be told once the payment is verified.", ready_toast: "The DO team has been told to issue the DO.",
+    history_do_ready_pay: "Told the DO team to issue the DO (payment was already verified)", history_do_ready_both: "Told the DO team to issue the DO (approval and payment are both in)",
+    history_do_hold: "saved the approval. The DO team will be told once the payment is verified",
+    history_pay_reported: "Consignee reported the invoice as paid (not verified yet)", history_pay_cleared: "cleared the payment report",
     manage_users: "Admin",
     signed_in_as: "Signed in as",
     log_out: "Log out",
@@ -435,6 +444,15 @@ const I18N = {
     req_note: " - تم طلب الفاتورة", importer_saved: "تم حفظ رقم المستورد", operator_label: "المشغّل",
     history_requested: "طلب الفاتورة من فريق أمر التسليم. رقم المستورد {value}", action_importer: "غيّر رقم المستورد",
     history_importer: 'ضبط رقم المستورد على "{value}"', history_importer_cleared: "مسح رقم المستورد",
+    payrep_tag: "تم إبلاغ السداد، بانتظار التحقق", payrep_title: "أبلغ العميل في {time} أن الفاتورة مسددة. تحقق من فسح ثم أرفق الفاتورة المسددة.",
+    payrep_clear: "مسح", payrep_sure: "تأكيد المسح؟", payrep_clear_title: "امسح هذا البلاغ إذا لم يوجد سداد. ستعرض صفحة العميل أننا لم نعثر عليه بعد.",
+    payrep_cleared_toast: "تم مسح بلاغ السداد.",
+    hold_tag: "بانتظار السداد", hold_title: "تم حفظ الموافقة. سيُبلَّغ فريق أمر التسليم بإصدار أمر التسليم فور التحقق من السداد.",
+    ready_tag: "جاهز للإصدار", ready_title: "تم استلام الموافقة والتحقق من السداد. يمكن إصدار أمر التسليم.",
+    hold_toast: "تم حفظ الموافقة. سيُبلَّغ فريق أمر التسليم فور التحقق من السداد.", ready_toast: "تم إبلاغ فريق أمر التسليم بإصدار أمر التسليم.",
+    history_do_ready_pay: "تم إبلاغ فريق أمر التسليم بإصدار أمر التسليم (السداد متحقق منه مسبقًا)", history_do_ready_both: "تم إبلاغ فريق أمر التسليم بإصدار أمر التسليم (الموافقة والسداد مكتملان)",
+    history_do_hold: "حفظ الموافقة. سيُبلَّغ فريق أمر التسليم فور التحقق من السداد",
+    history_pay_reported: "أبلغ العميل بأن الفاتورة مسددة (لم يتم التحقق بعد)", history_pay_cleared: "مسح بلاغ السداد",
     manage_users: "الإدارة",
     signed_in_as: "مسجّل الدخول باسم",
     log_out: "تسجيل الخروج",
@@ -1152,9 +1170,10 @@ def init_db():
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_bl ON audit_log (bl_number)")
     # The bell (alerts between an operator and the DO team), the importer no. a B/L's invoice is raised against,
-    # and when the DO team was asked for that invoice. A DO-team account is one the Owner ticked in Admin.
+    # when the DO team was asked for that invoice, and when the consignee pressed "I have paid" on the tracking page (and when
+    # that report was cleared), and when the DO team was told a B/L is ready for its Delivery Order. A DO-team account is one the Owner ticked in Admin.
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS do_team INTEGER DEFAULT 0")
-    for _col in ("importer_no", "inv_requested_at", "inv_requested_by"):
+    for _col in ("importer_no", "inv_requested_at", "inv_requested_by", "pay_reported_at", "pay_cleared_at", "do_ready_at"):
         cur.execute(f"ALTER TABLE records ADD COLUMN IF NOT EXISTS {_col} TEXT DEFAULT ''")
     cur.execute("""CREATE TABLE IF NOT EXISTS notifications (
         id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT DEFAULT 'info', title TEXT DEFAULT '', body TEXT DEFAULT '',
@@ -3055,6 +3074,8 @@ def user_avatar_remove(user_id):
 # the invoice, the paid receipt and the Delivery Order and tick Invoice issued, Paid and DO issued. Nothing else changes.
 DO_KINDS = ("invoice", "receipt", "do")
 DO_FIELDS = ("invoice_issued", "paid", "do_issued")
+# A B/L is on the DO team's board once an operator asked them for its invoice, the consignee said they had paid it, or it is ready for its DO.
+DO_SEES_SQL = "(COALESCE(inv_requested_at, '') <> '' OR COALESCE(pay_reported_at, '') <> '' OR COALESCE(do_ready_at, '') <> '')"
 
 
 def _is_do_team():
@@ -3066,10 +3087,10 @@ def _is_do_team():
 
 
 def _do_access(bl_number):
-    """The DO team may work on a B/L once an operator has asked them for its invoice."""
+    """The DO team may work on a B/L once an operator has asked them for its invoice, the consignee has said they paid it, or it is ready for its DO."""
     if not _is_do_team():
         return False
-    return get_db().execute("SELECT 1 FROM records WHERE bl_number = ? AND COALESCE(inv_requested_at, '') <> ''", (bl_number,)).fetchone() is not None
+    return get_db().execute("SELECT 1 FROM records WHERE bl_number = ? AND " + DO_SEES_SQL, (bl_number,)).fetchone() is not None
 
 
 def _may_attach(bl_number, kind):
@@ -3098,10 +3119,10 @@ def _mail_alerts(addrs, subject, text):
             pass
 
 
-def _notify(db, people, kind, title, body, bl_number=""):
+def _notify(db, people, kind, title, body, bl_number="", skip_me=True):
     """One bell entry for each person (never for the one who did the thing), then a backup email when email is set up.
     Shares the caller's transaction: it lands when the caller commits. Returns how many people were told."""
-    me = session.get("user_id")
+    me = session.get("user_id") if skip_me else None
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     done, mails = set(), []
     for u in people:
@@ -3142,6 +3163,7 @@ def _maybe_request_invoice(db, bl, how="Requested"):
 _STEP_NOTE = {
     "invoice_issued": ("ask", "Invoice issued. Send it for payment", "invoice", "Send the QR code or the invoice to the consignee or the broker."),
     "do_issued": ("ok", "Delivery Order issued", "Delivery Order", "You can now send it to the consignee."),
+    "paid": ("ok", "Payment verified", "paid invoice", ""),
 }
 
 
@@ -3161,10 +3183,15 @@ def _notify_step(db, bls, field, via="switch"):
         if not u:
             continue
         items.sort()
-        if len(items) == 1:
+        shown = ", ".join(items[:3]) + ((" and %d more" % (len(items) - 3)) if len(items) > 3 else "")
+        if field == "paid":
+            if len(items) == 1:
+                _notify(db, [u], kind, title, items[0] + " · " + ("Paid invoice attached by " if via == "file" else "Marked as paid by ") + who + ".", items[0])
+            else:
+                _notify(db, [u], kind, "%d payments verified" % len(items), shown + " · Marked as paid by " + who + ".", items[0])
+        elif len(items) == 1:
             _notify(db, [u], kind, title, items[0] + " · " + who + " " + verb + ". " + tail, items[0])
         else:
-            shown = ", ".join(items[:3]) + ((" and %d more" % (len(items) - 3)) if len(items) > 3 else "")
             plural = "%d %ss issued" % (len(items), what)
             _notify(db, [u], kind, plural + ". " + ("Send them for payment" if field == "invoice_issued" else "Ready to send"), shown + " · " + who + " marked them as issued.", items[0])
 
@@ -3219,6 +3246,88 @@ def set_importer_no(bl_number):
     asked = _maybe_request_invoice(db, bl, "Importer no. added")
     db.commit()
     return jsonify({"ok": True, "importer_no": val, "requested": asked is not None, "no_team": asked == "no_team"})
+
+
+def _after_gate(db, bls, field, value):
+    """The Delivery Order needs two things first: Approval received and Paid (verified). When the second of the two comes in, the DO team is
+    told to issue it - once. Approval slid before payment is verified is saved on HOLD (a History line, no alert); the alert goes out
+    by itself when the paid invoice is attached or Paid is ticked later. Taking either back lets the next completion alert again.
+    Call it only for B/Ls whose Approval received / Paid really changed. Returns {"ready": [...], "hold": [...]}."""
+    out = {"ready": [], "hold": []}
+    bls = [b for b in dict.fromkeys(bls) if b]
+    if not bls or field not in ("approval_received", "paid"):
+        return out
+    if not value:
+        db.execute("UPDATE records SET do_ready_at = '' WHERE bl_number = ANY(?)", (bls,))
+        return out
+    ready, hold = [], []
+    for r in db.execute("SELECT bl_number, approval_received, paid, do_issued FROM records WHERE bl_number = ANY(?)", (bls,)).fetchall():
+        if r["do_issued"]:
+            continue
+        if r["approval_received"] and r["paid"]:
+            ready.append(r["bl_number"])
+        elif field == "approval_received" and r["approval_received"]:
+            hold.append(r["bl_number"])
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    if ready:
+        got = db.execute("UPDATE records SET do_ready_at = ? WHERE bl_number = ANY(?) AND COALESCE(do_ready_at, '') = '' RETURNING bl_number", (now, ready)).fetchall()
+        out["ready"] = sorted(r["bl_number"] for r in got)
+    out["hold"] = sorted(hold)
+    for bl in out["ready"]:
+        _log_audit(bl, "do_ready", "do_issued", "", "payment_in" if field == "approval_received" else "both_in")
+    for bl in out["hold"]:
+        _log_audit(bl, "do_hold", "do_issued", "", "")
+    told = out["ready"]
+    if told:
+        team = _do_team_users(db)
+        shown = ", ".join(told[:3]) + ((" and %d more" % (len(told) - 3)) if len(told) > 3 else "")
+        if len(told) == 1:
+            _notify(db, team, "ask", "Ready to issue the DO", told[0] + " · Approval received and payment verified.", told[0])
+        else:
+            _notify(db, team, "ask", "%d B/Ls ready for the DO" % len(told), shown + " · Approval received and payment verified.", told[0])
+    return out
+
+
+def _tell_payment_reported(db, rec):
+    """The consignee pressed "I have paid" on the tracking page. Nobody has checked it yet, so it is worded as a report, not as payment:
+    the DO team is asked to check FASAH, and the operator who owns the B/L is told that is happening."""
+    bl = rec["bl_number"]
+    team = _do_team_users(db)
+    op = _user_named(db, rec["created_by"])
+    if team:
+        _notify(db, team, "warn", "Consignee says the invoice is paid", bl + " · Not verified yet. Check FASAH, then attach the paid invoice.", bl, skip_me=False)
+        if op and op["id"] not in {u["id"] for u in team}:
+            _notify(db, [op], "info", "Consignee reported payment", bl + " · The DO team is checking it in FASAH.", bl, skip_me=False)
+    elif op:
+        _notify(db, [op], "warn", "Consignee says the invoice is paid", bl + " · Not verified yet. Check FASAH, then mark it as paid.", bl, skip_me=False)
+
+
+@app.route("/api/records/<path:bl_number>/pay-report/clear", methods=["POST"])
+@login_required
+def clear_pay_report(bl_number):
+    """"Payment reported, to verify" was a mistake (no payment is there). The operator or the DO team clears it; the other side is told,
+    and the consignee's page says the payment was not found yet, so they can contact us or report again."""
+    bl = bl_number.upper()
+    mine = _owns_record(bl)
+    if not (mine or _do_access(bl)):
+        return "Not your record.", 403
+    db = get_db()
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    got = db.execute("UPDATE records SET pay_reported_at = '', pay_cleared_at = ? WHERE bl_number = ? AND COALESCE(pay_reported_at, '') <> '' "
+                     "AND COALESCE(paid, 0) = 0 RETURNING bl_number, created_by", (now, bl)).fetchall()
+    if not got:
+        db.commit()
+        return jsonify({"ok": True, "cleared": False})
+    _log_audit(bl, "pay_cleared", "paid", "", "")
+    who = _who()
+    if mine:
+        _notify(db, _do_team_users(db), "info", "Payment report cleared", bl + " · " + who + " cleared it, so there is nothing to check.", bl)
+    else:
+        op = _user_named(db, got[0]["created_by"])
+        if op:
+            _notify(db, [op], "info", "Payment report cleared", bl + " · " + who + " could not find the payment yet and cleared the report.", bl)
+    db.commit()
+    return jsonify({"ok": True, "cleared": True})
 # ==== NOTIFICATIONS END ====
 
 
@@ -4163,7 +4272,7 @@ def list_records():
     elif _is_do_team():
         # the DO team also sees every B/L an operator has asked them an invoice for - to work on, not to own
         rows = db.execute(
-            f"SELECT r.*{ATTACHMENT_FLAGS_SQL} FROM records r WHERE created_by = ANY(?) OR COALESCE(inv_requested_at, '') <> '' ORDER BY created_at DESC",
+            f"SELECT r.*{ATTACHMENT_FLAGS_SQL} FROM records r WHERE created_by = ANY(?) OR {DO_SEES_SQL} ORDER BY created_at DESC",
             (team,),
         ).fetchall()
     else:
@@ -9385,8 +9494,11 @@ def toggle_status(bl_number):
     _log_audit(bl_number.upper(), "toggle", field, "" if value else "1", "1" if value else "")
     if value and was and not was["v"]:
         _notify_step(db, [bl_number.upper()], field)
+    gate = {"ready": [], "hold": []}
+    if field in ("approval_received", "paid") and was and bool(was["v"]) != bool(value):
+        gate = _after_gate(db, [bl_number.upper()], field, value)
     db.commit()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "gate": "ready" if gate["ready"] else "hold" if gate["hold"] else ""})
 
 
 @app.route("/api/records/<path:bl_number>/remarks", methods=["POST"])
@@ -9706,8 +9818,9 @@ def bulk_toggle_records():
         _log_audit(bl_number, "toggle", field, "" if value else "1", "1" if value else "")
     if value and updated:
         _notify_step(db, updated, field)
+    gate = _after_gate(db, updated, field, value) if field in ("approval_received", "paid") else {"ready": [], "hold": []}
     db.commit()
-    return jsonify({"updated": updated})
+    return jsonify({"updated": updated, "ready": len(gate["ready"]), "hold": len(gate["hold"])})
 
 
 @app.route("/api/vessel/eta", methods=["POST"])
@@ -10135,7 +10248,7 @@ def detect_attachment():
         bl_rows = db.execute("SELECT bl_number FROM records").fetchall()
     elif _is_do_team():
         bl_rows = db.execute(
-            "SELECT bl_number FROM records WHERE created_by = ANY(?) OR COALESCE(inv_requested_at, '') <> ''", (_team(),)
+            "SELECT bl_number FROM records WHERE created_by = ANY(?) OR " + DO_SEES_SQL, (_team(),)
         ).fetchall()
     else:
         bl_rows = db.execute(
@@ -10296,8 +10409,10 @@ def _store_attachment(db, bl_number, kind, file_name, data):
         if kind == "receipt":                     # paid, and the receipt is the proof
             db.execute("UPDATE records SET paid_via = 'receipt' WHERE bl_number = ?", (bl_number,))
 
-    if auto_issued and status_field in ("invoice_issued", "do_issued"):
+    if auto_issued and status_field in ("invoice_issued", "do_issued", "paid"):
         _notify_step(db, [bl_number], status_field, via="file")
+    if auto_issued and status_field == "paid":
+        _after_gate(db, [bl_number], "paid", 1)
     asked = _maybe_request_invoice(db, bl_number, "B/L copy attached") if kind == "bl" else None
     db.commit()
     return {
@@ -10824,6 +10939,11 @@ TRACK_TEXT = {
                    "Delivery Order issued."],
         "pending": "Pending", "updated": "Last updated", "not_found_title": "Link not active",
         "download_invoice": "Download invoice (PDF)",
+        "pay_hint": "After you have paid the invoice, press the button so that we can confirm your payment.",
+        "pay_btn": "I have paid", "pay_sure": "Please confirm that you have paid this invoice.", "pay_yes": "Yes, I have paid",
+        "pay_reported_title": "Thank you. Payment reported.", "pay_reported": "We have noted that you paid and will confirm it shortly.",
+        "pay_done": "Payment confirmed",
+        "pay_cleared": "We could not find your payment yet. If you have already paid, please contact us.",
         "not_found": "This tracking link is no longer active. Please contact Sea Power for an updated link.",
         "contact": "Questions about this shipment?", "lang_switch": "العربية",
         "company": COMPANY_NAME_EN,
@@ -10843,6 +10963,11 @@ TRACK_TEXT = {
                    "تم إصدار أمر التسليم."],
         "pending": "قيد الانتظار", "updated": "آخر تحديث", "not_found_title": "الرابط غير فعال",
         "download_invoice": "تحميل الفاتورة (PDF)",
+        "pay_hint": "بعد سداد الفاتورة، اضغطوا الزر ليتسنى لنا تأكيد السداد.",
+        "pay_btn": "تم السداد", "pay_sure": "يرجى تأكيد أنكم سددتم هذه الفاتورة.", "pay_yes": "نعم، تم السداد",
+        "pay_reported_title": "شكرًا لكم. تم تسجيل إشعار السداد.", "pay_reported": "سنؤكد السداد قريبًا.",
+        "pay_done": "تم تأكيد السداد",
+        "pay_cleared": "لم نعثر على سدادكم بعد. إذا كنتم قد سددتم بالفعل، يرجى التواصل معنا.",
         "not_found": "رابط التتبع هذا لم يعد فعالًا. يرجى التواصل مع سي باور للحصول على رابط محدّث.",
         "contact": "هل لديكم استفسار حول هذه الشحنة؟", "lang_switch": "English",
         "company": COMPANY_NAME_AR,
@@ -10920,7 +11045,7 @@ def public_tracking(token):
     if re.fullmatch(r"[A-Za-z0-9_-]{16,64}", token or ""):
         rec = get_db().execute(
             """SELECT bl_number, vessel, port, eta, invoice_issued, invoice_at, approval_received, approval_at,
-                      do_issued, do_at, created_at, vessel_status, etb, berth_no, etcd
+                      do_issued, do_at, created_at, vessel_status, etb, berth_no, etcd, paid, pay_reported_at, pay_cleared_at
                FROM records WHERE track_token = ?""",
             (token,),
         ).fetchone()
@@ -10941,6 +11066,7 @@ def public_tracking(token):
             "stage": stage, "status": tx["status"][stage],
             "updated": _track_date(max(stamps), lang) if stamps else "",
             "invoice_url": f"/t/{token}/invoice" if _track_invoice(token) else "",
+            "pay": _track_pay(rec, lang), "token": token,
         })
     html = render_template_string(TRACK_HTML, **ctx)
     resp = Response(html, status=200 if rec else 404, mimetype="text/html")
@@ -10950,6 +11076,18 @@ def public_tracking(token):
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["Referrer-Policy"] = "no-referrer"
     return resp
+
+
+def _track_pay(rec, lang):
+    """What the payment card on the tracking page says: nothing before the invoice is issued, then 'open' (the I-have-paid button),
+    'reported' (thank you, we will confirm it) or 'paid' (confirmed by the DO team)."""
+    if not rec["invoice_issued"]:
+        return None
+    if rec["paid"]:
+        return {"state": "paid"}
+    if (rec["pay_reported_at"] or "").strip():
+        return {"state": "reported", "when": _track_date(rec["pay_reported_at"], lang)}
+    return {"state": "open", "cleared": bool((rec["pay_cleared_at"] or "").strip())}
 
 
 def _track_invoice(token):
@@ -10983,6 +11121,36 @@ def public_tracking_invoice(token):
     resp = Response(bytes(row["data"]), mimetype="application/pdf")
     resp.headers["Content-Disposition"] = _content_disposition(row["filename"] or f"invoice_{row['bl_number']}.pdf", f"invoice_{row['bl_number']}.pdf")
     resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    return resp
+
+
+@app.route("/t/<token>/paid", methods=["POST"])
+def public_tracking_paid(token):
+    """"I have paid" on the tracking page. Whoever holds the link may press it, once the invoice is issued and before it is marked paid.
+    It never marks anything as paid: it records the report, tells the DO team to check FASAH and the operator that it is being checked.
+    Pressing again does nothing, and after a cleared report at most 3 alerts go out per B/L per day."""
+    lang = "ar" if request.form.get("lang") == "ar" else "en"
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", token or ""):
+        return Response("This link is no longer active.", status=404, mimetype="text/plain")
+    db = get_db()
+    rec = db.execute("SELECT bl_number, created_by FROM records WHERE track_token = ?", (token,)).fetchone()
+    if not rec:
+        return Response("This link is no longer active.", status=404, mimetype="text/plain")
+    now_dt = datetime.utcnow()
+    now = now_dt.strftime("%Y-%m-%d %H:%M")
+    got = db.execute("UPDATE records SET pay_reported_at = ?, pay_cleared_at = '' WHERE bl_number = ? AND COALESCE(invoice_issued, 0) = 1 "
+                     "AND COALESCE(paid, 0) = 0 AND COALESCE(pay_reported_at, '') = '' RETURNING bl_number", (now, rec["bl_number"])).fetchall()
+    if got:
+        recent = db.execute("SELECT COUNT(*) AS n FROM audit_log WHERE bl_number = ? AND action = 'pay_reported' AND at >= ?",
+                            (rec["bl_number"], (now_dt - timedelta(days=1)).strftime("%Y-%m-%d %H:%M"))).fetchone()["n"]
+        db.execute("INSERT INTO audit_log (bl_number, action, field, old_value, new_value, by_user, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                   (rec["bl_number"], "pay_reported", "paid", "", "", "tracking link", now))
+        if recent < 3:
+            _tell_payment_reported(db, rec)
+    db.commit()
+    resp = redirect(f"/t/{token}" + ("?lang=ar" if lang == "ar" else ""), code=303)
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["Referrer-Policy"] = "no-referrer"
     return resp
@@ -23257,6 +23425,26 @@ TRACK_HTML = """<!DOCTYPE html>
         font-weight: 700; font-size: 15px; text-decoration: none; }
   .dl svg { width: 18px; height: 18px; flex-shrink: 0; }
   .dl:active { opacity: .85; }
+  .pay { margin-top: 14px; border-radius: 14px; padding: 14px; background: color-mix(in srgb, var(--gold) 12%, transparent);
+         border: 1px solid color-mix(in srgb, var(--gold) 38%, transparent); }
+  .pay.paid { background: var(--ok-bg); border-color: color-mix(in srgb, var(--ok) 35%, transparent); color: var(--ok); }
+  .pay.reported { background: color-mix(in srgb, var(--navy) 9%, transparent); border-color: color-mix(in srgb, var(--navy) 25%, transparent); }
+  .pay-done { display: flex; align-items: center; gap: 9px; font-weight: 800; font-size: 15px; }
+  .pay-done svg { width: 20px; height: 20px; flex-shrink: 0; }
+  .pay-rep b { display: block; font-size: 15px; color: var(--navy); }
+  .pay-rep span { display: block; margin-top: 4px; font-size: 14px; line-height: 1.6; }
+  .pay-rep small { display: block; margin-top: 4px; font-size: 12px; color: var(--muted); }
+  .pay-hint { margin: 0 0 12px; font-size: 14px; line-height: 1.6; }
+  .pay-note { margin: 0 0 10px; font-size: 13.5px; line-height: 1.6; font-weight: 700; color: var(--text); }
+  .pay form { margin: 0; }
+  summary.pay-btn { display: flex; align-items: center; justify-content: center; padding: 12px 16px; border-radius: 12px; cursor: pointer;
+                    border: 2px solid var(--navy); color: var(--navy); background: var(--card); font-weight: 800; font-size: 15px; list-style: none; }
+  summary.pay-btn::-webkit-details-marker { display: none; }
+  summary.pay-btn:active { opacity: .85; }
+  .pay-sure { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; font-size: 14px; line-height: 1.6; }
+  .pay-yes { padding: 13px 16px; border: 0; border-radius: 12px; background: var(--navy); color: #fff; font: inherit; font-weight: 800; font-size: 15px; cursor: pointer; }
+  .pay-yes:active { opacity: .85; }
+  @media (prefers-color-scheme: dark) { .pay-yes { color: #08203a; } }
   .foot { margin-top: 18px; text-align: center; font-size: 13px; color: var(--muted); line-height: 1.7; }
   .foot a { color: var(--navy); font-weight: 700; text-decoration: none; }
   .nf h1 { font-size: 20px; margin: 0 0 8px; }
@@ -23313,6 +23501,25 @@ TRACK_HTML = """<!DOCTYPE html>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12M12 16l-5-5M12 16l5-5"/><path d="M4 20h16"/></svg>
       {{ tx.download_invoice }}
     </a>
+    {% endif %}
+    {% if pay %}
+    <div class="pay {{ pay.state }}">
+      {% if pay.state == 'paid' %}
+      <div class="pay-done"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 12l3 3 5-6"/></svg>{{ tx.pay_done }}</div>
+      {% elif pay.state == 'reported' %}
+      <div class="pay-rep"><b>{{ tx.pay_reported_title }}</b><span>{{ tx.pay_reported }}</span>{% if pay.when %}<small>{{ pay.when }}</small>{% endif %}</div>
+      {% else %}
+      {% if pay.cleared %}<p class="pay-note">{{ tx.pay_cleared }}</p>{% endif %}
+      <p class="pay-hint">{{ tx.pay_hint }}</p>
+      <form method="post" action="/t/{{ token }}/paid">
+        <input type="hidden" name="lang" value="{{ lang }}">
+        <details>
+          <summary class="pay-btn">{{ tx.pay_btn }}</summary>
+          <div class="pay-sure"><span>{{ tx.pay_sure }}</span><button type="submit" class="pay-yes">{{ tx.pay_yes }}</button></div>
+        </details>
+      </form>
+      {% endif %}
+    </div>
     {% endif %}
     {% if updated %}<div class="updated">{{ tx.updated }}: {{ updated }}</div>{% endif %}
   </div>
@@ -24031,6 +24238,17 @@ PAGE_HTML = """
   .stag.req { background: color-mix(in srgb, var(--gold) 24%, transparent); color: #7a5200; cursor: default; }
   :root[data-theme="dark"] .stag.req { color: var(--gold); }
   .stag.req::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .cell-note { max-width: 100%; }
+  .cell-note .stag { height: auto; min-height: 22px; padding: 3px 9px; white-space: normal; line-height: 1.25; text-align: start; }
+  .stag.rdy { background: color-mix(in srgb, var(--navy-light) 16%, transparent); color: var(--navy); cursor: default; }
+  .stag.rdy::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .payrep { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 2px 4px 2px 8px; border-radius: 8px;
+            background: color-mix(in srgb, var(--gold) 24%, transparent); color: #7a5200; font-size: 11px; font-weight: 700; line-height: 1.3; }
+  :root[data-theme="dark"] .payrep { color: var(--gold); }
+  .payrep-t { min-width: 0; overflow-wrap: anywhere; }
+  .payrep-x { flex-shrink: 0; border: 0; border-radius: 6px; padding: 2px 7px; background: rgba(0,0,0,.08); color: inherit; font: inherit; font-size: 10.5px; cursor: pointer; }
+  .payrep-x:hover { background: rgba(0,0,0,.16); }
+  .payrep-x.arm { background: var(--danger); color: #fff; }
   .imp-wrap { display: flex; align-items: center; gap: 6px; max-width: 100%; }
   input.imp-input { width: 132px; max-width: 100%; border: 1px solid var(--border); background: transparent; color: var(--text);
                font-size: 11.5px; font-family: inherit; padding: 3px 7px; border-radius: 6px; font-variant-numeric: tabular-nums; box-shadow: none; }
@@ -24958,6 +25176,11 @@ function toggle(bl, field, value) {
         body: JSON.stringify({field, value})
       });
       ok = res.ok;
+      if (ok && field === 'approval_received' && value) {
+        const d = await res.json().catch(() => ({}));
+        if (d.gate === 'hold') showToast(t('hold_toast'), {duration: 6000});
+        else if (d.gate === 'ready') showToast(t('ready_toast'), {duration: 5000});
+      }
     } catch (e) { ok = false; }
     endWrite();
     if (!ok) showToast(t('could_not_save_retry'));
@@ -25013,6 +25236,14 @@ async function showHistory(bl) {
     const byUser = esc(e.by_user || t('unknown_user'));
     if (e.action === 'customer_download') {
       line = esc(t('history_customer_download'));
+    } else if (e.action === 'pay_reported') {
+      line = esc(t('history_pay_reported'));
+    } else if (e.action === 'do_ready') {
+      line = esc(t(e.new_value === 'payment_in' ? 'history_do_ready_pay' : 'history_do_ready_both'));
+    } else if (e.action === 'do_hold') {
+      line = `<b>${byUser}</b> ${esc(t('history_do_hold'))}`;
+    } else if (e.action === 'pay_cleared') {
+      line = `<b>${byUser}</b> ${esc(t('history_pay_cleared'))}`;
     } else if (e.action === 'toggle') {
       line = `<b>${byUser}</b> ${t('history_set_field', {field: esc(historyFieldLabel(e.field)), value: e.new_value ? t('yes') : t('no')})}`;
     } else if (e.action === 'remarks') {
@@ -25028,7 +25259,7 @@ async function showHistory(bl) {
     } else {
       line = `<b>${byUser}</b> ${esc(auditActionLabel(e.action))}`;
     }
-    const face = (e.by_user && e.action !== 'customer_download' && window.cpAvatar) ? cpAvatar(e.by_user, 20) : '';
+    const face = (e.by_user && e.action !== 'customer_download' && e.action !== 'pay_reported' && e.action !== 'do_ready' && window.cpAvatar) ? cpAvatar(e.by_user, 20) : '';
     return `<div class="history-row"><div>${face}${line}</div><div class="when">${esc(formatLocalTime(e.at))}</div></div>`;
   }).join('');
 }
@@ -25893,8 +26124,31 @@ function toggleGroup(key) {
 }
 
 // The Invoice cell carries the Paid tag; the DO cell carries Send / Sent.
+function payRepHtml(r) {
+  return `<div class="payrep" title="${esc(t('payrep_title', {time: formatLocalTime(r.pay_reported_at)}))}"><span class="payrep-t">${esc(t('payrep_tag'))}</span>` +
+    `<button type="button" class="payrep-x" title="${esc(t('payrep_clear_title'))}" onclick="clearPayReport(${jsq(r.bl_number)}, this)">${esc(t('payrep_clear'))}</button></div>`;
+}
+let payClearArmed = null, payClearTimer = null;
+function payClearDisarm(btn) {
+  if (payClearArmed === null) return;
+  payClearArmed = null; clearTimeout(payClearTimer);
+  if (btn && btn.isConnected) { btn.classList.remove('arm'); btn.textContent = t('payrep_clear'); }
+  markEditing(-1);
+}
+async function clearPayReport(bl, btn) {
+  if (payClearArmed !== bl) {              // first press arms it, the second one clears (a slip should not tell the other side anything)
+    payClearDisarm(null); payClearArmed = bl; btn.classList.add('arm'); btn.textContent = t('payrep_sure'); markEditing(1);
+    payClearTimer = setTimeout(() => payClearDisarm(btn), 4000);
+    return;
+  }
+  payClearDisarm(null);
+  let res = null;
+  try { res = await apiWrite('/api/records/' + encodeURIComponent(bl) + '/pay-report/clear', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}); } catch (e) { res = null; }
+  showToast(t(res && res.ok ? 'payrep_cleared_toast' : 'could_not_save_retry'));
+  fetchRecords(true);
+}
 function invoiceCell(r) {
-  let tag = '';
+  let tag = '', extra = '';
   if (r.invoice_issued) {
     if (r.paid) {
       const how = r.paid_via === 'receipt' ? t('paid_by_receipt') : r.paid_via === 'before' ? t('paid_before') : t('paid_by_hand');
@@ -25902,11 +26156,17 @@ function invoiceCell(r) {
       tag = `<button type="button" class="stag ok" title="${esc(how + when)}" onclick="toggle(${jsq(r.bl_number)}, 'paid', false)">${t('paid_tag')}</button>`;
     } else {
       tag = `<button type="button" class="stag todo" onclick="toggle(${jsq(r.bl_number)}, 'paid', true)">${t('mark_paid')}</button>`;
+      if (r.pay_reported_at) extra = payRepHtml(r);
     }
   } else if (r.inv_requested_at) {
     tag = `<span class="stag req" title="${esc(t('req_title', {user: r.inv_requested_by || '', time: formatLocalTime(r.inv_requested_at)}))}">${t('req_tag')}</span>`;
   }
-  return checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at, tag);
+  return checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at, tag, null, false, extra);
+}
+function approvalCell(r, only) {
+  // slid before the payment was verified: saved, and the DO team is told by itself once it is
+  const note = (r.approval_received && !r.paid && !r.do_issued) ? `<div class="cell-note"><span class="stag req" title="${esc(t('hold_title'))}">${t('hold_tag')}</span></div>` : '';
+  return checkbox(r.bl_number, 'approval_received', !!r.approval_received, r.approval_by, r.approval_at, '', null, only, note);
 }
 function doCell(r) {
   let tag = '', meta = null;
@@ -25922,10 +26182,11 @@ function doCell(r) {
       tag = `<button type="button" class="stag act" onclick="openSendDo(${jsq(r.bl_number)})"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>${t('send_tag')}</button>`;
     }
   }
-  return checkbox(r.bl_number, 'do_issued', !!r.do_issued, r.do_by, r.do_at, tag, meta);
+  const note = (!r.do_issued && r.approval_received && r.paid) ? `<div class="cell-note"><span class="stag rdy" title="${esc(t('ready_title'))}">${t('ready_tag')}</span></div>` : '';
+  return checkbox(r.bl_number, 'do_issued', !!r.do_issued, r.do_by, r.do_at, tag, meta, false, note);
 }
 
-function checkbox(bl, field, checked, by, at, tag, metaText, dis) {
+function checkbox(bl, field, checked, by, at, tag, metaText, dis, extra) {
   const id = bl + '_' + field;
   const sw = `<label class="switch">
         <input type="checkbox" id="${esc(id)}" ${checked ? 'checked' : ''} ${dis ? 'disabled' : ''}
@@ -25937,6 +26198,7 @@ function checkbox(bl, field, checked, by, at, tag, metaText, dis) {
     <div class="checkwrap">
       ${tag ? `<div class="sw-line">${sw}${tag}</div>` : sw}
       ${checked ? `<span class="meta" title="${esc(metaStr)}">${(!metaText && by && window.cpAvatar) ? cpAvatar(by, 16) : ''}${esc(metaStr)}</span>` : ''}
+      ${extra || ''}
     </div>`;
 }
 
@@ -26008,7 +26270,7 @@ function rowsHtml(list) {
         </div>
       </td>
       <td data-label="${t('th_invoice_issued')}">${invoiceCell(r)}</td>
-      <td data-label="${t('th_approval_received')}">${checkbox(r.bl_number, 'approval_received', !!r.approval_received, r.approval_by, r.approval_at, '', null, only)}</td>
+      <td data-label="${t('th_approval_received')}">${approvalCell(r, only)}</td>
       <td data-label="${t('th_do_issued')}">${doCell(r)}</td>
       <td data-label="${t('th_remarks')}"><input class="remarks-input" type="text" dir="${autoDir(r.remarks)}" value="${esc(r.remarks || '')}" ${only ? 'readonly' : ''}
             oninput="this.dir = autoDir(this.value); onRemarksInput(${jsq(r.bl_number)}, this.value)"
@@ -26107,8 +26369,10 @@ async function bulkSetField(vesselKey, field, value) {
     });
     if (res.ok) data = await res.json();
   } catch (e) { data = null; }
-  if (data && Array.isArray(data.updated)) showToast(t('bls_updated', {n: data.updated.length}));
-  else showToast(t('could_not_save_retry'));
+  if (data && Array.isArray(data.updated)) {
+    showToast(t('bls_updated', {n: data.updated.length}));
+    if (field === 'approval_received' && value && data.hold) showToast(t('hold_toast'), {duration: 6000});
+  } else showToast(t('could_not_save_retry'));
   await fetchRecords(true);
 }
 
