@@ -125,8 +125,8 @@ const I18N = {
     req_note: " - invoice requested", importer_saved: "Importer no. saved", operator_label: "Operator",
     history_requested: "asked the DO team for the invoice. Importer no. {value}", action_importer: "changed the importer no.",
     history_importer: 'set the importer no. to "{value}"', history_importer_cleared: "cleared the importer no.",
-    payrep_tag: "Payment reported, to verify", payrep_title: "The consignee reported on {time} that the invoice is paid. Check FASAH, then attach the paid invoice.",
-    payrep_clear: "Clear", payrep_sure: "Sure? Clear", payrep_clear_title: "Clear this report if there is no payment. The consignee's page will say we could not find it yet.",
+    verify_btn: "Verify", payrep_title: "The consignee reported on {time} that the invoice is paid. Check FASAH, then attach the paid invoice or press Verify.",
+    payrep_clear: "×", payrep_sure: "Clear?", payrep_clear_title: "Clear this report if there is no payment. The consignee's page will say we could not find it yet.",
     payrep_cleared_toast: "Payment report cleared.",
     hold_tag: "Awaiting payment", hold_title: "Approval is saved. The DO team will be told to issue the DO as soon as the payment is verified.",
     ready_tag: "Ready to issue", ready_title: "Approval received and payment verified. The DO can be issued.",
@@ -444,8 +444,8 @@ const I18N = {
     req_note: " - تم طلب الفاتورة", importer_saved: "تم حفظ رقم المستورد", operator_label: "المشغّل",
     history_requested: "طلب الفاتورة من فريق أمر التسليم. رقم المستورد {value}", action_importer: "غيّر رقم المستورد",
     history_importer: 'ضبط رقم المستورد على "{value}"', history_importer_cleared: "مسح رقم المستورد",
-    payrep_tag: "تم إبلاغ السداد، بانتظار التحقق", payrep_title: "أبلغ العميل في {time} أن الفاتورة مسددة. تحقق من فسح ثم أرفق الفاتورة المسددة.",
-    payrep_clear: "مسح", payrep_sure: "تأكيد المسح؟", payrep_clear_title: "امسح هذا البلاغ إذا لم يوجد سداد. ستعرض صفحة العميل أننا لم نعثر عليه بعد.",
+    verify_btn: "تحقق", payrep_title: "أبلغ العميل في {time} أن الفاتورة مسددة. تحقق من فسح ثم أرفق الفاتورة المسددة أو اضغط تحقق.",
+    payrep_clear: "×", payrep_sure: "مسح؟", payrep_clear_title: "امسح هذا البلاغ إذا لم يوجد سداد. ستعرض صفحة العميل أننا لم نعثر عليه بعد.",
     payrep_cleared_toast: "تم مسح بلاغ السداد.",
     hold_tag: "بانتظار السداد", hold_title: "تم حفظ الموافقة. سيُبلَّغ فريق أمر التسليم بإصدار أمر التسليم فور التحقق من السداد.",
     ready_tag: "جاهز للإصدار", ready_title: "تم استلام الموافقة والتحقق من السداد. يمكن إصدار أمر التسليم.",
@@ -10940,7 +10940,7 @@ TRACK_TEXT = {
         "pending": "Pending", "updated": "Last updated", "not_found_title": "Link not active",
         "download_invoice": "Download invoice (PDF)",
         "pay_hint": "After you have paid the invoice, press the button so that we can confirm your payment.",
-        "pay_btn": "I have paid", "pay_sure": "Please confirm that you have paid this invoice.", "pay_yes": "Yes, I have paid",
+        "pay_btn": "I have paid",
         "pay_reported_title": "Thank you. Payment reported.", "pay_reported": "We have noted that you paid and will confirm it shortly.",
         "pay_done": "Payment confirmed",
         "pay_cleared": "We could not find your payment yet. If you have already paid, please contact us.",
@@ -10964,7 +10964,7 @@ TRACK_TEXT = {
         "pending": "قيد الانتظار", "updated": "آخر تحديث", "not_found_title": "الرابط غير فعال",
         "download_invoice": "تحميل الفاتورة (PDF)",
         "pay_hint": "بعد سداد الفاتورة، اضغطوا الزر ليتسنى لنا تأكيد السداد.",
-        "pay_btn": "تم السداد", "pay_sure": "يرجى تأكيد أنكم سددتم هذه الفاتورة.", "pay_yes": "نعم، تم السداد",
+        "pay_btn": "تم السداد",
         "pay_reported_title": "شكرًا لكم. تم تسجيل إشعار السداد.", "pay_reported": "سنؤكد السداد قريبًا.",
         "pay_done": "تم تأكيد السداد",
         "pay_cleared": "لم نعثر على سدادكم بعد. إذا كنتم قد سددتم بالفعل، يرجى التواصل معنا.",
@@ -23437,14 +23437,10 @@ TRACK_HTML = """<!DOCTYPE html>
   .pay-hint { margin: 0 0 12px; font-size: 14px; line-height: 1.6; }
   .pay-note { margin: 0 0 10px; font-size: 13.5px; line-height: 1.6; font-weight: 700; color: var(--text); }
   .pay form { margin: 0; }
-  summary.pay-btn { display: flex; align-items: center; justify-content: center; padding: 12px 16px; border-radius: 12px; cursor: pointer;
-                    border: 2px solid var(--navy); color: var(--navy); background: var(--card); font-weight: 800; font-size: 15px; list-style: none; }
-  summary.pay-btn::-webkit-details-marker { display: none; }
-  summary.pay-btn:active { opacity: .85; }
-  .pay-sure { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; font-size: 14px; line-height: 1.6; }
-  .pay-yes { padding: 13px 16px; border: 0; border-radius: 12px; background: var(--navy); color: #fff; font: inherit; font-weight: 800; font-size: 15px; cursor: pointer; }
-  .pay-yes:active { opacity: .85; }
-  @media (prefers-color-scheme: dark) { .pay-yes { color: #08203a; } }
+  .pay-btn { display: block; width: 100%; padding: 13px 16px; border: 0; border-radius: 12px; background: var(--navy); color: #fff;
+             font: inherit; font-weight: 800; font-size: 15px; cursor: pointer; }
+  .pay-btn:active { opacity: .85; }
+  @media (prefers-color-scheme: dark) { .pay-btn { color: #08203a; } }
   .foot { margin-top: 18px; text-align: center; font-size: 13px; color: var(--muted); line-height: 1.7; }
   .foot a { color: var(--navy); font-weight: 700; text-decoration: none; }
   .nf h1 { font-size: 20px; margin: 0 0 8px; }
@@ -23513,10 +23509,7 @@ TRACK_HTML = """<!DOCTYPE html>
       <p class="pay-hint">{{ tx.pay_hint }}</p>
       <form method="post" action="/t/{{ token }}/paid">
         <input type="hidden" name="lang" value="{{ lang }}">
-        <details>
-          <summary class="pay-btn">{{ tx.pay_btn }}</summary>
-          <div class="pay-sure"><span>{{ tx.pay_sure }}</span><button type="submit" class="pay-yes">{{ tx.pay_yes }}</button></div>
-        </details>
+        <button type="submit" class="pay-btn">{{ tx.pay_btn }}</button>
       </form>
       {% endif %}
     </div>
@@ -24242,13 +24235,14 @@ PAGE_HTML = """
   .cell-note .stag { height: auto; min-height: 22px; padding: 3px 9px; white-space: normal; line-height: 1.25; text-align: start; }
   .stag.rdy { background: color-mix(in srgb, var(--navy-light) 16%, transparent); color: var(--navy); cursor: default; }
   .stag.rdy::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-  .payrep { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 2px 4px 2px 8px; border-radius: 8px;
-            background: color-mix(in srgb, var(--gold) 24%, transparent); color: #7a5200; font-size: 11px; font-weight: 700; line-height: 1.3; }
-  :root[data-theme="dark"] .payrep { color: var(--gold); }
-  .payrep-t { min-width: 0; overflow-wrap: anywhere; }
-  .payrep-x { flex-shrink: 0; border: 0; border-radius: 6px; padding: 2px 7px; background: rgba(0,0,0,.08); color: inherit; font: inherit; font-size: 10.5px; cursor: pointer; }
-  .payrep-x:hover { background: rgba(0,0,0,.16); }
-  .payrep-x.arm { background: var(--danger); color: #fff; }
+  .stag.verify { background: color-mix(in srgb, var(--gold) 26%, transparent); color: #7a5200; border-color: color-mix(in srgb, var(--gold) 55%, transparent); }
+  :root[data-theme="dark"] .stag.verify { color: var(--gold); }
+  .stag.verify::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .stag.verify:hover { filter: brightness(.95); }
+  .payrep-x { flex-shrink: 0; height: 22px; min-width: 22px; padding: 0 6px; border: 1px solid var(--border); border-radius: 999px; background: none;
+              color: var(--muted); font: inherit; font-size: 12px; line-height: 1; cursor: pointer; }
+  .payrep-x:hover { background: var(--bg); color: var(--danger); }
+  .payrep-x.arm { background: var(--danger); border-color: var(--danger); color: #fff; font-size: 11px; font-weight: 600; }
   .imp-wrap { display: flex; align-items: center; gap: 6px; max-width: 100%; }
   input.imp-input { width: 132px; max-width: 100%; border: 1px solid var(--border); background: transparent; color: var(--text);
                font-size: 11.5px; font-family: inherit; padding: 3px 7px; border-radius: 6px; font-variant-numeric: tabular-nums; box-shadow: none; }
@@ -26124,9 +26118,10 @@ function toggleGroup(key) {
 }
 
 // The Invoice cell carries the Paid tag; the DO cell carries Send / Sent.
-function payRepHtml(r) {
-  return `<div class="payrep" title="${esc(t('payrep_title', {time: formatLocalTime(r.pay_reported_at)}))}"><span class="payrep-t">${esc(t('payrep_tag'))}</span>` +
-    `<button type="button" class="payrep-x" title="${esc(t('payrep_clear_title'))}" onclick="clearPayReport(${jsq(r.bl_number)}, this)">${esc(t('payrep_clear'))}</button></div>`;
+// The consignee pressed "I have paid": the Mark paid button becomes a small Verify (same action: the payment has been checked), with a little x to clear a false report.
+function verifyTags(r) {
+  return `<button type="button" class="stag verify" title="${esc(t('payrep_title', {time: formatLocalTime(r.pay_reported_at)}))}" onclick="toggle(${jsq(r.bl_number)}, 'paid', true)">${t('verify_btn')}</button>` +
+    `<button type="button" class="payrep-x" title="${esc(t('payrep_clear_title'))}" aria-label="${esc(t('payrep_clear_title'))}" onclick="clearPayReport(${jsq(r.bl_number)}, this)">${esc(t('payrep_clear'))}</button>`;
 }
 let payClearArmed = null, payClearTimer = null;
 function payClearDisarm(btn) {
@@ -26148,20 +26143,20 @@ async function clearPayReport(bl, btn) {
   fetchRecords(true);
 }
 function invoiceCell(r) {
-  let tag = '', extra = '';
+  let tag = '';
   if (r.invoice_issued) {
     if (r.paid) {
       const how = r.paid_via === 'receipt' ? t('paid_by_receipt') : r.paid_via === 'before' ? t('paid_before') : t('paid_by_hand');
       const when = r.paid_at ? ' · ' + formatLocalTime(r.paid_at) : '';
       tag = `<button type="button" class="stag ok" title="${esc(how + when)}" onclick="toggle(${jsq(r.bl_number)}, 'paid', false)">${t('paid_tag')}</button>`;
     } else {
-      tag = `<button type="button" class="stag todo" onclick="toggle(${jsq(r.bl_number)}, 'paid', true)">${t('mark_paid')}</button>`;
-      if (r.pay_reported_at) extra = payRepHtml(r);
+      tag = r.pay_reported_at ? verifyTags(r)
+        : `<button type="button" class="stag todo" onclick="toggle(${jsq(r.bl_number)}, 'paid', true)">${t('mark_paid')}</button>`;
     }
   } else if (r.inv_requested_at) {
     tag = `<span class="stag req" title="${esc(t('req_title', {user: r.inv_requested_by || '', time: formatLocalTime(r.inv_requested_at)}))}">${t('req_tag')}</span>`;
   }
-  return checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at, tag, null, false, extra);
+  return checkbox(r.bl_number, 'invoice_issued', !!r.invoice_issued, r.invoice_by, r.invoice_at, tag);
 }
 function approvalCell(r, only) {
   // slid before the payment was verified: saved, and the DO team is told by itself once it is
