@@ -2209,13 +2209,25 @@ DESK_ICONS = {
     "operations": '<circle cx="12" cy="5" r="2"/><path d="M12 7v13"/><path d="M6 12h12"/><path d="M5 15c0 3 3 5 7 5s7-2 7-5"/>',
     "accounts": '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6"/>',
 }
+# Small picture for each tool, by its address (used for the tool chips on the home screen).
+TOOL_ICONS = {
+    "/manifest-desk": '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 5L2 7"/>',
+    "/do-tracker": '<rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2M12 11h4M12 16h4M8 11h.01M8 16h.01"/>',
+    "/sof": '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+    "/vessel-tracker": '<path d="M2 21c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1 .6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1M19.4 20A11.6 11.6 0 0 0 21 14l-9-4-9 4c0 2.9.9 5.3 2.8 7.8M19 13V7a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v6M12 10v4M12 2v3"/>',
+    "/direct-delivery": '<path d="M14 18V6a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v11a1 1 0 0 0 1 1h2M15 18H9M19 18h2a1 1 0 0 0 1-1v-3.65a1 1 0 0 0-.22-.62l-3.48-4.35A1 1 0 0 0 17.52 8H14"/><circle cx="17" cy="18" r="2"/><circle cx="7" cy="18" r="2"/>',
+    "/lineups": '<path d="M3 3v18h18M18 17V9M13 17V5M8 17v-3"/>',
+    "/kpi": '<path d="m12 14 4-4M3.34 19a10 10 0 1 1 17.32 0"/>',
+    "/jobs": '<path d="M16 20V4a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/><rect x="2" y="6" width="20" height="14" rx="2"/>',
+    "/pda": '<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><path d="M14 2v6h6M16 13H8M16 17H8"/>',
+}
 
 
 def _desks_for(feats):
     """Desks the person can open, each with only the tools their account has. Owner passes every feature."""
     out = []
     for key, name, blurb, tools in DESKS:
-        mine = [{"key": k, "name": n, "url": u} for k, n, u in tools if k in feats]
+        mine = [{"key": k, "name": n, "url": u, "icon": TOOL_ICONS.get(u, "")} for k, n, u in tools if k in feats]
         if mine:
             out.append({"key": key, "name": name, "blurb": blurb, "tools": mine, "icon": DESK_ICONS[key]})
     return out
@@ -2336,6 +2348,7 @@ _HDR_CSS = r"""
 @media (max-width:860px){.dh-tools{display:none}.dh-sec-tools{display:block}.dh-desk{position:static}.dh-dmenu{inset-inline:12px;width:auto;top:calc(100% - 6px)}}
 .dh-sec-lang{display:none}
 @media (max-width:600px){.dh-right>.lang-switch{display:none}.dh-sec-lang{display:block}.dh-sec-lang .lang-switch{display:inline-flex;margin:2px 10px 6px}}
+@media (max-width:560px){.dh-home .dh-brand-text .app-tag{display:none}}
 @media (max-width:440px){.dh{gap:8px;padding:0 12px}.dh-right{gap:6px}.dh-desk{margin-inline-start:0}.dh-chip .lbl{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}}
 @media print{.dh{display:none}}
 @view-transition{navigation:auto}
@@ -2384,6 +2397,7 @@ _HDR_JS = r"""
 """
 
 _DESK_ICO = '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">%s</svg>'
+_ALL_DESKS_ICON = '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/>'
 _HDR_I18N_TOOL = {"manifest": "hdr_tool_manifest", "do": "hdr_tool_do"}
 
 
@@ -2395,13 +2409,17 @@ def _desk_header_html(path, lang_switch=False):
     """The one header every page of a desk wears: Compass logo, the desk (a button that opens the list of desks),
     that desk's tools as a toggle, then language / theme / account. Built from the person's own features."""
     desks = _desks_for(_features())
-    key = _desk_of_path(path)
+    home = (path == "/")
+    key = None if home else _desk_of_path(path)
     cur = next((d for d in desks if d["key"] == key), None)
+    if home:
+        # The home screen ("Choose a desk") wears the same header; its desk button reads "All desks" and has no tools beside it.
+        cur = {"key": "all", "name": "All desks", "blurb": "", "tools": [], "icon": _ALL_DESKS_ICON}
     if not cur:
         return ""
     e = html_escape
     me = session.get("display_name") or session.get("username") or ""
-    on = lambda u: path == u or path.startswith(u + "/")
+    on = lambda u: (not home) and (path == u or path.startswith(u + "/"))
     tool_key = lambda t: _HDR_I18N_TOOL.get(t["key"])
     tools = "".join('<a href="%s"%s%s>%s</a>' % (e(t["url"]), ' aria-current="page"' if on(t["url"]) else "", _hdr_i(tool_key(t)), e(t["name"])) for t in cur["tools"])
     mtools = "".join('<a role="menuitem" href="%s"%s><span%s>%s</span>%s</a>' % (e(t["url"]), ' class="cur"' if on(t["url"]) else "", _hdr_i(tool_key(t)), e(t["name"]), "<i>&#10003;</i>" if on(t["url"]) else "") for t in cur["tools"])
@@ -2426,19 +2444,21 @@ def _desk_header_html(path, lang_switch=False):
     cur_tool = next((t for t in cur["tools"] if on(t["url"])), None)
     tag_name = cur_tool["name"] if cur_tool else cur["name"]
     tag_i18n = _hdr_i(tool_key(cur_tool) if cur_tool else "hdr_desk_" + cur["key"])
+    if home:
+        tag_name, tag_i18n = "Sea Power Marine Services Co. Ltd", ""
     spec = ('<script type="speculationrules">' + json.dumps({"prerender": [{"where": {"href_matches": others}, "eagerness": "moderate"}]}) + '</script>') if others else ""
     chev = '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>'
     return (
-        '<header class="dh" id="dh">'
+        '<header class="dh' + (' dh-home' if home else '') + '" id="dh">'
         '<a href="/" class="dh-brand" aria-label="Compass, all desks"><img src="data:image/png;base64,' + LOGO_B64 + '" alt="Sea Power"><div class="dh-brand-text"><span class="app-name">Compass</span><span class="app-tag"' + tag_i18n + '>' + e(tag_name) + '</span></div></a>'
         '<div class="dh-desk">'
         '<button type="button" class="dh-chip" id="dhDeskBtn" aria-haspopup="menu" aria-expanded="false" aria-controls="dhDeskMenu">' + (_DESK_ICO % cur["icon"]) +
-        '<span class="lbl" data-i18n="hdr_desk_' + cur["key"] + '">' + e(cur["name"]) + '</span>' + chev + '</button>'
-        '<nav class="dh-tools" aria-label="' + e(cur["name"]) + '">' + tools + '</nav>'
+        '<span class="lbl" data-i18n="hdr_' + ("all_desks" if home else "desk_" + cur["key"]) + '">' + e(cur["name"]) + '</span>' + chev + '</button>'
+        + ('' if home else '<nav class="dh-tools" aria-label="' + e(cur["name"]) + '">' + tools + '</nav>') +
         '<div class="dh-panel dh-dmenu" id="dhDeskMenu" role="menu" hidden>'
-        '<div class="dh-sec-tools"><div class="dh-h" data-i18n="hdr_in_desk">In this desk</div>' + mtools + '<hr></div>'
-        '<div class="dh-h" data-i18n="hdr_your_desks">Your desks</div>' + mdesks +
-        '<hr><a role="menuitem" href="/" data-i18n="hdr_all_desks">All desks</a></div>'
+        + ('' if home else '<div class="dh-sec-tools"><div class="dh-h" data-i18n="hdr_in_desk">In this desk</div>' + mtools + '<hr></div>') +
+        '<div class="dh-h" data-i18n="hdr_your_desks">Your desks</div>' + mdesks
+        + ('</div>' if home else '<hr><a role="menuitem" href="/" data-i18n="hdr_all_desks">All desks</a></div>') +
         '</div>'
         '<span class="dh-spacer"></span>'
         '<div class="dh-right">' + lang + theme +
@@ -3155,7 +3175,7 @@ def logout():
 @app.route("/")
 @login_required
 def index():
-    return render_template_string(HUB_HTML, username=session.get("username"), role=session.get("role"), desks=_desks_for(_features()))
+    return render_template_string(HUB_HTML, username=session.get("username"), role=session.get("role"), desks=_desks_for(_features()), hdr_html=_desk_header_html("/"))
 
 
 @app.route("/do-tracker")
@@ -17686,6 +17706,13 @@ HUB_HTML = """
     --navy: #123a56; --navy-deep: #0b2740; --navy-light: #1f5c85; --gold: #c9a227; --gold-light: #e0bd53;
     --shadow-sm: 0 1px 2px rgba(18,58,86,0.05);
     --shadow-md: 0 10px 30px rgba(18,58,86,0.10);
+    /* home screen only */
+    --soft: #5b6b80; --chip: #eef1f5; --line: #e3e7ec; --gold-text: #8a6209; --accent: #1f6fa8;
+    --btn: #123a56; --btn-text: #ffffff; --btn-shadow: 0 8px 18px rgba(18,58,86,.22);
+    --glow1: rgba(31,111,168,.11); --glow2: rgba(201,160,36,.11);
+    --row-shadow: 0 1px 2px rgba(16,32,52,.05), 0 14px 32px rgba(16,32,52,.07);
+    --row-shadow-hover: 0 2px 4px rgba(16,32,52,.06), 0 20px 40px rgba(16,32,52,.11);
+    --h-manifest: #2f86cc; --h-operations: #1f9a8a; --h-accounts: #c58a14;
     color-scheme: light;
   }
   :root[data-theme="dark"] {
@@ -17693,31 +17720,24 @@ HUB_HTML = """
     --navy: #3f86ba; --navy-deep: #274a67; --navy-light: #5aa2d1; --gold: #e3bb4c; --gold-light: #f0cf72;
     --shadow-sm: 0 1px 2px rgba(0,0,0,0.25);
     --shadow-md: 0 10px 30px rgba(0,0,0,0.35);
+    --soft: #9aabbf; --chip: rgba(255,255,255,.07); --line: rgba(255,255,255,.09); --gold-text: #e3b94d; --accent: #63aee6;
+    --btn: #2f78b0; --btn-text: #ffffff; --btn-shadow: 0 8px 20px rgba(0,0,0,.35);
+    --glow1: rgba(63,140,196,.16); --glow2: rgba(227,185,77,.06);
+    --row-shadow: 0 1px 0 rgba(255,255,255,.05) inset, 0 18px 40px rgba(0,0,0,.34);
+    --row-shadow-hover: 0 1px 0 rgba(255,255,255,.07) inset, 0 24px 48px rgba(0,0,0,.42);
+    --h-manifest: #5aaee8; --h-operations: #34c0ad; --h-accounts: #e3b94d;
     color-scheme: dark;
   }
   * { box-sizing: border-box; }
+  html { height: 100%; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif;
-    background: var(--bg); color: var(--text); margin: 0; padding: 0 16px 48px;
+    background: var(--bg); color: var(--text); margin: 0; padding: 0;
     transition: background-color .25s ease, color .25s ease;
   }
-  .topbar {
-    position: sticky; top: 0; z-index: 50; display: flex; justify-content: space-between; align-items: center;
-    gap: 12px; flex-wrap: wrap; padding: 14px 16px; margin: 0 -16px 20px;
-    background: color-mix(in srgb, var(--bg) 86%, transparent);
-    backdrop-filter: saturate(180%) blur(14px); -webkit-backdrop-filter: saturate(180%) blur(14px);
-    border-bottom: 1px solid var(--border);
-  }
-  .brand { display: flex; align-items: center; gap: 10px; }
-  .brand img { height: 32px; width: auto; }
-  .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
-  .brand-text .app-name { font-size: 14.5px; font-weight: 700; color: var(--text); }
-  .brand-text .app-tag { font-size: 11px; color: var(--muted); }
-  .topbar-right { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
-  .topbar-right a { color: var(--navy); text-decoration: none; font-weight: 600; font-size: 13px; padding: 6px 12px; border-radius: 20px; transition: background .15s ease; }
-  :root[data-theme="dark"] .topbar-right a { color: var(--navy-light); }
-  .topbar-right a:hover { background: var(--border); }
+  body.hub { display: flex; flex-direction: column; min-height: 100vh; min-height: 100dvh; }
 
+  /* the theme switch (the shared header places it) */
   .theme-switch { position: relative; display: inline-flex; width: 54px; height: 29px; cursor: pointer; }
   .theme-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
   .theme-track { position: absolute; inset: 0; border-radius: 999px; display: flex; align-items: center; justify-content: space-between; padding: 0 7px; background: linear-gradient(135deg,#8fcaf0,#f4d58d); transition: background .3s ease; }
@@ -17727,133 +17747,117 @@ HUB_HTML = """
   .theme-knob { position: absolute; top: 3px; left: 3px; width: 23px; height: 23px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.3); transition: transform .3s cubic-bezier(.4,0,.2,1); }
   input:checked + .theme-track .theme-knob { transform: translateX(25px); background: #0b2740; }
 
-  .hero { padding: 28px 4px 8px; }
-  .hero .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--gold); margin-bottom: 6px; }
-  :root[data-theme="dark"] .hero .eyebrow { color: var(--gold-light); }
-  .hero h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -0.01em; }
-  .hero p { color: var(--muted); margin: 0; font-size: 14.5px; }
+  /* ---- Choose a desk ---- */
+  .page { --rowmax: clamp(190px, 21vh, 250px); flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0;
+    padding: clamp(24px, 5vh, 52px) clamp(16px, 5vw, 72px) clamp(20px, 4vh, 40px);
+    background: radial-gradient(900px 440px at 10% -10%, var(--glow1), transparent 70%), radial-gradient(760px 400px at 100% 105%, var(--glow2), transparent 70%); }
+  .inner { width: 100%; max-width: clamp(1280px, 62vw, 1680px); margin: 0 auto; display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+  .hero .eyebrow { font-size: 12px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; color: var(--gold-text); }
+  .hero h1 { margin: 8px 0 6px; font-size: clamp(30px, 4.4vw, 42px); line-height: 1.1; font-weight: 800; letter-spacing: -.025em; }
+  .hero p { margin: 0; font-size: 16px; color: var(--soft); }
 
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; margin-top: 24px; }
-  .tile {
-    display: flex; flex-direction: column; gap: 12px; background: var(--card); border: 1px solid var(--border);
-    border-radius: 18px; padding: 20px; text-decoration: none; color: var(--text); box-shadow: var(--shadow-sm);
+  .rows { flex: 1 1 0; min-height: 0; max-height: calc(3 * var(--rowmax) + 28px); display: flex; flex-direction: column; gap: 14px; margin-top: clamp(18px, 3.4vh, 32px); }
+  .row { --hue: var(--accent); position: relative; flex: 1 1 0; min-height: 104px; max-height: var(--rowmax);
+    display: grid; grid-template-columns: 62px minmax(190px, 250px) minmax(0, 1fr) auto; align-items: center; gap: 26px; padding: 0 28px;
+    border-radius: 24px; border: 1px solid var(--line); box-shadow: var(--row-shadow);
+    background: linear-gradient(90deg, color-mix(in srgb, var(--hue) 13%, transparent), transparent 46%), var(--card);
     transition: transform .18s cubic-bezier(.16,1,.3,1), box-shadow .18s ease, border-color .18s ease;
-    animation: tile-in .5s cubic-bezier(.16,1,.3,1) both;
-  }
-  .tile:hover { transform: translateY(-3px); box-shadow: var(--shadow-md); border-color: var(--navy-light); }
-  .tile:active { transform: translateY(-1px) scale(.99); }
-  @keyframes tile-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-  .tile .tile-icon {
-    width: 44px; height: 44px; border-radius: 13px; display: flex; align-items: center; justify-content: center;
-    background: color-mix(in srgb, var(--navy) 12%, transparent); color: var(--navy);
-  }
-  :root[data-theme="dark"] .tile .tile-icon { color: var(--navy-light); background: color-mix(in srgb, var(--navy-light) 18%, transparent); }
-  .tile .tile-icon svg { width: 22px; height: 22px; }
-  .tile h3 { margin: 0; font-size: 16px; font-weight: 700; }
-  .tile p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
-  .tile .tile-go { margin-top: auto; font-size: 12.5px; font-weight: 700; color: var(--navy); display: flex; align-items: center; gap: 4px; }
-  :root[data-theme="dark"] .tile .tile-go { color: var(--navy-light); }
-  .tile .tile-go svg { width: 13px; height: 13px; transition: transform .18s ease; }
-  .tile:hover .tile-go svg { transform: translateX(3px); }
+    animation: row-in .5s cubic-bezier(.16,1,.3,1) both; animation-delay: calc(var(--i, 0) * 70ms); }
+  .row:hover { transform: translateY(-2px); box-shadow: var(--row-shadow-hover); border-color: color-mix(in srgb, var(--hue) 30%, var(--line)); }
+  .row[data-desk="manifest"] { --hue: var(--h-manifest); }
+  .row[data-desk="operations"] { --hue: var(--h-operations); }
+  .row[data-desk="accounts"] { --hue: var(--h-accounts); }
+  @keyframes row-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+  .dk-ico { width: 62px; height: 62px; border-radius: 19px; display: grid; place-items: center; color: #fff;
+    background: linear-gradient(150deg, color-mix(in srgb, var(--hue) 72%, #fff), var(--hue));
+    box-shadow: 0 10px 22px color-mix(in srgb, var(--hue) 34%, transparent), inset 0 1px 0 rgba(255,255,255,.4); }
+  :root[data-theme="dark"] .dk-ico { color: #0b1620; }
+  .dk-ico svg { width: 29px; height: 29px; }
+  .meta { min-width: 0; }
+  .row h2 { margin: 0 0 4px; font-size: 24px; line-height: 1.15; font-weight: 800; letter-spacing: -.02em; }
+  .row-link { color: inherit; text-decoration: none; }
+  /* the whole row opens the desk; the tool chips and the button sit above it */
+  .row-link::after { content: ""; position: absolute; inset: 0; border-radius: 24px; }
+  .row-link:focus-visible { outline: none; }
+  .row-link:focus-visible::after { outline: 2px solid var(--navy-light); outline-offset: 2px; }
+  .row .desc { margin: 0; font-size: 14.5px; color: var(--soft); }
+  .count { display: inline-block; margin-top: 10px; padding: 5px 10px; border-radius: 999px; background: var(--chip); color: var(--soft); font-size: 11px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+  .tools { display: flex; flex-wrap: wrap; gap: 10px; min-width: 0; }
+  .tools a { position: relative; z-index: 2; display: inline-flex; align-items: center; gap: 9px; height: 42px; padding: 0 16px 0 13px; border-radius: 14px;
+    background: var(--chip); border: 1px solid var(--line); color: var(--text); text-decoration: none; font-size: 14.5px; font-weight: 600; white-space: nowrap;
+    transition: background .15s ease, border-color .15s ease, transform .15s ease; }
+  .tools a svg { width: 17px; height: 17px; color: var(--hue); flex: none; }
+  .tools a:hover { background: color-mix(in srgb, var(--hue) 14%, var(--card)); border-color: color-mix(in srgb, var(--hue) 45%, transparent); }
+  .tools a:focus-visible, .open:focus-visible, .strip:focus-visible { outline: 2px solid var(--navy-light); outline-offset: 2px; }
+  .open { position: relative; z-index: 2; display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 48px; padding: 0 22px; border-radius: 15px; flex: none;
+    background: var(--btn); color: var(--btn-text); text-decoration: none; font-size: 15px; font-weight: 700; white-space: nowrap; box-shadow: var(--btn-shadow); transition: transform .15s ease, filter .15s ease; }
+  .open:hover { filter: brightness(1.08); }
+  .open svg { width: 17px; height: 17px; transition: transform .18s ease; }
+  .open:hover svg { transform: translateX(3px); }
 
-  .tile.soon { opacity: .55; cursor: default; }
-  .tile.soon:hover { transform: none; box-shadow: var(--shadow-sm); border-color: var(--border); }
-  .tile.soon .tile-go { color: var(--muted); }
-  .soon-pill { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); background: color-mix(in srgb, var(--border) 60%, transparent); padding: 2px 8px; border-radius: 999px; align-self: flex-start; }
-  html, body { height: 100%; }
-  body.hub { display: flex; flex-direction: column; min-height: 100vh; min-height: 100dvh; padding-bottom: clamp(12px, 2.4vh, 28px); }
-  .hub .hero { padding: clamp(6px, 2.4vh, 28px) 4px 0; }
-  .hub .hero h1 { font-size: clamp(24px, 4.4vh, 38px); letter-spacing: -.03em; margin-bottom: 4px; }
-  .hub .hero p { font-size: clamp(13px, 2vh, 16px); }
-  .hub .hero .eyebrow { margin-bottom: 4px; }
-  .hub .hero, .hub .hubmain { width: 100%; max-width: 1320px; margin-left: auto; margin-right: auto; }
-  .hubmain { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: clamp(10px, 2vh, 20px); padding-top: clamp(12px, 2.6vh, 28px); }
-  .desks { flex: 1 1 0; max-height: 560px; min-height: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: clamp(12px, 2vh, 22px); }
-  .desk { display: flex; flex-direction: column; gap: clamp(8px, 1.8vh, 18px); padding: clamp(16px, 3vh, 28px); border-radius: 24px; text-decoration: none; color: var(--text); min-height: 0; overflow: hidden;
-    background: var(--card); border: 1px solid var(--border); box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 14px 36px rgba(0,0,0,.06);
-    transition: transform .18s cubic-bezier(.16,1,.3,1), box-shadow .18s ease; animation: tile-in .5s cubic-bezier(.16,1,.3,1) both; }
-  .desk:hover { transform: translateY(-3px); box-shadow: 0 2px 4px rgba(0,0,0,.05), 0 20px 44px rgba(0,0,0,.09); }
-  .desk-top { display: flex; align-items: center; justify-content: space-between; }
-  .desk-icon { width: clamp(38px, 6vh, 52px); height: clamp(38px, 6vh, 52px); border-radius: 16px; display: flex; align-items: center; justify-content: center;
-    background: color-mix(in srgb, var(--navy) 10%, transparent); color: var(--navy); }
-  :root[data-theme="dark"] .desk-icon { color: var(--navy-light); background: color-mix(in srgb, var(--navy-light) 18%, transparent); }
-  .desk-icon svg { width: 50%; height: 50%; }
-  .desk-count { font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); background: color-mix(in srgb, var(--border) 70%, transparent); padding: 4px 10px; border-radius: 999px; }
-  .desk-name { font-size: clamp(18px, 3.4vh, 24px); font-weight: 700; letter-spacing: -.025em; }
-  .desk-blurb { margin-top: 2px; font-size: clamp(12.5px, 1.9vh, 14px); color: var(--muted); }
-  .desk-tools { display: flex; flex-direction: column; min-height: 0; }
-  .desk-tool { padding: clamp(5px, 1.2vh, 10px) 0; border-top: 1px solid var(--border); font-size: clamp(12.5px, 1.9vh, 14px); }
-  .desk-open { align-self: flex-start; margin-top: auto; padding: clamp(7px, 1.2vh, 10px) 20px; border-radius: 999px; background: var(--navy); color: #fff; font-size: 14px; font-weight: 600; box-shadow: 0 6px 16px rgba(15,58,92,.25); }
-  :root[data-theme="dark"] .desk-open { background: var(--navy-light); color: #0b2740; }
-  .extras { flex: 0 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: clamp(12px, 2vh, 22px); }
-  .extras .desk { flex-direction: row; align-items: center; justify-content: space-between; padding: clamp(12px, 2.2vh, 22px) 26px; }
-  .extras .desk-name { font-size: 17px; }
-  @media (max-height: 700px) { .desk-blurb, .hub .hero p { display: none; } }
-  @media (max-width: 700px) {
-    .desks { flex: 0 0 auto; }
-    .desk { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 14px; padding: 16px 18px; overflow: visible; }
-    .desk-top { display: contents; }
-    .desk-icon { order: 0; width: 44px; height: 44px; }
-    .desk-top + div { order: 1; min-width: 0; }
-    .desk-count { order: 2; }
-    .desk-tools, .desk-open { display: none; }
-    .extras .desk { display: flex; }
+  .strips { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; margin-top: 24px; }
+  .strip { display: flex; align-items: center; gap: 14px; min-height: 78px; padding: 12px 22px; border-radius: 22px; background: var(--card); border: 1px solid var(--line);
+    box-shadow: var(--row-shadow); color: var(--text); text-decoration: none; transition: transform .18s cubic-bezier(.16,1,.3,1), box-shadow .18s ease; }
+  .strip:hover { transform: translateY(-2px); box-shadow: var(--row-shadow-hover); }
+  .strip .tile { width: 42px; height: 42px; border-radius: 13px; display: grid; place-items: center; background: var(--chip); color: var(--accent); flex: none; }
+  .strip .tile svg { width: 20px; height: 20px; }
+  .strip .txt { min-width: 0; }
+  .strip b { display: block; font-size: 17px; font-weight: 700; letter-spacing: -.01em; }
+  .strip small { display: block; margin-top: 2px; font-size: 13.5px; color: var(--soft); }
+  .owner { margin-inline-start: auto; padding: 6px 12px; border-radius: 999px; background: color-mix(in srgb, var(--gold-text) 16%, transparent); color: var(--gold-text); font-size: 11px; font-weight: 800; letter-spacing: .1em; flex: none; }
+  .empty { color: var(--soft); margin: 8px 0 0; font-size: 15px; }
+
+  @media (max-width: 1040px) {
+    .rows { flex: 0 0 auto; max-height: none; }
+    .row { flex: none; max-height: none; grid-template-columns: 62px minmax(0, 1fr) auto; row-gap: 16px; padding: 22px 24px; }
+    .row .dk-ico { grid-column: 1; grid-row: 1; }
+    .row .meta { grid-column: 2; grid-row: 1; }
+    .row .open { grid-column: 3; grid-row: 1; }
+    .row .tools { grid-column: 1 / -1; grid-row: 2; }
   }
-  @media (max-width: 700px) and (max-height: 700px) { .desk { padding: 10px 16px; } .extras .desk { padding: 9px 18px; } .desk-icon { width: 38px; height: 38px; } .hub .hero { padding-top: 0; } }
+  @media (max-width: 640px) {
+    .row { grid-template-columns: 52px minmax(0, 1fr); gap: 14px; padding: 18px; border-radius: 20px; }
+    .row-link::after { border-radius: 20px; }
+    .dk-ico { width: 52px; height: 52px; border-radius: 16px; }
+    .dk-ico svg { width: 25px; height: 25px; }
+    .row h2 { font-size: 21px; }
+    .row .tools { grid-row: 2; gap: 8px; }
+    .tools a { height: 38px; font-size: 13.5px; padding: 0 13px 0 11px; gap: 7px; }
+    .row .open { grid-column: 1 / -1; grid-row: 3; width: 100%; }
+    .strips { grid-template-columns: 1fr; gap: 12px; }
+    .strip { padding: 12px 16px; }
+  }
+  @media (prefers-reduced-motion: reduce) { .row { animation: none; } .row, .strip, .open svg { transition: none; } }
+  @media print { .page { background: none; } }
 </style>
+<style>""" + _HDR_CSS + """</style>
 </head><body class="hub">
-  <div class="topbar">
-    <a href="/" class="brand" style="text-decoration:none;">
-      <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
-      <div class="brand-text">
-        <span class="app-name">Compass</span>
-        <span class="app-tag">Sea Power Marine Services Co. Ltd</span>
-      </div>
-    </a>
-    <div class="topbar-right">
-      <label class="theme-switch" title="Toggle dark mode">
-        <input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')">
-        <span class="theme-track">
-          <span class="theme-icon sun">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg>
-          </span>
-          <span class="theme-icon moon">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg>
-          </span>
-          <span class="theme-knob"></span>
-        </span>
-      </label>
-      
-      <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
-      <a href="/logout">Log out</a>
-    </div>
-  </div>
-
+{{ hdr_html|safe }}
+<main class="page"><div class="inner">
   <div class="hero">
     <div class="eyebrow">Welcome, {{ first_name }}</div>
     <h1>Choose a desk</h1>
     <p>Each desk holds the tools for one team.</p>
   </div>
 
-  <div class="hubmain">
-  <div class="desks">
-{% if not desks %}<p style="color:var(--muted);">Nothing is switched on for your account yet. Ask the Owner.</p>{% endif %}
+  <div class="rows">
+{% if not desks %}<p class="empty">Nothing is switched on for your account yet. Ask the Owner.</p>{% endif %}
 {% for d in desks %}
-    <a class="desk" href="{{ d.tools[0].url }}">
-      <div class="desk-top"><span class="desk-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">{{ d.icon|safe }}</svg></span><span class="desk-count">{{ d.tools|length }} tool{{ '' if d.tools|length == 1 else 's' }}</span></div>
-      <div><div class="desk-name">{{ d.name }}</div><div class="desk-blurb">{{ d.blurb }}</div></div>
-      <div class="desk-tools">{% for t in d.tools %}<span class="desk-tool">{{ t.name }}</span>{% endfor %}</div>
-      <span class="desk-open">Open desk</span>
-    </a>
+    <section class="row" data-desk="{{ d.key }}" style="--i:{{ loop.index0 }}">
+      <span class="dk-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{{ d.icon|safe }}</svg></span>
+      <div class="meta"><h2><a class="row-link" href="{{ d.tools[0].url }}">{{ d.name }}</a></h2><p class="desc">{{ d.blurb }}</p><span class="count">{{ d.tools|length }} tool{{ '' if d.tools|length == 1 else 's' }}</span></div>
+      <div class="tools">{% for t in d.tools %}<a href="{{ t.url }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{{ t.icon|safe }}</svg>{{ t.name }}</a>{% endfor %}</div>
+      <a class="open" href="{{ d.tools[0].url }}">Open desk<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+    </section>
 {% endfor %}
   </div>
 {% if role == 'owner' %}
-  <div class="extras">
-    <a class="desk" href="/learned"><span><span class="desk-name">Learning room</span><span class="desk-blurb" style="display:block;">What Compass learned, and where it still needs help</span></span><span class="desk-count">Owner</span></a>
-    <a class="desk" href="/users"><span><span class="desk-name">Admin</span><span class="desk-blurb" style="display:block;">Users, desks and settings</span></span><span class="desk-count">Owner</span></a>
+  <div class="strips">
+    <a class="strip" href="/learned"><span class="tile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2zM22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></span><span class="txt"><b>Learning room</b><small>What Compass learned, and where it still needs help</small></span><span class="owner">OWNER</span></a>
+    <a class="strip" href="/users"><span class="tile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span><span class="txt"><b>Admin</b><small>Users, desks and settings</small></span><span class="owner">OWNER</span></a>
   </div>
 {% endif %}
-  </div>
+</div></main>
 
 <script>
 (function initTheme() {
@@ -17871,6 +17875,7 @@ function setTheme(mode) {
   try { localStorage.setItem('theme', mode); } catch (e) {}
 }
 </script>
+<script>""" + _HDR_JS + """</script>
 </body></html>
 """
 
