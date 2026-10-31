@@ -2836,7 +2836,7 @@ def _desk_header_html(path, lang_switch=False):
     that desk's tools as a toggle, then language / theme / account. Built from the person's own features."""
     desks = _desks_for(_features())
     home = (path == "/")
-    admin = (path == "/users")
+    admin = path in ("/users", "/learned")
     key = None if home else _desk_of_path(path)
     cur = next((d for d in desks if d["key"] == key), None)
     if admin:
@@ -8165,7 +8165,7 @@ def memory_cargo():
 def learned_page():
     if not _is_owner():
         return redirect("/")
-    page = LEARNED_HTML.replace("__NAME__", html.escape(session.get("display_name") or session.get("username") or "", quote=True))
+    page = LEARNED_HTML.replace("__HDR__", _desk_header_html("/learned"))
     return Response(page, mimetype="text/html")
 
 
@@ -17329,73 +17329,150 @@ if (location.hash === '#add') toggleAdd(true);
 </body></html>
 """
 
-LEARNED_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+LEARNED_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Compass - Learning room</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + FAVICON_B64 + r"""">
 <style>
-  :root { --bg: #f2f4f7; --card: #ffffff; --text: #1c2b3a; --muted: #5f6d7b; --border: #e6e9ed; --navy: #123a56; --navy-light: #1f5c85; --gold: #d9b24c; --ok: #1f7a54; --warn: #8a5a00; --seg: #e6e9ed; color-scheme: light; }
-  :root[data-theme="dark"] { --bg: #131a23; --card: #1a232f; --text: #e9eef3; --muted: #a3b0be; --border: #29323f; --navy: #3f86ba; --navy-light: #5aa2d1; --gold: #e3bb4c; --ok: #43c08a; --warn: #e0a640; --seg: #29323f; color-scheme: dark; }
+  :root {
+    --bg: #f2f4f7; --card: #ffffff; --text: #1c2b3a; --muted: #7a8794; --border: #e6e9ed;
+    --navy: #123a56; --navy-deep: #0b2740; --navy-light: #1f5c85; --gold: #c9a227;
+    --soft: #5b6b80; --chip: #eef1f5; --line: #e3e7ec; --gold-text: #8a6209; --accent: #1f6fa8;
+    --btn: #123a56; --btn-text: #ffffff;
+    --glow1: rgba(31,111,168,.11); --glow2: rgba(201,160,36,.11);
+    --row-shadow: 0 1px 2px rgba(16,32,52,.05), 0 14px 32px rgba(16,32,52,.07);
+    --edge: color-mix(in srgb, #5b6b80 50%, transparent);
+    --ok: #176b45; --warn: #8a5a00; --danger-solid: #b3261e; --bar-a: #123a56; --bar-b: #d9a521;
+    --h-blue: #2f86cc; --h-green: #1f9a6a; --h-gold: #c58a14; --h-orange: #d9822b;
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --bg: #131a23; --card: #1a232f; --text: #e9eef3; --muted: #93a1b1; --border: #29323f;
+    --navy: #3f86ba; --navy-deep: #274a67; --navy-light: #5aa2d1; --gold: #e3bb4c;
+    --soft: #9aabbf; --chip: rgba(255,255,255,.07); --line: rgba(255,255,255,.09); --gold-text: #e3b94d; --accent: #63aee6;
+    --btn: #2f78b0; --btn-text: #ffffff;
+    --glow1: rgba(63,140,196,.16); --glow2: rgba(227,185,77,.06);
+    --row-shadow: 0 1px 0 rgba(255,255,255,.05) inset, 0 18px 40px rgba(0,0,0,.34);
+    --edge: color-mix(in srgb, #9aabbf 45%, transparent);
+    --ok: #43c08a; --warn: #e0a640; --danger-solid: #c0392f; --bar-a: #5aa2d1; --bar-b: #e3bb4c;
+    --h-blue: #5aaee8; --h-green: #43c08a; --h-gold: #e3b94d; --h-orange: #eba14f;
+    color-scheme: dark;
+  }
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", Inter, "Segoe UI", Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0 16px 48px; -webkit-font-smoothing: antialiased; }
-  .topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 14px 16px; margin: 0 -16px 24px; border-bottom: 1px solid var(--border); }
-  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--text); }
-  .brand img { height: 32px; width: auto; }
-  .brand b { font-size: 14.5px; display: block; } .brand small { font-size: 11px; color: var(--muted); }
-  .topbar-right { display: flex; align-items: center; gap: 6px; font-size: 13px; flex-wrap: wrap; }
-  .topbar-right a { color: var(--navy-light); text-decoration: none; font-weight: 600; padding: 6px 12px; border-radius: 20px; }
-  .topbar-right a:hover { background: var(--border); }
-  .wrap { max-width: 1120px; margin: 0 auto; }
-  .head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }
-  h1 { font-size: 40px; margin: 0; letter-spacing: -.035em; line-height: 1.05; font-weight: 700; }
-  .sub { color: var(--muted); font-size: 16px; margin-top: 8px; max-width: 58ch; }
-  .seg { display: flex; padding: 3px; border-radius: 999px; background: var(--seg); overflow-x: auto; max-width: 100%; }
-  .seg button { height: 32px; padding: 0 15px; border: 0; border-radius: 999px; background: transparent; color: var(--muted); font: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer; white-space: nowrap; }
-  .seg button.on { background: var(--card); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.15); }
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 16px; margin-bottom: 18px; }
-  .card { background: var(--card); border-radius: 22px; box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 14px 36px rgba(0,0,0,.06); padding: 22px 26px; min-width: 0; }
-  .stat b { display: block; font-size: 38px; letter-spacing: -.03em; line-height: 1.1; font-variant-numeric: tabular-nums; }
-  .eyebrow { font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); display: block; margin-bottom: 4px; }
-  .stat small { color: var(--muted); font-size: 13px; }
-  h2 { font-size: 20px; margin: 0; letter-spacing: -.02em; }
-  .ph { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding-bottom: 8px; }
-  .muted { color: var(--muted); font-size: 13px; }
-  .barrow { display: grid; grid-template-columns: 150px 1fr 110px; gap: 14px; align-items: center; padding: 7px 0; font-size: 14px; }
-  .bar { height: 8px; border-radius: 4px; background: var(--border); overflow: hidden; display: flex; }
-  @media (max-width: 600px) { .barrow { grid-template-columns: 1fr auto; row-gap: 6px; } .barrow .bar { grid-column: 1 / -1; grid-row: 2; } }
-  .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 18px; margin-top: 18px; }
-  .li { padding: 14px 0; border-top: 1px solid var(--border); }
+  html { height: 100%; -webkit-font-smoothing: antialiased; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif; font-size: 14px; line-height: 1.45;
+    background: var(--bg); color: var(--text); margin: 0; padding: 0; transition: background-color .25s ease, color .25s ease; }
+  body.adm { display: flex; flex-direction: column; min-height: 100vh; min-height: 100dvh; }
+  [hidden] { display: none !important; }
+  h1, h2, p { margin: 0; }
+  :focus-visible { outline: 2px solid var(--navy-light); outline-offset: 2px; }
+  .skip { position: absolute; left: -999px; top: 8px; background: var(--navy); color: #fff; padding: 8px 14px; border-radius: 8px; z-index: 5000; }
+  .skip:focus { left: 8px; }
+  .sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  .dh .dh-brand-text .app-tag { color: var(--soft); }
+
+  .theme-switch { position: relative; display: inline-flex; width: 54px; height: 29px; cursor: pointer; }
+  .theme-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .theme-track { position: absolute; inset: 0; border-radius: 999px; display: flex; align-items: center; justify-content: space-between; padding: 0 7px; background: linear-gradient(135deg,#8fcaf0,#f4d58d); transition: background .3s ease; }
+  :root[data-theme="dark"] .theme-track { background: linear-gradient(135deg,#1f2b42,#33456a); }
+  .theme-switch input:focus-visible + .theme-track { outline: 2px solid var(--navy-light); outline-offset: 2px; }
+  .theme-icon { width: 13px; height: 13px; color: #fff; opacity: .9; z-index: 1; }
+  .theme-icon svg { width: 100%; height: 100%; }
+  .theme-knob { position: absolute; top: 3px; left: 3px; width: 23px; height: 23px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.3); transition: transform .3s cubic-bezier(.4,0,.2,1); }
+  input:checked + .theme-track .theme-knob { transform: translateX(25px); background: #0b2740; }
+
+  .page { flex: 1 1 auto; min-width: 0; padding: clamp(24px, 5vh, 48px) clamp(16px, 5vw, 72px) clamp(28px, 5vh, 56px);
+    background: radial-gradient(900px 440px at 10% -10%, var(--glow1), transparent 70%), radial-gradient(760px 400px at 100% 105%, var(--glow2), transparent 70%); }
+  .inner { width: 100%; max-width: clamp(1080px, 62vw, 1500px); margin: 0 auto; }
+  .hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+  .hero .eyebrow { font-size: 12px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; color: var(--gold-text); }
+  .hero h1 { margin: 8px 0 6px; font-size: clamp(30px, 4.4vw, 42px); line-height: 1.1; font-weight: 800; letter-spacing: -.025em; }
+  .hero p { font-size: 16px; color: var(--soft); max-width: 62ch; }
+  .tabs { display: inline-flex; align-items: center; gap: 2px; padding: 3px; border-radius: 999px; border: 1px solid var(--edge); background: var(--card); max-width: 100%; overflow-x: auto; }
+  .tabs button { height: 40px; padding: 0 18px; border: 0; border-radius: 999px; background: transparent; color: var(--soft); font: inherit; font-size: 14px; font-weight: 700; cursor: pointer; white-space: nowrap; }
+  .tabs button:hover:not([aria-pressed="true"]) { background: var(--chip); color: var(--text); }
+  .tabs button[aria-pressed="true"] { background: var(--btn); color: var(--btn-text); }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 16px; margin-top: 26px; }
+  .card { --hue: var(--accent); min-width: 0; border-radius: 24px; border: 1px solid var(--line); box-shadow: var(--row-shadow); background: var(--card); padding: 22px 26px; }
+  .stat { background: linear-gradient(90deg, color-mix(in srgb, var(--hue) 13%, transparent), transparent 55%), var(--card); animation: row-in .5s cubic-bezier(.16,1,.3,1) both; animation-delay: calc(var(--i, 0) * 60ms); }
+  .stat .lab { display: block; font-size: 12px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; color: var(--soft); margin-bottom: 6px; }
+  .stat b { display: block; font-size: 40px; letter-spacing: -.03em; line-height: 1.1; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .stat small { color: var(--soft); font-size: 14px; }
+  .panel { margin-top: 18px; }
+  .panel h2 { font-size: 20px; font-weight: 800; letter-spacing: -.015em; }
+  .ph { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; padding-bottom: 10px; }
+  .muted { color: var(--soft); font-size: 13.5px; }
+  .barrow { display: grid; grid-template-columns: 170px 1fr 110px; gap: 16px; align-items: center; padding: 8px 0; font-size: 14.5px; font-weight: 600; }
+  .bar { height: 10px; border-radius: 5px; background: var(--border); overflow: hidden; display: flex; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-top: 8px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 5px; margin-right: 7px; }
+  .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 18px; margin-top: 18px; }
+  .two .panel { margin-top: 0; }
+  .li { padding: 16px 0; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
   .li:first-of-type { border-top: 0; }
-  .lit { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
-  .lit b { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
-  .chip { display: inline-flex; align-items: center; height: 24px; padding: 0 10px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; background: color-mix(in srgb, var(--navy-light) 16%, transparent); color: var(--navy-light); }
+  .lit { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .lit b { font-size: 15.5px; font-weight: 700; overflow-wrap: anywhere; }
+  .lit .muted { overflow-wrap: anywhere; }
+  .chip { display: inline-flex; align-items: center; height: 26px; padding: 0 11px; border-radius: 999px; font-size: 12px; font-weight: 700; white-space: nowrap; flex: none;
+    background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--navy-light); }
+  :root[data-theme="dark"] .chip { color: var(--accent); }
   .chip.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
   .chip.good { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
-  .chip.mut { background: var(--border); color: var(--muted); }
-  button.act { height: 30px; padding: 0 13px; border-radius: 999px; border: 0; background: var(--border); color: var(--text); font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; }
-  button.act:hover { filter: brightness(.95); }
-  .empty { color: var(--muted); font-size: 14px; padding: 20px 0 24px; }
-  .note { margin-top: 16px; color: var(--muted); font-size: 13px; }
+  .chip.mut { background: var(--chip); color: var(--soft); }
+  .act { min-height: 38px; padding: 0 16px; border-radius: 999px; border: 1px solid var(--edge); background: transparent; color: var(--text); font: inherit; font-size: 13px; font-weight: 700; cursor: pointer; flex: none; transition: background .15s ease; }
+  .act:hover { background: var(--chip); }
+  .act.armed { background: var(--danger-solid); border-color: var(--danger-solid); color: #fff; }
+  .empty { color: var(--soft); font-size: 14.5px; padding: 18px 0 22px; }
+  .note { margin-top: 18px; color: var(--soft); font-size: 13.5px; }
+  @keyframes row-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+  @media (max-width: 760px) {
+    .barrow { grid-template-columns: 1fr auto; row-gap: 8px; } .barrow .bar { grid-column: 1 / -1; grid-row: 2; }
+    .two { grid-template-columns: minmax(0, 1fr); }
+    .card { padding: 18px 16px; border-radius: 20px; }
+    .stat b { font-size: 34px; }
+    .tabs { width: 100%; } .tabs button { flex: 1 0 auto; }
+    .lit { align-items: flex-start; }
+  }
+  @media (prefers-reduced-motion: reduce) { .stat { animation: none; } }
 </style>
+<style>""" + _HDR_CSS + r"""</style>
 <script>
-(function () { var m = 'light'; try { m = localStorage.getItem('theme') || 'light'; } catch (e) {} document.documentElement.setAttribute('data-theme', m); })();
+(function initTheme() {
+  var saved = null;
+  try { saved = localStorage.getItem('theme'); } catch (e) {}
+  var mode = saved || 'light';
+  document.documentElement.setAttribute('data-theme', mode);
+  window.addEventListener('DOMContentLoaded', function () {
+    var cb = document.getElementById('themeToggle');
+    if (cb) cb.checked = mode === 'dark';
+  });
+})();
+function setTheme(mode) {
+  document.documentElement.setAttribute('data-theme', mode);
+  try { localStorage.setItem('theme', mode); } catch (e) {}
+}
 </script>
-</head><body>
-<div class="topbar">
-  <a href="/" class="brand"><img src="data:image/png;base64,""" + LOGO_B64 + r"""" alt="Sea Power"><span><b>Compass</b><small>Learning room</small></span></a>
-  <div class="topbar-right"><a href="/">All desks</a><a href="/users">Admin</a><span><b>__NAME__</b></span><a href="/logout">Log out</a></div>
-</div>
-<div class="wrap">
-  <div class="head">
-    <div><h1>What Compass learned</h1><div class="sub">Every time Gemini helps, Compass takes note. Here is what stuck, and where it still needs a hand. Owner only.</div></div>
-    <div class="seg" id="tabs"></div>
+</head><body class="adm">
+<a class="skip" href="#main">Skip to the content</a>
+__HDR__
+<main class="page" id="main"><div class="inner">
+  <div class="hero">
+    <div>
+      <div class="eyebrow">Admin</div>
+      <h1>What Compass learned</h1>
+      <p>Every time Gemini helps, Compass takes note. Here is what stuck, and where it still needs a hand. Owner only.</p>
+    </div>
+    <div class="tabs" id="tabs" role="group" aria-label="Show results for"></div>
   </div>
-  <div class="stats" id="stats"></div>
-  <div class="card" id="work" style="margin-bottom:18px"></div>
+  <div class="stats" id="stats" aria-live="polite"></div>
+  <section class="card panel" id="work" aria-labelledby="workTitle"></section>
   <div class="two">
-    <div class="card"><div class="ph"><h2>Learned</h2><span class="muted">Newest first</span></div><div id="learned"></div></div>
-    <div class="card"><div class="ph"><h2>Still lacking</h2><span class="muted">Where Compass needs you</span></div><div id="lacking"></div></div>
+    <section class="card panel" aria-labelledby="learnedTitle"><div class="ph"><h2 id="learnedTitle">Learned</h2><span class="muted">Newest first</span></div><div id="learned"><div class="empty">Loading...</div></div></section>
+    <section class="card panel" aria-labelledby="lackingTitle"><div class="ph"><h2 id="lackingTitle">Still lacking</h2><span class="muted">Where Compass needs you</span></div><div id="lacking"><div class="empty">Loading...</div></div></section>
   </div>
-  <div class="note">Gemini currently helps with manifests only. Other features show up here as soon as they use it, and line-up problems appear under Still lacking.</div>
-</div>
+  <p class="note">Gemini currently helps with manifests only. Other features show up here as soon as they use it, and line-up problems appear under Still lacking.</p>
+</div></main>
+<div class="sr" id="live" role="status" aria-live="polite"></div>
 <script>
 var NAMES = {manifests: 'Manifests', lineups: 'Line-ups', sof: 'SOF', notices: 'Notices'};
 var D = null, F = 'all';
@@ -17408,41 +17485,65 @@ function render() {
   D.learned.concat(D.lacking).forEach(function (x) { feats[x.feature] = 1; }); Object.keys(D.work).forEach(function (f) { feats[f] = 1; });
   var keys = Object.keys(feats);
   $('tabs').innerHTML = [['all', 'All features']].concat(keys.map(function (k) { return [k, nm(k)]; })).map(function (t) {
-    return '<button class="' + (F === t[0] ? 'on' : '') + '" onclick="setF(\'' + t[0] + '\')">' + esc(t[1]) + '</button>'; }).join('');
+    return '<button type="button" data-f="' + esc(t[0]) + '" aria-pressed="' + (F === t[0] ? 'true' : 'false') + '">' + esc(t[1]) + '</button>'; }).join('');
   var L = D.learned.filter(ok), K = D.lacking.filter(ok);
   var tot = 0, gem = 0; Object.keys(D.work).forEach(function (f) { if (D.work[f].total) { tot += D.work[f].total; gem += D.work[f].gemini; } });
   var alone = tot ? Math.round((tot - gem) * 100 / tot) + '%' : '-';
-  $('stats').innerHTML = '<div class="card stat"><span class="eyebrow">Learned</span><b>' + L.length + '</b><small>things remembered</small></div>' +
-    '<div class="card stat"><span class="eyebrow">Handled alone</span><b style="color:var(--ok)">' + alone + '</b><small>of manifests without Gemini</small></div>' +
-    '<div class="card stat"><span class="eyebrow">Gemini reads this month</span><b>' + D.calls + '</b><small>of ' + D.cap + ' allowed (' + esc(D.ai) + ')</small></div>' +
-    '<div class="card stat"><span class="eyebrow">Needs a look</span><b style="color:var(--warn)">' + K.length + '</b><small>open items</small></div>';
+  $('stats').innerHTML =
+    '<div class="card stat" style="--i:0;--hue:var(--h-blue)"><span class="lab">Learned</span><b>' + L.length + '</b><small>things remembered</small></div>' +
+    '<div class="card stat" style="--i:1;--hue:var(--h-green)"><span class="lab">Handled alone</span><b style="color:var(--ok)">' + alone + '</b><small>of manifests without Gemini</small></div>' +
+    '<div class="card stat" style="--i:2;--hue:var(--h-gold)"><span class="lab">Gemini reads this month</span><b>' + D.calls + '</b><small>of ' + D.cap + ' allowed (' + esc(D.ai) + ')</small></div>' +
+    '<div class="card stat" style="--i:3;--hue:var(--h-orange)"><span class="lab">Needs a look</span><b style="color:var(--warn)">' + K.length + '</b><small>open items</small></div>';
   var rows = Object.keys(D.work).filter(function (f) { return F === 'all' || F === f; }).filter(function (f) { return D.work[f].total; }).map(function (f) {
     var w = D.work[f], a = Math.round((w.total - w.gemini) * 100 / w.total);
-    return '<div class="barrow"><span>' + esc(nm(f)) + ' reader</span><div class="bar"><div style="width:' + a + '%;background:var(--navy)"></div><div style="width:' + (100 - a) + '%;background:var(--gold)"></div></div><span class="muted">' + a + '% alone</span></div>'; }).join('');
-  $('work').innerHTML = '<div class="ph"><h2>Who did the work</h2><span class="muted">Since this was switched on</span></div>' +
-    (rows ? rows + '<div class="muted" style="display:flex;gap:18px;margin-top:8px"><span><i style="display:inline-block;width:8px;height:8px;border-radius:4px;background:var(--navy);margin-right:6px"></i>Compass alone</span><span><i style="display:inline-block;width:8px;height:8px;border-radius:4px;background:var(--gold);margin-right:6px"></i>Needed Gemini</span></div>'
+    return '<div class="barrow"><span>' + esc(nm(f)) + ' reader</span><div class="bar" role="img" aria-label="' + a + ' percent read by Compass alone, ' + (100 - a) + ' percent needed Gemini"><div style="width:' + a + '%;background:var(--bar-a)"></div><div style="width:' + (100 - a) + '%;background:var(--bar-b)"></div></div><span class="muted">' + a + '% alone</span></div>'; }).join('');
+  $('work').innerHTML = '<div class="ph"><h2 id="workTitle">Who did the work</h2><span class="muted">Since this was switched on</span></div>' +
+    (rows ? rows + '<div class="legend muted"><span><i style="background:var(--bar-a)"></i>Compass alone</span><span><i style="background:var(--bar-b)"></i>Needed Gemini</span></div>'
       : '<div class="empty">No manifests have been read yet. This fills in as people upload.</div>');
   $('learned').innerHTML = L.length ? L.map(function (x) {
     return '<div class="li"><div class="lit"><b>' + esc(x.title) + '</b><span class="chip ' + (x.tag ? 'good' : '') + '">' + esc(x.tag || nm(x.feature)) + '</span></div><div class="lit"><span class="muted">' + esc(x.detail) + '</span>' +
-      (x.forget ? '<button class="act" onclick="forget(\'' + x.forget.kind + '\',' + JSON.stringify(x.forget.id).replace(/"/g, '&quot;') + ')">Forget</button>' : '') + '</div></div>'; }).join('')
+      (x.forget ? '<button type="button" class="act" data-kind="' + esc(x.forget.kind) + '" data-id="' + esc(x.forget.id) + '" data-say="forgetting ' + esc(x.title) + '" aria-label="Forget: ' + esc(x.title) + '">Forget</button>' : '') + '</div></div>'; }).join('')
     : '<div class="empty">Nothing learned here yet.</div>';
   $('lacking').innerHTML = K.length ? K.map(function (x) {
     return '<div class="li"><div class="lit"><b>' + esc(x.title) + '</b><span class="chip ' + (x.tag === 'Needs Gemini' ? 'mut' : 'warn') + '">' + esc(x.tag) + '</span></div><div class="lit"><span class="muted">' + esc(x.detail) + '</span>' +
-      (x.dismiss ? '<button class="act" onclick="forget(\'dismiss\',' + x.dismiss + ')">Done</button>' : '') + '</div></div>'; }).join('')
+      (x.dismiss ? '<button type="button" class="act" data-kind="dismiss" data-id="' + esc(x.dismiss) + '" data-once="1" aria-label="Mark as done: ' + esc(x.title) + '">Done</button>' : '') + '</div></div>'; }).join('')
     : '<div class="empty">Nothing lacking here. Compass has this covered.</div>';
 }
-function setF(f) { F = f; render(); }
+function setF(f) {
+  F = f; render();
+  var t = document.querySelector('#tabs button[data-f="' + f + '"]'); if (t) t.focus();
+}
 async function load() {
   var r = await fetch('/api/learned'); var d = await r.json();
-  if (!r.ok) { $('learned').innerHTML = '<div class="empty">' + esc(d.error || 'Could not load.') + '</div>'; return; }
+  if (!r.ok) { $('learned').innerHTML = '<div class="empty">' + esc(d.error || 'Could not load.') + '</div>'; $('lacking').innerHTML = ''; return; }
   D = d; render();
 }
 async function forget(kind, id) {
   await fetch('/api/learned/forget', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({kind: kind, id: id})});
   load();
 }
+// "Forget" removes something Compass learned, so it asks twice: the first press turns the button red, the second does it.
+function disarm(b) {
+  clearTimeout(b._t);
+  if (b.dataset.armed !== '1') return;
+  b.dataset.armed = '0'; b.textContent = b.dataset.was; b.classList.remove('armed');
+  if (b.dataset.wasLabel) b.setAttribute('aria-label', b.dataset.wasLabel);
+}
+document.addEventListener('click', function (e) {
+  var t = e.target.closest ? e.target.closest('button[data-f],button[data-kind]') : null;
+  if (!t) return;
+  if (t.dataset.f) { setF(t.dataset.f); return; }
+  if (t.dataset.once || t.dataset.armed === '1') { disarm(t); forget(t.dataset.kind, t.dataset.id); return; }
+  t.dataset.armed = '1'; t.dataset.was = t.textContent; t.dataset.wasLabel = t.getAttribute('aria-label') || '';
+  t.textContent = 'Confirm'; t.classList.add('armed');
+  var say = 'Press again to confirm ' + (t.dataset.say || 'forgetting this'); t.setAttribute('aria-label', say); $('live').textContent = say;
+  t._t = setTimeout(function () { disarm(t); }, 4000);
+  t.addEventListener('blur', function () { disarm(t); }, {once: true});
+});
 load();
-</script></body></html>"""
+</script>
+<script>""" + _HDR_JS + r"""</script>
+</body></html>"""
 
 DESK_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Compass - Arrival notices</title><link rel="icon" type="image/png" href="data:image/png;base64,__FAVICON__">
