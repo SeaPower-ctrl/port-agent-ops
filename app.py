@@ -2808,6 +2808,7 @@ _HDR_JS = r"""
 """
 
 _DESK_ICO = '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">%s</svg>'
+_ADMIN_ICON = '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>'
 _ALL_DESKS_ICON = '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/>'
 _HDR_I18N_TOOL = {"manifest": "hdr_tool_manifest", "do": "hdr_tool_do"}
 
@@ -2835,8 +2836,14 @@ def _desk_header_html(path, lang_switch=False):
     that desk's tools as a toggle, then language / theme / account. Built from the person's own features."""
     desks = _desks_for(_features())
     home = (path == "/")
+    admin = (path == "/users")
     key = None if home else _desk_of_path(path)
     cur = next((d for d in desks if d["key"] == key), None)
+    if admin:
+        # Admin is not a desk, but it wears the same header: its button reads "Admin" and its two pages sit beside it.
+        key = "admin"
+        cur = {"key": "admin", "name": "Admin", "blurb": "Users and settings", "icon": _ADMIN_ICON,
+               "tools": [{"key": "users", "name": "Users", "url": "/users", "icon": ""}, {"key": "learned", "name": "Learning room", "url": "/learned", "icon": ""}]}
     if home:
         # The home screen ("Choose a desk") wears the same header; its desk button reads "All desks" and has no tools beside it.
         cur = {"key": "all", "name": "All desks", "blurb": "", "tools": [], "icon": _ALL_DESKS_ICON}
@@ -2877,7 +2884,7 @@ def _desk_header_html(path, lang_switch=False):
                 '<div class="dh-bell-h"><b data-i18n="hdr_bell">Notifications</b><button type="button" id="dhBellAll" data-i18n="hdr_notifs_all" disabled>Mark all as read</button></div>'
                 '<div class="dh-bell-list" id="dhBellList"></div>'
                 '<div class="dh-bell-empty" id="dhBellEmpty" data-i18n="hdr_notifs_none">You are all caught up.</div></div>')
-    others = [t["url"] for t in cur["tools"] if not on(t["url"])]
+    others = [] if admin else [t["url"] for t in cur["tools"] if not on(t["url"])]
     cur_tool = next((t for t in cur["tools"] if on(t["url"])), None)
     tag_name = cur_tool["name"] if cur_tool else cur["name"]
     tag_i18n = _hdr_i(tool_key(cur_tool) if cur_tool else "hdr_desk_" + cur["key"])
@@ -4094,7 +4101,7 @@ def users_page():
     mgr_names = {u["id"]: (u["full_name"] or u["username"]) for u in users if u["role"] == "manager"}
     return render_template_string(USERS_HTML, users=users, username=session.get("username"), open_counts=open_counts,
                                   managers=[{"id": k, "name": v} for k, v in mgr_names.items()], mgr_names=mgr_names,
-                                  feature_defs=FEATURES, presets=dict(FEATURE_PRESETS))
+                                  feature_defs=FEATURES, presets=dict(FEATURE_PRESETS), hdr_html=_desk_header_html("/users"))
 
 
 @app.route("/api/users", methods=["POST"])
@@ -16760,110 +16767,209 @@ SECURITY_HTML = """
 """
 
 USERS_HTML = """
-<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Compass - Admin</title><link rel="icon" type="image/png" href="data:image/png;base64,""" + FAVICON_B64 + """">
 <style>
   :root {
     --bg: #f2f4f7; --card: #ffffff; --text: #1c2b3a; --muted: #7a8794; --border: #e6e9ed;
     --navy: #123a56; --navy-deep: #0b2740; --navy-light: #1f5c85; --gold: #c9a227; --gold-light: #e0bd53;
-    --danger: #d1483f; --danger-bg: #fbeceb;
     --shadow-sm: 0 1px 2px rgba(18,58,86,0.05);
+    --soft: #5b6b80; --chip: #eef1f5; --line: #e3e7ec; --gold-text: #8a6209; --accent: #1f6fa8;
+    --btn: #123a56; --btn-text: #ffffff; --btn-shadow: 0 8px 18px rgba(18,58,86,.22);
+    --glow1: rgba(31,111,168,.11); --glow2: rgba(201,160,36,.11);
+    --row-shadow: 0 1px 2px rgba(16,32,52,.05), 0 14px 32px rgba(16,32,52,.07);
+    --h-manifest: #2f86cc; --h-operations: #1f9a8a; --h-accounts: #c58a14;
+    --edge: color-mix(in srgb, #5b6b80 50%, transparent);
+    --ok: #1a7a4f; --ok-bg: #e4f3ea; --danger: #b83a31; --danger-bg: #fbeceb; --danger-solid: #b3261e; --warn: #8a5a00;
     color-scheme: light;
   }
   :root[data-theme="dark"] {
     --bg: #131a23; --card: #1a232f; --text: #e9eef3; --muted: #93a1b1; --border: #29323f;
     --navy: #3f86ba; --navy-deep: #274a67; --navy-light: #5aa2d1; --gold: #e3bb4c; --gold-light: #f0cf72;
-    --danger: #e2685f; --danger-bg: #3a2220;
     --shadow-sm: 0 1px 2px rgba(0,0,0,0.25);
+    --soft: #9aabbf; --chip: rgba(255,255,255,.07); --line: rgba(255,255,255,.09); --gold-text: #e3b94d; --accent: #63aee6;
+    --btn: #2f78b0; --btn-text: #ffffff; --btn-shadow: 0 8px 20px rgba(0,0,0,.35);
+    --glow1: rgba(63,140,196,.16); --glow2: rgba(227,185,77,.06);
+    --row-shadow: 0 1px 0 rgba(255,255,255,.05) inset, 0 18px 40px rgba(0,0,0,.34);
+    --h-manifest: #5aaee8; --h-operations: #34c0ad; --h-accounts: #e3b94d;
+    --edge: color-mix(in srgb, #9aabbf 45%, transparent);
+    --ok: #43c08a; --ok-bg: rgba(67,192,138,.14); --danger: #f0877f; --danger-bg: #3a2220; --danger-solid: #c0392f; --warn: #e0a640;
     color-scheme: dark;
   }
   * { box-sizing: border-box; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif;
-    background: var(--bg); color: var(--text); margin: 0; padding: 0 16px 32px;
-    transition: background-color .25s ease, color .25s ease;
-  }
-  .topbar {
-    position: sticky; top: 0; z-index: 50; display: flex; justify-content: space-between; align-items: center;
-    gap: 12px; flex-wrap: wrap; padding: 14px 16px; margin: 0 -16px 20px;
-    background: color-mix(in srgb, var(--bg) 86%, transparent);
-    backdrop-filter: saturate(180%) blur(14px); -webkit-backdrop-filter: saturate(180%) blur(14px);
-    border-bottom: 1px solid var(--border);
-  }
-  .brand { display: flex; align-items: center; gap: 10px; }
-  .brand img { height: 32px; width: auto; }
-  .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
-  .brand-text .app-name { font-size: 14.5px; font-weight: 700; color: var(--text); }
-  .brand-text .app-tag { font-size: 11px; color: var(--muted); }
-  .topbar-right { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
-  .topbar-right a { color: var(--navy); text-decoration: none; font-weight: 600; font-size: 13px; padding: 6px 12px; border-radius: 20px; transition: background .15s ease; }
-  :root[data-theme="dark"] .topbar-right a { color: var(--navy-light); }
-  .topbar-right a:hover { background: var(--border); }
+  html { height: 100%; -webkit-font-smoothing: antialiased; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif; font-size: 14px; line-height: 1.45;
+    background: var(--bg); color: var(--text); margin: 0; padding: 0; transition: background-color .25s ease, color .25s ease; }
+  body.adm { display: flex; flex-direction: column; min-height: 100vh; min-height: 100dvh; }
+  [hidden] { display: none !important; }
+  h1, h2, p { margin: 0; }
+  :focus-visible { outline: 2px solid var(--navy-light); outline-offset: 2px; }
+  .skip { position: absolute; left: -999px; top: 8px; background: var(--navy); color: #fff; padding: 8px 14px; border-radius: 8px; z-index: 5000; }
+  .skip:focus { left: 8px; }
+  .sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  .dh .dh-brand-text .app-tag { color: var(--soft); }
 
   .theme-switch { position: relative; display: inline-flex; width: 54px; height: 29px; cursor: pointer; }
   .theme-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
   .theme-track { position: absolute; inset: 0; border-radius: 999px; display: flex; align-items: center; justify-content: space-between; padding: 0 7px; background: linear-gradient(135deg,#8fcaf0,#f4d58d); transition: background .3s ease; }
   :root[data-theme="dark"] .theme-track { background: linear-gradient(135deg,#1f2b42,#33456a); }
+  .theme-switch input:focus-visible + .theme-track { outline: 2px solid var(--navy-light); outline-offset: 2px; }
   .theme-icon { width: 13px; height: 13px; color: #fff; opacity: .9; z-index: 1; }
   .theme-icon svg { width: 100%; height: 100%; }
   .theme-knob { position: absolute; top: 3px; left: 3px; width: 23px; height: 23px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.3); transition: transform .3s cubic-bezier(.4,0,.2,1); }
   input:checked + .theme-track .theme-knob { transform: translateX(25px); background: #0b2740; }
 
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px; margin-bottom: 16px; box-shadow: var(--shadow-sm); }
-  .feat-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
-  .feat-line .feat-title { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-right: 4px; }
-  .feat-line select { padding: 6px 10px; font-size: 13px; }
-  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 11px; border: 1px solid var(--border); border-radius: 99px; font-size: 13px; cursor: pointer; background: var(--card); user-select: none; }
-  .chip input { margin: 0; accent-color: var(--navy); }
-  .chip:has(input:checked) { border-color: var(--navy); background: color-mix(in srgb, var(--navy) 9%, transparent); }
-  :root[data-theme="dark"] .chip:has(input:checked) { border-color: var(--navy-light); background: color-mix(in srgb, var(--navy-light) 18%, transparent); }
-  .card-label { font-size: 12px; font-weight: 600; color: var(--navy); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 10px; }
-  :root[data-theme="dark"] .card-label { color: var(--navy-light); }
-  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-  th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; background: color-mix(in srgb, var(--border) 40%, transparent); }
-  tbody tr:last-child td { border-bottom: none; }
-  .role-pill { display: inline-block; font-size: 10.5px; font-weight: 700; padding: 2px 9px; border-radius: 999px; text-transform: uppercase; letter-spacing: .03em; }
-  .role-pill.admin, .role-pill.manager { background: color-mix(in srgb, var(--gold) 18%, transparent); color: var(--gold); }
-  .role-pill.owner { background: var(--navy); color: #fff; }
-  .sub-line { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
-  :root { --av1:#1f6fa8; --av2:#178575; --av3:#2f8a50; --av4:#a06a0c; --av5:#c4521c; --av6:#b83a54; --av7:#6a4cc0; }
-  .uname { display: flex; align-items: center; gap: 11px; }
-  .u-av { width: 34px; height: 34px; border-radius: 50%; background: var(--navy) center / cover; color: #fff; display: inline-grid; place-items: center; font-weight: 700; font-size: 14px; flex: none; overflow: hidden; }
-  :root[data-theme="dark"] .u-av { color: #0b1620; }
-  .role-pill.staff { background: color-mix(in srgb, var(--navy-light) 14%, transparent); color: var(--navy-light); }
-  input[type=text], input[type=password] {
-    border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 14px; font-family: inherit;
-    background: var(--bg); color: var(--text); transition: border-color .15s ease, background .15s ease, box-shadow .15s ease;
-  }
-  input:focus { outline: none; border-color: var(--navy-light); background: var(--card); box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 20%, transparent); }
-  select { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 14px; font-family: inherit; background: var(--bg); color: var(--text); }
-  button { background: var(--navy); color: #fff; border: none; border-radius: 999px; padding: 10px 18px; font-size: 13px; font-weight: 600; cursor: pointer; transition: background .15s ease, transform .08s ease; }
-  button:hover { background: var(--navy-light); }
-  button:active { transform: scale(.97); }
-  .del { background: none; color: var(--danger); font-size: 12px; font-weight: 600; padding: 5px 10px; border-radius: 999px; }
-  .del:hover { background: var(--danger-bg); }
-  button.sec { background: transparent; color: var(--text); border: 1px solid var(--border); }
-  button.sec:hover { background: var(--border); }
-  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-  .pw-meter { margin-top: 8px; }
-  .pw-meter .bar { height: 4px; border-radius: 99px; background: var(--border); overflow: hidden; }
+  /* ---- page ---- */
+  .page { flex: 1 1 auto; min-width: 0; padding: clamp(24px, 5vh, 48px) clamp(16px, 5vw, 72px) clamp(28px, 5vh, 56px);
+    background: radial-gradient(900px 440px at 10% -10%, var(--glow1), transparent 70%), radial-gradient(760px 400px at 100% 105%, var(--glow2), transparent 70%); }
+  .inner { width: 100%; max-width: clamp(1080px, 62vw, 1500px); margin: 0 auto; }
+  .hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+  .hero .eyebrow { font-size: 12px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; color: var(--gold-text); }
+  .hero h1 { margin: 8px 0 6px; font-size: clamp(30px, 4.4vw, 42px); line-height: 1.1; font-weight: 800; letter-spacing: -.025em; }
+  .hero p { font-size: 16px; color: var(--soft); max-width: 60ch; }
+  .facts { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+  .count { display: inline-flex; align-items: center; padding: 6px 12px; border-radius: 999px; background: var(--chip); color: var(--soft); font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+
+  /* ---- buttons ---- */
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 0 20px; border-radius: 999px; border: 1px solid transparent;
+    background: var(--btn); color: var(--btn-text); font: inherit; font-size: 14px; font-weight: 700; cursor: pointer; white-space: nowrap; transition: background .15s ease, filter .15s ease, transform .08s ease; }
+  .btn:hover { filter: brightness(1.1); }
+  .btn:active { transform: scale(.97); }
+  .btn.sec { background: transparent; color: var(--text); border-color: var(--edge); }
+  .btn.sec:hover { background: var(--chip); filter: none; }
+  .btn.danger { background: transparent; color: var(--danger); border-color: color-mix(in srgb, var(--danger) 50%, transparent); }
+  .btn.danger:hover { background: var(--danger-bg); filter: none; }
+  .btn.danger.armed, .btn.sec.armed { background: var(--danger-solid); color: #fff; border-color: var(--danger-solid); }
+  .btn.small { min-height: 40px; padding: 0 16px; font-size: 13px; }
+  .btn:disabled { opacity: .45; cursor: not-allowed; transform: none; filter: none; }
+  .cta { display: inline-flex; align-items: center; justify-content: center; gap: 9px; height: 48px; padding: 0 22px; border-radius: 15px; border: 0; flex: none;
+    background: var(--btn); color: var(--btn-text); font: inherit; font-size: 15px; font-weight: 700; white-space: nowrap; cursor: pointer; box-shadow: var(--btn-shadow); transition: transform .15s ease, filter .15s ease; }
+  .cta:hover { filter: brightness(1.08); }
+  .cta svg { width: 17px; height: 17px; transition: transform .18s ease; }
+  .cta[aria-expanded="true"] svg { transform: rotate(45deg); }
+
+  /* ---- fields ---- */
+  .fld { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .flab { font-size: 12px; font-weight: 700; color: var(--soft); text-transform: uppercase; letter-spacing: .05em; }
+  .flab em { font-style: normal; font-weight: 600; text-transform: none; letter-spacing: 0; }
+  input[type=text], input[type=password], .sel { width: 100%; min-width: 0; height: 46px; padding: 0 14px; border: 1px solid var(--edge); border-radius: 12px; background: var(--bg); color: var(--text);
+    font: inherit; font-size: 14.5px; transition: border-color .15s ease, background .15s ease, box-shadow .15s ease; }
+  input::placeholder { color: var(--soft); opacity: .8; }
+  input[type=text]:focus, input[type=password]:focus, .sel:focus { outline: none; border-color: var(--navy-light); background: var(--card); box-shadow: 0 0 0 3px color-mix(in srgb, var(--navy-light) 24%, transparent); }
+  .sel { appearance: none; -webkit-appearance: none; padding-right: 40px; cursor: pointer;
+    background-image: linear-gradient(45deg, transparent 50%, var(--soft) 50%), linear-gradient(135deg, var(--soft) 50%, transparent 50%);
+    background-position: calc(100% - 21px) 20px, calc(100% - 16px) 20px; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; }
+  .sel option { background: var(--card); color: var(--text); }
+  .sel.small { height: 40px; width: auto; min-width: 150px; font-size: 13.5px; background-position: calc(100% - 21px) 17px, calc(100% - 16px) 17px; }
+  .pwrow { display: flex; gap: 8px; align-items: center; }
+  .pwrow input { flex: 1 1 140px; }
+  .seg { display: inline-flex; align-items: center; align-self: flex-start; gap: 2px; height: 46px; padding: 3px; border-radius: 999px; border: 1px solid var(--edge); background: var(--card); }
+  .seg label { position: relative; display: block; cursor: pointer; }
+  .seg input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+  .seg span { display: inline-flex; align-items: center; height: 38px; padding: 0 20px; border-radius: 999px; font-size: 14px; font-weight: 700; color: var(--soft); }
+  .seg label:hover input:not(:checked) + span { background: var(--chip); color: var(--text); }
+  .seg input:checked + span { background: var(--btn); color: var(--btn-text); }
+  .seg input:focus-visible + span { outline: 2px solid var(--navy-light); outline-offset: 2px; }
+  .fgroup { display: flex; flex-direction: column; gap: 10px; }
+  .fhead { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .qs { display: flex; align-items: center; gap: 10px; }
+  .fchips { display: flex; flex-wrap: wrap; gap: 10px; }
+  .fchip { position: relative; display: inline-flex; align-items: center; gap: 9px; min-height: 42px; padding: 0 16px 0 12px; border-radius: 14px; border: 1px solid var(--line); background: var(--chip);
+    color: var(--text); font-size: 14px; font-weight: 600; cursor: pointer; user-select: none; transition: background .15s ease, border-color .15s ease; }
+  .fchip:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+  .fchip input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+  .fchip .tick { width: 20px; height: 20px; border-radius: 6px; border: 1.5px solid color-mix(in srgb, var(--soft) 65%, transparent); background: var(--card); display: grid; place-items: center; flex: none; color: #fff; }
+  .fchip .tick svg { width: 12px; height: 12px; opacity: 0; }
+  :root[data-theme="dark"] .fchip .tick { color: #0b1620; }
+  .fchip:has(input:checked) { background: color-mix(in srgb, var(--accent) 13%, var(--card)); border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+  .fchip:has(input:checked) .tick { background: var(--accent); border-color: var(--accent); }
+  .fchip:has(input:checked) .tick svg { opacity: 1; }
+  .fchip:has(input:focus-visible) { outline: 2px solid var(--navy-light); outline-offset: 2px; }
+  .note { font-size: 13px; color: var(--soft); }
+  .dtrow { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px 18px; align-items: start; }
+  .span2 { grid-column: span 2; }
+  .pw-meter { margin-top: 2px; }
+  .pw-meter .bar { height: 5px; border-radius: 99px; background: var(--border); overflow: hidden; }
   .pw-meter .bar i { display: block; height: 100%; width: 0; border-radius: 99px; background: var(--danger); transition: width .25s ease, background .25s ease; }
-  .pw-meter .hint { font-size: 12px; margin-top: 5px; min-height: 16px; color: var(--muted); font-weight: 500; }
+  .pw-meter .hint { font-size: 13px; margin-top: 6px; min-height: 18px; color: var(--soft); font-weight: 500; }
   .pw-meter.bad .hint { color: var(--danger); }
   .pw-meter.ok .bar i { background: var(--gold); }
   .pw-meter.ok .hint { color: var(--text); }
-  .pw-meter.strong .bar i { background: #2e9e6b; }
-  .pw-meter.strong .hint { color: #2e9e6b; }
-  #toastHost { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; pointer-events: none; max-width: min(320px, calc(100vw - 40px)); }
-  #toastHost .toast { pointer-events: auto; }
-  .toast { background: var(--navy-deep); color: #fff; padding: 11px 16px; border-radius: 12px; font-size: 13px; display: flex; align-items: center; gap: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); animation: toast-in .18s ease-out; max-width: 320px; }
-  .toast.error { background: var(--danger); }
-  .toast a { color: var(--gold-light); font-weight: 700; text-decoration: none; cursor: pointer; white-space: nowrap; }
+  .pw-meter.strong .bar i { background: var(--ok); }
+  .pw-meter.strong .hint { color: var(--ok); }
+
+  /* ---- the add card ---- */
+  .panel { margin-top: 22px; padding: 24px 28px; border-radius: 24px; border: 1px solid var(--line); background: var(--card); box-shadow: var(--row-shadow); display: flex; flex-direction: column; gap: 20px; }
+  .panel h2 { font-size: 20px; font-weight: 800; letter-spacing: -.015em; }
+  .panel-foot { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+
+  /* ---- people ---- */
+  .people { list-style: none; margin: 22px 0 0; padding: 0; display: flex; flex-direction: column; gap: 14px; }
+  .person { --hue: var(--accent); position: relative; display: grid; align-items: center; gap: 6px 22px; padding: 18px 24px;
+    grid-template-columns: 52px minmax(0, 1.3fr) minmax(0, 1.1fr) 176px 196px;
+    grid-template-areas: "av who contact state acts" "edit edit edit edit edit";
+    border-radius: 24px; border: 1px solid var(--line); box-shadow: var(--row-shadow);
+    background: linear-gradient(90deg, color-mix(in srgb, var(--hue) 12%, transparent), transparent 46%), var(--card);
+    animation: row-in .5s cubic-bezier(.16,1,.3,1) both; animation-delay: calc(var(--i, 0) * 60ms); transition: border-color .18s ease; }
+  .person[data-role="owner"] { --hue: var(--h-accounts); }
+  .person[data-role="manager"] { --hue: var(--h-operations); }
+  .person[data-role="staff"] { --hue: var(--h-manifest); }
+  .person.editing { border-color: color-mix(in srgb, var(--hue) 45%, var(--line)); }
+  @keyframes row-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+  .av { grid-area: av; width: 52px; height: 52px; border-radius: 50%; background: var(--navy) center / cover; color: #fff; display: grid; place-items: center; font-size: 20px; font-weight: 700; overflow: hidden; }
+  :root[data-theme="dark"] .av { color: #0b1620; }
+  .who { grid-area: who; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .who h2 { font-size: 18px; line-height: 1.2; font-weight: 700; letter-spacing: -.01em; overflow-wrap: anywhere; }
+  .sub { font-size: 13px; color: var(--soft); overflow-wrap: anywhere; }
+  .sub.warn { color: var(--warn); font-weight: 600; }
+  .contact { grid-area: contact; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .em { font-size: 14.5px; font-weight: 600; overflow-wrap: anywhere; }
+  .state { grid-area: state; display: flex; flex-direction: column; align-items: flex-start; gap: 7px; }
+  .pill { display: inline-flex; align-items: center; gap: 7px; height: 26px; padding: 0 11px; border-radius: 999px; font-size: 11.5px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; white-space: nowrap; }
+  .pill i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .pill.owner { background: var(--navy); color: #fff; }
+  :root[data-theme="dark"] .pill.owner { color: #0b1620; }
+  .pill.manager { background: color-mix(in srgb, var(--gold-text) 16%, transparent); color: var(--gold-text); }
+  .pill.staff { background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--navy-light); }
+  :root[data-theme="dark"] .pill.staff { color: var(--accent); }
+  .pill.on { background: var(--ok-bg); color: var(--ok); }
+  .pill.off { background: var(--chip); color: var(--soft); }
+  .acts { grid-area: acts; display: flex; gap: 10px; justify-content: flex-end; }
+  .edit-row { grid-area: edit; margin-top: 14px; padding-top: 20px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 20px; }
+  .edit-acts { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .edit-acts .grow { flex: 1 1 auto; }
+  .edit-acts .btn { min-height: 44px; }
+
+  #toastHost { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; pointer-events: none; max-width: min(340px, calc(100vw - 40px)); }
+  .toast { pointer-events: auto; background: var(--navy-deep); color: #fff; padding: 12px 16px; border-radius: 14px; font-size: 14px; display: flex; align-items: center; gap: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); animation: toast-in .18s ease-out; }
+  :root[data-theme="dark"] .toast { background: #223447; }
+  .toast.error { background: var(--danger-solid); }
   .toast.fading { animation: toast-out .2s ease-in forwards; }
   @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
   @keyframes toast-out { to { opacity: 0; transform: translateY(8px); } }
+
+  @media (max-width: 1040px) {
+    .person { grid-template-columns: 52px minmax(0, 1fr) auto; grid-template-areas: "av who acts" ". contact contact" ". state state" "edit edit edit"; }
+    .state { flex-direction: row; flex-wrap: wrap; margin-top: 2px; }
+    .grid3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 640px) {
+    .person { grid-template-columns: 48px minmax(0, 1fr); padding: 16px; border-radius: 20px; gap: 8px 14px;
+      grid-template-areas: "av who" "contact contact" "state state" "acts acts" "edit edit"; }
+    .av { width: 48px; height: 48px; font-size: 18px; }
+    .acts .btn { flex: 1 1 0; }
+    .panel { padding: 20px 16px; border-radius: 20px; }
+    .grid3 { grid-template-columns: minmax(0, 1fr); }
+    .span2 { grid-column: auto; }
+    .hero .cta { width: 100%; }
+    .pwrow { flex-wrap: wrap; }
+    .edit-acts .grow { display: none; }
+    .edit-acts .btn { flex: 1 1 auto; }
+  }
+  @media (prefers-reduced-motion: reduce) { .person { animation: none; } .cta svg, .toast { transition: none; animation: none; } }
 </style>
+<style>""" + _HDR_CSS + """</style>
 <script>
 (function initTheme() {
   let saved = null;
@@ -16880,100 +16986,115 @@ function setTheme(mode) {
   try { localStorage.setItem('theme', mode); } catch (e) {}
 }
 </script>
-</head><body>
-  <div class="topbar">
-    <a href="/" class="brand" style="text-decoration:none;">
-      <img src="data:image/png;base64,""" + LOGO_B64 + """" alt="Sea Power">
-      <div class="brand-text">
-        <span class="app-name">Compass</span>
-        <span class="app-tag">Admin</span>
-      </div>
-    </a>
-    <div class="topbar-right">
-      <label class="theme-switch" title="Toggle dark mode">
-        <input type="checkbox" id="themeToggle" onchange="setTheme(this.checked ? 'dark' : 'light')">
-        <span class="theme-track">
-          <span class="theme-icon sun">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg>
-          </span>
-          <span class="theme-icon moon">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1111.2 3a7 7 0 009.8 9.8z"/></svg>
-          </span>
-          <span class="theme-knob"></span>
-        </span>
-      </label>
-      <a href="/">&larr; Back to board</a>
-      <span style="padding:6px 4px;"><b>{{ display_name }}</b></span>
-      <a href="/logout">Log out</a>
+</head><body class="adm">
+{% macro fchip(value, label, checked=False, id='', onchange='') -%}
+<label class="fchip"><input type="checkbox" value="{{ value }}"{% if id %} id="{{ id }}"{% endif %}{% if checked %} checked{% endif %}{% if onchange %} onchange="{{ onchange }}"{% endif %}><span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5 9-10"/></svg></span>{{ label }}</label>
+{%- endmacro %}
+{% macro presetsel(box) -%}
+<div class="qs"><label class="flab" for="qs_{{ box }}">Quick set</label><select class="sel small" id="qs_{{ box }}" onchange="applyPreset(this, '{{ box }}')"><option value="">Choose...</option>{% for k in presets %}<option value="{{ k }}">{{ k }}</option>{% endfor %}</select></div>
+{%- endmacro %}
+<a class="skip" href="#main">Skip to the list of users</a>
+{{ hdr_html|safe }}
+<main class="page" id="main"><div class="inner">
+  {% set n_users = users|length %}{% set n_2fa = users|selectattr('totp_enabled')|list|length %}
+  <div class="hero">
+    <div>
+      <div class="eyebrow">Admin</div>
+      <h1>Users</h1>
+      <p>Who can sign in to Compass, and which tools each person can use.</p>
+      <div class="facts"><span class="count">{{ n_users }} {{ 'person' if n_users == 1 else 'people' }}</span><span class="count">2-step on for {{ n_2fa }} of {{ n_users }}</span></div>
     </div>
+    <button type="button" class="cta" id="addToggle" aria-expanded="false" aria-controls="addCard" onclick="toggleAdd()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span class="t">Add a user</span></button>
   </div>
 
-  <div class="card">
-    <div class="card-label">Add a user</div>
-    <div class="row">
-      <input type="text" id="newName" placeholder="Full name" autocomplete="off" style="flex:1 1 170px;">
-      <input type="text" id="newEmail" placeholder="Company email (name@seapower.com.sa)" autocomplete="off" autocapitalize="none" style="flex:1.4 1 230px;">
-      <input type="password" id="newPassword" placeholder="Temporary password" autocomplete="new-password" style="flex:1 1 150px;">
-      <button type="button" class="sec" id="genPwBtn" onclick="genPw()">Generate</button>
-      <button type="button" class="sec" id="copyPwBtn" onclick="copyPw()">Copy</button>
-      <select id="newRole" onchange="toggleNewMgr()"><option value="staff">Staff</option><option value="manager">Manager</option></select>
-      <select id="newMgr" title="Who this person reports to"><option value="">Reports to...</option>{% for m in managers %}<option value="{{ m['id'] }}">{{ m['name'] }}</option>{% endfor %}</select>
-      <button onclick="addUser()">Add User</button>
+  <section class="panel" id="addCard" aria-labelledby="addTitle" data-enter="addUser" hidden>
+    <h2 id="addTitle">Add a user</h2>
+    <div class="grid3">
+      <div class="fld"><label class="flab" for="newName">Full name</label><input type="text" id="newName" autocomplete="off"></div>
+      <div class="fld"><label class="flab" for="newEmail">Company email</label><input type="text" id="newEmail" placeholder="name@seapower.com.sa" autocomplete="off" autocapitalize="none"></div>
+      <div class="fld"><span class="flab" id="nrl">Role</span>
+        <div class="seg" role="radiogroup" aria-labelledby="nrl"><label><input type="radio" name="newRole" value="staff" checked onchange="toggleNewMgr()"><span>Staff</span></label><label><input type="radio" name="newRole" value="manager" onchange="toggleNewMgr()"><span>Manager</span></label></div></div>
+      <div class="fld span2"><label class="flab" for="newPassword">Temporary password</label>
+        <div class="pwrow"><input type="password" id="newPassword" autocomplete="new-password"><button type="button" class="btn sec small" id="genPwBtn" onclick="genPw()">Generate</button><button type="button" class="btn sec small" id="copyPwBtn" onclick="copyPw()">Copy</button></div></div>
+      <div class="fld" id="newMgrFld"><label class="flab" for="newMgr">Reports to</label><select class="sel" id="newMgr"><option value="">Nobody yet</option>{% for m in managers %}<option value="{{ m['id'] }}">{{ m['name'] }}</option>{% endfor %}</select></div>
     </div>
-    <div class="feat-line" id="nf">
-      <span class="feat-title">Features</span>
-      {% for f in feature_defs %}<label class="chip"><input type="checkbox" value="{{ f[0] }}" checked> {{ f[1] }}</label>{% endfor %}
-      <select onchange="applyPreset(this, 'nf')" title="Tick a ready-made set"><option value="">Quick set...</option>{% for k in presets %}<option value="{{ k }}">{{ k }}</option>{% endfor %}</select>
+    <div class="fgroup" id="nf">
+      <div class="fhead"><span class="flab">Tools they can use</span>{{ presetsel('nf') }}</div>
+      <div class="fchips">{% for f in feature_defs %}{{ fchip(f[0], f[1], True) }}{% endfor %}</div>
     </div>
-    <div id="newPwMeter" data-watch="newName,newEmail">""" + PW_METER_HTML + """</div>
-    <div style="font-size:12px;color:var(--muted);margin-top:10px;">They sign in with this email and set up their authenticator app the first time.</div>
-  </div>
-  <div class="card" style="overflow-x:auto">
-    <table style="min-width:640px">
-      <thead><tr><th>Name</th><th>Email / username</th><th>Role</th><th>2-step</th><th>Created</th><th></th></tr></thead>
-      <tbody>
-        {% for u in users %}
-        <tr id="u{{ u['id'] }}">
-          <td><div class="uname"><span class="u-av"{% if u['avatar_v'] %} style="background-image:url(/avatar/{{ u['id'] }}?v={{ u['avatar_v'] }})"{% elif u['avatar_color'] %} style="background-color:var(--av{{ u['avatar_color'] }});color:#fff"{% endif %} aria-hidden="true">{% if not u['avatar_v'] %}{{ ((u['full_name'] or u['username'] or '?')[:1])|upper }}{% endif %}</span><div><b>{{ u['full_name'] or u['username'] }}</b>{% if u['role'] == 'staff' and u['manager_id'] and mgr_names.get(u['manager_id']) %}<div class="sub-line">Reports to {{ mgr_names.get(u['manager_id']) }}</div>{% endif %}{% if u['feat_text'] %}<div class="sub-line">{{ u['feat_text'] }}</div>{% endif %}{% if u['do_team'] %}<div class="sub-line">DO team: gets invoice and DO requests{% if u['do_inert'] %} (needs the DO Tracker feature){% endif %}</div>{% endif %}</div></div></td>
-          <td>{% if u['email'] %}{{ u['email'] }}<div style="font-size:11.5px;color:var(--muted);">{{ u['username'] }}</div>{% else %}{{ u['username'] }}<div style="font-size:11.5px;color:var(--muted);">no email yet</div>{% endif %}</td>
-          <td><span class="role-pill {{ u['role'] }}">{{ u['role'] }}</span></td>
-          <td>{% if u['totp_enabled'] %}<span class="role-pill staff" style="background:color-mix(in srgb,#2e9e6b 16%,transparent);color:#2e9e6b;">On</span>{% else %}<span class="role-pill" style="background:var(--border);color:var(--muted);">Not yet</span>{% endif %}</td>
-          <td class="local-time" data-utc="{{ u['created_at'] }}">{{ u['created_at'] }}</td>
-          <td style="white-space:nowrap;"><button class="del" style="color:var(--navy-light);" onclick="toggleEdit({{ u['id'] }})">Edit</button>{% if u['avatar_v'] %}<button class="del" onclick='rmPhoto({{ u["id"] }}, {{ (u["full_name"] or u["username"])|tojson }})'>Remove photo</button>{% endif %}{% if u['role'] != 'owner' %}<button class="del" onclick='delUser({{ u["id"] }}, {{ (u["full_name"] or u["username"])|tojson }})'>Remove</button>{% endif %}</td>
-        </tr>
-        <tr class="edit-row" id="e{{ u['id'] }}" data-username="{{ u['username'] }}" style="display:none;">
-          <td colspan="6" style="background:color-mix(in srgb,var(--border) 30%,transparent);">
-            <div class="row">
-              <input type="text" id="en{{ u['id'] }}" value="{{ u['full_name'] }}" placeholder="Full name" style="flex:1 1 160px;">
-              <input type="text" id="eu{{ u['id'] }}" value="{{ u['username'] }}" placeholder="Username" autocapitalize="none" autocomplete="off" style="flex:1 1 150px;">
-              <input type="text" id="ee{{ u['id'] }}" value="{{ u['email'] }}" placeholder="name@seapower.com.sa" autocapitalize="none" style="flex:1.3 1 220px;">
-              <input type="password" id="ep{{ u['id'] }}" placeholder="New password (optional)" autocomplete="new-password" style="flex:1 1 150px;">
-              {% if u['role'] != 'owner' %}<select id="er{{ u['id'] }}" onchange="toggleEditMgr({{ u['id'] }})"><option value="staff"{% if u['role'] == 'staff' %} selected{% endif %}>Staff</option><option value="manager"{% if u['role'] != 'staff' %} selected{% endif %}>Manager</option></select>
-              <select id="em{{ u['id'] }}" title="Reports to"{% if u['role'] != 'staff' %} style="display:none"{% endif %}><option value="">Reports to...</option>{% for m in managers %}<option value="{{ m['id'] }}"{% if u['manager_id'] == m['id'] %} selected{% endif %}>{{ m['name'] }}</option>{% endfor %}</select>{% endif %}
-              <button onclick="saveUser({{ u['id'] }})">Save</button>
-              {% if u['totp_enabled'] %}<button class="del" style="border:1px solid var(--border);" onclick="reset2fa({{ u['id'] }})">Reset 2-step</button>{% endif %}
-              {% set n_open = open_counts.get(u['id'], 0) %}<button class="del" style="border:1px solid var(--border);" onclick="signOutAll({{ u['id'] }})" title="Ends every sign-in this person has open, on any phone or computer"{% if not n_open %} disabled{% endif %}>Sign out everywhere{% if n_open %} ({{ n_open }}){% endif %}</button>
-            </div>
-            {% if u['role'] != 'owner' %}<div class="feat-line" id="ef{{ u['id'] }}">
-              <span class="feat-title">Features</span>
-              {% for f in feature_defs %}<label class="chip"><input type="checkbox" value="{{ f[0] }}"{% if f[0] in u['feat_list'] %} checked{% endif %}> {{ f[1] }}</label>{% endfor %}
-              <select onchange="applyPreset(this, 'ef{{ u['id'] }}')" title="Tick a ready-made set"><option value="">Quick set...</option>{% for k in presets %}<option value="{{ k }}">{{ k }}</option>{% endfor %}</select>
-            </div>{% endif %}
-            <div class="feat-line" id="edtl{{ u['id'] }}">
-              <span class="feat-title">DO team</span>
-              <label class="chip"><input type="checkbox" id="edt{{ u['id'] }}"{% if u['do_team'] %} checked{% endif %} onchange="dtTick({{ u['id'] }})"> Gets the invoice and Delivery Order requests from the operators</label>
-            </div>
-            <div class="pw-meter" id="epm{{ u['id'] }}" style="display:none;max-width:420px;"><div class="bar"><i></i></div><div class="hint"></div></div>
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  <div id="toastHost"></div>
+    <div id="newPwMeter" data-watch="newName,newEmail" style="max-width:440px">""" + PW_METER_HTML + """</div>
+    <div class="panel-foot">
+      <span class="note">They sign in with this email and set up their authenticator app the first time.</span>
+      <button type="button" class="btn" onclick="addUser()">Add user</button>
+    </div>
+  </section>
+
+  <ul class="people" aria-label="People with a Compass account">
+  {% for u in users %}
+    {% set nm = u['full_name'] or u['username'] %}
+    {% set role = 'manager' if u['role'] == 'admin' else u['role'] %}
+    <li class="person" id="u{{ u['id'] }}" data-role="{{ role }}" style="--i:{{ loop.index0 }}">
+      <span class="av"{% if u['avatar_v'] %} style="background-image:url(/avatar/{{ u['id'] }}?v={{ u['avatar_v'] }})"{% elif u['avatar_color'] %} style="background-color:var(--av{{ u['avatar_color'] }});color:#fff"{% endif %} aria-hidden="true">{% if not u['avatar_v'] %}{{ ((u['full_name'] or u['username'] or '?')[:1])|upper }}{% endif %}</span>
+      <div class="who">
+        <h2>{{ nm }}</h2>
+        {% if role == 'staff' and u['manager_id'] and mgr_names.get(u['manager_id']) %}<span class="sub">Reports to {{ mgr_names.get(u['manager_id']) }}</span>{% endif %}
+        {% if u['feat_text'] %}<span class="sub">{{ u['feat_text'] }}</span>{% endif %}
+        {% if u['do_team'] %}<span class="sub{% if u['do_inert'] %} warn{% endif %}">DO team: gets invoice and DO requests{% if u['do_inert'] %} (needs the DO Tracker feature){% endif %}</span>{% endif %}
+      </div>
+      <div class="contact">
+        {% if u['email'] %}<span class="em">{{ u['email'] }}</span><span class="sub">Username: {{ u['username'] }}</span>{% else %}<span class="em">{{ u['username'] }}</span><span class="sub">No email yet</span>{% endif %}
+        <span class="sub">Added <time class="local-time" data-utc="{{ u['created_at'] }}">{{ u['created_at'] }}</time></span>
+      </div>
+      <div class="state">
+        <span class="pill {{ role }}">{{ role }}</span>
+        {% if u['totp_enabled'] %}<span class="pill on"><i></i>2-step on</span>{% else %}<span class="pill off"><i></i>2-step not set up</span>{% endif %}
+      </div>
+      <div class="acts">
+        <button type="button" class="btn sec" id="eb{{ u['id'] }}" data-name="{{ nm }}" aria-expanded="false" aria-controls="e{{ u['id'] }}" aria-label="Edit {{ nm }}" onclick="toggleEdit({{ u['id'] }})">Edit</button>
+        {% if role != 'owner' %}<button type="button" class="btn danger" id="rb{{ u['id'] }}" aria-label="Remove {{ nm }}" onclick='armRemove(this, {{ u["id"] }}, {{ nm|tojson }})'>Remove</button>{% endif %}
+      </div>
+
+      <div class="edit-row" id="e{{ u['id'] }}" data-username="{{ u['username'] }}" data-enter="saveUser" data-id="{{ u['id'] }}" role="group" aria-label="Edit {{ nm }}" hidden>
+        <div class="grid3">
+          <div class="fld"><label class="flab" for="en{{ u['id'] }}">Full name</label><input type="text" id="en{{ u['id'] }}" value="{{ u['full_name'] }}" autocomplete="off"></div>
+          <div class="fld"><label class="flab" for="eu{{ u['id'] }}">Username</label><input type="text" id="eu{{ u['id'] }}" value="{{ u['username'] }}" autocapitalize="none" autocomplete="off"></div>
+          <div class="fld"><label class="flab" for="ee{{ u['id'] }}">Company email</label><input type="text" id="ee{{ u['id'] }}" value="{{ u['email'] }}" placeholder="name@seapower.com.sa" autocapitalize="none" autocomplete="off"></div>
+          <div class="fld"><label class="flab" for="ep{{ u['id'] }}">New password <em>(optional)</em></label><input type="password" id="ep{{ u['id'] }}" placeholder="Leave empty to keep it" autocomplete="new-password"></div>
+          {% if role != 'owner' %}
+          <div class="fld"><span class="flab" id="erl{{ u['id'] }}">Role</span>
+            <div class="seg" role="radiogroup" aria-labelledby="erl{{ u['id'] }}"><label><input type="radio" name="er{{ u['id'] }}" value="staff"{% if role == 'staff' %} checked{% endif %} onchange="toggleEditMgr({{ u['id'] }})"><span>Staff</span></label><label><input type="radio" name="er{{ u['id'] }}" value="manager"{% if role != 'staff' %} checked{% endif %} onchange="toggleEditMgr({{ u['id'] }})"><span>Manager</span></label></div></div>
+          <div class="fld" id="emf{{ u['id'] }}"{% if role != 'staff' %} hidden{% endif %}><label class="flab" for="em{{ u['id'] }}">Reports to</label><select class="sel" id="em{{ u['id'] }}"><option value="">Nobody yet</option>{% for m in managers %}<option value="{{ m['id'] }}"{% if u['manager_id'] == m['id'] %} selected{% endif %}>{{ m['name'] }}</option>{% endfor %}</select></div>
+          {% endif %}
+        </div>
+        <div class="pw-meter" id="epm{{ u['id'] }}" style="display:none;max-width:440px"><div class="bar"><i></i></div><div class="hint"></div></div>
+        {% if role != 'owner' %}
+        <div class="fgroup" id="ef{{ u['id'] }}">
+          <div class="fhead"><span class="flab">Tools they can use</span>{{ presetsel('ef' ~ u['id']) }}</div>
+          <div class="fchips">{% for f in feature_defs %}{{ fchip(f[0], f[1], f[0] in u['feat_list']) }}{% endfor %}</div>
+        </div>
+        {% endif %}
+        <div class="fgroup" id="edtl{{ u['id'] }}">
+          <span class="flab">DO team</span>
+          <div class="dtrow">{{ fchip('do_team', 'On the DO team', u['do_team'], 'edt' ~ u['id'], 'dtTick(' ~ u['id'] ~ ')') }}<span class="note">Gets the invoice and Delivery Order requests from the operators.</span></div>
+        </div>
+        <div class="edit-acts">
+          <button type="button" class="btn" onclick="saveUser({{ u['id'] }})">Save changes</button>
+          <button type="button" class="btn sec" onclick="cancelEdit({{ u['id'] }})">Cancel</button>
+          <span class="grow"></span>
+          {% if u['totp_enabled'] %}<button type="button" class="btn sec" data-name="{{ nm }}" onclick="armReset(this, {{ u['id'] }})">Reset 2-step</button>{% endif %}
+          {% set n_open = open_counts.get(u['id'], 0) %}<button type="button" class="btn sec" onclick="signOutAll({{ u['id'] }})" title="Ends every sign-in this person has open, on any phone or computer"{% if not n_open %} disabled{% endif %}>Sign out everywhere{% if n_open %} ({{ n_open }}){% endif %}</button>
+          {% if u['avatar_v'] %}<button type="button" class="btn sec" onclick='rmPhoto({{ u["id"] }}, {{ nm|tojson }})'>Remove photo</button>{% endif %}
+        </div>
+      </div>
+    </li>
+  {% endfor %}
+  </ul>
+</div></main>
+<div id="toastHost" aria-live="polite"></div>
+<div class="sr" id="live" role="status" aria-live="polite"></div>
 """ + PW_METER_JS + """
 <script>
-// The server stores "Created" timestamps as naive UTC - convert each one to
+// The server stores "Added" timestamps as naive UTC - convert each one to
 // the viewer's own timezone before displaying it.
 document.querySelectorAll('.local-time').forEach(el => {
   const raw = el.dataset.utc;
@@ -16981,9 +17102,9 @@ document.querySelectorAll('.local-time').forEach(el => {
   const iso = raw.includes('T') ? raw : raw.replace(' ', 'T') + ':00Z';
   const d = new Date(iso);
   if (!isNaN(d.getTime())) {
-    el.textContent = d.toLocaleString(undefined, {
-      year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
-    });
+    el.textContent = d.toLocaleDateString(undefined, {year: 'numeric', month: 'short', day: 'numeric'});
+    el.title = d.toLocaleString(undefined, {year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+    el.setAttribute('datetime', d.toISOString());
   }
 });
 
@@ -17004,6 +17125,7 @@ function showToast(message, opts) {
     setTimeout(() => el.remove(), 220);
   }
 }
+function say(text) { var l = document.getElementById('live'); if (l) l.textContent = text; }
 function randInt(n) {
   var a = new Uint32Array(1), lim = Math.floor(4294967296 / n) * n;
   do { crypto.getRandomValues(a); } while (a[0] >= lim);
@@ -17041,11 +17163,16 @@ function copyPw() {
   if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(i.value).then(done, fallback);
   else fallback();
 }
+function radioVal(name) {
+  var r = document.querySelector('input[name="' + name + '"]:checked');
+  return r ? r.value : null;
+}
 function toggleNewMgr() {
-  document.getElementById('newMgr').style.display = document.getElementById('newRole').value === 'staff' ? '' : 'none';
+  document.getElementById('newMgrFld').hidden = radioVal('newRole') !== 'staff';
 }
 function toggleEditMgr(id) {
-  document.getElementById('em' + id).style.display = document.getElementById('er' + id).value === 'staff' ? '' : 'none';
+  var f = document.getElementById('emf' + id);
+  if (f) f.hidden = radioVal('er' + id) !== 'staff';
 }
 var PRESETS = {{ presets|tojson }};
 function applyPreset(sel, boxId) {
@@ -17059,11 +17186,19 @@ function readFeatures(boxId) {
   if (!box) return undefined;
   return Array.prototype.map.call(box.querySelectorAll('input[type=checkbox]:checked'), function (cb) { return cb.value; });
 }
+function toggleAdd(force) {
+  var c = document.getElementById('addCard'), b = document.getElementById('addToggle');
+  var open = (typeof force === 'boolean') ? force : c.hidden;
+  c.hidden = !open;
+  b.setAttribute('aria-expanded', open ? 'true' : 'false');
+  b.querySelector('.t').textContent = open ? 'Close' : 'Add a user';
+  if (open) { document.getElementById('newName').focus(); } else { b.focus(); }
+}
 async function addUser() {
   const full_name = document.getElementById('newName').value.trim();
   const email = document.getElementById('newEmail').value.trim();
   const password = document.getElementById('newPassword').value;
-  const role = document.getElementById('newRole').value;
+  const role = radioVal('newRole') || 'staff';
   if (!full_name || !email || !password) { showToast('Fill in the name, company email and a temporary password.', {error:true}); return; }
   const res = await fetch('/api/users', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({full_name, email, password, role, manager_id: document.getElementById('newMgr').value, features: readFeatures('nf')})});
@@ -17073,8 +17208,22 @@ async function addUser() {
   setTimeout(() => location.reload(), 500);
 }
 function toggleEdit(id) {
-  const r = document.getElementById('e' + id);
-  r.style.display = r.style.display === 'none' ? '' : 'none';
+  var r = document.getElementById('e' + id), b = document.getElementById('eb' + id), li = document.getElementById('u' + id);
+  var open = r.hidden;
+  r.hidden = !open;
+  li.classList.toggle('editing', open);
+  b.setAttribute('aria-expanded', open ? 'true' : 'false');
+  b.textContent = open ? 'Close' : 'Edit';
+  b.setAttribute('aria-label', (open ? 'Close editing ' : 'Edit ') + (b.dataset.name || ''));
+  if (open) { var f = document.getElementById('en' + id); if (f) f.focus(); } else { b.focus(); }
+}
+function cancelEdit(id) {
+  var r = document.getElementById('e' + id);
+  r.querySelectorAll('input[type=text],input[type=password]').forEach(function (i) { i.value = i.defaultValue; i.dispatchEvent(new Event('input', {bubbles: true})); });
+  r.querySelectorAll('input[type=checkbox],input[type=radio]').forEach(function (i) { i.checked = i.defaultChecked; });
+  var m = document.getElementById('em' + id); if (m) { var o = m.querySelector('option[selected]'); m.value = o ? o.value : ''; }
+  toggleEditMgr(id);
+  toggleEdit(id);
 }
 // live password hints
 (function () {
@@ -17102,8 +17251,8 @@ async function saveUser(id) {
   const body = {full_name: document.getElementById('en' + id).value.trim(), username: document.getElementById('eu' + id).value.trim(), email: document.getElementById('ee' + id).value.trim()};
   const pw = document.getElementById('ep' + id).value;
   if (pw) body.password = pw;
-  const er = document.getElementById('er' + id), em = document.getElementById('em' + id);
-  if (er) { body.role = er.value; if (er.value === 'staff' && em) body.manager_id = em.value; }
+  const rv = radioVal('er' + id), em = document.getElementById('em' + id);
+  if (rv) { body.role = rv; if (rv === 'staff' && em) body.manager_id = em.value; }
   var fl = readFeatures('ef' + id); if (fl) body.features = fl;
   var dt = document.getElementById('edt' + id); if (dt) body.do_team = dt.checked ? 1 : 0;
   const res = await fetch('/api/users/' + id, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
@@ -17112,6 +17261,22 @@ async function saveUser(id) {
   showToast('Saved.');
   setTimeout(() => location.reload(), 500);
 }
+// A risky button asks twice: the first press changes its words, the second does it. It goes back after four seconds or when you leave it.
+function arm(btn, armedText, spoken, run) {
+  if (btn.dataset.armed === '1') { disarm(btn); run(); return; }
+  btn.dataset.armed = '1'; btn.dataset.was = btn.textContent; btn.dataset.wasLabel = btn.getAttribute('aria-label') || '';
+  btn.textContent = armedText; btn.classList.add('armed'); btn.setAttribute('aria-label', spoken); say(spoken);
+  clearTimeout(btn._t); btn._t = setTimeout(function () { disarm(btn); }, 4000);
+  btn.addEventListener('blur', function () { disarm(btn); }, {once: true});
+}
+function disarm(btn) {
+  clearTimeout(btn._t);
+  if (btn.dataset.armed !== '1') return;
+  btn.dataset.armed = '0'; btn.textContent = btn.dataset.was; btn.classList.remove('armed');
+  if (btn.dataset.wasLabel) btn.setAttribute('aria-label', btn.dataset.wasLabel); else btn.removeAttribute('aria-label');
+}
+function armRemove(btn, id, name) { arm(btn, 'Confirm', 'Press again to confirm removing ' + name, function () { delUser(id, name); }); }
+function armReset(btn, id) { arm(btn, 'Confirm reset', 'Press again to confirm resetting 2-step for ' + (btn.dataset.name || ''), function () { reset2fa(id); }); }
 async function reset2fa(id) {
   const res = await fetch('/api/users/' + id, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({reset_2fa: true})});
   const data = await res.json().catch(() => ({}));
@@ -17133,7 +17298,6 @@ async function rmPhoto(id, name) {
   showToast('Removed the photo of ' + (name || '') + '.');
   setTimeout(() => location.reload(), 500);
 }
-
 async function delUser(id, username) {
   const res = await fetch('/api/users/' + id, {method:'DELETE'});
   const data = await res.json().catch(() => ({}));
@@ -17144,7 +17308,24 @@ async function delUser(id, username) {
   showToast('Removed user ' + (username || '') + '.');
   setTimeout(() => location.reload(), 500);
 }
+// Enter saves the form you are typing in; Escape closes it.
+document.addEventListener('keydown', function (e) {
+  var t = e.target;
+  if (e.key === 'Enter' && t && t.matches && t.matches('input[type=text],input[type=password]')) {
+    var box = t.closest('[data-enter]');
+    if (!box) return;
+    e.preventDefault();
+    if (box.dataset.enter === 'addUser') addUser(); else saveUser(parseInt(box.dataset.id, 10));
+  } else if (e.key === 'Escape' && t && t.closest) {
+    var row = t.closest('.edit-row');
+    if (row && !row.hidden) { e.preventDefault(); cancelEdit(parseInt(row.dataset.id, 10)); return; }
+    var add = t.closest('#addCard');
+    if (add && !add.hidden) { e.preventDefault(); toggleAdd(false); }
+  }
+});
+if (location.hash === '#add') toggleAdd(true);
 </script>
+<script>""" + _HDR_JS + """</script>
 </body></html>
 """
 
